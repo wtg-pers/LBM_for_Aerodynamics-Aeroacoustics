@@ -38,8 +38,8 @@ class StreamingPull:
         # Compute source indices: (Q, Nx, Ny, Nz)
         # Pull scheme: source = current - velocity
         self.src_x = (IX[None, :, :, :] - c[0, :, None, None, None] + Nx) % Nx
-        self.src_y = (IY[None, :, :, :] - c[1, :, None, None, None] + Nx) % Nx
-        self.src_z = (IZ[None, :, :, :] - c[2, :, None, None, None] + Nx) % Nx
+        self.src_y = (IY[None, :, :, :] - c[1, :, None, None, None] + Ny) % Ny
+        self.src_z = (IZ[None, :, :, :] - c[2, :, None, None, None] + Nz) % Nz
 
         self.src_x = self.src_x.astype(xp.int32)
         self.src_y = self.src_y.astype(xp.int32)
