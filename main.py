@@ -105,6 +105,14 @@ def parse_args():
         help='Restart from latest checkpoint'
     )
     parser.add_argument(
+        '--extend', type=int, default=None,
+        help='Extend simulation by N additional steps from restart point'
+    )
+    parser.add_argument(
+        '--max-steps', type=int, default=None,
+        help='Override max_steps from config (absolute end step)'
+    )
+    parser.add_argument(
         '--output-dir', type=str, default='./results',
         help='Output directory for VTK files'
     )
@@ -229,7 +237,7 @@ def main():
      # Relaxation time from ν = c_s² * (τ - 0.5)  →  τ = 3ν + 0.5
     tau = 3.0 * nu + 0.5              # [dimensionless]
 
-    max_steps = time_config.get('time', {}).get('max_steps', 10000)
+    config_max_steps = time_config.get('time', {}).get('max_steps', 10000)
     output_interval = time_config.get('time', {}).get('output_interval', 500)
     checkpoint_interval = time_config.get('checkpoint_interval', 2000)
 
@@ -291,18 +299,27 @@ def main():
         checkpoint_mgr.print_available()
         state = checkpoint_mgr.load_latest()
         f_old = xp.asarray(state['f'])
-        start_step = state['step']
+        
+        # Checkpoint saves the COMPLETED step, so we start from step+1
+        completed_step = state['step']
+        start_step = completed_step + 1
+        
+        print(f"  Loaded checkpoint from step {completed_step}")
         print(f"  Resuming from step {start_step}")
         
     elif args.restart:
         print(f"\n[5] Restarting from: {args.restart}")
         state = checkpoint_mgr.load(args.restart)
         f_old = xp.asarray(state['f'])
-        start_step = state['step']
+        
+        completed_step = state['step']
+        start_step = completed_step + 1
+        
+        print(f"  Loaded checkpoint from step {completed_step}")
         print(f"  Resuming from step {start_step}")
         
     else:
-        print(f"\n[5] Initializing Flow Field...")
+        print(f"\n[5] Initializing Flow Field (Fresh Start)...")
         
         # Initial conditions: uniform density, uniform x-velocity
         rho0 = xp.ones((Nx, Ny, Nz), dtype=xp.float64)   # [dimensionless]
@@ -313,6 +330,33 @@ def main():
         f_old = eq.compute(rho0, u0)
         print(f"  Initial total mass: {float(xp.sum(f_old)):.6f}")
     
+    # =========================================================================
+    # Determine End Step (max_steps)
+    # =========================================================================
+    # Priority: --max-steps > --extend > config
+    if args.max_steps is not None:
+        # Absolute end step specified
+        end_step = args.max_steps
+        print(f"\n  End step (--max-steps): {end_step}")
+    elif args.extend is not None:
+        # Extend from current position
+        end_step = start_step + args.extend
+        print(f"\n  Extending by {args.extend} steps: {start_step} → {end_step}")
+    else:
+        # Use config value
+        end_step = config_max_steps
+        print(f"\n  End step (from config): {end_step}")
+    
+    # Validate
+    if start_step >= end_step:
+        print(f"\n  ⚠️  Warning: start_step ({start_step}) >= end_step ({end_step})")
+        print(f"      Use --extend N or --max-steps N to continue simulation")
+        print(f"      Example: python main.py --restart-latest --extend 10000")
+        return True
+    
+    total_steps = end_step - start_step
+    print(f"  Steps to run: {total_steps} (from {start_step} to {end_step - 1})")
+    
     # Allocate work arrays
     f_new = xp.empty_like(f_old)
     f_post = xp.empty_like(f_old)
@@ -320,13 +364,15 @@ def main():
     # =========================================================================
     # Time Loop
     # =========================================================================
-    print(f"\n[6] Running Simulation: {max_steps} time steps")
+    print(f"\n[6] Running Simulation: step {start_step} → {end_step - 1}")
     print("="*70)
 
     # Run simulation
     start_time = time.perf_counter()
     custom_format = "{l_bar}{bar:8}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]"
-    pbar = tqdm(range(max_steps), ncols=72, bar_format=custom_format)
+    pbar = tqdm(range(start_step, end_step), 
+                unit="step",
+                ncols=72, bar_format=custom_format)
     
     flux_history = []
 
@@ -402,11 +448,18 @@ def main():
             )
 
     elapsed = time.perf_counter() - start_time
-    actual_steps = max_steps - start_step
-    mlups = (Nx * Ny * Nz * actual_steps) / elapsed / 1e6
+    mlups = (Nx * Ny * Nz * total_steps) / elapsed / 1e6
+
+    # =========================================================================
+    # Final Output
+    # =========================================================================
+    final_step = end_step - 1  # Last completed step
     
-    print("="*70)
-    print(f"[7] Performance: {elapsed:.2f}s, {mlups:.2f} MLUPS")
+    print("\n" + "="*70)
+    print(f"[7] Performance Summary")
+    print(f"  Steps completed: {start_step} → {final_step}")
+    print(f"  Elapsed time: {elapsed:.2f}s")
+    print(f"  MLUPS: {mlups:.2f}")
     
     # Final macroscopic state
     rho_final, u_final = macro.compute(f_old)
@@ -414,23 +467,22 @@ def main():
     # Final VTK output
     if vtk_writer is not None:
         vtk_writer.write(
-            step=max_steps, 
-            rho=rho_final, 
-            u=u_final, 
-            solid_mask=solid_mask_np, 
-            time=float(max_steps)
+            step=final_step,
+            rho=rho_final,
+            u=u_final,
+            solid_mask=solid_mask_np,
+            time=float(final_step)
         )
         pvd_path = vtk_writer.write_pvd('simulation.pvd')
-        print(f"  PVD file written: {pvd_path}")
-        print(f"  Open in ParaView to view time series animation")
+        print(f"\n  PVD file: {pvd_path}")
     
-    # Final checkpoint
+    # Final checkpoint (saves the last COMPLETED step)
     checkpoint_mgr.save(
-        step=max_steps, 
-        f=f_old, 
-        rho=rho_final, 
-        u=u_final, 
-        tau=tau, 
+        step=final_step,
+        f=f_old,
+        rho=rho_final,
+        u=u_final,
+        tau=tau,
         config=sim_params
     )
     

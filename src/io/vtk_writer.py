@@ -2,7 +2,7 @@
 VTK Output Module for LBM Solver
 
 This module provides VTK file output for ParaView visualization.
-Uses VTK XML ImageData format (.vti) with optional compression.
+Uses VTK XML ImageData format (.vti) with appended binary data.
 
 Supported Output Variables:
     - density (ρ): Scalar field  [dimensionless, ρ/ρ_0]
@@ -11,24 +11,18 @@ Supported Output Variables:
     - velocity_magnitude: Scalar field  [lattice units]
     - solid_mask: Integer field (0=fluid, 1=solid)
 
-File Size Optimization:
-    - Binary encoding (base64)
-    - zlib compression (configurable level 1-9)
-    - float32 precision (optional)
-
-References:
-    - VTK File Formats: https://vtk.org/wp-content/uploads/2015/04/file-formats.pdf
-    - ParaView: https://www.paraview.org/
+File Format:
+    VTK XML ImageData (.vti) with appended binary encoding.
+    This format is compatible with all ParaView versions.
 
 Author: LBM Development Team
 Date: 2026-01
 """
 
 import os
-import base64
-import zlib
 import struct
-from typing import TYPE_CHECKING, Optional, Dict, List, Union
+import re
+from typing import TYPE_CHECKING, Optional, Dict, List
 import numpy as np
 
 if TYPE_CHECKING:
@@ -37,18 +31,17 @@ if TYPE_CHECKING:
 
 
 class VTKWriter:
-    """VTK ImageData (.vti) writer with compression support
+    """VTK ImageData (.vti) writer with appended binary format
     
     Writes 3D scalar and vector fields to VTK XML format for ParaView.
-    Supports binary encoding and zlib compression for reduced file size.
+    Uses appended binary encoding for compatibility and efficiency.
     
     Attributes:
         output_dir: Directory for output files
         precision: Data precision ('float32' or 'float64')
-        compression_level: zlib compression (0=none, 1-9=compressed)
         
     Example:
-        >>> writer = VTKWriter('./results', precision='float32', compression_level=6)
+        >>> writer = VTKWriter('./results', domain_shape=(100,40,40))
         >>> writer.write(step=1000, rho=rho, u=u, solid_mask=mask)
     """
     
@@ -56,105 +49,66 @@ class VTKWriter:
                  output_dir: str,
                  domain_shape: tuple,
                  precision: str = 'float32',
-                 compression_level: int = 6,
+                 compression_level: int = 0,
                  origin: tuple = (0.0, 0.0, 0.0),
                  spacing: tuple = (1.0, 1.0, 1.0)) -> None:
         """Initialize VTK writer
         
         Args:
             output_dir: Output directory path
-            domain_shape: (Nx, Ny, Nz) grid dimensions
+            domain_shape: (Nx, Ny, Nz) grid dimensions  [lattice units]
             precision: 'float32' or 'float64'
-            compression_level: 0 (no compression) to 9 (max compression)
-            origin: Grid origin (x0, y0, z0)  [physical units or lattice units]
-            spacing: Grid spacing (dx, dy, dz)  [physical units or lattice units]
+            compression_level: Compression level (currently unused)
+            origin: Grid origin (x0, y0, z0)  [physical or lattice units]
+            spacing: Grid spacing (dx, dy, dz)  [physical or lattice units]
         """
         self.output_dir = output_dir
         self.Nx, self.Ny, self.Nz = domain_shape
         self.precision = precision
-        self.compression_level = compression_level
         self.origin = origin
         self.spacing = spacing
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Determine numpy dtype
-        self.dtype = np.float32 if precision == 'float32' else np.float64
-        self.vtk_type = 'Float32' if precision == 'float32' else 'Float64'
+        # Determine numpy dtype and VTK type string
+        if precision == 'float32':
+            self.dtype = np.float32
+            self.vtk_type = 'Float32'
+        else:
+            self.dtype = np.float64
+            self.vtk_type = 'Float64'
         
         # For time series (PVD file)
-        self.time_steps: List[tuple] = []  # [(time, filename), ...]
+        self.time_steps: List[tuple] = []
+        
+        # Scan existing VTK files to support restart
+        self._scan_existing_files()
+    
+    def _scan_existing_files(self, prefix: str = 'lbm') -> None:
+        """Scan output directory for existing VTK files"""
+        if not os.path.exists(self.output_dir):
+            return
+        
+        pattern = re.compile(rf'^{prefix}_(\d+)\.vti$')
+        
+        for filename in os.listdir(self.output_dir):
+            match = pattern.match(filename)
+            if match:
+                step = int(match.group(1))
+                self.time_steps.append((float(step), filename))
+        
+        self.time_steps.sort(key=lambda x: x[0])
+        
+        if self.time_steps:
+            print(f"    Found {len(self.time_steps)} existing VTK files")
+            print(f"    Step range: {int(self.time_steps[0][0])} → {int(self.time_steps[-1][0])}")
     
     def _to_numpy(self, arr: 'npt.NDArray') -> np.ndarray:
         """Convert CuPy array to NumPy if necessary"""
-        if hasattr(arr, 'get'):  # CuPy array
+        if hasattr(arr, 'get'):
             return arr.get()
         return np.asarray(arr)
-    
-    def _prepare_scalar(self, data: 'npt.NDArray') -> np.ndarray:
-        """Prepare scalar field for VTK output
-        
-        VTK expects Fortran order (column-major) for structured grids.
-        
-        Args:
-            data: Scalar field, shape (Nx, Ny, Nz)
-            
-        Returns:
-            Flattened array in Fortran order
-        """
-        data = self._to_numpy(data).astype(self.dtype)
-        # VTK uses Fortran ordering (x varies fastest)
-        return np.asfortranarray(data).ravel(order='F')
-    
-    def _prepare_vector(self, data: 'npt.NDArray') -> np.ndarray:
-        """Prepare vector field for VTK output
-        
-        Args:
-            data: Vector field, shape (3, Nx, Ny, Nz)
-            
-        Returns:
-            Interleaved array [vx0,vy0,vz0, vx1,vy1,vz1, ...]
-        """
-        data = self._to_numpy(data).astype(self.dtype)
-        # Reshape to (Nx, Ny, Nz, 3) then flatten in Fortran order
-        vector = np.moveaxis(data, 0, -1)  # (Nx, Ny, Nz, 3)
-        return np.asfortranarray(vector).ravel(order='F')
-    
-    def _encode_data(self, data: np.ndarray) -> str:
-        """Encode data as base64 with optional compression
-        
-        VTK XML format uses base64 encoding for binary data.
-        With compression, data is: [header][compressed_data]
-        Header contains: num_blocks, block_size, last_block_size, compressed_sizes
-        
-        Args:
-            data: NumPy array to encode
-            
-        Returns:
-            Base64 encoded string
-        """
-        raw_bytes = data.tobytes()
-        
-        if self.compression_level > 0:
-            # Compressed format with header
-            compressed = zlib.compress(raw_bytes, self.compression_level)
-            
-            # Header: [num_blocks, uncompressed_block_size, last_block_size, compressed_size]
-            # All as 32-bit unsigned integers
-            header = struct.pack('<4I', 
-                                 1,                    # num_blocks
-                                 len(raw_bytes),      # uncompressed size
-                                 len(raw_bytes),      # last block size (same for 1 block)
-                                 len(compressed))     # compressed size
-            
-            encoded = base64.b64encode(header + compressed).decode('ascii')
-        else:
-            # Uncompressed: just prepend size header
-            header = struct.pack('<I', len(raw_bytes))
-            encoded = base64.b64encode(header + raw_bytes).decode('ascii')
-        
-        return encoded
     
     def write(self, 
               step: int,
@@ -179,109 +133,102 @@ class VTKWriter:
         filename = f"{prefix}_{step:08d}.vti"
         filepath = os.path.join(self.output_dir, filename)
         
-        # Build XML content
-        xml_lines = self._build_vti_header()
-        
-        # Add data arrays
-        data_arrays = []
-        
-        if rho is not None:
-            # Density
-            rho_data = self._prepare_scalar(rho)
-            data_arrays.append(('density', 'Scalars', 1, rho_data))
-            
-            # Pressure: p = ρ * c_s² = ρ / 3
-            pressure = rho_data / 3.0
-            data_arrays.append(('pressure', 'Scalars', 1, pressure))
-        
-        if u is not None:
-            # Velocity vector
-            u_data = self._prepare_vector(u)
-            data_arrays.append(('velocity', 'Vectors', 3, u_data))
-            
-            # Velocity magnitude
-            u_np = self._to_numpy(u)
-            u_mag = np.sqrt(np.sum(u_np**2, axis=0))
-            u_mag_data = self._prepare_scalar(u_mag)
-            data_arrays.append(('velocity_magnitude', 'Scalars', 1, u_mag_data))
-        
-        if solid_mask is not None:
-            # Solid mask as integer (0=fluid, 1=solid)
-            mask_np = self._to_numpy(solid_mask).astype(np.int8)
-            mask_data = np.asfortranarray(mask_np).ravel(order='F')
-            data_arrays.append(('solid_mask', 'Scalars', 1, mask_data))
-        
-        # Write PointData section
-        xml_lines.append('      <PointData>')
-        
-        for name, attr_type, num_components, data in data_arrays:
-            if name == 'solid_mask':
-                vtype = 'Int8'
-            else:
-                vtype = self.vtk_type
-            
-            xml_lines.append(
-                f'        <DataArray type="{vtype}" Name="{name}" '
-                f'NumberOfComponents="{num_components}" format="binary"'
-                + (f' compression="zlib"' if self.compression_level > 0 else '') + '>'
-            )
-            xml_lines.append('          ' + self._encode_data(data))
-            xml_lines.append('        </DataArray>')
-        
-        xml_lines.append('      </PointData>')
-        xml_lines.append('      <CellData></CellData>')
-        
-        # Close tags
-        xml_lines.extend(self._build_vti_footer())
-        
-        # Write file
-        with open(filepath, 'w') as f:
-            f.write('\n'.join(xml_lines))
-        
-        # Record for PVD
-        if time is None:
-            time = float(step)
-        self.time_steps.append((time, filename))
-        
-        return filepath
-    
-    def _build_vti_header(self) -> List[str]:
-        """Build VTI file header"""
         Nx, Ny, Nz = self.Nx, self.Ny, self.Nz
         ox, oy, oz = self.origin
         dx, dy, dz = self.spacing
         
-        # WholeExtent is 0-indexed, point-based (Nx points = Nx-1 cells, but for point data use Nx)
-        # For PointData on structured grid: extent goes from 0 to N-1
-        lines = [
+        # Collect data arrays: (name, vtk_type, num_components, data_bytes)
+        data_arrays = []
+        
+        if rho is not None:
+            # Density - C order, then reshape for VTK (x fastest)
+            rho_np = self._to_numpy(rho).astype(self.dtype)
+            # VTK expects x to vary fastest, but our array is (Nx, Ny, Nz) in C order
+            # Transpose to (Nz, Ny, Nx) then flatten in C order = x varies fastest
+            rho_vtk = np.ascontiguousarray(rho_np.transpose(2, 1, 0)).ravel()
+            data_arrays.append(('density', self.vtk_type, 1, rho_vtk.tobytes()))
+            
+            # Pressure: p = ρ * c_s² = ρ / 3
+            pressure = (rho_vtk / 3.0).astype(self.dtype)
+            data_arrays.append(('pressure', self.vtk_type, 1, pressure.tobytes()))
+        
+        if u is not None:
+            # Velocity vector (3, Nx, Ny, Nz)
+            u_np = self._to_numpy(u).astype(self.dtype)
+            
+            # Transpose spatial dimensions: (3, Nx, Ny, Nz) -> (3, Nz, Ny, Nx)
+            u_transposed = u_np.transpose(0, 3, 2, 1)
+            
+            # Interleave components: (Nz, Ny, Nx, 3)
+            u_interleaved = np.ascontiguousarray(u_transposed.transpose(1, 2, 3, 0))
+            data_arrays.append(('velocity', self.vtk_type, 3, u_interleaved.ravel().tobytes()))
+            
+            # Velocity magnitude
+            u_mag = np.sqrt(np.sum(u_np**2, axis=0))
+            u_mag_vtk = np.ascontiguousarray(u_mag.transpose(2, 1, 0)).ravel()
+            data_arrays.append(('velocity_magnitude', self.vtk_type, 1, u_mag_vtk.astype(self.dtype).tobytes()))
+        
+        if solid_mask is not None:
+            mask_np = self._to_numpy(solid_mask).astype(np.int8)
+            mask_vtk = np.ascontiguousarray(mask_np.transpose(2, 1, 0)).ravel()
+            data_arrays.append(('solid_mask', 'Int8', 1, mask_vtk.tobytes()))
+        
+        # Build XML with correct extent
+        # VTK ImageData extent: number of points in each dimension
+        # For Nx cells, we have Nx points (cell-centered data treated as point data)
+        xml_lines = [
             '<?xml version="1.0"?>',
-            '<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian"'
-            + (' compressor="vtkZLibDataCompressor"' if self.compression_level > 0 else '') + '>',
+            '<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt64">',
             f'  <ImageData WholeExtent="0 {Nx-1} 0 {Ny-1} 0 {Nz-1}" '
             f'Origin="{ox} {oy} {oz}" Spacing="{dx} {dy} {dz}">',
             f'    <Piece Extent="0 {Nx-1} 0 {Ny-1} 0 {Nz-1}">',
+            '      <PointData>',
         ]
-        return lines
-    
-    def _build_vti_footer(self) -> List[str]:
-        """Build VTI file footer"""
-        return [
+        
+        # Add DataArray entries with offset references
+        offset = 0
+        for name, vtype, ncomp, data_bytes in data_arrays:
+            xml_lines.append(
+                f'        <DataArray type="{vtype}" Name="{name}" '
+                f'NumberOfComponents="{ncomp}" format="appended" offset="{offset}"/>'
+            )
+            offset += 8 + len(data_bytes)
+        
+        xml_lines.extend([
+            '      </PointData>',
+            '      <CellData>',
+            '      </CellData>',
             '    </Piece>',
             '  </ImageData>',
-            '</VTKFile>'
-        ]
+            '  <AppendedData encoding="raw">',
+            '   _',
+        ])
+        
+        # Write file
+        with open(filepath, 'wb') as f:
+            header_text = '\n'.join(xml_lines)
+            f.write(header_text.encode('ascii'))
+            
+            for name, vtype, ncomp, data_bytes in data_arrays:
+                size_header = struct.pack('<Q', len(data_bytes))
+                f.write(size_header)
+                f.write(data_bytes)
+            
+            footer = '\n  </AppendedData>\n</VTKFile>\n'
+            f.write(footer.encode('ascii'))
+        
+        # Record for PVD
+        if time is None:
+            time = float(step)
+        
+        self.time_steps = [(t, f) for t, f in self.time_steps if t != time]
+        self.time_steps.append((time, filename))
+        self.time_steps.sort(key=lambda x: x[0])
+        
+        return filepath
     
     def write_pvd(self, filename: str = 'simulation.pvd') -> str:
-        """Write ParaView Data (PVD) file for time series
-        
-        PVD files allow ParaView to load all time steps as an animation.
-        
-        Args:
-            filename: PVD filename
-            
-        Returns:
-            Path to PVD file
-        """
+        """Write ParaView Data (PVD) file for time series"""
         filepath = os.path.join(self.output_dir, filename)
         
         lines = [
@@ -290,7 +237,7 @@ class VTKWriter:
             '  <Collection>'
         ]
         
-        for time, vti_file in self.time_steps:
+        for time, vti_file in sorted(self.time_steps, key=lambda x: x[0]):
             lines.append(f'    <DataSet timestep="{time}" file="{vti_file}"/>')
         
         lines.extend([
@@ -307,61 +254,65 @@ class VTKWriter:
                                 include_rho: bool = True,
                                 include_u: bool = True,
                                 include_mask: bool = True) -> Dict[str, float]:
-        """Estimate output file size
-        
-        Returns:
-            Dictionary with size estimates in MB
-        """
+        """Estimate output file size"""
         n_points = self.Nx * self.Ny * self.Nz
         bytes_per_float = 4 if self.precision == 'float32' else 8
         
-        # Raw sizes
-        scalar_size = n_points * bytes_per_float
-        vector_size = n_points * 3 * bytes_per_float
-        mask_size = n_points * 1  # int8
-        
         total_raw = 0
         if include_rho:
-            total_raw += scalar_size * 2  # density + pressure
+            total_raw += n_points * bytes_per_float * 2
         if include_u:
-            total_raw += vector_size + scalar_size  # velocity + magnitude
+            total_raw += n_points * bytes_per_float * 4
         if include_mask:
-            total_raw += mask_size
-        
-        # Compression ratio estimate (typical for CFD data)
-        if self.compression_level > 0:
-            compression_ratio = 0.3  # ~70% reduction typical
-        else:
-            compression_ratio = 1.35  # base64 expansion
-        
-        estimated_size = total_raw * compression_ratio
+            total_raw += n_points * 1
         
         return {
             'raw_MB': total_raw / 1e6,
-            'estimated_MB': estimated_size / 1e6,
+            'estimated_MB': total_raw / 1e6,
             'n_points': n_points
         }
 
 
-class VTKWriterLegacy:
-    """Legacy VTK writer (.vtk format)
+class VTKWriterASCII:
+    """Legacy ASCII VTK writer (.vtk format)
     
-    Simpler format but no compression. Use VTKWriter for better performance.
-    Kept for compatibility with older ParaView versions.
+    Simplest format, compatible with all VTK readers.
+    Use for debugging or when binary formats fail.
     """
     
     def __init__(self, output_dir: str, domain_shape: tuple) -> None:
         self.output_dir = output_dir
         self.Nx, self.Ny, self.Nz = domain_shape
         os.makedirs(output_dir, exist_ok=True)
+        self.time_steps = []
+        self._scan_existing_files()
+    
+    def _scan_existing_files(self, prefix: str = 'lbm') -> None:
+        """Scan for existing files"""
+        if not os.path.exists(self.output_dir):
+            return
+        
+        pattern = re.compile(rf'^{prefix}_(\d+)\.vtk$')
+        
+        for filename in os.listdir(self.output_dir):
+            match = pattern.match(filename)
+            if match:
+                step = int(match.group(1))
+                self.time_steps.append((float(step), filename))
+        
+        self.time_steps.sort(key=lambda x: x[0])
+        
+        if self.time_steps:
+            print(f"    Found {len(self.time_steps)} existing VTK files")
     
     def _to_numpy(self, arr):
         if hasattr(arr, 'get'):
             return arr.get()
         return np.asarray(arr)
     
-    def write(self, step: int, rho=None, u=None, solid_mask=None, prefix='lbm') -> str:
-        """Write legacy VTK file"""
+    def write(self, step: int, rho=None, u=None, solid_mask=None, 
+              time=None, prefix='lbm') -> str:
+        """Write legacy ASCII VTK file"""
         filename = f"{prefix}_{step:08d}.vtk"
         filepath = os.path.join(self.output_dir, filename)
         
@@ -384,10 +335,19 @@ class VTKWriterLegacy:
                 rho_np = self._to_numpy(rho).astype(np.float32)
                 f.write('SCALARS density float 1\n')
                 f.write('LOOKUP_TABLE default\n')
+                # VTK STRUCTURED_POINTS: x varies fastest, then y, then z
                 for k in range(Nz):
                     for j in range(Ny):
                         for i in range(Nx):
-                            f.write(f'{rho_np[i,j,k]:.6f}\n')
+                            f.write(f'{rho_np[i,j,k]:.6g}\n')
+                
+                # Pressure
+                f.write('SCALARS pressure float 1\n')
+                f.write('LOOKUP_TABLE default\n')
+                for k in range(Nz):
+                    for j in range(Ny):
+                        for i in range(Nx):
+                            f.write(f'{rho_np[i,j,k]/3.0:.6g}\n')
             
             # Velocity
             if u is not None:
@@ -396,6 +356,63 @@ class VTKWriterLegacy:
                 for k in range(Nz):
                     for j in range(Ny):
                         for i in range(Nx):
-                            f.write(f'{u_np[0,i,j,k]:.6f} {u_np[1,i,j,k]:.6f} {u_np[2,i,j,k]:.6f}\n')
+                            f.write(f'{u_np[0,i,j,k]:.6g} {u_np[1,i,j,k]:.6g} {u_np[2,i,j,k]:.6g}\n')
+                
+                # Velocity magnitude
+                u_mag = np.sqrt(np.sum(u_np**2, axis=0))
+                f.write('SCALARS velocity_magnitude float 1\n')
+                f.write('LOOKUP_TABLE default\n')
+                for k in range(Nz):
+                    for j in range(Ny):
+                        for i in range(Nx):
+                            f.write(f'{u_mag[i,j,k]:.6g}\n')
+            
+            # Solid mask
+            if solid_mask is not None:
+                mask_np = self._to_numpy(solid_mask).astype(np.int32)
+                f.write('SCALARS solid_mask int 1\n')
+                f.write('LOOKUP_TABLE default\n')
+                for k in range(Nz):
+                    for j in range(Ny):
+                        for i in range(Nx):
+                            f.write(f'{mask_np[i,j,k]}\n')
+        
+        if time is None:
+            time = float(step)
+        self.time_steps = [(t, fn) for t, fn in self.time_steps if t != time]
+        self.time_steps.append((time, filename))
+        self.time_steps.sort(key=lambda x: x[0])
         
         return filepath
+    
+    def write_pvd(self, filename: str = 'simulation.pvd') -> str:
+        """Write PVD file for time series"""
+        filepath = os.path.join(self.output_dir, filename)
+        
+        lines = [
+            '<?xml version="1.0"?>',
+            '<VTKFile type="Collection" version="0.1">',
+            '  <Collection>'
+        ]
+        
+        for time, vtk_file in sorted(self.time_steps, key=lambda x: x[0]):
+            lines.append(f'    <DataSet timestep="{time}" file="{vtk_file}"/>')
+        
+        lines.extend([
+            '  </Collection>',
+            '</VTKFile>'
+        ])
+        
+        with open(filepath, 'w') as f:
+            f.write('\n'.join(lines))
+        
+        return filepath
+    
+    def get_file_size_estimate(self, **kwargs) -> Dict[str, float]:
+        """Estimate file size (rough)"""
+        n_points = self.Nx * self.Ny * self.Nz
+        return {
+            'raw_MB': n_points * 50 / 1e6,  # ~50 bytes per point in ASCII
+            'estimated_MB': n_points * 50 / 1e6,
+            'n_points': n_points
+        }
