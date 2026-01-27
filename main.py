@@ -12,7 +12,15 @@ from src.macroscopic.compute import Macroscopic
 from src.collision.bgk import BGK
 from src.streaming.stream import StreamingPull
 
+# Boundary imports
+from src.boundary.base import (
+    BoundaryLocation, 
+    BoundaryManager,
+    create_boundary_from_config,
+    create_all_boundaries_from_config
+)
 from src.boundary.inlet import EquilibriumInlet
+from src.boundary.outlet import CharacteristicOutlet
 
 from src.utilities.check_conservation import ConservationChecker
 
@@ -42,11 +50,31 @@ def main():
     print(f"  Total cells: {Nx*Ny*Nz:,}")
 
     west_bc = config_loader.get_boundary_config('west')
-    print(west_bc)
-    inlet = EquilibriumInlet(xp, lattice, west_bc,
-                             west_bc['velocity'],
-                             density=1.0,
-                             shape=domain_shape)
+    print(f"\n[Boundary Config - west]")
+    print(f"  {west_bc}")
+    inlet = EquilibriumInlet(
+        xp, lattice, 
+        'west',
+        velocity=west_bc['velocity'],
+        density=1.0,
+        shape=domain_shape
+    )
+
+    east_bc = config_loader.get_boundary_config('east')
+    print(f"\n[Boundary Config - east]")
+    print(f"  {east_bc}")
+    outlet = CharacteristicOutlet(
+        xp, lattice,
+        'east',
+        rho_target=1.0,
+        relax_coeff=0.1,
+        shape=domain_shape
+    )
+
+    bc_manager = BoundaryManager()
+    bc_manager.add(inlet)
+    print(f"\n[Boundary Conditions]")
+    print(f"  Inlet (West): velocity = {west_bc['velocity']}")
 
     Re = physics_config.get('Re')
     u_init = physics_config.get('u_init')
@@ -54,9 +82,10 @@ def main():
 
     max_steps = sim_params.get('time', {}).get('max_steps', 10000)
     output_interval = sim_params.get('time', {}).get('output_interval', 500)
-    print(f"Re: {Re}")
-    print(f"u_initial: {u_init}")
-    print(f"L_char: {char_length}")
+    print(f"\n[Physics]")
+    print(f"  Re: {Re}")
+    print(f"  u_initial: {u_init}")
+    print(f"  L_char: {char_length}")
 
     streaming = StreamingPull(xp, lattice, domain_shape)
     conservation = ConservationChecker(xp, lattice)
@@ -80,12 +109,13 @@ def main():
     X, Y, Z = xp.meshgrid(x, y, z, indexing='ij')
     
     # Gaussian perturbation
-    u0[0] = 0.05 * xp.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
+    # u0[0] = 0.05 * xp.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
 
     f = eq.compute(rho0, u0)  # domain.f
     f_temp = xp.empty_like(f)
     print("Initialization complete!")
 
+    bc_manager.apply_all(f)
     conservation.set_reference(f)
     # ======================================================================
 
@@ -95,19 +125,27 @@ def main():
 
     print(f"\n[2] Running {max_steps} time steps...")
     print(f"    τ = {tau}, ν = {(1/3)*(tau-0.5):.6f}")
-    print(f"    Boundary: Periodic (all directions)")
 
     # Run simulation
     start_time = time.perf_counter()
-    pbar = tqdm(range(max_steps))
+    pbar = tqdm(range(max_steps), ncols=72)
 
     for i in pbar:
+        # 1. Macroscopic
         rho, u = macro.compute(f)
+
+        # 2. Equilibrium
         f_eq = eq.compute(rho, u)
+        
+        # 3. Collision
         f_post = collision.collide(f, f_eq, tau)
 
+        # 4. Streaming
         streaming.compute(f_post, f_temp)
         f, f_temp = f_temp, f
+
+        # 5. Boundary Conditions (AFTER streaming)
+        bc_manager.apply_all(f)
 
         pbar.set_postfix(avg_rho=f"{rho.mean():.6f}")
 
