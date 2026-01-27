@@ -21,7 +21,8 @@ simulation = {
     },
     "time": {
         "max_steps": 20000,
-        "output_interval": 200
+        "output_interval": 200,         # VTK output interval
+        "checkpoint_interval": 2000     # Checkpoint save interval
     }
 }
 
@@ -34,9 +35,28 @@ boundaries = {
     "top": {"type": "wall", "location": Nz - 1, "method": "bouzidi", "q": 0.5}
 }
 
+
+# =============================================================================
+# Output Configuration
+# =============================================================================
+output = {
+    "vtk": {
+        "enabled": True,
+        "precision": "float32",     # 'float32' or 'float64'
+        "compression_level": 6,     # 0 (none) to 9 (max compression)
+        "variables": ["density", "pressure", "velocity", "velocity_magnitude", "solid_mask"]
+    },
+    "checkpoint": {
+        "enabled": True,
+        "keep_last_n": 3           # Number of checkpoints to keep (0=keep all)
+    }
+}
+
+
 # 3. 최종적으로 ConfigLoader가 가져갈 딕셔너리 통합
 config = {
     "simulation": simulation,
     "boundaries": boundaries,
+    "output": output
     # 필요 시 추가 섹션
 }

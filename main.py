@@ -1,9 +1,11 @@
-import os, sys, time
+import os, sys, time, argparse
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.io.config_loader import ConfigLoader
+from src.io.vtk_writer import VTKWriter
+from src.io.checkpoint import CheckpointManager
 from src.utilities.device import setup_library
 from src.lattice.d3q27 import D3Q27
 from src.domain.domain import Domain
@@ -82,9 +84,48 @@ def verify_mass_flux_balance(xp, rho, u, verbose=True):
 
 
 # =============================================================================
+# Command Line Arguments
+# =============================================================================
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='LBM Solver for Aerodynamics/Aeroacoustics'
+    )
+    parser.add_argument(
+        '--config', type=str, default='./configs/input_config.py',
+        help='Path to configuration file'
+    )
+    parser.add_argument(
+        '--restart', type=str, default=None,
+        help='Path to checkpoint file for restart'
+    )
+    parser.add_argument(
+        '--restart-latest', action='store_true',
+        help='Restart from latest checkpoint'
+    )
+    parser.add_argument(
+        '--output-dir', type=str, default='./results',
+        help='Output directory for VTK files'
+    )
+    parser.add_argument(
+        '--checkpoint-dir', type=str, default='./checkpoints',
+        help='Directory for checkpoint files'
+    )
+    parser.add_argument(
+        '--no-vtk', action='store_true',
+        help='Disable VTK output'
+    )
+    
+    return parser.parse_args()
+
+
+# =============================================================================
 # Main Simulation
 # =============================================================================
 def main():
+    args = parse_args()
+
     print("="*70)
     print(" Initializing LBM Solver...")
     print("="*70)
@@ -97,9 +138,10 @@ def main():
 
     sim_params = config_loader.get_simulation_params()
     device_mode = sim_params.get('device_mode')
-    lattice_model = sim_params.get('lattice_model', 'D3Q27')
+    # lattice_model = sim_params.get('lattice_model', 'D3Q27')
     domain_config = sim_params.get('domain', {})
     physics_config = sim_params.get('physics', {})
+    time_config = sim_params.get('time', {})
 
     xp = setup_library(device_mode)
     lattice = D3Q27(xp)
@@ -109,7 +151,7 @@ def main():
     # =========================================================================
     print("\n[0] Validating Lattice Model...")
     validator = LatticeValidator(xp)
-    is_valid, validation_results = validator.validate_all(
+    is_valid, _ = validator.validate_all(
         lattice.c, lattice.w, lattice.cs2, verbose=True
     )
     if not is_valid:
@@ -171,6 +213,8 @@ def main():
     print(f"\n  Internal obstacle:")
     print(f"  {wall_bc.get_info()}")
 
+    # Convert mask for VTK output (ensure NumPy array)
+    solid_mask_np = cylinder_mask.get() if hasattr(cylinder_mask, 'get') else cylinder_mask
 
     # =========================================================================
     # Physics Parameters
@@ -185,8 +229,9 @@ def main():
      # Relaxation time from ν = c_s² * (τ - 0.5)  →  τ = 3ν + 0.5
     tau = 3.0 * nu + 0.5              # [dimensionless]
 
-    max_steps = sim_params.get('time', {}).get('max_steps', 10000)
-    output_interval = sim_params.get('time', {}).get('output_interval', 500)
+    max_steps = time_config.get('time', {}).get('max_steps', 10000)
+    output_interval = time_config.get('time', {}).get('output_interval', 500)
+    checkpoint_interval = time_config.get('checkpoint_interval', 2000)
 
     print(f"\n[3] Physics Parameters")
     print(f"  Re = {Re}")
@@ -194,6 +239,37 @@ def main():
     print(f"  L_char = {char_length} [Δx]")
     print(f"  ν = {nu:.6f} [Δx²/Δt]")
     print(f"  τ = {tau:.6f}")
+
+    # =========================================================================
+    # Initialize I/O Modules
+    # =========================================================================
+    print(f"\n[4] I/O Setup")
+    
+    # VTK Writer (compressed .vti format)
+    if not args.no_vtk:
+        vtk_writer = VTKWriter(
+            output_dir=args.output_dir,
+            domain_shape=domain_shape,
+            precision='float32',      # 50% smaller than float64
+            compression_level=6       # zlib compression (0-9)
+        )
+        size_est = vtk_writer.get_file_size_estimate()
+        print(f"  VTK output: {args.output_dir}")
+        print(f"    Estimated file size: {size_est['estimated_MB']:.2f} MB per snapshot")
+    else:
+        vtk_writer = None
+        print("  VTK output: DISABLED")
+    
+    # Checkpoint Manager
+    checkpoint_mgr = CheckpointManager(
+        output_dir=args.checkpoint_dir,
+        prefix='checkpoint',
+        keep_last_n=3,  # Keep only last 3 checkpoints to save disk space
+        xp=xp
+    )
+    ckpt_est = checkpoint_mgr.get_size_estimate((lattice.Q, Nx, Ny, Nz))
+    print(f"  Checkpoints: {args.checkpoint_dir}")
+    print(f"    Estimated size: {ckpt_est['estimated_MB']:.2f} MB per checkpoint")
 
 
     # =========================================================================
@@ -208,34 +284,43 @@ def main():
     # ======================================================================
     # initial condition
     # ======================================================================
-    print(f"\n[4] Initializing Flow Field...")
-
-    rho0 = xp.ones_like(domain.rho, dtype=xp.float64)  # [dimensionless]
-    u0 = xp.zeros_like(domain.u, dtype=xp.float64)     # [lattice units]
-
-    u0[0] = u_init
-
-    # Gaussian perturbation
-    # x = xp.linspace(0, 1, Nx)
-    # y = xp.linspace(0, 1, Ny)
-    # z = xp.linspace(0, 1, Nz)
-    # X, Y, Z = xp.meshgrid(x, y, z, indexing='ij')
-    # u0[0] = 0.05 * xp.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
-
-    # Initialize distribution to equilibrium
-    f_old = eq.compute(rho0, u0)
+    start_step = 0
+    
+    if args.restart_latest:
+        print(f"\n[5] Restarting from latest checkpoint...")
+        checkpoint_mgr.print_available()
+        state = checkpoint_mgr.load_latest()
+        f_old = xp.asarray(state['f'])
+        start_step = state['step']
+        print(f"  Resuming from step {start_step}")
+        
+    elif args.restart:
+        print(f"\n[5] Restarting from: {args.restart}")
+        state = checkpoint_mgr.load(args.restart)
+        f_old = xp.asarray(state['f'])
+        start_step = state['step']
+        print(f"  Resuming from step {start_step}")
+        
+    else:
+        print(f"\n[5] Initializing Flow Field...")
+        
+        # Initial conditions: uniform density, uniform x-velocity
+        rho0 = xp.ones((Nx, Ny, Nz), dtype=xp.float64)   # [dimensionless]
+        u0 = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64) # [lattice units]
+        u0[0] = u_init  # u_x = u_init everywhere
+        
+        # Initialize distribution to equilibrium
+        f_old = eq.compute(rho0, u0)
+        print(f"  Initial total mass: {float(xp.sum(f_old)):.6f}")
+    
+    # Allocate work arrays
     f_new = xp.empty_like(f_old)
     f_post = xp.empty_like(f_old)
-
-    initial_total_mass = float(xp.sum(f_old))
-    print(f"  Initial total mass: {initial_total_mass:.6f}")
-    print(f"  Initialization complete!")
     
     # =========================================================================
     # Time Loop
     # =========================================================================
-    print(f"\n[5] Running Simulation: {max_steps} time steps")
-    print(f"    Output interval: {output_interval} steps")
+    print(f"\n[6] Running Simulation: {max_steps} time steps")
     print("="*70)
 
     # Run simulation
@@ -293,73 +378,77 @@ def main():
                 'out': f"{flux_out:.1f}"
             }, refresh=False)
 
+            # VTK output
+            if vtk_writer is not None:
+                vtk_writer.write(
+                    step=step,
+                    rho=rho,
+                    u=u,
+                    solid_mask=solid_mask_np,
+                    time=float(step)
+                )
+        
+        # -----------------------------------------------------------------
+        # Checkpoint (periodic save)
+        # -----------------------------------------------------------------
+        if step > 0 and step % checkpoint_interval == 0:
+            checkpoint_mgr.save(
+                step=step,
+                f=f_old,
+                rho=rho,
+                u=u,
+                tau=tau,
+                config=sim_params
+            )
+
     elapsed = time.perf_counter() - start_time
-    mlups = (Nx * Ny * Nz * max_steps) / elapsed / 1e6
+    actual_steps = max_steps - start_step
+    mlups = (Nx * Ny * Nz * actual_steps) / elapsed / 1e6
     
     print("="*70)
-    print(f"\n[6] Performance Summary")
-    print(f"  Elapsed time: {elapsed:.3f} s")
-    print(f"  MLUPS: {mlups:.2f} (Million Lattice Updates Per Second)")
+    print(f"[7] Performance: {elapsed:.2f}s, {mlups:.2f} MLUPS")
     
-    # =========================================================================
-    # Final Analysis
-    # =========================================================================
-    print(f"\n[7] Final State Analysis")
-    
+    # Final macroscopic state
     rho_final, u_final = macro.compute(f_old)
     
-    print(f"\n  Density [ρ/ρ_0]:")
-    print(f"    Range: [{float(rho_final.min()):.6f}, {float(rho_final.max()):.6f}]")
-    print(f"    Mean:  {float(rho_final.mean()):.6f}")
+    # Final VTK output
+    if vtk_writer is not None:
+        vtk_writer.write(
+            step=max_steps, 
+            rho=rho_final, 
+            u=u_final, 
+            solid_mask=solid_mask_np, 
+            time=float(max_steps)
+        )
+        pvd_path = vtk_writer.write_pvd('simulation.pvd')
+        print(f"  PVD file written: {pvd_path}")
+        print(f"  Open in ParaView to view time series animation")
     
-    print(f"\n  Velocity u_x [Δx/Δt]:")
-    print(f"    Range: [{float(u_final[0].min()):.6f}, {float(u_final[0].max()):.6f}]")
-    print(f"    Mean:  {float(u_final[0].mean()):.6f}")
-    
-    # =========================================================================
-    # Mass Flux Balance Verification
-    # =========================================================================
-    print(f"\n[8] Mass Flux Balance (Open Boundary Verification)")
-    print("-"*60)
-    print("  NOTE: For open boundaries (inlet/outlet), total mass is NOT")
-    print("  conserved. Instead, we verify MASS FLUX BALANCE at steady state.")
-    print("-"*60)
-    
-    flux_inlet, flux_outlet, imbalance = verify_mass_flux_balance(
-        xp, rho_final, u_final, verbose=True
+    # Final checkpoint
+    checkpoint_mgr.save(
+        step=max_steps, 
+        f=f_old, 
+        rho=rho_final, 
+        u=u_final, 
+        tau=tau, 
+        config=sim_params
     )
     
-    # Check convergence to steady state
-    if len(flux_history) >= 2:
-        _, last_in, last_out = flux_history[-1]
-        _, prev_in, prev_out = flux_history[-2]
-        
-        flux_change = abs(last_out - prev_out) / (abs(prev_out) + 1e-10)
-        print(f"\n  Flux change (last interval): {flux_change*100:.4f}%")
-        
-        if flux_change < 0.01:
-            print("  → Steady state likely reached ✓")
-        else:
-            print("  → Still evolving, may need more steps")
-    
-    # Final verdict
-    if abs(imbalance) < 5.0:
-        print(f"\n  ✅ Mass flux balanced within 5% tolerance!")
-    else:
-        print(f"\n  ⚠️  Mass flux imbalance > 5%")
-        print("     Possible causes:")
-        print("     - Simulation needs more steps to reach steady state")
-        print("     - Boundary conditions need adjustment")
+    # =========================================================================
+    # Mass Flux Verification
+    # =========================================================================
+    print(f"\n[8] Final Mass Flux Balance")
+    print("-"*60)
+    verify_mass_flux_balance(xp, rho_final, u_final, verbose=True)
     
     # Stability check
     if xp.isnan(rho_final).any() or xp.isinf(rho_final).any():
-        print("\n  ❌ INSTABILITY DETECTED: NaN or Inf values found!")
+        print("\n  ❌ INSTABILITY DETECTED: NaN or Inf values!")
         return False
     
     print("\n" + "="*70)
     print(" Simulation completed successfully!")
     print("="*70)
-
     return True
 
 
