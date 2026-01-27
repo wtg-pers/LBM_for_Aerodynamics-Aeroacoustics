@@ -376,6 +376,12 @@ class MovingWallBounceBack(HalfwayBounceBack):
             rho = xp.sum(f, axis=0)
         
         f_source = f if f_post is None else f_post
+        if f_post is None:
+            import warnings
+            warnings.warn("f_post not provided; using post-streaming f as approximation. "
+                        "This is only accurate for steady-state flows.", 
+                        UserWarning)
+            f_source = f
         
         for i in range(1, self.Q):
             i_opp = int(opp[i])

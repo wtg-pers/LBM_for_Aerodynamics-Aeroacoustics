@@ -24,29 +24,74 @@ from src.boundary.outlet import CharacteristicOutlet
 from src.boundary.wall import HalfwayBounceBack, create_cylinder_mask
 
 from src.utilities.check_conservation import ConservationChecker
+from src.utilities.lattice_validation import LatticeValidator
 
 
+# =============================================================================
+# Mass Flux Utilities (for open boundary verification)
+# =============================================================================
 def compute_mass_flux(xp, rho, u, face='west'):
-    """경계면을 통과하는 질량 플럭스 계산"""
+    """경계면을 통과하는 질량 플럭스 계산
+    
+    Mass flux: ṁ = ∫∫ ρ * u_n dA
+    Discretized: ṁ = Σ ρ[face] * u_normal[face]
+    
+    Args:
+        xp: Array module (numpy or cupy)
+        rho: Density field, shape (Nx, Ny, Nz)  [dimensionless]
+        u: Velocity field, shape (3, Nx, Ny, Nz)  [lattice units]
+        face: Boundary face ('west' or 'east')
+        
+    Returns:
+        float: Total mass flux through the face  [lattice units: mass/time]
+    """
     if face == 'west':
+        # West face: x = 0, normal direction = +x
         return float(xp.sum(rho[0, :, :] * u[0, 0, :, :]))
     elif face == 'east':
+        # East face: x = Nx-1, normal direction = +x (outward)
         return float(xp.sum(rho[-1, :, :] * u[0, -1, :, :]))
+    else:
+        raise ValueError(f"Unknown face: {face}. Use 'west' or 'east'.")
 
-    # 검증
+
+def verify_mass_flux_balance(xp, rho, u, verbose=True):
+    """Verify mass flux balance at inlet/outlet (for open boundaries)
+    
+    At steady state: ṁ_in ≈ ṁ_out
+    
+    Args:
+        xp: Array module
+        rho: Density field
+        u: Velocity field
+        verbose: Print results if True
+        
+    Returns:
+        tuple: (flux_inlet, flux_outlet, imbalance_percent)
+    """
     flux_inlet = compute_mass_flux(xp, rho, u, 'west')
     flux_outlet = compute_mass_flux(xp, rho, u, 'east')
-    imbalance = (flux_inlet - flux_outlet) / flux_inlet * 100
+    imbalance = (flux_inlet - flux_outlet) / (abs(flux_inlet) + 1e-10) * 100
 
-    print(f"Inlet flux: {flux_inlet:.4f}")
-    print(f"Outlet flux: {flux_outlet:.4f}")
-    print(f"Imbalance: {imbalance:.2f}%")  # 정상상태에서 ~0%
+    if verbose:
+        print(f"Inlet flux:  {flux_inlet:.6f}")
+        print(f"Outlet flux: {flux_outlet:.6f}")
+        print(f"Imbalance:   {imbalance:.4f}%")
+    
+    return flux_inlet, flux_outlet, imbalance
 
 
-
+# =============================================================================
+# Main Simulation
+# =============================================================================
 def main():
     print("="*70)
-    print(" Initializing...")
+    print(" Initializing LBM Solver...")
+    print("="*70)
+
+    # =========================================================================
+    # Configuration Loading
+    # =========================================================================
     config_path = './configs/input_config.py'
     config_loader = ConfigLoader(config_path)
 
@@ -59,18 +104,37 @@ def main():
     xp = setup_library(device_mode)
     lattice = D3Q27(xp)
 
+    # =========================================================================
+    # Lattice Validation
+    # =========================================================================
+    print("\n[0] Validating Lattice Model...")
+    validator = LatticeValidator(xp)
+    is_valid, validation_results = validator.validate_all(
+        lattice.c, lattice.w, lattice.cs2, verbose=True
+    )
+    if not is_valid:
+        raise RuntimeError("Lattice validation failed! Check lattice definition.")
+    
+    # =========================================================================
+    # Domain Setup
+    # =========================================================================
     Nx = domain_config.get('Nx')
     Ny = domain_config.get('Ny')
     Nz = domain_config.get('Nz')
     domain = Domain(lattice, xp, Nx, Ny, Nz)
     domain_shape = (Nx, Ny, Nz)
-    print(f"\n[Setup]")
+
+    print(f"\n[1] Domain Setup")
     print(f"  Grid: {Nx} x {Ny} x {Nz}")
     print(f"  Total cells: {Nx*Ny*Nz:,}")
 
+    # =========================================================================
+    # Boundary Conditions
+    # =========================================================================
+    print(f"\n[2] Boundary Conditions")
+
     west_bc = config_loader.get_boundary_config('west')
-    print(f"\n[Boundary Config - west]")
-    print(f"  {west_bc}")
+    print(f"  West (inlet): {west_bc}")
     inlet = EquilibriumInlet(
         xp, lattice, 
         'west',
@@ -80,8 +144,7 @@ def main():
     )
 
     east_bc = config_loader.get_boundary_config('east')
-    print(f"\n[Boundary Config - east]")
-    print(f"  {east_bc}")
+    print(f"  East (outlet): {east_bc}")
     outlet = CharacteristicOutlet(
         xp, lattice,
         'east',
@@ -93,46 +156,62 @@ def main():
     bc_manager = BoundaryManager()
     bc_manager.add(inlet)
     bc_manager.add(outlet)
-    print(f"\n[Boundary Conditions]")
-    print(f"  Inlet (West): Equilibrium, velocity = {west_bc['velocity']}")
-    print(f"  Outlet (East): Characteristic, K = {east_bc['k']}")
-    print(f"  - Y/Z directions: Periodic (implicit)")
+    print(f"  → Inlet: Equilibrium BC, u = {west_bc['velocity']}")
+    print(f"  → Outlet: Characteristic BC, K = {east_bc['k']}")
+    print(f"  → Y/Z faces: Periodic (implicit via streaming)")
 
-    cylinder_mask = create_cylinder_mask(xp, domain_shape,
-                                         center=(Nx//4, Ny//2),
-                                         radius=Ny//10,
-                                         axis='z')
+    # Internal obstacle (cylinder)
+    cylinder_mask = create_cylinder_mask(
+        xp, domain_shape,
+        center=(Nx//4, Ny//2),
+        radius=Ny//10,
+        axis='z'
+    )
     wall_bc = HalfwayBounceBack(xp, lattice, cylinder_mask)
-    print(wall_bc.get_info())
+    print(f"\n  Internal obstacle:")
+    print(f"  {wall_bc.get_info()}")
 
 
+    # =========================================================================
+    # Physics Parameters
+    # =========================================================================
     Re = physics_config.get('Re')
     u_init = physics_config.get('u_init')
     char_length = physics_config.get('characteristic_length')
 
+    # Kinematic viscosity from Re = U*L/ν  →  ν = U*L/Re
+    nu = u_init * char_length / Re    # [lattice units: Δx²/Δt]
+
+     # Relaxation time from ν = c_s² * (τ - 0.5)  →  τ = 3ν + 0.5
+    tau = 3.0 * nu + 0.5              # [dimensionless]
+
     max_steps = sim_params.get('time', {}).get('max_steps', 10000)
     output_interval = sim_params.get('time', {}).get('output_interval', 500)
-    print(f"\n[Physics]")
-    print(f"  Re: {Re}")
-    print(f"  u_initial: {u_init}")
-    print(f"  L_char: {char_length}")
 
-    # Initialize componets
+    print(f"\n[3] Physics Parameters")
+    print(f"  Re = {Re}")
+    print(f"  u_init = {u_init} [Δx/Δt]")
+    print(f"  L_char = {char_length} [Δx]")
+    print(f"  ν = {nu:.6f} [Δx²/Δt]")
+    print(f"  τ = {tau:.6f}")
+
+
+    # =========================================================================
+    # Initialize Components
+    # =========================================================================
     streaming = StreamingPull(xp, lattice, domain_shape)
     conservation = ConservationChecker(xp, lattice)
     eq = Maxwellian(xp, lattice, domain)
     macro = Macroscopic(xp, lattice)
     collision = BGK(xp)
-
-    print("...done.")
-    print("="*70)
     
     # ======================================================================
     # initial condition
     # ======================================================================
-    print("\n[1] Initializing with Gaussian velocity perturbation...")
-    rho0 = xp.ones_like(domain.rho, dtype=xp.float64)
-    u0 = xp.zeros_like(domain.u, dtype=xp.float64)
+    print(f"\n[4] Initializing Flow Field...")
+
+    rho0 = xp.ones_like(domain.rho, dtype=xp.float64)  # [dimensionless]
+    u0 = xp.zeros_like(domain.u, dtype=xp.float64)     # [lattice units]
 
     u0[0] = u_init
 
@@ -143,101 +222,114 @@ def main():
     # X, Y, Z = xp.meshgrid(x, y, z, indexing='ij')
     # u0[0] = 0.05 * xp.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
 
-    f = eq.compute(rho0, u0)  # domain.f
-    f_temp = xp.empty_like(f)
-    f_post = xp.empty_like(f)
+    # Initialize distribution to equilibrium
+    f_old = eq.compute(rho0, u0)
+    f_new = xp.empty_like(f_old)
+    f_post = xp.empty_like(f_old)
 
-    initial_total_mass = float(xp.sum(f))
+    initial_total_mass = float(xp.sum(f_old))
     print(f"  Initial total mass: {initial_total_mass:.6f}")
-    print("Initialization complete!")
-    # conservation.set_reference(f)
+    print(f"  Initialization complete!")
     
-    # Physics parameters
-    nu = u_init * char_length / Re
-    tau = 3.0 * nu + 0.5
-
-    print(f"\n[2] Running {max_steps} time steps...")
-    print(f"    τ = {tau}, ν = {(1/3)*(tau-0.5):.6f}")
-    # ======================================================================
+    # =========================================================================
+    # Time Loop
+    # =========================================================================
+    print(f"\n[5] Running Simulation: {max_steps} time steps")
+    print(f"    Output interval: {output_interval} steps")
+    print("="*70)
 
     # Run simulation
     start_time = time.perf_counter()
-    pbar = tqdm(range(max_steps), ncols=72)
+    custom_format = "{l_bar}{bar:8}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]"
+    pbar = tqdm(range(max_steps), ncols=72, bar_format=custom_format)
     
     flux_history = []
 
     for step in pbar:
-        # 1. Macroscopic
-        rho, u = macro.compute(f)
+        # ---------------------------------------------------------------------
+        # Step 1: Compute Macroscopic Variables
+        # ---------------------------------------------------------------------
+        rho, u = macro.compute(f_old)
 
-        # 2. Equilibrium
+        # ---------------------------------------------------------------------
+        # Step 2: Compute Equilibrium Distribution
+        # ---------------------------------------------------------------------
         f_eq = eq.compute(rho, u)
         
-        # 3. Collision
-        f_post[:] = collision.collide(f, f_eq, tau)
+        # ---------------------------------------------------------------------
+        # Step 3: Collision (BGK)
+        #   f_post = f - (1/τ)(f - f_eq)
+        # ---------------------------------------------------------------------
+        f_post[:] = collision.collide(f_old, f_eq, tau)
 
-        # 4. Streaming
-        streaming.compute(f_post, f_temp)
-        f, f_temp = f_temp, f
+        # ---------------------------------------------------------------------
+        # Step 4: Streaming (Pull scheme)
+        #   f_new[i, x] = f_post[i, x - c_i]
+        # ---------------------------------------------------------------------
+        streaming.compute(f_post, f_new)
 
-        # 5. Boundary Conditions (AFTER streaming)
-        bc_manager.apply_all(f)
-        wall_bc.apply_with_reset(f, f_post)
+        # ---------------------------------------------------------------------
+        # Step 5: Boundary Conditions (applied AFTER streaming)
+        # ---------------------------------------------------------------------
+        bc_manager.apply_all(f_new)
+        wall_bc.apply_with_reset(f_new, f_post)
 
-        # pbar.set_postfix(avg_rho=f"{rho.mean():.6f}")
-        # Track mass flux periodically
+        # ---------------------------------------------------------------------
+        # Step 6: Swap buffers for next iteration
+        # ---------------------------------------------------------------------
+        f_old, f_new = f_new, f_old
+
+        # ---------------------------------------------------------------------
+        # Output / Monitoring
+        # ---------------------------------------------------------------------
         if step % output_interval == 0:
             flux_in = compute_mass_flux(xp, rho, u, 'west')
             flux_out = compute_mass_flux(xp, rho, u, 'east')
             flux_history.append((step, flux_in, flux_out))
             
-            # Update progress bar
             pbar.set_postfix({
-                'ρ_avg': f"{float(rho.mean()):.3f}"
-                # 'flux_in': f"{flux_in:.2f}",
-                # 'flux_out': f"{flux_out:.2f}"
-            })
+                'ρ_avg': f"{float(rho.mean()):.4f}",
+                'in': f"{flux_in:.1f}",
+                'out': f"{flux_out:.1f}"
+            }, refresh=False)
 
     elapsed = time.perf_counter() - start_time
     mlups = (Nx * Ny * Nz * max_steps) / elapsed / 1e6
     
-    print(f"\n[3] Performance:")
-    print(f"    Elapsed: {elapsed:.3f} s")
-    print(f"    MLUPS:   {mlups:.2f}")
+    print("="*70)
+    print(f"\n[6] Performance Summary")
+    print(f"  Elapsed time: {elapsed:.3f} s")
+    print(f"  MLUPS: {mlups:.2f} (Million Lattice Updates Per Second)")
     
-    # ======================================================================
-    # Final Analysis (Appropriate for Open Boundaries)
-    # ======================================================================
-    print(f"\n[4] Final State Analysis:")
+    # =========================================================================
+    # Final Analysis
+    # =========================================================================
+    print(f"\n[7] Final State Analysis")
     
-    rho_final, u_final = macro.compute(f)
+    rho_final, u_final = macro.compute(f_old)
     
-    print(f"\n  Density:")
+    print(f"\n  Density [ρ/ρ_0]:")
     print(f"    Range: [{float(rho_final.min()):.6f}, {float(rho_final.max()):.6f}]")
     print(f"    Mean:  {float(rho_final.mean()):.6f}")
     
-    print(f"\n  Velocity (u_x):")
+    print(f"\n  Velocity u_x [Δx/Δt]:")
     print(f"    Range: [{float(u_final[0].min()):.6f}, {float(u_final[0].max()):.6f}]")
     print(f"    Mean:  {float(u_final[0].mean()):.6f}")
     
-    # ======================================================================
-    # Mass Flux Balance Check (Correct for Open BCs!)
-    # ======================================================================
-    print(f"\n[5] Mass Flux Balance Check:")
-    print("="*60)
+    # =========================================================================
+    # Mass Flux Balance Verification
+    # =========================================================================
+    print(f"\n[8] Mass Flux Balance (Open Boundary Verification)")
+    print("-"*60)
     print("  NOTE: For open boundaries (inlet/outlet), total mass is NOT")
-    print("  conserved. Instead, we check MASS FLUX BALANCE at steady state.")
-    print("="*60)
+    print("  conserved. Instead, we verify MASS FLUX BALANCE at steady state.")
+    print("-"*60)
     
-    flux_inlet = compute_mass_flux(xp, rho_final, u_final, 'west')
-    flux_outlet = compute_mass_flux(xp, rho_final, u_final, 'east')
-    flux_imbalance = (flux_inlet - flux_outlet) / (abs(flux_inlet) + 1e-10)
+    flux_inlet, flux_outlet, imbalance = verify_mass_flux_balance(
+        xp, rho_final, u_final, verbose=True
+    )
     
-    print(f"\n  Inlet mass flux:  {flux_inlet:.6f}")
-    print(f"  Outlet mass flux: {flux_outlet:.6f}")
-    print(f"  Imbalance: {flux_imbalance*100:.4f}%")
-    
-    # Check if steady state is reached
+    # Check convergence to steady state
     if len(flux_history) >= 2:
         _, last_in, last_out = flux_history[-1]
         _, prev_in, prev_out = flux_history[-2]
@@ -245,31 +337,30 @@ def main():
         flux_change = abs(last_out - prev_out) / (abs(prev_out) + 1e-10)
         print(f"\n  Flux change (last interval): {flux_change*100:.4f}%")
         
-        if flux_change < 0.01:  # Less than 1% change
+        if flux_change < 0.01:
             print("  → Steady state likely reached ✓")
         else:
             print("  → Still evolving, may need more steps")
     
     # Final verdict
-    if abs(flux_imbalance) < 0.05:  # Less than 5% imbalance
-        print(f"\n✅ Mass flux balanced within 5% tolerance!")
+    if abs(imbalance) < 5.0:
+        print(f"\n  ✅ Mass flux balanced within 5% tolerance!")
     else:
-        print(f"\n⚠️ Mass flux imbalance > 5%")
-        print("   This may indicate:")
-        print("   - Simulation needs more steps to reach steady state")
-        print("   - Boundary conditions need adjustment")
+        print(f"\n  ⚠️  Mass flux imbalance > 5%")
+        print("     Possible causes:")
+        print("     - Simulation needs more steps to reach steady state")
+        print("     - Boundary conditions need adjustment")
     
-    # Check for instability
+    # Stability check
     if xp.isnan(rho_final).any() or xp.isinf(rho_final).any():
-        print("\n❌ INSTABILITY DETECTED: NaN or Inf values found!")
+        print("\n  ❌ INSTABILITY DETECTED: NaN or Inf values found!")
         return False
     
     print("\n" + "="*70)
     print(" Simulation completed successfully!")
     print("="*70)
 
-
-    return None
+    return True
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ class StreamingPull:
             Streamed distribution (new array)
         """
         f_next = self.xp.empty_like(f)
-        self.stream(f, f_next)
+        self.compute(f, f_next)
         return f_next
 
     # def compute(self, f_post, f_next):
