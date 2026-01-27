@@ -20,7 +20,7 @@ simulation = {
         "characteristic_length": 20
     },
     "time": {
-        "max_steps": 20000,
+        "max_steps": 10000,
         "output_interval": 200,         # VTK output interval
         "checkpoint_interval": 2000     # Checkpoint save interval
     }
@@ -40,6 +40,12 @@ boundaries = {
 # Output Configuration
 # =============================================================================
 output = {
+    #Directory settings
+    "output_dir": "./results",              # VTK output directory
+    "checkpoint_dir": "./checkpoints",      # Checkpoint directory
+
+    "clear_previous": True,
+
     "vtk": {
         "enabled": True,
         "precision": "float32",     # 'float32' or 'float64'
