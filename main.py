@@ -23,7 +23,8 @@ from src.boundary.base import (
 )
 from src.boundary.inlet import EquilibriumInlet
 from src.boundary.outlet import CharacteristicOutlet
-from src.boundary.wall import HalfwayBounceBack, create_cylinder_mask
+from src.boundary.wall import HalfwayBounceBack
+from src.boundary.geometry import create_cylinder_mask
 
 from src.utilities.check_conservation import ConservationChecker
 from src.utilities.lattice_validation import LatticeValidator
@@ -306,17 +307,18 @@ def main():
     print(f"  → Outlet: Characteristic BC, K = {east_bc['k']}")
 
     # Internal obstacle (cylinder)
-    cylinder_mask = create_cylinder_mask(
+    mask = create_cylinder_mask(
         xp, domain_shape,
         center=(Nx//4, Ny//2),
-        radius=Ny//10,
-        axis='z'
+        radius=10,
+        axis='z',
+        axis_range=(30, 50)
     )
-    wall_bc = HalfwayBounceBack(xp, lattice, cylinder_mask)
+    wall_bc = HalfwayBounceBack(xp, lattice, mask)
     print(f"  → Internal obstacle: {wall_bc.get_info()}")
 
     # Convert mask for VTK output (ensure NumPy array)
-    solid_mask_np = cylinder_mask.get() if hasattr(cylinder_mask, 'get') else cylinder_mask
+    solid_mask_np = mask.get() if hasattr(mask, 'get') else mask
 
     # =========================================================================
     # Physics Parameters

@@ -1,9 +1,9 @@
 """
 User parameter settings
 """
-Nx = 100
-Ny = 40
-Nz = 40
+Nx = 200
+Ny = 80
+Nz = 80
 
 simulation = {
     "device_mode": "gpu",
@@ -20,8 +20,8 @@ simulation = {
         "characteristic_length": 20
     },
     "time": {
-        "max_steps": 10000,
-        "output_interval": 200,         # VTK output interval
+        "max_steps": 20000,
+        "output_interval": 100,         # VTK output interval
         "checkpoint_interval": 2000     # Checkpoint save interval
     }
 }
