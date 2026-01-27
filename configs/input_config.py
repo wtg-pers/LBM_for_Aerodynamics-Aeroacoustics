@@ -27,7 +27,7 @@ simulation = {
 
 boundaries = {
     "west": {"type": "inlet", "location": 0, "velocity": 0.1, "profile": "uniform"},
-    "east": {"type": "outlet", "location": Nx - 1, "pressure": 1.0},
+    "east": {"type": "outlet", "location": Nx - 1, "rho": 1.0, "k": 0.1},
     "south": {"type": "wall", "location": 0, "method": "bouzidi", "q": 0.5},
     "north": {"type": "wall", "location": Ny - 1, "method": "bouzidi", "q": 0.5},
     "bottom": {"type": "wall", "location": 0, "method": "bouzidi", "q": 0.5},
