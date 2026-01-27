@@ -21,6 +21,7 @@ from src.boundary.base import (
 )
 from src.boundary.inlet import EquilibriumInlet
 from src.boundary.outlet import CharacteristicOutlet
+from src.boundary.wall import HalfwayBounceBack, create_cylinder_mask
 
 from src.utilities.check_conservation import ConservationChecker
 
@@ -97,6 +98,14 @@ def main():
     print(f"  Outlet (East): Characteristic, K = {east_bc['k']}")
     print(f"  - Y/Z directions: Periodic (implicit)")
 
+    cylinder_mask = create_cylinder_mask(xp, domain_shape,
+                                         center=(Nx//4, Ny//2),
+                                         radius=Ny//10,
+                                         axis='z')
+    wall_bc = HalfwayBounceBack(xp, lattice, cylinder_mask)
+    print(wall_bc.get_info())
+
+
     Re = physics_config.get('Re')
     u_init = physics_config.get('u_init')
     char_length = physics_config.get('characteristic_length')
@@ -136,6 +145,7 @@ def main():
 
     f = eq.compute(rho0, u0)  # domain.f
     f_temp = xp.empty_like(f)
+    f_post = xp.empty_like(f)
 
     initial_total_mass = float(xp.sum(f))
     print(f"  Initial total mass: {initial_total_mass:.6f}")
@@ -164,7 +174,7 @@ def main():
         f_eq = eq.compute(rho, u)
         
         # 3. Collision
-        f_post = collision.collide(f, f_eq, tau)
+        f_post[:] = collision.collide(f, f_eq, tau)
 
         # 4. Streaming
         streaming.compute(f_post, f_temp)
@@ -172,6 +182,7 @@ def main():
 
         # 5. Boundary Conditions (AFTER streaming)
         bc_manager.apply_all(f)
+        wall_bc.apply_with_reset(f, f_post)
 
         # pbar.set_postfix(avg_rho=f"{rho.mean():.6f}")
         # Track mass flux periodically
