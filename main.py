@@ -12,13 +12,15 @@ from src.macroscopic.compute import Macroscopic
 from src.collision.bgk import BGK
 from src.streaming.stream import StreamingPull
 
+from src.boundary.inlet import EquilibriumInlet
+
 from src.utilities.check_conservation import ConservationChecker
 
 
 def main():
     print("="*70)
     print(" Initializing...")
-    config_path = './configs/test.json'
+    config_path = './configs/input_config.py'
     config_loader = ConfigLoader(config_path)
 
     sim_params = config_loader.get_simulation_params()
@@ -38,6 +40,13 @@ def main():
     print(f"\n[Setup]")
     print(f"  Grid: {Nx} x {Ny} x {Nz}")
     print(f"  Total cells: {Nx*Ny*Nz:,}")
+
+    west_bc = config_loader.get_boundary_config('west')
+    print(west_bc)
+    inlet = EquilibriumInlet(xp, lattice, west_bc,
+                             west_bc['velocity'],
+                             density=1.0,
+                             shape=domain_shape)
 
     Re = physics_config.get('Re')
     u_init = physics_config.get('u_init')
