@@ -278,9 +278,33 @@ def main():
     print(f"  Total cells: {Nx*Ny*Nz:,}")
 
     # =========================================================================
+    # Physics Parameters
+    # =========================================================================
+    Re = physics_config.get('Re')
+    u_init = physics_config.get('u_init')
+    char_length = physics_config.get('characteristic_length')
+
+    # Kinematic viscosity from Re = U*L/ν  →  ν = U*L/Re
+    nu = u_init * char_length / Re    # [lattice units: Δx²/Δt]
+
+     # Relaxation time from ν = c_s² * (τ - 0.5)  →  τ = 3ν + 0.5
+    tau = 3.0 * nu + 0.5              # [dimensionless]
+
+    config_max_steps = time_config.get('max_steps', 10000)
+    output_interval = time_config.get('output_interval', 500)
+    checkpoint_interval = time_config.get('checkpoint_interval', 2000)
+
+    print(f"\n[2] Physics Parameters")
+    print(f"  Re = {Re}")
+    print(f"  u_init = {u_init} [Δx/Δt]")
+    print(f"  L_char = {char_length} [Δx]")
+    print(f"  ν = {nu:.6f} [Δx²/Δt]")
+    print(f"  τ = {tau:.6f}")
+
+    # =========================================================================
     # Boundary Conditions
     # =========================================================================
-    print(f"\n[2] Boundary Conditions")
+    print(f"\n[3] Boundary Conditions")
 
     west_bc = config_loader.get_boundary_config('west')
     inlet = EquilibriumInlet(
@@ -310,7 +334,7 @@ def main():
     mask = create_cylinder_mask(
         xp, domain_shape,
         center=(Nx//4, Ny//2),
-        radius=10,
+        radius=(char_length//2),
         axis='z',
         axis_range=(30, 50)
     )
@@ -319,30 +343,6 @@ def main():
 
     # Convert mask for VTK output (ensure NumPy array)
     solid_mask_np = mask.get() if hasattr(mask, 'get') else mask
-
-    # =========================================================================
-    # Physics Parameters
-    # =========================================================================
-    Re = physics_config.get('Re')
-    u_init = physics_config.get('u_init')
-    char_length = physics_config.get('characteristic_length')
-
-    # Kinematic viscosity from Re = U*L/ν  →  ν = U*L/Re
-    nu = u_init * char_length / Re    # [lattice units: Δx²/Δt]
-
-     # Relaxation time from ν = c_s² * (τ - 0.5)  →  τ = 3ν + 0.5
-    tau = 3.0 * nu + 0.5              # [dimensionless]
-
-    config_max_steps = time_config.get('max_steps', 10000)
-    output_interval = time_config.get('output_interval', 500)
-    checkpoint_interval = time_config.get('checkpoint_interval', 2000)
-
-    print(f"\n[3] Physics Parameters")
-    print(f"  Re = {Re}")
-    print(f"  u_init = {u_init} [Δx/Δt]")
-    print(f"  L_char = {char_length} [Δx]")
-    print(f"  ν = {nu:.6f} [Δx²/Δt]")
-    print(f"  τ = {tau:.6f}")
 
     # =========================================================================
     # Initialize I/O Modules

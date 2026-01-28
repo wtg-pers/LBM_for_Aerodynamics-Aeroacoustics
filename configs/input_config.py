@@ -17,12 +17,12 @@ simulation = {
     "physics": {
         "Re": 100.0,
         "u_init": 0.1,
-        "characteristic_length": 20
+        "characteristic_length": 30
     },
     "time": {
-        "max_steps": 20000,
+        "max_steps": 100000,
         "output_interval": 100,         # VTK output interval
-        "checkpoint_interval": 2000     # Checkpoint save interval
+        "checkpoint_interval": 10000     # Checkpoint save interval
     }
 }
 
@@ -41,8 +41,8 @@ boundaries = {
 # =============================================================================
 output = {
     #Directory settings
-    "output_dir": "./results",              # VTK output directory
-    "checkpoint_dir": "./checkpoints",      # Checkpoint directory
+    "output_dir": "./results/short_cyl",              # VTK output directory
+    "checkpoint_dir": "./checkpoints/short_cyl",      # Checkpoint directory
 
     "clear_previous": True,
 
