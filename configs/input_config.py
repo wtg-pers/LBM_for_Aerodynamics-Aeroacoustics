@@ -1,9 +1,9 @@
 """
 User parameter settings
 """
-Nx = 200
-Ny = 80
-Nz = 80
+Nx = 750
+Ny = 120
+Nz = 120
 
 simulation = {
     "device_mode": "gpu",
@@ -15,7 +15,7 @@ simulation = {
         "Nz": Nz
     },
     "physics": {
-        "Re": 100.0,
+        "Re": 20.0,
         "u_init": 0.1,
         "characteristic_length": 30
     },
@@ -41,8 +41,8 @@ boundaries = {
 # =============================================================================
 output = {
     #Directory settings
-    "output_dir": "./results/short_cyl",              # VTK output directory
-    "checkpoint_dir": "./checkpoints/short_cyl",      # Checkpoint directory
+    "output_dir": "./results_test",              # VTK output directory
+    "checkpoint_dir": "./checkpoints_test",      # Checkpoint directory
 
     "clear_previous": True,
 

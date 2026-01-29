@@ -333,10 +333,10 @@ def main():
     # Internal obstacle (cylinder)
     mask = create_cylinder_mask(
         xp, domain_shape,
-        center=(Nx//4, Ny//2),
+        center=(Nx//5, Ny//2),
         radius=(char_length//2),
         axis='z',
-        axis_range=(30, 50)
+        axis_range=(0, Nz-1)
     )
     wall_bc = HalfwayBounceBack(xp, lattice, mask)
     print(f"  → Internal obstacle: {wall_bc.get_info()}")
