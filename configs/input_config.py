@@ -1,9 +1,9 @@
 """
 User parameter settings
 """
-Nx = 750
-Ny = 120
-Nz = 120
+Nx = 500
+Ny = 80
+Nz = 80
 
 simulation = {
     "device_mode": "gpu",
@@ -20,49 +20,118 @@ simulation = {
         "characteristic_length": 30
     },
     "time": {
-        "max_steps": 100000,
-        "output_interval": 100,         # VTK output interval
-        "checkpoint_interval": 10000     # Checkpoint save interval
+        "max_steps": 50000,
+        "output_interval": 100,
+        "checkpoint_interval": 10000
     }
 }
 
 boundaries = {
-    "west": {"type": "inlet", "location": 0, "velocity": 0.1, "profile": "uniform"},
-    "east": {"type": "outlet", "location": Nx - 1, "rho": 1.0, "k": 0.1},
-    "south": {"type": "wall", "location": 0, "method": "bouzidi", "q": 0.5},
-    "north": {"type": "wall", "location": Ny - 1, "method": "bouzidi", "q": 0.5},
-    "bottom": {"type": "wall", "location": 0, "method": "bouzidi", "q": 0.5},
-    "top": {"type": "wall", "location": Nz - 1, "method": "bouzidi", "q": 0.5}
+    # Inlet at x = 0
+    "inlet": {
+        "type": "inlet",
+        "location": "xmin",
+        "velocity": 0.1,
+        "profile": "uniform"
+    },
+    
+    # Outlet at x = Nx-1
+    "outlet": {
+        "type": "outlet",
+        "location": "xmax",
+        "rho": 1.0,
+        "k": 0.1,
+        "method": "characteristic"
+    },
+    
+    # Side walls (y-direction)
+    "wall_ymin": {
+        "type": "wall",
+        "location": "ymin",
+        "method": "bounce_back",
+        "exclude_inlet_outlet": True
+    },
+    "wall_ymax": {
+        "type": "wall",
+        "location": "ymax",
+        "method": "bounce_back",
+        "exclude_inlet_outlet": True
+    },
+    
+    # Top/bottom walls z-direction)
+    "wall_zmin": {
+        "type": "wall",
+        "location": "zmin",
+        "method": "bounce_back",
+        "exclude_inlet_outlet": True
+    },
+    "wall_zmax": {
+        "type": "wall",
+        "location": "zmax",
+        "method": "bounce_back",
+        "exclude_inlet_outlet": True
+    },
 }
 
+# =============================================================================
+# Internal Geometry (Obstacles)
+# =============================================================================
+internal_geometry = {
+    "cylinder": {
+        "enabled": True,
+        "type": "cylinder",
+        "center": (Nx // 5, Ny // 2),   # (x, y) center
+        "radius": 10,                    # characteristic_length // 2
+        "axis": "z",
+        "axis_range": (0, Nz - 1)       # Full span in z
+    }
+}
 
 # =============================================================================
 # Output Configuration
 # =============================================================================
 output = {
-    #Directory settings
-    "output_dir": "./results_test",              # VTK output directory
-    "checkpoint_dir": "./checkpoints_test",      # Checkpoint directory
-
+    # Directory settings
+    "output_dir": "./results/vtk",
+    "checkpoint_dir": "./checkpoints",
+    "csv_dir": "./results_test/csv",
+    
     "clear_previous": True,
-
+    
     "vtk": {
         "enabled": True,
-        "precision": "float32",     # 'float32' or 'float64'
-        "compression_level": 6,     # 0 (none) to 9 (max compression)
+        "precision": "float32",
+        "compression_level": 6,
         "variables": ["density", "pressure", "velocity", "velocity_magnitude", "solid_mask"]
     },
     "checkpoint": {
         "enabled": True,
-        "keep_last_n": 3           # Number of checkpoints to keep (0=keep all)
+        "keep_last_n": 3
     }
 }
 
 
-# 3. 최종적으로 ConfigLoader가 가져갈 딕셔너리 통합
+# =============================================================================
+# Force Calculation (for future use)
+# =============================================================================
+force_calculation = {
+    "enabled": False,
+    "interval": 1,
+    "start_step": 0,
+    "reference": {
+        "rho": 1.0,
+        "velocity": 0.1,
+        "area": 30  # characteristic_length
+    }
+}
+
+# =============================================================================
+# Final Config Dictionary
+# =============================================================================
 config = {
     "simulation": simulation,
     "boundaries": boundaries,
-    "output": output
-    # 필요 시 추가 섹션
+    "internal_geometry": internal_geometry,
+    "output": output,
+    "force_calculation": force_calculation
 }
