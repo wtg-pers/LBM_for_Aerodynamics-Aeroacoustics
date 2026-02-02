@@ -314,37 +314,52 @@ def create_boundary_from_config(xp: 'ModuleType',
                                  shape: Tuple[int, ...]) -> Optional[BoundaryCondition]:
     """Create a boundary condition from config dictionary
     
-    Factory function that creates the appropriate BC based on config.
+    Factory function that creates the appropriate BC based on 'method'.
+    
+    The 'method' parameter determines the BC type:
+        - 'equilibrium': Equilibrium inlet (f = f_eq)
+        - 'non_equilibrium': Non-eq extrapolation inlet (preserves viscous info)
+        - 'characteristic': Non-reflecting open BC (for outlet/far-field)
+        - 'convective': Advective outlet
+        - 'extrapolation': Zero-gradient outlet
+        - 'bounce_back': Half-way bounce-back wall
+        - 'periodic': No explicit BC (handled by streaming)
     
     Args:
         xp: Array module
         lattice: Lattice model
         bc_name: User-defined name for this boundary (for logging)
         config: Boundary config dictionary with keys:
-                - type: 'inlet', 'outlet', 'wall', 'periodic'
-                - location: 'xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'
-                - (type-specific parameters)
+                - location: 'xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax' (required)
+                - method: BC method (required)
+                - (method-specific parameters)
         shape: Domain shape (Nx, Ny, Nz)
         
     Returns:
-        BoundaryCondition instance, or None if type is periodic/unknown
+        BoundaryCondition instance, or None if method is periodic/unknown
         
-    Example config:
-        >>> config = {
-        ...     "type": "inlet",
-        ...     "location": "xmin",
-        ...     "velocity": 0.1,
-        ...     "profile": "uniform"
-        ... }
-        >>> bc = create_boundary_from_config(np, lattice, "my_inlet", config, shape)
+    Example configs:
+        >>> # Inlet
+        >>> config = {"location": "xmin", "method": "non_equilibrium", 
+        ...           "velocity": 0.1, "rho": 1.0}
+        
+        >>> # Open boundary (far-field)
+        >>> config = {"location": "ymin", "method": "characteristic",
+        ...           "rho": 1.0, "k": 0.1}
+        
+        >>> # Wall
+        >>> config = {"location": "ymax", "method": "bounce_back"}
     """
     # Import here to avoid circular imports
-    from .inlet import EquilibriumInlet, EquilibriumInletProfile
+    from .inlet import EquilibriumInlet, NonEquilibriumInlet
     from .outlet import CharacteristicOutlet, ConvectiveOutlet, ExtrapolationOutlet
     from .domain_wall import DomainWallBounceBack
     
-    bc_type = config.get('type', '').lower()
-    location_str = config.get('location', bc_name)  # fallback to bc_name if no location
+    # Get location (required)
+    location_str = config.get('location')
+    if location_str is None:
+        print(f"Warning: 'location' not specified for boundary '{bc_name}'")
+        return None
     
     try:
         location = BoundaryLocation.from_string(location_str)
@@ -352,72 +367,100 @@ def create_boundary_from_config(xp: 'ModuleType',
         print(f"Warning: {e}")
         return None
     
+    # Get method (required)
+    method = config.get('method', '').lower()
+    if not method:
+        # Legacy support: check for 'type' field
+        bc_type = config.get('type', '').lower()
+        if bc_type == 'inlet':
+            method = config.get('method', 'non_equilibrium').lower()
+        elif bc_type == 'outlet':
+            method = config.get('method', 'characteristic').lower()
+        elif bc_type == 'wall':
+            method = config.get('method', 'bounce_back').lower()
+        elif bc_type == 'open':
+            method = 'characteristic'
+        elif bc_type == 'periodic':
+            method = 'periodic'
+        else:
+            print(f"Warning: No 'method' specified for boundary '{bc_name}'")
+            return None
+    
     # =========================================================================
-    # Inlet BC
+    # Equilibrium Inlet
     # =========================================================================
-    if bc_type == 'inlet':
+    if method in ['equilibrium', 'eq']:
         velocity = config.get('velocity', 0.1)
-        density = config.get('density', 1.0)
-        profile = config.get('profile', 'uniform')
+        density = config.get('rho', config.get('density', 1.0))
         
-        if profile == 'parabolic':
-            return EquilibriumInletProfile(xp, lattice, location,
-                                           u_max=velocity, shape=shape,
-                                           density=density)
-        else:  # uniform
-            return EquilibriumInlet(xp, lattice, location,
-                                    velocity=velocity, density=density,
+        return EquilibriumInlet(xp, lattice, location,
+                                velocity=velocity, density=density,
+                                shape=shape)
+    
+    # =========================================================================
+    # Non-Equilibrium Inlet (recommended for mass conservation)
+    # =========================================================================
+    elif method in ['non_equilibrium', 'non_eq', 'neq']:
+        velocity = config.get('velocity', 0.1)
+        density = config.get('rho', config.get('density', 1.0))
+        
+        return NonEquilibriumInlet(xp, lattice, location,
+                                   velocity=velocity, density=density,
+                                   shape=shape)
+    
+    # =========================================================================
+    # Characteristic / Open BC (non-reflecting, for outlet or far-field)
+    # =========================================================================
+    elif method in ['characteristic', 'open', 'non_reflecting', 'farfield']:
+        rho_target = config.get('rho', config.get('rho_target', config.get('pressure', 1.0)))
+        relax_coeff = config.get('k', config.get('relax_coeff', 0.1))
+        
+        return CharacteristicOutlet(xp, lattice, location,
+                                    rho_target=rho_target,
+                                    relax_coeff=relax_coeff,
                                     shape=shape)
     
     # =========================================================================
-    # Outlet BC
+    # Convective Outlet
     # =========================================================================
-    elif bc_type == 'outlet':
-        method = config.get('method', 'characteristic').lower()
-        rho_target = config.get('pressure', config.get('rho', config.get('rho_target', 1.0)))
+    elif method in ['convective', 'advective']:
+        u_conv = config.get('convective_velocity', config.get('velocity', 0.1))
         
-        if method == 'characteristic' or method == 'open':
-            relax_coeff = config.get('relax_coeff', config.get('k', 0.1))
-            return CharacteristicOutlet(xp, lattice, location,
-                                        rho_target=rho_target,
-                                        relax_coeff=relax_coeff,
-                                        shape=shape)
-        elif method == 'convective':
-            u_conv = config.get('convective_velocity', 0.1)
-            return ConvectiveOutlet(xp, lattice, location,
-                                    convective_velocity=u_conv,
-                                    shape=shape)
-        elif method == 'extrapolation':
-            order = config.get('order', 1)
-            return ExtrapolationOutlet(xp, lattice, location, order=order)
-        else:
-            print(f"Warning: Unknown outlet method '{method}', using characteristic")
-            return CharacteristicOutlet(xp, lattice, location,
-                                        rho_target=rho_target, shape=shape)
+        return ConvectiveOutlet(xp, lattice, location,
+                                convective_velocity=u_conv,
+                                shape=shape)
     
     # =========================================================================
-    # Wall BC (domain boundary)
+    # Extrapolation Outlet (zero-gradient)
     # =========================================================================
-    elif bc_type == 'wall':
-        method = config.get('method', 'bounce_back').lower()
-        exclude_io = config.get('exclude_inlet_outlet', True)
+    elif method in ['extrapolation', 'zero_gradient', 'neumann']:
+        order = config.get('order', 1)
         
-        if method in ['bounce_back', 'hwbb', 'halfway']:
-            return DomainWallBounceBack(xp, lattice, location, shape,
-                                        exclude_inlet_outlet=exclude_io)
-        else:
-            print(f"Warning: Wall method '{method}' not yet implemented, using bounce_back")
-            return DomainWallBounceBack(xp, lattice, location, shape,
-                                        exclude_inlet_outlet=exclude_io)
+        return ExtrapolationOutlet(xp, lattice, location, order=order)
     
     # =========================================================================
-    # Periodic BC (handled by streaming, no explicit BC needed)
+    # Bounce-Back Wall
     # =========================================================================
-    elif bc_type == 'periodic':
+    elif method in ['bounce_back', 'hwbb', 'halfway', 'wall']:
+        exclude_io = config.get('exclude_inlet_outlet', False)
+        
+        return DomainWallBounceBack(xp, lattice, location, shape,
+                                    exclude_inlet_outlet=exclude_io)
+    
+    # =========================================================================
+    # Periodic (handled by streaming, no explicit BC)
+    # =========================================================================
+    elif method in ['periodic', 'none']:
         return None
     
+    # =========================================================================
+    # Unknown method
+    # =========================================================================
     else:
-        print(f"Warning: Unknown boundary type '{bc_type}' for {bc_name}")
+        print(f"Warning: Unknown method '{method}' for boundary '{bc_name}'")
+        print(f"  Available methods: equilibrium, non_equilibrium, characteristic,")
+        print(f"                     convective, extrapolation, bounce_back, periodic")
+        return None
         return None
 
 

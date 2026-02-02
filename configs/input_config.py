@@ -1,10 +1,18 @@
-"""
-User parameter settings
-"""
-Nx = 500
-Ny = 80
-Nz = 80
+# =============================================================================
+# Domain Configuration
+# =============================================================================
+Nx = 200
+Ny = 200
+Nz = 200
+# Cylinder parameters
+cylinder_diameter = 20      # [lattice units]
+cylinder_center_x = Nx // 5  # Located at 20% from inlet
+cylinder_center_y = Ny // 2  # Centered in y
 
+
+# =============================================================================
+# Simulation Parameters
+# =============================================================================
 simulation = {
     "device_mode": "gpu",
     "dimension": 3,
@@ -15,75 +23,94 @@ simulation = {
         "Nz": Nz
     },
     "physics": {
-        "Re": 20.0,
+        "Re": 100.0,
         "u_init": 0.1,
-        "characteristic_length": 30
+        "characteristic_length": cylinder_diameter
     },
     "time": {
         "max_steps": 50000,
-        "output_interval": 100,
-        "checkpoint_interval": 10000
+        "output_interval": 500,
+        "checkpoint_interval": 10000,
+        "probe_interval": 10                  # Force/probe sampling
     }
 }
+
+
+# =============================================================================
+# Boundary Conditions (Method-Based Configuration)
+# =============================================================================
+# Available methods:
+#   - 'non_equilibrium': Inlet with velocity specification (preserves f_neq)
+#   - 'equilibrium': Simple inlet (may cause mass drift)
+#   - 'characteristic': Non-reflecting open BC (outlet/far-field)
+#   - 'convective': Advective outlet
+#   - 'extrapolation': Zero-gradient outlet
+#   - 'bounce_back': Half-way bounce-back wall
+#   - 'periodic': No BC (handled by streaming)
+#
+# For TRUE EXTERNAL FLOW: Use 'characteristic' on all non-inlet boundaries!
 
 boundaries = {
     # Inlet at x = 0
     "inlet": {
-        "type": "inlet",
         "location": "xmin",
         "velocity": 0.1,
+        "method": "non_equilibrium",
         "profile": "uniform"
     },
     
     # Outlet at x = Nx-1
     "outlet": {
-        "type": "outlet",
         "location": "xmax",
+        "method": "characteristic",
+        "rho": 1.0,
+        "k": 0.1
+    },
+    
+    "ymin": {
+        "location": "ymin",
+        "method": "characteristic",
         "rho": 1.0,
         "k": 0.1,
-        "method": "characteristic"
     },
-    
-    # Side walls (y-direction)
-    "wall_ymin": {
-        "type": "wall",
-        "location": "ymin",
-        "method": "bounce_back",
-        "exclude_inlet_outlet": True
-    },
-    "wall_ymax": {
-        "type": "wall",
+    "ymax": {
         "location": "ymax",
-        "method": "bounce_back",
-        "exclude_inlet_outlet": True
+        "method": "characteristic",
+        "rho": 1.0,
+        "k": 0.1,
     },
     
-    # Top/bottom walls z-direction)
-    "wall_zmin": {
-        "type": "wall",
+    "zmin": {
         "location": "zmin",
-        "method": "bounce_back",
-        "exclude_inlet_outlet": True
+        "method": "characteristic",
+        "rho": 1.0,
+        "k": 0.1,
     },
-    "wall_zmax": {
-        "type": "wall",
+    "zmax": {
         "location": "zmax",
-        "method": "bounce_back",
-        "exclude_inlet_outlet": True
+        "method": "characteristic",
+        "rho": 1.0,
+        "k": 0.1,
     },
 }
 
 # =============================================================================
-# Internal Geometry (Obstacles)
+# Alternative: Periodic z-direction (quasi-2D simulation)
 # =============================================================================
+# For faster quasi-2D simulations, comment out farfield_bottom/top above
+# and z-direction will default to periodic.
+
+# =============================================================================
+# Internal Geometry (Obstacle)
+# =============================================================================
+
 internal_geometry = {
     "cylinder": {
         "enabled": True,
-        "type": "cylinder",
-        "center": (Nx // 5, Ny // 2),   # (x, y) center
-        "radius": 10,                    # characteristic_length // 2
-        "axis": "z",
-        "axis_range": (0, Nz - 1)       # Full span in z
+        "center": (cylinder_center_x, cylinder_center_y),
+        "radius": cylinder_diameter // 2,
+        "axis": "z",                  # Cylinder axis direction
+        "axis_range": (0, Nz - 1)     # Full span in z
     }
 }
 
@@ -91,12 +118,11 @@ internal_geometry = {
 # Output Configuration
 # =============================================================================
 output = {
-    # Directory settings
-    "output_dir": "./results/vtk",
-    "checkpoint_dir": "./checkpoints",
-    "csv_dir": "./results_test/csv",
+    "output_dir": "./results_external/vtk",
+    "checkpoint_dir": "./checkpoints_external",
+    "csv_dir": "./results_external/csv",
     
-    "clear_previous": True,
+    "clear_previous": False,          # Set True for fresh start
     
     "vtk": {
         "enabled": True,
@@ -107,6 +133,14 @@ output = {
     "checkpoint": {
         "enabled": True,
         "keep_last_n": 3
+    },
+    "probes": {
+        "enabled": True,
+        "force_on_obstacle": True,    # Compute drag/lift
+        "wake_probes": [              # Velocity probes for Strouhal
+            (cylinder_center_x + 2 * cylinder_diameter, cylinder_center_y, Nz // 2),
+            (cylinder_center_x + 5 * cylinder_diameter, cylinder_center_y, Nz // 2)
+        ]
     }
 }
 
@@ -132,6 +166,5 @@ config = {
     "simulation": simulation,
     "boundaries": boundaries,
     "internal_geometry": internal_geometry,
-    "output": output,
-    "force_calculation": force_calculation
+    "output": output
 }

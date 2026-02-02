@@ -22,11 +22,376 @@ Author: LBM Development Team
 Date: 2026-01
 """
 
-from typing import TYPE_CHECKING, Tuple, Optional
+from typing import TYPE_CHECKING, Tuple, Optional, Dict, List
 
 if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
+
+
+# =============================================================================
+# Control Volume Conservation Checker (Recommended)
+# =============================================================================
+
+class ControlVolumeChecker:
+    """Control Volume based conservation checker
+    
+    Implements Reynolds Transport Theorem for mass and momentum:
+    
+        dM_CV/dt = -∮ ρ(u·n̂) dA = Σ(ṁ_in) - Σ(ṁ_out)
+        
+    where the surface integral is over ALL faces of the control volume.
+    
+    This is more accurate than simple inlet/outlet comparison because:
+    1. Accounts for ALL boundary fluxes (including far-field)
+    2. Can check conservation in sub-regions (e.g., around obstacle)
+    3. Properly handles open boundaries in all directions
+    
+    Attributes:
+        xp: Array module (numpy or cupy)
+        bounds: Control volume bounds (x_min, x_max, y_min, y_max, z_min, z_max)
+        solid_mask: Optional solid mask within CV
+        
+    Example:
+        >>> # Check entire domain
+        >>> cv = ControlVolumeChecker(xp, domain_shape)
+        >>> result = cv.check(rho, u, step)
+        >>>
+        >>> # Check region around cylinder
+        >>> cv_local = ControlVolumeChecker(xp, domain_shape,
+        ...     bounds=(50, 150, 30, 70, 0, Nz))  # Box around obstacle
+        >>> result = cv_local.check(rho, u, step)
+    """
+    
+    def __init__(self, xp: 'ModuleType',
+                 domain_shape: Tuple[int, int, int],
+                 bounds: Optional[Tuple[int, int, int, int, int, int]] = None,
+                 solid_mask: Optional['npt.NDArray'] = None,
+                 exclude_domain_boundary: bool = False) -> None:
+        """Initialize Control Volume checker
+        
+        Args:
+            xp: Array module (numpy or cupy)
+            domain_shape: Full domain shape (Nx, Ny, Nz)
+            bounds: CV bounds (x0, x1, y0, y1, z0, z1). 
+                   If None, uses entire domain.
+            solid_mask: Solid nodes mask (True = solid)
+            exclude_domain_boundary: If True, don't count flux at domain edges
+                                    (useful for internal CV checks)
+        """
+        self.xp = xp
+        self.Nx, self.Ny, self.Nz = domain_shape
+        self.solid_mask = solid_mask
+        self.exclude_domain_boundary = exclude_domain_boundary
+        
+        # Set bounds (default: entire domain)
+        if bounds is None:
+            self.x0, self.x1 = 0, self.Nx - 1
+            self.y0, self.y1 = 0, self.Ny - 1
+            self.z0, self.z1 = 0, self.Nz - 1
+        else:
+            self.x0, self.x1, self.y0, self.y1, self.z0, self.z1 = bounds
+        
+        # For tracking
+        self.M_prev = None
+        self.M_initial = None  # For total drift calculation
+        self.step_prev = None
+        self.initialized = False
+    
+    def initialize(self, rho: 'npt.NDArray', step: int = 0) -> float:
+        """Initialize with starting state
+        
+        Args:
+            rho: Initial density field
+            step: Initial step number
+            
+        Returns:
+            Initial mass in CV
+        """
+        self.M_prev = self._compute_cv_mass(rho)
+        self.M_initial = self.M_prev  # Store for total drift calculation
+        self.step_prev = step
+        self.initialized = True
+        return self.M_prev
+    
+    def _compute_cv_mass(self, rho: 'npt.NDArray') -> float:
+        """Compute total mass within control volume"""
+        xp = self.xp
+        
+        # Extract CV region
+        rho_cv = rho[self.x0:self.x1+1, self.y0:self.y1+1, self.z0:self.z1+1]
+        
+        # Exclude solid nodes if mask provided
+        if self.solid_mask is not None:
+            mask_cv = self.solid_mask[self.x0:self.x1+1, self.y0:self.y1+1, self.z0:self.z1+1]
+            return float(xp.sum(rho_cv[~mask_cv]))
+        else:
+            return float(xp.sum(rho_cv))
+    
+    def _compute_face_flux(self, rho: 'npt.NDArray', u: 'npt.NDArray',
+                           face: str) -> float:
+        """Compute mass flux through one face of the CV
+        
+        Convention: Positive flux = leaving CV (outward normal)
+        
+        Args:
+            rho: Density field
+            u: Velocity field (3, Nx, Ny, Nz)
+            face: 'xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'
+            
+        Returns:
+            Mass flux (positive = outflow from CV)
+        """
+        xp = self.xp
+        x0, x1 = self.x0, self.x1
+        y0, y1 = self.y0, self.y1
+        z0, z1 = self.z0, self.z1
+        
+        if face == 'xmin':
+            # x = x0 face, outward normal = -x direction
+            # Outflow = -ρ * u_x (negative u_x leaves through xmin)
+            if self.exclude_domain_boundary and x0 == 0:
+                return 0.0
+            rho_face = rho[x0, y0:y1+1, z0:z1+1]
+            u_face = u[0, x0, y0:y1+1, z0:z1+1]
+            return float(-xp.sum(rho_face * u_face))  # Negative sign for outward normal
+            
+        elif face == 'xmax':
+            # x = x1 face, outward normal = +x direction
+            if self.exclude_domain_boundary and x1 == self.Nx - 1:
+                return 0.0
+            rho_face = rho[x1, y0:y1+1, z0:z1+1]
+            u_face = u[0, x1, y0:y1+1, z0:z1+1]
+            return float(xp.sum(rho_face * u_face))
+            
+        elif face == 'ymin':
+            # y = y0 face, outward normal = -y direction
+            if self.exclude_domain_boundary and y0 == 0:
+                return 0.0
+            rho_face = rho[x0:x1+1, y0, z0:z1+1]
+            u_face = u[1, x0:x1+1, y0, z0:z1+1]
+            return float(-xp.sum(rho_face * u_face))
+            
+        elif face == 'ymax':
+            # y = y1 face, outward normal = +y direction
+            if self.exclude_domain_boundary and y1 == self.Ny - 1:
+                return 0.0
+            rho_face = rho[x0:x1+1, y1, z0:z1+1]
+            u_face = u[1, x0:x1+1, y1, z0:z1+1]
+            return float(xp.sum(rho_face * u_face))
+            
+        elif face == 'zmin':
+            # z = z0 face, outward normal = -z direction
+            if self.exclude_domain_boundary and z0 == 0:
+                return 0.0
+            rho_face = rho[x0:x1+1, y0:y1+1, z0]
+            u_face = u[2, x0:x1+1, y0:y1+1, z0]
+            return float(-xp.sum(rho_face * u_face))
+            
+        elif face == 'zmax':
+            # z = z1 face, outward normal = +z direction
+            if self.exclude_domain_boundary and z1 == self.Nz - 1:
+                return 0.0
+            rho_face = rho[x0:x1+1, y0:y1+1, z1]
+            u_face = u[2, x0:x1+1, y0:y1+1, z1]
+            return float(xp.sum(rho_face * u_face))
+        
+        else:
+            raise ValueError(f"Unknown face: {face}")
+    
+    def compute_all_fluxes(self, rho: 'npt.NDArray', 
+                           u: 'npt.NDArray') -> Dict[str, float]:
+        """Compute mass flux through all 6 faces of CV
+        
+        Returns:
+            Dictionary with fluxes for each face (positive = outflow)
+        """
+        faces = ['xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax']
+        fluxes = {}
+        
+        for face in faces:
+            fluxes[face] = self._compute_face_flux(rho, u, face)
+        
+        # Net outflow (positive = mass leaving CV)
+        fluxes['net_outflow'] = sum(fluxes[f] for f in faces)
+        
+        return fluxes
+    
+    def check(self, rho: 'npt.NDArray', u: 'npt.NDArray' = None,
+              step: int = 0, verbose: bool = False) -> Dict:
+        """Check mass conservation in control volume
+        
+        Tracks actual mass change in the CV over time.
+        This is the TRUE conservation check based on Σf_i (all distributions).
+        
+        Note:
+            The velocity field 'u' is optional and only used for diagnostic
+            macroscopic flux calculation, which may not match actual LBM 
+            transport near boundaries.
+        
+        Args:
+            rho: Current density field (= Σf_i at each node)
+            u: Current velocity field (optional, for diagnostic only)
+            step: Current step number
+            verbose: Print detailed results
+            
+        Returns:
+            Dictionary with conservation metrics
+        """
+        if not self.initialized:
+            self.initialize(rho, step)
+            return {'status': 'initialized', 'M_initial': self.M_prev}
+        
+        # Current CV mass (TRUE conservation metric)
+        M_current = self._compute_cv_mass(rho)
+        
+        # Time interval
+        interval = max(step - self.step_prev, 1)
+        
+        # Mass change (PRIMARY METRIC)
+        dM = M_current - self.M_prev
+        dM_per_step = dM / interval
+        
+        # Relative mass change (compared to initial mass)
+        mass_drift_percent = (M_current - self.M_initial) / self.M_initial * 100
+        
+        # Update state
+        self.M_prev = M_current
+        self.step_prev = step
+        
+        result = {
+            'M_current': M_current,
+            'M_initial': self.M_initial,
+            'dM': dM,
+            'interval': interval,
+            'dM_per_step': dM_per_step,
+            'mass_drift_percent': mass_drift_percent,
+        }
+        
+        # Optional: Compute macroscopic fluxes (diagnostic only)
+        if u is not None:
+            fluxes = self.compute_all_fluxes(rho, u)
+            result['fluxes'] = fluxes
+            result['net_outflow'] = fluxes['net_outflow']
+        
+        if verbose:
+            self._print_result(result)
+        
+        return result
+    
+    def _print_result(self, result: Dict) -> None:
+        """Print formatted conservation check result"""
+        print("\n" + "="*60)
+        print(" Control Volume Conservation Check")
+        print("="*60)
+        print(f" CV bounds: x=[{self.x0}, {self.x1}], y=[{self.y0}, {self.y1}], z=[{self.z0}, {self.z1}]")
+        print("-"*60)
+        
+        # Primary metric: Mass tracking
+        print(" Mass Tracking:")
+        print(f"   Current mass:  {result['M_current']:.6f}")
+        print(f"   Initial mass:  {result['M_initial']:.6f}")
+        drift = result['mass_drift_percent']
+        print(f"   Total drift:   {drift:+.6f}%", end="")
+        
+        if abs(drift) < 0.01:
+            print("  ✓ Excellent")
+        elif abs(drift) < 0.1:
+            print("  ✓ Good")
+        elif abs(drift) < 1.0:
+            print("  ⚠ Acceptable")
+        else:
+            print("  ✗ Check BCs")
+        
+        # Rate of change (convergence indicator)
+        print(f"   dM (interval): {result['dM']:+.4e}")
+        print(f"   dM/step:       {result['dM_per_step']:+.4e}", end="")
+        if abs(result['dM_per_step']) < 1e-6:
+            print("  (steady state)")
+        elif abs(result['dM_per_step']) < 1e-4:
+            print("  (converging)")
+        else:
+            print("  (transient)")
+        print("="*60)
+
+
+def create_obstacle_cv(xp: 'ModuleType',
+                       domain_shape: Tuple[int, int, int],
+                       obstacle_center: Tuple[float, float],
+                       obstacle_radius: float,
+                       margin: float = 2.0,
+                       solid_mask: Optional['npt.NDArray'] = None) -> 'ControlVolumeChecker':
+    """Create a control volume around an obstacle
+    
+    Useful for checking local conservation near the obstacle.
+    The CV extends from (center - radius - margin) to (center + radius + margin)
+    in x and y, and spans the full z-direction.
+    
+    Args:
+        xp: Array module
+        domain_shape: (Nx, Ny, Nz)
+        obstacle_center: (x, y) center of obstacle
+        obstacle_radius: Radius of obstacle  [lattice units]
+        margin: Extra margin around obstacle  [lattice units]
+        solid_mask: Solid mask
+        
+    Returns:
+        ControlVolumeChecker instance for the obstacle region
+        
+    Example:
+        >>> # Check conservation in a box around the cylinder
+        >>> cv = create_obstacle_cv(xp, (420, 180, 60), (84, 90), 10, margin=20)
+        >>> cv.initialize(rho, step=0)
+        >>> result = cv.check(rho, u, step, verbose=True)
+    """
+    Nx, Ny, Nz = domain_shape
+    cx, cy = obstacle_center
+    r = obstacle_radius
+    
+    # CV bounds with margin
+    x0 = max(0, int(cx - r - margin))
+    x1 = min(Nx - 1, int(cx + r + margin))
+    y0 = max(0, int(cy - r - margin))
+    y1 = min(Ny - 1, int(cy + r + margin))
+    z0 = 0
+    z1 = Nz - 1
+    
+    return ControlVolumeChecker(
+        xp, domain_shape,
+        bounds=(x0, x1, y0, y1, z0, z1),
+        solid_mask=solid_mask,
+        exclude_domain_boundary=True  # Internal CV, don't count domain boundary flux
+    )
+
+
+def create_domain_cv(xp: 'ModuleType',
+                     domain_shape: Tuple[int, int, int],
+                     solid_mask: Optional['npt.NDArray'] = None) -> 'ControlVolumeChecker':
+    """Create a control volume for the entire domain
+    
+    This is the standard conservation check that accounts for ALL 
+    boundary fluxes (inlet, outlet, and all far-field boundaries).
+    
+    Args:
+        xp: Array module
+        domain_shape: (Nx, Ny, Nz)
+        solid_mask: Solid mask
+        
+    Returns:
+        ControlVolumeChecker for entire domain
+        
+    Example:
+        >>> cv = create_domain_cv(xp, (420, 180, 60), solid_mask)
+        >>> cv.initialize(rho, step=0)
+        >>> # In time loop:
+        >>> result = cv.check(rho, u, step, verbose=True)
+    """
+    return ControlVolumeChecker(
+        xp, domain_shape,
+        bounds=None,  # Full domain
+        solid_mask=solid_mask,
+        exclude_domain_boundary=False  # Count all boundary fluxes
+    )
 
 
 # =============================================================================

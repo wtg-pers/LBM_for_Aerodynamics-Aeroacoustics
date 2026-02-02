@@ -40,10 +40,15 @@ from src.utilities.device import setup_library
 from src.utilities.check_conservation import ConservationChecker
 from src.utilities.lattice_validation import LatticeValidator
 from src.utilities.directory_utils import setup_output_directories
+# from src.utilities.flux_utils import (
+#     compute_mass_flux, 
+#     verify_mass_flux_balance,
+#     MassConservationTracker
+# )
 from src.utilities.flux_utils import (
-    compute_mass_flux, 
-    verify_mass_flux_balance,
-    MassConservationTracker
+    ControlVolumeChecker,
+    create_domain_cv,
+    create_obstacle_cv
 )
 
 
@@ -126,34 +131,80 @@ def main():
     print(f"  ν = {nu:.6f} [Δx²/Δt], τ = {tau:.6f}")
 
     # =========================================================================
-    # Boundary Conditions
+    # Boundary Conditions (Factory Pattern)
     # =========================================================================
+    print(f"\n[3] Boundary Conditions")
+    
     # Get boundaries config
     boundaries_config = config_loader.config.get('boundaries', {})
     
-    # Separate inlet/outlet from walls
-    io_boundaries = {}  # inlet, outlet
-    wall_boundaries = {}  # wall type
+    # Separate boundaries by method
+    # - Wall methods (bounce_back): need f_post, use DomainWallManager
+    # - Inlet methods: equilibrium, non_equilibrium (applied LAST for corner priority)
+    # - Farfield/outlet methods: characteristic, convective, etc. (applied FIRST)
+    inlet_boundaries = {}    # inlet BCs (applied last → corner priority)
+    farfield_boundaries = {} # farfield/outlet BCs (applied first)
+    wall_boundaries = {}     # bounce_back walls (separate handling with f_post)
+    
+    inlet_methods = ['equilibrium', 'non_equilibrium', 'eq', 'neq', 'non_eq']
+    wall_methods = ['bounce_back', 'wall', 'hwbb', 'halfway']
+    skip_methods = ['periodic', 'none', '']
+    # Everything else is farfield/outlet: characteristic, convective, extrapolation, open, farfield
     
     for bc_name, bc_config in boundaries_config.items():
-        bc_type = bc_config.get('type', '').lower()
-        if bc_type in ['inlet', 'outlet']:
-            io_boundaries[bc_name] = bc_config
-        elif bc_type == 'wall':
+        method = bc_config.get('method', '').lower()
+        
+        # Legacy support: if 'type' exists but no 'method'
+        if not method:
+            bc_type = bc_config.get('type', '').lower()
+            if bc_type == 'wall':
+                method = 'bounce_back'
+            elif bc_type == 'inlet':
+                method = bc_config.get('method', 'non_equilibrium').lower()
+            elif bc_type in ['outlet', 'open']:
+                method = bc_config.get('method', 'characteristic').lower()
+        
+        if method in wall_methods:
             wall_boundaries[bc_name] = bc_config
+        elif method in inlet_methods:
+            inlet_boundaries[bc_name] = bc_config
+        elif method not in skip_methods:
+            farfield_boundaries[bc_name] = bc_config
     
-    # Create inlet/outlet BCs using factory
+    # Create BCs with correct application order:
+    # 1. Farfield/outlet FIRST (general open boundaries)
+    # 2. Inlet LAST (overwrites corners → inlet has priority at edges)
+    #
+    # This ensures: at corner (x=0, y=0), inlet condition is applied,
+    # not farfield. Physically correct for external flow.
+    
     bc_manager = BoundaryManager()
-    print("  Inlet/Outlet:")
-    for bc_name, bc_config in io_boundaries.items():
+    print("  Boundaries (in application order):")
+    
+    # --- Step 1: Add farfield/outlet BCs first ---
+    for bc_name, bc_config in farfield_boundaries.items():
         bc = create_boundary_from_config(xp, lattice, bc_name, bc_config, domain_shape)
         if bc is not None:
             bc_manager.add(bc)
             loc = bc_config.get('location', bc_name)
-            if bc_config['type'] == 'inlet':
-                print(f"    {bc_name}: inlet at {loc}, u = {bc_config.get('velocity', 0.1)}")
-            else:
-                print(f"    {bc_name}: outlet at {loc}, ρ = {bc_config.get('rho', 1.0)}")
+            method = bc_config.get('method', 'characteristic')
+            rho = bc_config.get('rho', 1.0)
+            k = bc_config.get('k', bc_config.get('relax_coeff', 0.1))
+            print(f"    {bc_name}: {method} at {loc}, ρ={rho}, k={k}")
+    
+    # --- Step 2: Add inlet BCs last (corner priority) ---
+    for bc_name, bc_config in inlet_boundaries.items():
+        bc = create_boundary_from_config(xp, lattice, bc_name, bc_config, domain_shape)
+        if bc is not None:
+            bc_manager.add(bc)
+            loc = bc_config.get('location', bc_name)
+            method = bc_config.get('method', 'non_equilibrium')
+            velocity = bc_config.get('velocity', 0.1)
+            rho = bc_config.get('rho', 1.0)
+            print(f"    {bc_name}: {method} at {loc}, u={velocity}, ρ={rho} [corner priority]")
+    
+    if len(bc_manager) == 0:
+        print("    (none)")
     
     # Create domain wall BCs
     print("  Domain Walls:")
@@ -162,12 +213,12 @@ def main():
         domain_walls = DomainWallManager(
             xp, lattice, domain_shape,
             walls=wall_locations,
-            exclude_inlet_outlet=True
+            exclude_inlet_outlet=False  # Let other BCs overwrite at corners
         )
         print(f"    {domain_walls.get_info()}")
     else:
         domain_walls = None
-        print("    (none)")
+        print("    (none - using periodic for unlisted boundaries)")
 
     # Internal obstacle (from config or default)
     internal_geom = config_loader.config.get('internal_geometry', {})
@@ -268,7 +319,6 @@ def main():
     # Initialize Components
     # =========================================================================
     streaming = StreamingPull(xp, lattice, domain_shape)
-    # conservation = ConservationChecker(xp, lattice)
     eq = Maxwellian(xp, lattice, domain)
     macro = Macroscopic(xp, lattice)
     collision = BGK(xp)
@@ -337,13 +387,31 @@ def main():
     f_new = xp.empty_like(f_old)
     f_post = xp.empty_like(f_old)
 
-    # Initialize mass conservation tracker
-    mass_tracker = MassConservationTracker(xp, solid_mask=mask)
-
-    # Get initial macroscopic for tracker initialization
+    # =========================================================================
+    # Initialize Conservation Checkers (AFTER f_old is ready)
+    # =========================================================================
+    print(f"\n[5.1] Initializing Conservation Checkers...")
+    
+    # Compute initial macroscopic fields from f_old
     rho_init, u_init_field = macro.compute(f_old)
-    initial_mass = mass_tracker.initialize(rho_init)
+    initial_mass = float(xp.sum(rho_init[~mask])) if mask is not None else float(xp.sum(rho_init))
     print(f"  Initial fluid mass: {initial_mass:.6f}")
+    
+    # 1. Domain-wide conservation checker (all boundary fluxes)
+    cv_domain = create_domain_cv(xp, domain_shape, mask)
+    cv_domain.initialize(rho_init, step=start_step)
+    print(f"  Domain CV initialized: bounds=[0:{Nx-1}, 0:{Ny-1}, 0:{Nz-1}]")
+    
+    # 2. Local checker around obstacle (optional, for detailed analysis)
+    cv_obstacle = create_obstacle_cv(
+        xp, domain_shape,
+        obstacle_center=cyl_center,
+        obstacle_radius=cyl_radius,
+        margin=3.0 * cyl_radius,  # margin = 3R around obstacle
+        solid_mask=mask
+    )
+    cv_obstacle.initialize(rho_init, step=start_step)
+    print(f"  Obstacle CV initialized: margin={3.0 * cyl_radius:.1f} around cylinder")
     
     # =========================================================================
     # Time Loop
@@ -354,12 +422,13 @@ def main():
     # Run simulation
     start_time = time.perf_counter()
     # custom_format = "{l_bar}{bar:5}|{n_fmt}/{total_fmt}[{elapsed}{postfix}]"
-    custom_format = "{l_bar}{bar:5}|{n_fmt} [{elapsed}{postfix}]"
+    custom_format = "{l_bar}{bar:15}|{n_fmt} [{elapsed}{postfix}]"
     pbar = tqdm(range(start_step, end_step), 
                 unit="step",
                 ncols=70, bar_format=custom_format)
     
-    flux_history = []
+    # For progress bar updates
+    last_result = {'relative_error': 0.0}
 
     for step in pbar:
         # ---------------------------------------------------------------------
@@ -385,9 +454,9 @@ def main():
         # ---------------------------------------------------------------------
         # Step 5: Boundary Conditions (applied AFTER streaming)
         # ---------------------------------------------------------------------
-        bc_manager.apply_all(f_new)              # Inlet (xmin), Outlet (xmax)
         if domain_walls is not None:
-            domain_walls.apply_all(f_new, f_post)   # Walls at y,z boundaries
+            domain_walls.apply_all(f_new, f_post)   # Walls at y,z boundaries (FIRST)
+        bc_manager.apply_all(f_new)              # Inlet/Outlet (overwrites wall at corners)
         obstacle_bc.apply_with_reset(f_new, f_post)  # Internal cylinder
         # ---------------------------------------------------------------------
         # Step 6: Swap buffers for next iteration
@@ -397,15 +466,18 @@ def main():
         # ---------------------------------------------------------------------
         # Output / Monitoring
         # ---------------------------------------------------------------------
-        if step % output_interval == 0:
-            mass_result = mass_tracker.check(rho, u, step=step, inlet='xmin', outlet='xmax')
-            
+        if step % 10 == 0:
             pbar.set_postfix({
                 'ρ': f"{float(rho.mean()):.4f}",
-                'in': f"{mass_result['flux_in']:.2f}",
-                'out': f"{mass_result['flux_out']:.2f}",
-                'err': f"{mass_result['relative_error']:.3f}"
+                'drift': f"{last_result.get('mass_drift_percent', 0.0):+.4f}%"
             })
+
+        if step % output_interval == 0 and step > start_step:
+            # Domain-wide conservation
+            last_result = cv_domain.check(rho, u, step, verbose=True)
+
+            # Local conservation around obstacle (optional - uncomment if needed)
+            # cv_obstacle.check(rho, u, step, verbose=True)
             
             if vtk_writer is not None:
                 vtk_writer.write(step=step, rho=rho, u=u, 
@@ -443,20 +515,18 @@ def main():
     # =========================================================================
     # Mass Conservation Report
     # =========================================================================
-    print(f"\n[8] Mass Conservation Analysis")
-    print("-" * 50)
+    print(f"\n[8] Final Mass Conservation Analysis")
+    print("-" * 60)
     
-    # Final mass conservation check (use final_step for proper interval)
-    final_result = mass_tracker.check(rho_final, u_final, step=final_step, 
-                                       inlet='xmin', outlet='xmax')
-    print(mass_tracker.get_summary(final_result, verbose=True))
+    # Final conservation check
+    final_result = cv_domain.check(rho_final, u_final, step=final_step, verbose=True)
     
     # Total mass change from start
-    final_mass = final_result['M_current']
+    final_mass = float(xp.sum(rho_final[~mask])) if mask is not None else float(xp.sum(rho_final))
     mass_change_total = final_mass - initial_mass
     mass_change_percent = mass_change_total / initial_mass * 100
     
-    print(f"\n  Overall Mass Change:")
+    print(f"\n  Overall Mass Change (entire simulation):")
     print(f"    Initial mass:  {initial_mass:.6f}")
     print(f"    Final mass:    {final_mass:.6f}")
     print(f"    Change:        {mass_change_total:+.6e} ({mass_change_percent:+.4f}%)")
@@ -470,6 +540,7 @@ def main():
     else:
         print(f"    Assessment:    ⚠ Significant mass drift, check BCs")
     
+    # Stability check
     if xp.isnan(rho_final).any() or xp.isinf(rho_final).any():
         print("\n  ❌ INSTABILITY DETECTED!")
         return False

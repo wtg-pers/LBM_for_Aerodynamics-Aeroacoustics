@@ -34,9 +34,6 @@ def create_sphere_mask(xp: 'ModuleType',
         
     Returns:
         Boolean mask, shape (Nx, Ny, Nz), True inside sphere
-        
-    Example:
-        >>> mask = create_sphere_mask(np, (100, 40, 40), (50, 20, 20), 5.0)
     """
     Nx, Ny, Nz = shape
     cx, cy, cz = center
@@ -61,41 +58,18 @@ def create_cylinder_mask(xp: 'ModuleType',
                          axis_range: Optional[Tuple[float, float]] = None) -> 'npt.NDArray':
     """Create a cylindrical solid mask
     
-    Creates a cylinder aligned with the specified axis. Can be:
-    - Infinite: spans the entire domain along the axis (default)
-    - Finite: limited height specified by height/axis_center or axis_range
-    
     Args:
         xp: Array module (numpy or cupy)
         shape: Domain shape (Nx, Ny, Nz)  [lattice units]
         center: Cylinder center in the plane perpendicular to axis  [lattice units]
-                For axis='z': (x_center, y_center)
-                For axis='x': (y_center, z_center)
-                For axis='y': (x_center, z_center)
         radius: Cylinder radius  [lattice units]
         axis: Cylinder axis direction ('x', 'y', or 'z')
         height: Cylinder height/length along axis  [lattice units, optional]
-                If None, cylinder spans entire domain (infinite)
         axis_center: Center position along axis  [lattice units, optional]
-                     Only used if height is specified
-                     If None, defaults to domain center
         axis_range: Explicit range (min, max) along axis  [lattice units, optional]
-                    Alternative to height/axis_center specification
         
     Returns:
         Boolean mask, shape (Nx, Ny, Nz), True inside cylinder
-        
-    Examples:
-        # Infinite cylinder (spans entire z)
-        >>> mask = create_cylinder_mask(np, (100, 40, 40), (25, 20), 4.0, axis='z')
-        
-        # Finite cylinder with height=20, centered at z=20
-        >>> mask = create_cylinder_mask(np, (100, 40, 40), (25, 20), 4.0, 
-        ...                             axis='z', height=20, axis_center=20)
-        
-        # Finite cylinder with explicit z range
-        >>> mask = create_cylinder_mask(np, (100, 40, 40), (25, 20), 4.0,
-        ...                             axis='z', axis_range=(10, 30))
     """
     Nx, Ny, Nz = shape
     
@@ -104,7 +78,6 @@ def create_cylinder_mask(xp: 'ModuleType',
     z = xp.arange(Nz, dtype=xp.float64)
     X, Y, Z = xp.meshgrid(x, y, z, indexing='ij')
     
-    # Compute radial distance from cylinder axis
     if axis == 'z':
         cx, cy = center
         radial_distance = xp.sqrt((X - cx)**2 + (Y - cy)**2)
@@ -123,24 +96,19 @@ def create_cylinder_mask(xp: 'ModuleType',
     else:
         raise ValueError(f"axis must be 'x', 'y', or 'z', got '{axis}'")
     
-    # Radial condition: inside cylinder radius
     radial_mask = radial_distance <= radius
     
-    # Axial condition: within height limits
     if axis_range is not None:
-        # Explicit range specified
         z_min, z_max = axis_range
         axial_mask = (axis_coord >= z_min) & (axis_coord <= z_max)
     elif height is not None:
-        # Height and center specified
         if axis_center is None:
-            axis_center = (axis_length - 1) / 2.0  # Default: domain center
+            axis_center = (axis_length - 1) / 2.0
         half_height = height / 2.0
         z_min = axis_center - half_height
         z_max = axis_center + half_height
         axial_mask = (axis_coord >= z_min) & (axis_coord <= z_max)
     else:
-        # Infinite cylinder (spans entire axis)
         axial_mask = True
     
     return radial_mask & axial_mask
@@ -160,9 +128,6 @@ def create_box_mask(xp: 'ModuleType',
         
     Returns:
         Boolean mask, shape (Nx, Ny, Nz), True inside box
-        
-    Example:
-        >>> mask = create_box_mask(np, (100, 40, 40), (20, 10, 10), (30, 30, 30))
     """
     Nx, Ny, Nz = shape
     x_min, y_min, z_min = corner_min
@@ -185,22 +150,13 @@ def create_channel_walls_mask(xp: 'ModuleType',
                                wall_directions: str = 'yz') -> 'npt.NDArray':
     """Create wall masks for channel boundaries
     
-    Creates solid walls at the domain boundaries in specified directions.
-    
     Args:
         xp: Array module (numpy or cupy)
         shape: Domain shape (Nx, Ny, Nz)  [lattice units]
-        wall_directions: Which directions have walls
-                        'y' = walls at y=0 and y=Ny-1
-                        'z' = walls at z=0 and z=Nz-1
-                        'yz' = both (rectangular channel)
-                        'xyz' = all directions (closed box)
+        wall_directions: Which directions have walls ('y', 'z', 'yz', 'xyz')
                         
     Returns:
         Boolean mask, shape (Nx, Ny, Nz), True at wall nodes
-        
-    Example:
-        >>> mask = create_channel_walls_mask(np, (100, 40, 40), 'yz')
     """
     Nx, Ny, Nz = shape
     mask = xp.zeros(shape, dtype=bool)
@@ -226,20 +182,14 @@ def create_ellipsoid_mask(xp: 'ModuleType',
                           semi_axes: Tuple[float, float, float]) -> 'npt.NDArray':
     """Create an ellipsoidal solid mask
     
-    Ellipsoid equation: (x-cx)²/a² + (y-cy)²/b² + (z-cz)²/c² <= 1
-    
     Args:
         xp: Array module (numpy or cupy)
         shape: Domain shape (Nx, Ny, Nz)  [lattice units]
         center: Ellipsoid center (cx, cy, cz)  [lattice units]
         semi_axes: Semi-axes lengths (a, b, c)  [lattice units]
-                   a = x-direction, b = y-direction, c = z-direction
         
     Returns:
         Boolean mask, shape (Nx, Ny, Nz), True inside ellipsoid
-        
-    Example:
-        >>> mask = create_ellipsoid_mask(np, (100, 40, 40), (50, 20, 20), (10, 5, 5))
     """
     Nx, Ny, Nz = shape
     cx, cy, cz = center
@@ -250,7 +200,6 @@ def create_ellipsoid_mask(xp: 'ModuleType',
     z = xp.arange(Nz, dtype=xp.float64)
     X, Y, Z = xp.meshgrid(x, y, z, indexing='ij')
     
-    # Ellipsoid equation
     normalized_distance = ((X - cx)/a)**2 + ((Y - cy)/b)**2 + ((Z - cz)/c)**2
     
     return normalized_distance <= 1.0
@@ -264,15 +213,10 @@ def combine_masks(xp: 'ModuleType',
     Args:
         xp: Array module (numpy or cupy)
         *masks: Variable number of boolean masks (same shape)
-        operation: 'union' (OR), 'intersection' (AND), or 'difference' (first - others)
+        operation: 'union' (OR), 'intersection' (AND), or 'difference'
         
     Returns:
         Combined boolean mask
-        
-    Example:
-        >>> sphere = create_sphere_mask(np, shape, (50, 20, 20), 10)
-        >>> cylinder = create_cylinder_mask(np, shape, (50, 20), 5, 'x')
-        >>> combined = combine_masks(np, sphere, cylinder, operation='union')
     """
     if len(masks) == 0:
         raise ValueError("At least one mask required")
@@ -289,7 +233,7 @@ def combine_masks(xp: 'ModuleType',
         for mask in masks[1:]:
             result = result & (~mask)
     else:
-        raise ValueError(f"Unknown operation: {operation}. Use 'union', 'intersection', or 'difference'")
+        raise ValueError(f"Unknown operation: {operation}")
     
     return result
 
@@ -318,3 +262,72 @@ def get_geometry_info(mask: 'npt.NDArray', xp: 'ModuleType' = None) -> dict:
         'solid_fraction': solid_count / total_nodes,
         'shape': mask.shape
     }
+
+
+def create_domain_wall_mask(xp: 'ModuleType',
+                            shape: Tuple[int, int, int],
+                            walls: Optional[list] = None,
+                            exclude_x: bool = True) -> 'npt.NDArray':
+    """Create solid mask for domain boundary walls
+    
+    Creates a mask where boundary layers are marked as solid.
+    This allows using HalfwayBounceBack (wall.py) for domain walls,
+    which properly handles the periodic streaming issue.
+    
+    Args:
+        xp: Array module (numpy or cupy)
+        shape: Domain shape (Nx, Ny, Nz)  [lattice units]
+        walls: List of walls to include. Options:
+               - 'ymin' or 'south': y = 0
+               - 'ymax' or 'north': y = Ny-1
+               - 'zmin' or 'bottom': z = 0
+               - 'zmax' or 'top': z = Nz-1
+               - 'xmin' or 'west': x = 0 (usually inlet, excluded by default)
+               - 'xmax' or 'east': x = Nx-1 (usually outlet, excluded by default)
+               Default: ['ymin', 'ymax', 'zmin', 'zmax']
+        exclude_x: If True (default), exclude xmin/xmax from walls
+                   even if specified. Set False for closed box.
+        
+    Returns:
+        Boolean mask, shape (Nx, Ny, Nz), True = solid (wall)
+        
+    Note:
+        Using this mask with HalfwayBounceBack means the wall is at the
+        boundary layer (e.g., y=0), not between y=0 and y=1.
+        The effective fluid domain becomes (Nx, Ny-2, Nz-2) for channel flow.
+        
+    Example:
+        >>> wall_mask = create_domain_wall_mask(xp, (100, 40, 40))
+        >>> wall_bc = HalfwayBounceBack(xp, lattice, wall_mask)
+    """
+    Nx, Ny, Nz = shape
+    mask = xp.zeros(shape, dtype=bool)
+    
+    # Default walls
+    if walls is None:
+        walls = ['ymin', 'ymax', 'zmin', 'zmax']
+    
+    # Normalize wall names
+    wall_map = {
+        'south': 'ymin', 'north': 'ymax',
+        'bottom': 'zmin', 'top': 'zmax',
+        'west': 'xmin', 'east': 'xmax'
+    }
+    walls = [wall_map.get(w.lower(), w.lower()) for w in walls]
+    
+    # Apply walls
+    for wall in walls:
+        if wall == 'ymin':
+            mask[:, 0, :] = True
+        elif wall == 'ymax':
+            mask[:, -1, :] = True
+        elif wall == 'zmin':
+            mask[:, :, 0] = True
+        elif wall == 'zmax':
+            mask[:, :, -1] = True
+        elif wall == 'xmin' and not exclude_x:
+            mask[0, :, :] = True
+        elif wall == 'xmax' and not exclude_x:
+            mask[-1, :, :] = True
+    
+    return mask
