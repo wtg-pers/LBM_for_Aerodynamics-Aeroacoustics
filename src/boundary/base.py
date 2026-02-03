@@ -319,7 +319,10 @@ def create_boundary_from_config(xp: 'ModuleType',
     The 'method' parameter determines the BC type:
         - 'equilibrium': Equilibrium inlet (f = f_eq)
         - 'non_equilibrium': Non-eq extrapolation inlet (preserves viscous info)
-        - 'characteristic': Non-reflecting open BC (for outlet/far-field)
+        - 'characteristic': Non-reflecting open BC (for outlet)
+        - 'farfield': Far-field BC maintaining U∞ (for external flow)
+        - 'ambient': Ambient BC for hover (pressure-based, velocity free)
+        - 'sponge': Sponge layer (buffer zone damping)
         - 'convective': Advective outlet
         - 'extrapolation': Zero-gradient outlet
         - 'bounce_back': Half-way bounce-back wall
@@ -343,9 +346,17 @@ def create_boundary_from_config(xp: 'ModuleType',
         >>> config = {"location": "xmin", "method": "non_equilibrium", 
         ...           "velocity": 0.1, "rho": 1.0}
         
-        >>> # Open boundary (far-field)
-        >>> config = {"location": "ymin", "method": "characteristic",
-        ...           "rho": 1.0, "k": 0.1}
+        >>> # Far-field (maintains freestream for external flow)
+        >>> config = {"location": "ymin", "method": "farfield",
+        ...           "rho": 1.0, "u_inf": 0.1, "k": 0.1}
+        
+        >>> # Ambient (hover, velocity free)
+        >>> config = {"location": "zmax", "method": "ambient",
+        ...           "rho": 1.0, "k": 0.5}
+        
+        >>> # Sponge layer
+        >>> config = {"location": "xmax", "method": "sponge",
+        ...           "thickness": 20, "strength": 0.8, "rho": 1.0, "u_inf": 0.1}
         
         >>> # Wall
         >>> config = {"location": "ymax", "method": "bounce_back"}
@@ -354,6 +365,7 @@ def create_boundary_from_config(xp: 'ModuleType',
     from .inlet import EquilibriumInlet, NonEquilibriumInlet
     from .outlet import CharacteristicOutlet, ConvectiveOutlet, ExtrapolationOutlet
     from .domain_wall import DomainWallBounceBack
+    from .farfield import CharacteristicFarfield, AmbientBC, SpongeLayer
     
     # Get location (required)
     location_str = config.get('location')
@@ -409,9 +421,9 @@ def create_boundary_from_config(xp: 'ModuleType',
                                    shape=shape)
     
     # =========================================================================
-    # Characteristic / Open BC (non-reflecting, for outlet or far-field)
+    # Characteristic Outlet (for outlet, not far-field)
     # =========================================================================
-    elif method in ['characteristic', 'open', 'non_reflecting', 'farfield']:
+    elif method in ['characteristic', 'open', 'non_reflecting']:
         rho_target = config.get('rho', config.get('rho_target', config.get('pressure', 1.0)))
         relax_coeff = config.get('k', config.get('relax_coeff', 0.1))
         
@@ -419,6 +431,50 @@ def create_boundary_from_config(xp: 'ModuleType',
                                     rho_target=rho_target,
                                     relax_coeff=relax_coeff,
                                     shape=shape)
+    
+    # =========================================================================
+    # Characteristic Far-field (maintains U∞ for external flow)
+    # =========================================================================
+    elif method in ['farfield', 'far_field', 'freestream']:
+        rho_inf = config.get('rho', config.get('rho_inf', 1.0))
+        u_inf = config.get('u_inf', config.get('velocity', 0.1))
+        relax_coeff = config.get('k', config.get('relax_coeff', 0.1))
+        
+        return CharacteristicFarfield(xp, lattice, location,
+                                      rho_inf=rho_inf,
+                                      u_inf=u_inf,
+                                      relax_coeff=relax_coeff,
+                                      shape=shape)
+    
+    # =========================================================================
+    # Ambient BC (hover - pressure-based, velocity free)
+    # =========================================================================
+    elif method in ['ambient', 'pressure_open', 'hover']:
+        rho_ambient = config.get('rho', config.get('rho_ambient', 1.0))
+        relax_coeff = config.get('k', config.get('relax_coeff', 0.5))
+        
+        return AmbientBC(xp, lattice, location,
+                        rho_ambient=rho_ambient,
+                        relax_coeff=relax_coeff,
+                        shape=shape)
+    
+    # =========================================================================
+    # Sponge Layer (buffer zone damping)
+    # =========================================================================
+    elif method in ['sponge', 'sponge_layer', 'buffer']:
+        thickness = config.get('thickness', 10)
+        strength = config.get('strength', config.get('sigma_max', 0.5))
+        rho_inf = config.get('rho', config.get('rho_inf', 1.0))
+        u_inf = config.get('u_inf', config.get('velocity', 0.0))
+        profile = config.get('profile', 'polynomial')
+        
+        return SpongeLayer(xp, lattice, location,
+                          thickness=thickness,
+                          strength=strength,
+                          rho_inf=rho_inf,
+                          u_inf=u_inf,
+                          profile=profile,
+                          shape=shape)
     
     # =========================================================================
     # Convective Outlet
@@ -459,8 +515,8 @@ def create_boundary_from_config(xp: 'ModuleType',
     else:
         print(f"Warning: Unknown method '{method}' for boundary '{bc_name}'")
         print(f"  Available methods: equilibrium, non_equilibrium, characteristic,")
+        print(f"                     farfield, ambient, sponge,")
         print(f"                     convective, extrapolation, bounce_back, periodic")
-        return None
         return None
 
 
@@ -484,9 +540,9 @@ def create_all_boundaries_from_config(xp: 'ModuleType',
         
     Example:
         >>> boundaries_config = {
-        ...     "inlet": {"type": "inlet", "location": "xmin", "velocity": 0.1},
-        ...     "outlet": {"type": "outlet", "location": "xmax", "rho": 1.0},
-        ...     "wall_y0": {"type": "wall", "location": "ymin"},
+        ...     "inlet": {"location": "xmin", "method": "non_equilibrium", "velocity": 0.1},
+        ...     "outlet": {"location": "xmax", "method": "characteristic", "rho": 1.0},
+        ...     "farfield_y": {"location": "ymin", "method": "farfield", "u_inf": 0.1},
         ... }
         >>> bc_manager = create_all_boundaries_from_config(np, lattice, 
         ...                                                 boundaries_config, shape)
@@ -499,6 +555,7 @@ def create_all_boundaries_from_config(xp: 'ModuleType',
             manager.add(bc)
             if verbose:
                 loc = bc_config.get('location', bc_name)
-                print(f"    {bc_name}: {bc_config.get('type', 'unknown')} at {loc}")
+                method = bc_config.get('method', 'unknown')
+                print(f"    {bc_name}: {method} at {loc}")
     
     return manager

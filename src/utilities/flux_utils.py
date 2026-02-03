@@ -345,7 +345,7 @@ def create_obstacle_cv(xp: 'ModuleType',
         >>> result = cv.check(rho, u, step, verbose=True)
     """
     Nx, Ny, Nz = domain_shape
-    cx, cy = obstacle_center
+    cx, cy, cz = obstacle_center
     r = obstacle_radius
     
     # CV bounds with margin
@@ -353,8 +353,8 @@ def create_obstacle_cv(xp: 'ModuleType',
     x1 = min(Nx - 1, int(cx + r + margin))
     y0 = max(0, int(cy - r - margin))
     y1 = min(Ny - 1, int(cy + r + margin))
-    z0 = 0
-    z1 = Nz - 1
+    z0 = max(0, int(cz - r - margin))
+    z1 = min(Nz - 1, int(cz + r + margin))
     
     return ControlVolumeChecker(
         xp, domain_shape,

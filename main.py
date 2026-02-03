@@ -32,6 +32,7 @@ from src.boundary.base import (
 from src.boundary.wall import HalfwayBounceBack
 from src.boundary.domain_wall import DomainWallManager
 from src.boundary.geometry import create_cylinder_mask
+from src.boundary.geometry import create_sphere_mask
 
 # =============================================================================
 # Utilities
@@ -222,37 +223,34 @@ def main():
 
     # Internal obstacle (from config or default)
     internal_geom = config_loader.config.get('internal_geometry', {})
-    cylinder_config = internal_geom.get('cylinder', {})
+    obstacle_type = 'sphere'
+    obstacle_config = internal_geom.get(obstacle_type, {})
     
-    if cylinder_config.get('enabled', False):
-        cyl_center = cylinder_config.get('center', (Nx//5, Ny//2))
-        cyl_radius = cylinder_config.get('radius', char_length//2)
-        cyl_axis = cylinder_config.get('axis', 'z')
-        cyl_range = cylinder_config.get('axis_range', (0, Nz-1))
+    if obstacle_config.get('enabled', False):
+        center = obstacle_config.get('center', (Nx//5, Ny//2, Nz//2))
+        radius = obstacle_config.get('radius', char_length//2)
         
-        mask = create_cylinder_mask(
+        mask = create_sphere_mask(
             xp, domain_shape,
-            center=cyl_center,
-            radius=cyl_radius,
-            axis=cyl_axis,
-            axis_range=cyl_range
+            center=center,
+            radius=radius
         )
         obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
         print(f"  Internal Obstacle:")
-        print(f"    Cylinder: center={cyl_center}, R={cyl_radius}, axis={cyl_axis}")
+        print(f"    center={center}, R={radius}")
         print(f"    {obstacle_bc.get_info()}")
-    else:
-        # Default cylinder (backward compatibility)
-        mask = create_cylinder_mask(
-            xp, domain_shape,
-            center=(Nx//5, Ny//2),
-            radius=(char_length//2),
-            axis='z',
-            axis_range=(0, Nz-1)
-        )
-        obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-        print(f"  Internal Obstacle (default):")
-        print(f"    {obstacle_bc.get_info()}")
+    # else:
+    #     # Default cylinder (backward compatibility)
+    #     mask = create_cylinder_mask(
+    #         xp, domain_shape,
+    #         center=(Nx//5, Ny//2),
+    #         radius=(char_length//2),
+    #         axis='z',
+    #         axis_range=(0, Nz-1)
+    #     )
+    #     obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
+    #     print(f"  Internal Obstacle (default):")
+    #     print(f"    {obstacle_bc.get_info()}")
 
     # Convert mask for VTK output (ensure NumPy array)
     solid_mask_np = mask.get() if hasattr(mask, 'get') else mask
@@ -405,13 +403,13 @@ def main():
     # 2. Local checker around obstacle (optional, for detailed analysis)
     cv_obstacle = create_obstacle_cv(
         xp, domain_shape,
-        obstacle_center=cyl_center,
-        obstacle_radius=cyl_radius,
-        margin=3.0 * cyl_radius,  # margin = 3R around obstacle
+        obstacle_center=center,
+        obstacle_radius=radius,
+        margin=3.0 * radius,  # margin = 3R around obstacle
         solid_mask=mask
     )
     cv_obstacle.initialize(rho_init, step=start_step)
-    print(f"  Obstacle CV initialized: margin={3.0 * cyl_radius:.1f} around cylinder")
+    print(f"  Obstacle CV initialized: margin={3.0 * radius:.1f} around cylinder")
     
     # =========================================================================
     # Time Loop
@@ -474,7 +472,7 @@ def main():
 
         if step % output_interval == 0 and step > start_step:
             # Domain-wide conservation
-            last_result = cv_domain.check(rho, u, step, verbose=True)
+            # last_result = cv_domain.check(rho, u, step, verbose=True)
 
             # Local conservation around obstacle (optional - uncomment if needed)
             # cv_obstacle.check(rho, u, step, verbose=True)

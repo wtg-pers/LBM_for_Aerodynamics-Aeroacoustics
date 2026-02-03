@@ -2,12 +2,13 @@
 # Domain Configuration
 # =============================================================================
 Nx = 200
-Ny = 200
-Nz = 200
+Ny = 50
+Nz = 50
 # Cylinder parameters
-cylinder_diameter = 20      # [lattice units]
-cylinder_center_x = Nx // 5  # Located at 20% from inlet
-cylinder_center_y = Ny // 2  # Centered in y
+diameter = 20      # [lattice units]
+center_x = Nx // 4  # Located at 25% from inlet
+center_y = Ny // 2  # Centered in y
+center_z = Nz // 2
 
 
 # =============================================================================
@@ -25,10 +26,10 @@ simulation = {
     "physics": {
         "Re": 100.0,
         "u_init": 0.1,
-        "characteristic_length": cylinder_diameter
+        "characteristic_length": diameter
     },
     "time": {
-        "max_steps": 50000,
+        "max_steps": 200000,
         "output_interval": 500,
         "checkpoint_interval": 10000,
         "probe_interval": 10                  # Force/probe sampling
@@ -48,52 +49,21 @@ simulation = {
 #   - 'bounce_back': Half-way bounce-back wall
 #   - 'periodic': No BC (handled by streaming)
 #
-# For TRUE EXTERNAL FLOW: Use 'characteristic' on all non-inlet boundaries!
 
 boundaries = {
-    # Inlet at x = 0
-    "inlet": {
-        "location": "xmin",
-        "velocity": 0.1,
-        "method": "non_equilibrium",
-        "profile": "uniform"
-    },
-    
-    # Outlet at x = Nx-1
-    "outlet": {
-        "location": "xmax",
-        "method": "characteristic",
-        "rho": 1.0,
-        "k": 0.1
-    },
-    
-    "ymin": {
-        "location": "ymin",
-        "method": "characteristic",
-        "rho": 1.0,
-        "k": 0.1,
-    },
-    "ymax": {
-        "location": "ymax",
-        "method": "characteristic",
-        "rho": 1.0,
-        "k": 0.1,
-    },
-    
-    "zmin": {
-        "location": "zmin",
-        "method": "characteristic",
-        "rho": 1.0,
-        "k": 0.1,
-    },
-    "zmax": {
-        "location": "zmax",
-        "method": "characteristic",
-        "rho": 1.0,
-        "k": 0.1,
-    },
+    "inlet": {"location": "xmin", "method": "non_equilibrium", "velocity": 0.1},
+    "outlet": {"location": "xmax", "method": "characteristic", "rho": 1.0},
+    "ymin": {"location": "ymin", "method": "ambient", "rho": 1.0, "k": 0.3},
+    "ymax": {"location": "ymax", "method": "ambient", "rho": 1.0, "k": 0.3},
+    "zmin": {"location": "zmin", "method": "ambient", "rho": 1.0, "k": 0.3},
+    "zmax": {"location": "zmax", "method": "ambient", "rho": 1.0, "k": 0.3},
 }
-
+# boundaries = {
+#     "top": {"location": "zmax", "method": "ambient", "rho": 1.0, "k": 0.5},
+#     "bottom": {"location": "zmin", "method": "ambient", "rho": 1.0, "k": 0.5},
+#     "sides": {"location": "xmin", "method": "ambient", "rho": 1.0, "k": 0.5},
+#     # ... 나머지 경계도 동일
+# }
 # =============================================================================
 # Alternative: Periodic z-direction (quasi-2D simulation)
 # =============================================================================
@@ -104,13 +74,21 @@ boundaries = {
 # Internal Geometry (Obstacle)
 # =============================================================================
 
+# internal_geometry = {
+#     "cylinder": {
+#         "enabled": True,
+#         "center": (cylinder_center_x, cylinder_center_y),
+#         "radius": cylinder_diameter // 2,
+#         "axis": "z",                  # Cylinder axis direction
+#         "axis_range": (30, 70)     # Full span in z
+#     }
+# }
+
 internal_geometry = {
-    "cylinder": {
+    "sphere": {
         "enabled": True,
-        "center": (cylinder_center_x, cylinder_center_y),
-        "radius": cylinder_diameter // 2,
-        "axis": "z",                  # Cylinder axis direction
-        "axis_range": (0, Nz - 1)     # Full span in z
+        "center": (center_x, center_y, center_z),
+        "radius": diameter // 2
     }
 }
 
@@ -118,11 +96,11 @@ internal_geometry = {
 # Output Configuration
 # =============================================================================
 output = {
-    "output_dir": "./results_external/vtk",
-    "checkpoint_dir": "./checkpoints_external",
-    "csv_dir": "./results_external/csv",
+    "output_dir": "./results/vtk",
+    "checkpoint_dir": "./checkpoints",
+    "csv_dir": "./results/csv",
     
-    "clear_previous": False,          # Set True for fresh start
+    "clear_previous": True,          # Set True for fresh start
     
     "vtk": {
         "enabled": True,
@@ -138,8 +116,8 @@ output = {
         "enabled": True,
         "force_on_obstacle": True,    # Compute drag/lift
         "wake_probes": [              # Velocity probes for Strouhal
-            (cylinder_center_x + 2 * cylinder_diameter, cylinder_center_y, Nz // 2),
-            (cylinder_center_x + 5 * cylinder_diameter, cylinder_center_y, Nz // 2)
+            (center_x + 2 * diameter, center_y, center_z),
+            (center_x + 5 * diameter, center_y, center_z)
         ]
     }
 }
