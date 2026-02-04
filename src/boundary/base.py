@@ -28,7 +28,7 @@ Coordinate System:
         - zmax: z = Nz-1    
 
 Author: LBM Development Team
-Date: 2026-01
+Date: 2026-02
 """
 
 from abc import ABC, abstractmethod
@@ -316,17 +316,28 @@ def create_boundary_from_config(xp: 'ModuleType',
     
     Factory function that creates the appropriate BC based on 'method'.
     
-    The 'method' parameter determines the BC type:
-        - 'equilibrium': Equilibrium inlet (f = f_eq)
-        - 'non_equilibrium': Non-eq extrapolation inlet (preserves viscous info)
-        - 'characteristic': Non-reflecting open BC (for outlet)
-        - 'farfield': Far-field BC maintaining U∞ (for external flow)
-        - 'ambient': Ambient BC for hover (pressure-based, velocity free)
-        - 'sponge': Sponge layer (buffer zone damping)
-        - 'convective': Advective outlet
-        - 'extrapolation': Zero-gradient outlet
-        - 'bounce_back': Half-way bounce-back wall
-        - 'periodic': No explicit BC (handled by streaming)
+    Available Methods:
+    ==================
+    
+    Inlet BCs:
+        - 'equilibrium' / 'eq': EquilibriumInlet (simple, f = f^eq)
+        - 'non_equilibrium' / 'neq': NonEquilibriumInlet (preserves f^neq)
+    
+    Outlet BCs:
+        - 'pressure_relaxation': PressureRelaxationOutlet (recommended)
+        - 'characteristic': Alias for pressure_relaxation (deprecated name)
+        - 'convective': ConvectiveOutlet (advection-based)
+        - 'neumann' / 'extrapolation': NeumannOutlet (zero-gradient)
+    
+    Far-field BCs:
+        - 'freestream' / 'farfield': FreestreamBC (velocity FIXED to U∞)
+        - 'sponge': SpongeLayer (buffer zone damping)
+    
+    Wall BCs:
+        - 'bounce_back' / 'hwbb' / 'wall': DomainWallBounceBack
+    
+    Other:
+        - 'periodic' / 'none': No explicit BC (handled by streaming)
     
     Args:
         xp: Array module
@@ -346,26 +357,26 @@ def create_boundary_from_config(xp: 'ModuleType',
         >>> config = {"location": "xmin", "method": "non_equilibrium", 
         ...           "velocity": 0.1, "rho": 1.0}
         
-        >>> # Far-field (maintains freestream for external flow)
-        >>> config = {"location": "ymin", "method": "farfield",
-        ...           "rho": 1.0, "u_inf": 0.1, "k": 0.1}
+        >>> # Outlet (pressure relaxation)
+        >>> config = {"location": "xmax", "method": "pressure_relaxation",
+        ...           "rho": 1.0, "k": 0.1}
         
-        >>> # Ambient (hover, velocity free)
-        >>> config = {"location": "zmax", "method": "ambient",
-        ...           "rho": 1.0, "k": 0.5}
+        >>> # Far-field (freestream)
+        >>> config = {"location": "ymin", "method": "freestream",
+        ...           "rho": 1.0, "u_inf": 0.1, "k": 0.1}
         
         >>> # Sponge layer
         >>> config = {"location": "xmax", "method": "sponge",
-        ...           "thickness": 20, "strength": 0.8, "rho": 1.0, "u_inf": 0.1}
+        ...           "thickness": 20, "strength": 0.5, "rho": 1.0, "u_inf": 0.1}
         
         >>> # Wall
         >>> config = {"location": "ymax", "method": "bounce_back"}
     """
     # Import here to avoid circular imports
     from .inlet import EquilibriumInlet, NonEquilibriumInlet
-    from .outlet import CharacteristicOutlet, ConvectiveOutlet, ExtrapolationOutlet
+    from .outlet import PressureRelaxationOutlet, ConvectiveOutlet, NeumannOutlet
     from .domain_wall import DomainWallBounceBack
-    from .farfield import CharacteristicFarfield, AmbientBC, SpongeLayer
+    from .farfield import FreestreamBC, SpongeLayer
     
     # Get location (required)
     location_str = config.get('location')
@@ -387,11 +398,11 @@ def create_boundary_from_config(xp: 'ModuleType',
         if bc_type == 'inlet':
             method = config.get('method', 'non_equilibrium').lower()
         elif bc_type == 'outlet':
-            method = config.get('method', 'characteristic').lower()
+            method = config.get('method', 'pressure_relaxation').lower()
         elif bc_type == 'wall':
             method = config.get('method', 'bounce_back').lower()
         elif bc_type == 'open':
-            method = 'characteristic'
+            method = 'pressure_relaxation'
         elif bc_type == 'periodic':
             method = 'periodic'
         else:
@@ -421,42 +432,67 @@ def create_boundary_from_config(xp: 'ModuleType',
                                    shape=shape)
     
     # =========================================================================
-    # Characteristic Outlet (for outlet, not far-field)
+    # Pressure Relaxation Outlet (formerly CharacteristicOutlet)
     # =========================================================================
-    elif method in ['characteristic', 'open', 'non_reflecting']:
+    elif method in ['pressure_relaxation', 'characteristic', 'open', 'non_reflecting']:
         rho_target = config.get('rho', config.get('rho_target', config.get('pressure', 1.0)))
         relax_coeff = config.get('k', config.get('relax_coeff', 0.1))
         
-        return CharacteristicOutlet(xp, lattice, location,
-                                    rho_target=rho_target,
-                                    relax_coeff=relax_coeff,
-                                    shape=shape)
+        # Deprecation warning for old name
+        if method == 'characteristic':
+            import warnings
+            warnings.warn(
+                "method='characteristic' is deprecated. Use 'pressure_relaxation' instead.",
+                DeprecationWarning
+            )
+        
+        return PressureRelaxationOutlet(xp, lattice, location,
+                                         rho_target=rho_target,
+                                         relax_coeff=relax_coeff,
+                                         shape=shape)
     
     # =========================================================================
-    # Characteristic Far-field (maintains U∞ for external flow)
+    # Freestream BC (formerly CharacteristicFarfield)
     # =========================================================================
-    elif method in ['farfield', 'far_field', 'freestream']:
+    elif method in ['freestream', 'farfield', 'far_field']:
         rho_inf = config.get('rho', config.get('rho_inf', 1.0))
         u_inf = config.get('u_inf', config.get('velocity', 0.1))
         relax_coeff = config.get('k', config.get('relax_coeff', 0.1))
         
-        return CharacteristicFarfield(xp, lattice, location,
-                                      rho_inf=rho_inf,
-                                      u_inf=u_inf,
-                                      relax_coeff=relax_coeff,
-                                      shape=shape)
+        # Deprecation warning for old name
+        if method in ['farfield', 'far_field']:
+            import warnings
+            warnings.warn(
+                "method='farfield' is deprecated. Use 'freestream' instead.",
+                DeprecationWarning
+            )
+        
+        return FreestreamBC(xp, lattice, location,
+                            rho_inf=rho_inf,
+                            u_inf=u_inf,
+                            relax_coeff=relax_coeff,
+                            shape=shape)
     
     # =========================================================================
-    # Ambient BC (hover - pressure-based, velocity free)
+    # REMOVED: AmbientBC (was duplicate of PressureRelaxationOutlet)
     # =========================================================================
     elif method in ['ambient', 'pressure_open', 'hover']:
-        rho_ambient = config.get('rho', config.get('rho_ambient', 1.0))
+        # AmbientBC has been removed as it was identical to PressureRelaxationOutlet
+        # Redirect to PressureRelaxationOutlet with a warning
+        import warnings
+        warnings.warn(
+            "method='ambient' is deprecated and removed. "
+            "Use 'pressure_relaxation' instead (same algorithm).",
+            DeprecationWarning
+        )
+        
+        rho_target = config.get('rho', config.get('rho_ambient', 1.0))
         relax_coeff = config.get('k', config.get('relax_coeff', 0.5))
         
-        return AmbientBC(xp, lattice, location,
-                        rho_ambient=rho_ambient,
-                        relax_coeff=relax_coeff,
-                        shape=shape)
+        return PressureRelaxationOutlet(xp, lattice, location,
+                                         rho_target=rho_target,
+                                         relax_coeff=relax_coeff,
+                                         shape=shape)
     
     # =========================================================================
     # Sponge Layer (buffer zone damping)
@@ -487,12 +523,20 @@ def create_boundary_from_config(xp: 'ModuleType',
                                 shape=shape)
     
     # =========================================================================
-    # Extrapolation Outlet (zero-gradient)
+    # Neumann Outlet (zero-gradient, formerly ExtrapolationOutlet)
     # =========================================================================
-    elif method in ['extrapolation', 'zero_gradient', 'neumann']:
+    elif method in ['neumann', 'extrapolation', 'zero_gradient']:
         order = config.get('order', 1)
         
-        return ExtrapolationOutlet(xp, lattice, location, order=order)
+        # Deprecation warning for old name
+        if method == 'extrapolation':
+            import warnings
+            warnings.warn(
+                "method='extrapolation' is deprecated. Use 'neumann' instead.",
+                DeprecationWarning
+            )
+        
+        return NeumannOutlet(xp, lattice, location, order=order)
     
     # =========================================================================
     # Bounce-Back Wall
@@ -514,9 +558,12 @@ def create_boundary_from_config(xp: 'ModuleType',
     # =========================================================================
     else:
         print(f"Warning: Unknown method '{method}' for boundary '{bc_name}'")
-        print(f"  Available methods: equilibrium, non_equilibrium, characteristic,")
-        print(f"                     farfield, ambient, sponge,")
-        print(f"                     convective, extrapolation, bounce_back, periodic")
+        print(f"  Available methods:")
+        print(f"    Inlet: equilibrium, non_equilibrium")
+        print(f"    Outlet: pressure_relaxation, convective, neumann")
+        print(f"    Far-field: freestream, sponge")
+        print(f"    Wall: bounce_back")
+        print(f"    Other: periodic")
         return None
 
 
@@ -541,8 +588,8 @@ def create_all_boundaries_from_config(xp: 'ModuleType',
     Example:
         >>> boundaries_config = {
         ...     "inlet": {"location": "xmin", "method": "non_equilibrium", "velocity": 0.1},
-        ...     "outlet": {"location": "xmax", "method": "characteristic", "rho": 1.0},
-        ...     "farfield_y": {"location": "ymin", "method": "farfield", "u_inf": 0.1},
+        ...     "outlet": {"location": "xmax", "method": "pressure_relaxation", "rho": 1.0},
+        ...     "farfield_y": {"location": "ymin", "method": "freestream", "u_inf": 0.1},
         ... }
         >>> bc_manager = create_all_boundaries_from_config(np, lattice, 
         ...                                                 boundaries_config, shape)

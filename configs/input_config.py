@@ -55,14 +55,22 @@ simulation = {
 #
 
 boundaries = {
-    "inlet": {"location": "xmin", "method": "non_equilibrium", "velocity": MACH_INLET},
-    "outlet": {"location": "xmax", "method": "characteristic", "rho": RHO},
-    # "ymin": {"location": "ymin", "method": "ambient", "rho": RHO, "k": 0.3},
-    # "ymax": {"location": "ymax", "method": "ambient", "rho": RHO, "k": 0.3},
-    "ymin": {"location": "ymin", "method": "bounce_back"},
-    "ymax": {"location": "ymax", "method": "bounce_back"},
-    "zmin": {"location": "zmin", "method": "ambient", "rho": RHO, "k": 0.3},
-    "zmax": {"location": "zmax", "method": "ambient", "rho": RHO, "k": 0.3},
+    "inlet": {"location": "xmin", 
+              "method": "non_equilibrium", 
+              "velocity": MACH_INLET},
+    "outlet": {"location": "xmax", 
+               "method": "pressure_relaxation", 
+               "rho": RHO, "k":0.1},
+    "ymin": {"location": "ymin", 
+             "method": "bounce_back"},
+    "ymax": {"location": "ymax", 
+             "method": "bounce_back"},
+    "zmin": {"location": "zmin", 
+             "method": "pressure_relaxation", 
+             "rho": RHO, "k": 0.3},
+    "zmax": {"location": "zmax", 
+             "method": "pressure_relaxation", 
+             "rho": RHO, "k": 0.3},
 }
 
 # =============================================================================
