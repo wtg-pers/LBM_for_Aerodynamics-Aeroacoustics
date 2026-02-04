@@ -1,14 +1,18 @@
 # =============================================================================
 # Domain Configuration
 # =============================================================================
-Nx = 200
-Ny = 50
-Nz = 50
+Nx = 400
+Ny = 400
+Nz = 4
 # Cylinder parameters
 diameter = 20      # [lattice units]
-center_x = Nx // 4  # Located at 25% from inlet
+center_x = Nx // 5  # Located at 25% from inlet
 center_y = Ny // 2  # Centered in y
 center_z = Nz // 2
+
+MACH_INLET = 0.1
+RHO = 1.0
+RE_TGT = 150.0
 
 
 # =============================================================================
@@ -24,13 +28,13 @@ simulation = {
         "Nz": Nz
     },
     "physics": {
-        "Re": 100.0,
-        "u_init": 0.1,
+        "Re": RE_TGT,
+        "u_init": MACH_INLET,
         "characteristic_length": diameter
     },
     "time": {
-        "max_steps": 200000,
-        "output_interval": 500,
+        "max_steps": 50000,
+        "output_interval": 100,
         "checkpoint_interval": 10000,
         "probe_interval": 10                  # Force/probe sampling
     }
@@ -51,46 +55,123 @@ simulation = {
 #
 
 boundaries = {
-    "inlet": {"location": "xmin", "method": "non_equilibrium", "velocity": 0.1},
-    "outlet": {"location": "xmax", "method": "characteristic", "rho": 1.0},
-    "ymin": {"location": "ymin", "method": "ambient", "rho": 1.0, "k": 0.3},
-    "ymax": {"location": "ymax", "method": "ambient", "rho": 1.0, "k": 0.3},
-    "zmin": {"location": "zmin", "method": "ambient", "rho": 1.0, "k": 0.3},
-    "zmax": {"location": "zmax", "method": "ambient", "rho": 1.0, "k": 0.3},
+    "inlet": {"location": "xmin", "method": "non_equilibrium", "velocity": MACH_INLET},
+    "outlet": {"location": "xmax", "method": "characteristic", "rho": RHO},
+    # "ymin": {"location": "ymin", "method": "ambient", "rho": RHO, "k": 0.3},
+    # "ymax": {"location": "ymax", "method": "ambient", "rho": RHO, "k": 0.3},
+    "ymin": {"location": "ymin", "method": "bounce_back"},
+    "ymax": {"location": "ymax", "method": "bounce_back"},
+    "zmin": {"location": "zmin", "method": "ambient", "rho": RHO, "k": 0.3},
+    "zmax": {"location": "zmax", "method": "ambient", "rho": RHO, "k": 0.3},
 }
-# boundaries = {
-#     "top": {"location": "zmax", "method": "ambient", "rho": 1.0, "k": 0.5},
-#     "bottom": {"location": "zmin", "method": "ambient", "rho": 1.0, "k": 0.5},
-#     "sides": {"location": "xmin", "method": "ambient", "rho": 1.0, "k": 0.5},
-#     # ... 나머지 경계도 동일
-# }
-# =============================================================================
-# Alternative: Periodic z-direction (quasi-2D simulation)
-# =============================================================================
-# For faster quasi-2D simulations, comment out farfield_bottom/top above
-# and z-direction will default to periodic.
 
 # =============================================================================
 # Internal Geometry (Obstacle)
 # =============================================================================
-
-# internal_geometry = {
-#     "cylinder": {
-#         "enabled": True,
-#         "center": (cylinder_center_x, cylinder_center_y),
-#         "radius": cylinder_diameter // 2,
-#         "axis": "z",                  # Cylinder axis direction
-#         "axis_range": (30, 70)     # Full span in z
-#     }
-# }
-
 internal_geometry = {
-    "sphere": {
+    "cylinder": {
         "enabled": True,
+        "center": (center_x, center_y),
+        "radius": diameter // 2,
+        "axis": "z",
+        "axis_range": (0, Nz - 1)
+    },
+    "sphere": {
+        "enabled": False,
         "center": (center_x, center_y, center_z),
         "radius": diameter // 2
     }
 }
+
+
+# =============================================================================
+# Conservation Check Configuration
+# =============================================================================
+# Monitors mass conservation during simulation.
+# Supports domain-wide check and multiple control volumes (CVs).
+#
+# Usage:
+#   - enabled: Turn on/off all conservation checks
+#   - check_interval: How often to check (0 = use output_interval)
+#   - verbose: 0=silent, 1=summary, 2=detailed
+#   - log_to_csv: Save results to CSV for post-processing
+#
+# Control Volumes:
+#   Each CV monitors mass within specified bounds.
+#   Bounds use Python variables (Nx, Ny, Nz, diameter, center_x, etc.)
+
+conservation = {
+    # -------------------------------------------------------------------------
+    # Global Settings
+    # -------------------------------------------------------------------------
+    "enabled": True,
+    "check_interval": 1000,           # 0 = use output_interval
+    "verbose": 1,                  # 0: silent, 1: summary, 2: detailed
+    "log_to_csv": True,
+    
+    "tolerance": {
+        "mass_drift_percent": 1.0,  # Warning threshold (%)
+        "warn_on_exceed": True,
+    },
+    
+    # -------------------------------------------------------------------------
+    # Domain-wide Conservation Check
+    # -------------------------------------------------------------------------
+    "domain": {
+        "enabled": True,
+    },
+    
+    # -------------------------------------------------------------------------
+    # Control Volume based Conservation Check
+    # -------------------------------------------------------------------------
+    # Multiple CVs can be defined. Each CV monitors mass within specified bounds.
+    # Bounds are specified using Python variables directly.
+    
+    "control_volumes": [
+        # CV 1: Region around obstacle
+        {
+            "name": "obstacle_region",
+            "enabled": True,
+            "bounds": {
+                "xmin": center_x - 3 * diameter,
+                "xmax": center_x + 5 * diameter,
+                "ymin": center_y - 2 * diameter,
+                "ymax": center_y + 2 * diameter,
+                "zmin": 0,
+                "zmax": Nz - 1,
+            }
+        },
+        
+        # CV 2: Wake region (downstream of obstacle)
+        {
+            "name": "wake_region",
+            "enabled": True,
+            "bounds": {
+                "xmin": center_x + diameter,
+                "xmax": center_x + 10 * diameter,
+                "ymin": center_y - 2 * diameter,
+                "ymax": center_y + 2 * diameter,
+                "zmin": 0,
+                "zmax": Nz - 1,
+            }
+        },
+        
+        # # CV 3: Example of disabled CV
+        # {
+        #     "name": "inlet_region",
+        #     "enabled": False,
+        #     "bounds": {
+        #         "xmin": 0,
+        #         "xmax": 50,
+        #         "ymin": 0,
+        #         "ymax": Ny - 1,
+        #         "zmin": 0,
+        #         "zmax": Nz - 1,
+        #     }
+        # },
+    ],
+}
+
 
 # =============================================================================
 # Output Configuration
@@ -131,8 +212,8 @@ force_calculation = {
     "interval": 1,
     "start_step": 0,
     "reference": {
-        "rho": 1.0,
-        "velocity": 0.1,
+        "rho": RHO,
+        "velocity": MACH_INLET,
         "area": 30  # characteristic_length
     }
 }
@@ -144,5 +225,6 @@ config = {
     "simulation": simulation,
     "boundaries": boundaries,
     "internal_geometry": internal_geometry,
+    "conservation": conservation,
     "output": output
 }
