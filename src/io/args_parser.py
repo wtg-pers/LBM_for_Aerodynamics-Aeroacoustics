@@ -57,6 +57,17 @@ Examples:
         '--config', type=str, default='./configs/input_config.py',
         help='Path to configuration file (default: ./configs/input_config.py)'
     )
+
+    parser.add_argument(
+        '--gpu', type=int, default=None,
+        metavar='ID',
+        help='GPU device ID to use (0, 1, 2, ...). Overrides config file.'
+    )
+
+    parser.add_argument(
+        '--list-gpus', action='store_true',
+        help='List available GPUs and exit'
+    )
     
     # ==========================================================================
     # Restart Options

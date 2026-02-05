@@ -1,18 +1,19 @@
 # =============================================================================
 # Domain Configuration
 # =============================================================================
-Nx = 400
-Ny = 400
-Nz = 4
 # Cylinder parameters
 diameter = 20      # [lattice units]
+Nx = diameter * 30
+Ny = diameter * 15
+Nz = 3
+size = Nx*Ny*Nz / 10000
 center_x = Nx // 5  # Located at 25% from inlet
 center_y = Ny // 2  # Centered in y
 center_z = Nz // 2
 
 MACH_INLET = 0.1
 RHO = 1.0
-RE_TGT = 150.0
+RE_TGT = 100.0
 
 
 # =============================================================================
@@ -20,6 +21,7 @@ RE_TGT = 150.0
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
+    "device_id": 0,
     "dimension": 3,
     "lattice_model": "D3Q27",
     "domain": {
@@ -67,12 +69,12 @@ boundaries = {
     "ymax": {"location": "ymax", 
                "method": "pressure_relaxation", 
                "rho": RHO, "k":0.1},
-    "zmin": {"location": "zmin", 
-             "method": "pressure_relaxation", 
-             "rho": RHO, "k": 0.3},
-    "zmax": {"location": "zmax", 
-             "method": "pressure_relaxation", 
-             "rho": RHO, "k": 0.3},
+    # "zmin": {"location": "zmin", 
+    #          "method": "pressure_relaxation", 
+    #          "rho": RHO, "k": 0.3},
+    # "zmax": {"location": "zmax", 
+    #          "method": "pressure_relaxation", 
+    #          "rho": RHO, "k": 0.3},
 }
 
 # =============================================================================
@@ -184,6 +186,43 @@ conservation = {
 
 
 # =============================================================================
+# Force Calculation Configuration (UPDATED - Enabled)
+# =============================================================================
+# Computes hydrodynamic forces on obstacles using Momentum Exchange Method (MEM).
+#
+# Physical Principle:
+#   F = Σ (2 * c_i * f_i^post) at all boundary links
+#
+# Force Coefficients:
+#   C_D = F_x / (0.5 * ρ * U² * A)
+#   C_L = F_y / (0.5 * ρ * U² * A)
+#   where A = D * Lz (reference area)
+#
+# Expected values for Re=150 cylinder:
+#   C_D ≈ 1.3 - 1.4
+#   C_L oscillates around 0 with amplitude ~ 0.3-0.5
+#   St ≈ 0.18 - 0.19
+
+force_calculation = {
+    "enabled": True,                   # Enable force calculation
+    "interval": 10,                    # Compute every N steps
+    "start_step": 1000,                # Skip initial transient
+    
+    "reference": {
+        "rho": RHO,                    # Reference density [dimensionless]
+        "velocity": MACH_INLET,        # Reference velocity [Δx/Δt]
+        "char_length": diameter,       # Characteristic length D [Δx]
+        "span_length": Nz,             # Span length Lz [Δx] (for 2D: Nz)
+    },
+    
+    "log": {
+        "enabled": True,
+        "filename": "force_history",
+    },
+}
+
+
+# =============================================================================
 # Output Configuration
 # =============================================================================
 output = {
@@ -215,20 +254,6 @@ output = {
 
 
 # =============================================================================
-# Force Calculation (for future use)
-# =============================================================================
-force_calculation = {
-    "enabled": False,
-    "interval": 1,
-    "start_step": 0,
-    "reference": {
-        "rho": RHO,
-        "velocity": MACH_INLET,
-        "area": 30  # characteristic_length
-    }
-}
-
-# =============================================================================
 # Final Config Dictionary
 # =============================================================================
 config = {
@@ -236,5 +261,6 @@ config = {
     "boundaries": boundaries,
     "internal_geometry": internal_geometry,
     "conservation": conservation,
+    "force_calculation": force_calculation,
     "output": output
 }

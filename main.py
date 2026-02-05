@@ -39,6 +39,7 @@ from src.utilities.device import setup_library
 from src.utilities.lattice_validation import LatticeValidator
 from src.utilities.directory_utils import setup_output_directories
 from src.utilities.flux_utils import ConservationManager
+from src.utilities.force_calculator import ForceManager  # NEW: Force calculation
 
 
 # =============================================================================
@@ -46,6 +47,12 @@ from src.utilities.flux_utils import ConservationManager
 # =============================================================================
 def main():
     args = parse_args()
+
+    # GPU 목록 출력 후 종료
+    if args.list_gpus:
+        from src.utilities.device import print_gpu_info
+        print_gpu_info()
+        return
 
     print("="*70)
     print(" LBM Solver for Aerodynamics & Aeroacoustics")
@@ -58,6 +65,7 @@ def main():
 
     sim_params = config_loader.get_simulation_params()
     device_mode = sim_params.get('device_mode')
+    device_id = args.gpu if args.gpu is not None else sim_params.get('device_id', 0)
     domain_config = sim_params.get('domain', {})
     physics_config = sim_params.get('physics', {})
     time_config = sim_params.get('time', {})
@@ -69,8 +77,11 @@ def main():
     
     # Conservation configuration
     conservation_config = config_loader.config.get('conservation', {})
+    
+    # Force calculation configuration
+    force_config = config_loader.config.get('force_calculation', {})
 
-    xp = setup_library(device_mode)
+    xp = setup_library(device_mode, device_id=device_id)
     lattice = D3Q27(xp)
 
     # =========================================================================
@@ -110,6 +121,7 @@ def main():
     config_max_steps = time_config.get('max_steps', 10000)
     output_interval = time_config.get('output_interval', 500)
     checkpoint_interval = time_config.get('checkpoint_interval', 2000)
+    force_interval = time_config.get('probe_interval', force_config.get('interval', 10))
 
     print(f"\n[2] Physics Parameters")
     print(f"  Re = {Re}")
@@ -389,6 +401,50 @@ def main():
     conservation_mgr.initialize(rho_init, step=start_step)
     
     # =========================================================================
+    # Initialize Force Calculator (NEW)
+    # =========================================================================
+    print(f"\n[5.2] Force Calculation Setup")
+    
+    force_enabled = force_config.get('enabled', False) and obstacle_bc is not None
+    
+    if force_enabled and not args.no_force:
+        # Build force config with reference values
+        ref_config = force_config.get('reference', {})
+        force_calc_config = {
+            'enabled': True,
+            'interval': force_interval,
+            'start_step': force_config.get('start_step', 0),
+            'reference': {
+                'rho': ref_config.get('rho', 1.0),
+                'velocity': ref_config.get('velocity', u_init),
+                'char_length': ref_config.get('char_length', char_length),
+                'span_length': ref_config.get('span_length', Nz),
+            },
+            'log': {
+                'enabled': True,
+                'filename': 'force_history'
+            }
+        }
+        
+        force_mgr = ForceManager(
+            xp=xp,
+            lattice=lattice,
+            solid_mask=mask,
+            config=force_calc_config,
+            wall_bc=obstacle_bc,  # Reuse precomputed boundary links
+            csv_dir=csv_dir
+        )
+        force_mgr.initialize()
+    else:
+        force_mgr = None
+        if obstacle_bc is None:
+            print("  Force calculation: disabled (no obstacle)")
+        elif args.no_force:
+            print("  Force calculation: disabled (--no-force)")
+        else:
+            print("  Force calculation: disabled (config)")
+    
+    # =========================================================================
     # Time Loop
     # =========================================================================
     print(f"\n[6] Running Simulation")
@@ -401,6 +457,8 @@ def main():
                 ncols=70, bar_format=custom_format)
     
     last_drift = 0.0
+    last_Cd = 0.0
+    last_Cl = 0.0
 
     for step in pbar:
         # Step 1: Compute Macroscopic Variables
@@ -422,15 +480,32 @@ def main():
         if obstacle_bc is not None:
             obstacle_bc.apply_with_reset(f_new, f_post)
         
+        # =====================================================================
+        # Step 5.5: Force Calculation (using f_post, before BC application)
+        # =====================================================================
+        # Note: Force is calculated from f_post (post-collision, pre-streaming)
+        # which represents the momentum being transferred at boundary links
+        if force_mgr is not None and force_mgr.should_compute(step):
+            force_result = force_mgr.compute_and_log(step, f_post, verbose=False)
+            if force_result:
+                last_Cd = force_result['Cd']
+                last_Cl = force_result['Cl']
+        
         # Step 6: Swap buffers
         f_old, f_new = f_new, f_old
 
         # Output / Monitoring
         if step % 10 == 0:
-            pbar.set_postfix({
-                'ρ': f"{float(rho.mean()):.4f}",
-                'drift': f"{last_drift:+.4f}%"
-            })
+            if force_mgr is not None:
+                pbar.set_postfix({
+                    'Cd': f"{last_Cd:.3f}",
+                    'Cl': f"{last_Cl:.3f}"
+                })
+            else:
+                pbar.set_postfix({
+                    'ρ': f"{float(rho.mean()):.4f}",
+                    'drift': f"{last_drift:+.4f}%"
+                })
         
         # VTK output
         if vtk_writer is not None and step % output_interval == 0:
@@ -478,6 +553,31 @@ def main():
     
     # Close CSV
     conservation_mgr.close()
+    
+    # =========================================================================
+    # Force Summary (NEW)
+    # =========================================================================
+    if force_mgr is not None:
+        force_mgr.print_summary()
+
+        # Strouhal number 계산
+        from src.utilities.force_calculator import compute_strouhal_number
+        
+        St = compute_strouhal_number(
+            force_history=force_mgr.calculator.force_history,
+            char_length=char_length,
+            u_ref=u_init,
+            component='Cl',
+            min_periods=3
+        )
+        
+        if St is not None:
+            print(f"\n  Strouhal number: St = {St:.4f}")
+            print(f"    (Expected for Re=150: St ≈ 0.18-0.19)")
+        else:
+            print(f"\n  Strouhal number: insufficient data for FFT")
+
+        force_mgr.close()
     
     # Stability check
     if xp.isnan(rho_final).any() or xp.isinf(rho_final).any():
