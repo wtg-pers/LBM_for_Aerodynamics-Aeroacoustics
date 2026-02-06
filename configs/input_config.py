@@ -172,12 +172,16 @@ conservation = {
 
 
 # =============================================================================
-# Convergence Detection Configuration
+# Convergence Detection Configuration (UPDATED: Cauchy Criterion)
 # =============================================================================
-# CV-based convergence: CV = σ/μ < ε within rolling window
+# Cauchy convergence: |μ_new - μ_old| / |μ_old| < ε
+#   where μ_old, μ_new = means of first/second half of rolling window
 #
-# Path A (no obstacle): CV(avg_energy) < ε
-# Path B (with obstacle): CV(Cd) < ε_Cd  (energy & Cl are monitor-only)
+# This replaces the previous CV-based criterion (σ/|μ| < ε) which failed
+# for periodic flows (vortex shedding) because σ ≠ 0 when Cd oscillates.
+#
+# Path A (no obstacle): Cauchy(avg_energy) < ε
+# Path B (with obstacle): Cauchy(Cd) < ε_Cd  (energy & Cl are monitor-only)
 #
 # Window sizing (auto):
 #   T_conv = D / U  [timesteps]
@@ -186,24 +190,33 @@ conservation = {
 #
 #   Example (D=20, U=0.1, feed_interval=10):
 #     T_conv = 200, window = 200×50/10 = 1000 samples → fills at 10,000 steps
+#     Each half = 500 samples ≈ 5 shedding periods (for St≈0.2)
 
 convergence = {
     "enabled": True,
 
-    "statistical": {
+    "cauchy": {
         # --- Window Size ---
         "window_size": "auto",           # "auto" (recommended) | int (manual samples)
 
-        # --- CV Thresholds ---
-        "epsilon": 1e-4,                 # [dimensionless] avg kinetic energy
-        "Cd_epsilon": 0.01,              # [dimensionless] drag coefficient
-        #   Steady flow:     Cd_epsilon = 1e-3 ~ 1e-2
-        #   Periodic flow:   Cd_epsilon = 0.02 ~ 0.05  (natural CV ≈ 0.01)
+        # --- Cauchy Thresholds ---
+        # These answer: "has the mean stopped drifting by more than X%?"
+        # Much more intuitive than CV thresholds.
+        "epsilon": 1e-5,                 # [dimensionless] avg kinetic energy
+        "Cd_epsilon": 1e-3,              # [dimensionless] drag coefficient
+        #   Steady flow:     Cd mean converges tightly → 1e-4 works
+        #   Periodic flow:   Cd mean still converges  → 1e-3 works
+        #   (Unlike CV where periodic flows need ε ≈ 0.02~0.05)
+
+        # --- Consecutive passes ---
+        "n_required": 3,                 # Must pass N consecutive checks
+        #   Prevents false convergence during transient "quiet" periods.
+        #   3 checks × check_interval gives robust confirmation.
 
         # --- Auto Window Tuning ---
         "auto_window": {
             "time_coverage": 50.0,       # window spans this many T_conv [dimensionless]
-            "min_samples": 50,           # minimum buffer size [samples]
+            "min_samples": 100,          # minimum buffer size [samples]
         },
     },
 

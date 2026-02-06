@@ -1,59 +1,73 @@
 """
 Convergence Detection Module for LBM Solver
 
-Monitors simulation convergence using within-window coefficient of variation (CV),
-following Palabos (ValueTracer) and SU2 (CONV_CAUCHY) approaches.
+Monitors simulation convergence using Cauchy convergence criterion:
+successive window-mean comparison, following SU2 (CONV_CAUCHY) and
+Palabos (ValueTracer) approaches.
 
-Convergence Criterion:
-======================
-    CV = σ(Q) / |μ(Q)| < ε    within a rolling window of N samples
+Cauchy Convergence Criterion:
+=============================
+    Given a rolling window of N samples, split into two halves:
+
+        μ_old = mean(first half)
+        μ_new = mean(second half)
+
+        ε_cauchy = |μ_new - μ_old| / |μ_old|
+
+    Converged when: ε_cauchy < threshold for n_required consecutive checks.
+
+Why Cauchy over CV:
+===================
+    CV = σ/|μ| measures SPREAD within a window.
+    For periodic flows (vortex shedding), Cd oscillates → σ ≠ 0 → CV never → 0.
+
+    Cauchy measures DRIFT of the MEAN between successive windows.
+    Even if Cd oscillates (1.35 ± 0.01), the mean stabilizes → ε_cauchy → 0.
+
+    This correctly identifies:
+        - Transient phase: mean still shifting → ε_cauchy large → NOT converged
+        - Developed phase: mean stabilized → ε_cauchy ≈ 0 → CONVERGED
 
 Convergence Paths:
 ==================
     Path A (no obstacle): Energy is the sole criterion (Palabos style)
-        - CV(E_avg) < ε_energy         [criterion]
+        - Cauchy(E_avg) < ε_energy     [criterion]
 
     Path B (with obstacle): Cd is the sole criterion (SU2 style)
-        - CV(Cd) < ε_Cd                [criterion]
+        - Cauchy(Cd) < ε_Cd            [criterion]
         - Energy, Cl: logged only       [monitor]
-        - Rationale: Cd > 0 always → CV well-defined.
-          Cl oscillates near zero → CV ill-defined (excluded).
-          Energy is a domain average → less sensitive than force.
 
 Window Sizing:
 ==============
-    Window sizes are computed in SAMPLES, accounting for feed intervals:
+    T_conv = D / U  [timesteps]
+    window_timesteps = T_conv × time_coverage  [timesteps]
+    window_samples   = window_timesteps / feed_interval  [samples]
 
-        T_conv = D / U  [timesteps]
-        window_timesteps = T_conv × time_coverage  [timesteps]
-        window_samples   = window_timesteps / feed_interval  [samples]
+    The window should span enough shedding cycles so that the mean
+    is representative. Default time_coverage=50 gives ~10 shedding
+    periods for St ≈ 0.2.
 
-    Example (D=20, U=0.1, force_interval=10):
-        T_conv = 200 steps
-        time_coverage = 50 (default) → window_timesteps = 10,000
-        energy: 10,000 / 10 = 1000 samples → fills at step 10,000
-        force:  10,000 / 10 = 1000 samples → fills at step 10,000
+Cauchy Threshold Guidance:
+==========================
+    Cd:     ε = 1e-3   (mean drag stabilized to 0.1% between windows)
+    Energy: ε = 1e-5   (domain-averaged energy is very smooth)
 
-Cd Threshold (ε_Cd) Guidance:
-============================
-    Steady flow (low Re):     CV → 0,      ε_Cd = 1e-3 ~ 1e-2
-    Periodic flow (shedding): CV ≈ 0.01,   ε_Cd = 0.02 ~ 0.05
-    Default: 0.02 (targets periodic external aerodynamics)
+    These are much more intuitive than CV thresholds because they
+    directly answer: "has the mean stopped drifting?"
 
 IMPORTANT - Feed Intervals:
 ===========================
-    Energy and Force trackers are both fed at `force_interval` in main.py.
-    Convergence CHECK (evaluate & log) is done at `check_interval`.
-    This separation ensures buffers fill at the correct rate.
+    Energy and Force trackers are fed at `force_interval` in main.py.
+    Convergence CHECK is done at `check_interval`.
 
     main.py data flow:
         every force_interval:  feed_energy(), feed_force()
         every check_interval:  feed_divergence_check(), check()
 
 References:
-==========
-    - Palabos: src/core/util.h → ValueTracer
-    - SU2: CONV_CAUCHY criterion
+===========
+    - SU2: SU2_CFD/src/solvers/CSolver.cpp → CONV_CAUCHY
+    - Palabos: src/core/util.h → ValueTracer (relative change of avg)
     - OpenLB: src/utilities/valueTracer.h
 
 Author: LBM Development Team
@@ -63,7 +77,7 @@ Date: 2026-02
 import os
 import csv
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import numpy as np
 
 
@@ -88,6 +102,8 @@ class ConvergenceStatus(Enum):
 class RingBuffer:
     """Fixed-size circular buffer for scalar time series
     
+    Provides O(1) push and O(1) mean/std via incremental statistics.
+    
     Attributes:
         capacity: Buffer size  [samples]
         count: Values currently stored  [samples]
@@ -100,6 +116,7 @@ class RingBuffer:
         self.count: int = 0
     
     def push(self, value: float) -> None:
+        """Append value, overwriting oldest if full."""
         self._data[self._index] = value
         self._index = (self._index + 1) % self.capacity
         self.count = min(self.count + 1, self.capacity)
@@ -110,11 +127,14 @@ class RingBuffer:
     
     @property
     def values(self) -> np.ndarray:
+        """Return values in chronological order (oldest first)."""
         if self.count < self.capacity:
             return self._data[:self.count].copy()
+        # Ring buffer is full: unwrap from _index
         return np.roll(self._data, -self._index).copy()
     
     def mean(self) -> float:
+        """Mean of all stored values."""
         if self.count == 0:
             return 0.0
         if self.count < self.capacity:
@@ -122,6 +142,7 @@ class RingBuffer:
         return float(np.mean(self._data))
     
     def std(self) -> float:
+        """Standard deviation of all stored values."""
         if self.count < 2:
             return float('inf')
         if self.count < self.capacity:
@@ -129,7 +150,10 @@ class RingBuffer:
         return float(np.std(self._data))
     
     def cv(self) -> float:
-        """CV = σ / |μ|  [dimensionless]"""
+        """Coefficient of variation: CV = σ / |μ|  [dimensionless]
+        
+        Retained for monitoring/logging purposes, NOT for convergence.
+        """
         if self.count < 2:
             return float('inf')
         mu = self.mean()
@@ -138,6 +162,22 @@ class RingBuffer:
             return float('inf') if sigma > 1e-30 else 0.0
         return sigma / abs(mu)
     
+    def first_half_mean(self) -> float:
+        """Mean of the older half of the buffer (chronological order)."""
+        if self.count < 2:
+            return 0.0
+        vals = self.values
+        half = len(vals) // 2
+        return float(np.mean(vals[:half]))
+    
+    def second_half_mean(self) -> float:
+        """Mean of the newer half of the buffer (chronological order)."""
+        if self.count < 2:
+            return 0.0
+        vals = self.values
+        half = len(vals) // 2
+        return float(np.mean(vals[half:]))
+    
     def reset(self) -> None:
         self._data[:] = 0.0
         self._index = 0
@@ -145,93 +185,148 @@ class RingBuffer:
 
 
 # =============================================================================
-# Scalar Tracker
+# Cauchy Tracker (replaces ScalarTracker)
 # =============================================================================
 
-class ScalarTracker:
-    """Tracks convergence of a scalar via CV = σ/|μ| < ε
+class CauchyTracker:
+    """Tracks convergence via Cauchy criterion: relative change of window mean
+    
+    Cauchy Criterion:
+        ε_cauchy = |μ_new - μ_old| / |μ_old|
+        
+        where μ_old = mean(first half of window)
+              μ_new = mean(second half of window)
+        
+        Converged when ε_cauchy < epsilon for n_required consecutive checks.
+    
+    Physical Interpretation:
+        - For steady flow: Cd stabilizes → μ_new ≈ μ_old → ε_cauchy → 0
+        - For periodic flow (shedding): Cd oscillates around a stable mean
+          → window averages converge → ε_cauchy → 0
+        - During transient: mean is still drifting → ε_cauchy >> epsilon
+    
+    Comparison with CV:
+        CV = σ/|μ| → measures oscillation amplitude (fails for periodic flow)
+        Cauchy     → measures mean drift (works for both steady & periodic)
     
     Attributes:
         name: Identifier (e.g., 'Cd', 'avg_energy')
-        epsilon: CV threshold  [dimensionless]
+        epsilon: Cauchy threshold  [dimensionless]
         window_size: Buffer capacity  [samples]
+        n_required: Consecutive passes needed  [count]
         is_criterion: If True, participates in convergence decision
         feed_interval: Feed rate  [timesteps/sample]
     """
     
-    def __init__(self, name: str, epsilon: float, window_size: int,
+    def __init__(self,
+                 name: str,
+                 epsilon: float,
+                 window_size: int,
+                 n_required: int = 3,
                  is_criterion: bool = True,
                  feed_interval: int = 1) -> None:
         self.name: str = name
         self.epsilon: float = epsilon
         self.window_size: int = window_size
+        self.n_required: int = n_required
         self.is_criterion: bool = is_criterion
         self.feed_interval: int = feed_interval
+        
         self.buffer: RingBuffer = RingBuffer(window_size)
-        self._last_cv: float = float('inf')
+        
+        # Cauchy state
+        self._cauchy_value: float = float('inf')   # current ε_cauchy
+        self._consecutive: int = 0                  # consecutive passes
         self._converged: bool = False
+        self._total_fed: int = 0
     
     def push(self, value: float) -> None:
+        """Feed a new sample into the buffer."""
         self.buffer.push(value)
-        if self.buffer.is_full:
-            self._last_cv = self.buffer.cv()
-            self._converged = self._last_cv < self.epsilon
+        self._total_fed += 1
     
-    @property
-    def cv(self) -> float:
-        return self._last_cv
+    def evaluate(self) -> Dict[str, Any]:
+        """Evaluate Cauchy criterion
+        
+        Returns:
+            Dict with:
+                converged: bool
+                cauchy: current ε_cauchy value
+                mean: current window mean
+                std: current window std (for monitoring)
+                cv: current CV (for monitoring/logging)
+                consecutive: number of consecutive passes
+                samples: current sample count
+                window_size: buffer capacity
+        """
+        if not self.buffer.is_full:
+            self._cauchy_value = float('inf')
+            return self._build_status()
+        
+        # --- Cauchy criterion: compare first-half mean vs second-half mean ---
+        mu_old = self.buffer.first_half_mean()
+        mu_new = self.buffer.second_half_mean()
+        
+        if abs(mu_old) < 1e-30:
+            # Denominator near zero: use absolute difference
+            self._cauchy_value = abs(mu_new - mu_old)
+        else:
+            self._cauchy_value = abs(mu_new - mu_old) / abs(mu_old)
+        
+        # --- Consecutive pass tracking ---
+        if self._cauchy_value < self.epsilon:
+            self._consecutive += 1
+        else:
+            self._consecutive = 0
+        
+        if self._consecutive >= self.n_required:
+            self._converged = True
+        
+        return self._build_status()
     
-    def has_converged(self) -> bool:
-        return self._converged
-    
-    @property
-    def fill_steps(self) -> int:
-        """Estimated timesteps to fill buffer  [timesteps]"""
-        return self.window_size * self.feed_interval
-    
-    def get_status(self) -> Dict[str, Any]:
+    def _build_status(self) -> Dict[str, Any]:
+        """Build status dict for logging and convergence check."""
         return {
             'name': self.name,
-            'cv': self._last_cv,
-            'epsilon': self.epsilon,
             'converged': self._converged,
-            'is_criterion': self.is_criterion,
-            'samples': self.buffer.count,
-            'window_size': self.window_size,
-            'fill_ratio': self.buffer.count / self.window_size,
+            'cauchy': self._cauchy_value,
+            'epsilon': self.epsilon,
+            'consecutive': self._consecutive,
+            'n_required': self.n_required,
             'mean': self.buffer.mean(),
             'std': self.buffer.std(),
-            'feed_interval': self.feed_interval,
+            'cv': self.buffer.cv(),
+            'samples': self.buffer.count,
+            'window_size': self.window_size,
+            'is_criterion': self.is_criterion,
+            'total_fed': self._total_fed,
         }
     
-    def reset(self) -> None:
-        self.buffer.reset()
-        self._last_cv = float('inf')
-        self._converged = False
+    def get_status(self) -> Dict[str, Any]:
+        """Get current status without re-evaluating."""
+        return self._build_status()
 
 
 # =============================================================================
-# Auto Window Size Calculator
+# Auto Window Sizing
 # =============================================================================
 
 def compute_auto_window_sizes(
-    char_length: float,
-    u_ref: float,
-    feed_interval: int = 10,
-    time_coverage: float = 50.0,
-    min_samples: int = 50,
+        char_length: float,
+        u_ref: float,
+        feed_interval: int = 10,
+        time_coverage: float = 50.0,
+        min_samples: int = 100,
 ) -> Dict[str, Any]:
-    """Compute window sizes in samples, accounting for feed rate
+    """Compute window size in SAMPLES from physical time scales
     
-    Both energy and force trackers are fed at the same `feed_interval`
-    (= force_interval), so they share the same window size.
+    Window should span enough convective times (and shedding periods)
+    so that the half-window mean is representative.
     
-    T_conv = D / U  [timesteps]
-    window_timesteps = T_conv × time_coverage  [timesteps]
-    window_samples = window_timesteps / feed_interval  [samples]
-    
-    Default time_coverage=50:
-        For St≈0.2 → T_shed ≈ 5 T_conv → window ≈ 10 shedding periods
+    For Cauchy criterion, each half should cover at least several 
+    shedding periods. With time_coverage=50 and St≈0.2:
+        T_shed ≈ 5 T_conv → window ≈ 10 shedding periods
+        → each half ≈ 5 shedding periods (sufficient for stable mean)
     
     Args:
         char_length: D  [Δx]
@@ -256,6 +351,10 @@ def compute_auto_window_sizes(
         int(window_timesteps / feed_interval),
         min_samples
     )                                                    # [samples]
+    
+    # Ensure even number for clean half-splitting
+    if window_samples % 2 != 0:
+        window_samples += 1
     
     return {
         'window_samples': window_samples,
@@ -321,35 +420,24 @@ class ConvergenceMonitor:
     Architecture:
     =============
     Path A (no obstacle): Energy-based (Palabos style)
-        - CV(E_avg) < ε_energy   [criterion]
+        - Cauchy(E_avg) < ε_energy   [criterion]
     
     Path B (with obstacle): Cd-based (SU2 style)
-        - CV(Cd) < ε_Cd          [criterion]
-        - Energy                  [monitor]
-        - Cl                      [monitor]
+        - Cauchy(Cd) < ε_Cd          [criterion]
+        - Energy, Cl                  [monitor]
+    
+    Cauchy Criterion (replaces CV):
+    ===============================
+    Instead of checking σ/|μ| < ε (fails for periodic flows),
+    we check: |μ_new - μ_old| / |μ_old| < ε
+    
+    This measures whether the MEAN is still drifting, which works
+    correctly for both steady and periodic (vortex shedding) flows.
     
     Feed & Check Separation:
     ========================
     All trackers are FED at `feed_interval` (= force_interval in main.py).
     Convergence is CHECKED at `check_interval` (less frequently).
-    
-    This ensures buffers fill at the correct rate regardless of check frequency.
-    
-    main.py integration:
-        every feed_interval:   feed_energy(step, rho, u)
-                               feed_force(step, Cd, Cl)    # Path B only
-        every check_interval:  feed_divergence_check(rho, u)
-                               status = check(step)
-    
-    Cd Threshold for Periodic Flows:
-    ================================
-    For vortex shedding (Re > ~47 for cylinder):
-        Cd oscillates → CV(Cd) ≈ σ_oscillation / Cd_mean ≈ 0.01
-        Default ε_Cd = 0.02 accommodates this
-    
-    For steady flow (low Re):
-        Cd stabilizes → CV → 0
-        Use ε_Cd = 1e-3 for stricter check
     """
     
     def __init__(self,
@@ -379,9 +467,9 @@ class ConvergenceMonitor:
         self._converged_step: Optional[int] = None
         
         # Trackers (created in initialize)
-        self.energy_tracker: Optional[ScalarTracker] = None
-        self.Cd_tracker: Optional[ScalarTracker] = None
-        self.Cl_tracker: Optional[ScalarTracker] = None
+        self.energy_tracker: Optional[CauchyTracker] = None
+        self.Cd_tracker: Optional[CauchyTracker] = None
+        self.Cl_tracker: Optional[CauchyTracker] = None
         self.divergence_detector: DivergenceDetector = DivergenceDetector()
         
         # CSV
@@ -407,7 +495,7 @@ class ConvergenceMonitor:
             self._status = ConvergenceStatus.DISABLED
             return
         
-        stat_config = self.config.get('statistical', {})
+        stat_config = self.config.get('cauchy', {})
         window_cfg = stat_config.get('window_size', 'auto')
         
         # --- Window size ---
@@ -418,70 +506,88 @@ class ConvergenceMonitor:
                 u_ref=u_ref,
                 feed_interval=feed_interval,
                 time_coverage=auto_cfg.get('time_coverage', 50.0),
-                min_samples=auto_cfg.get('min_samples', 50),
+                min_samples=auto_cfg.get('min_samples', 100),
             )
             window_samples = sizes['window_samples']
             self._T_conv = sizes['T_conv']
         else:
             window_samples = int(window_cfg)
+            # Ensure even
+            if window_samples % 2 != 0:
+                window_samples += 1
             self._T_conv = char_length / max(u_ref, 1e-15)
         
         self._window_samples = window_samples
         self._feed_interval = feed_interval
         
         # --- Epsilon defaults ---
-        # Cd: 0.02 = suitable for periodic flows (CV_natural ≈ 0.01)
-        # Energy: 1e-4 = domain average converges tightly
-        epsilon_energy = stat_config.get('epsilon', 1e-4)
-        epsilon_Cd = stat_config.get('Cd_epsilon', 0.02)
+        # Cauchy thresholds are more intuitive than CV thresholds:
+        #   "Has the mean stopped changing by more than X%?"
+        # Cd:     1e-3 → mean Cd stable to 0.1% between halves
+        # Energy: 1e-5 → domain-averaged energy extremely stable
+        epsilon_energy = stat_config.get('epsilon', 1e-5)
+        epsilon_Cd = stat_config.get('Cd_epsilon', 1e-3)
+        n_required = stat_config.get('n_required', 3)
         
         # --- Create trackers ---
         if self.has_obstacle:
             # Path B: Cd is criterion, energy & Cl are monitoring
-            self.energy_tracker = ScalarTracker(
+            self.energy_tracker = CauchyTracker(
                 name='avg_energy',
                 epsilon=epsilon_energy,
                 window_size=window_samples,
+                n_required=n_required,
                 is_criterion=False,          # monitoring only
                 feed_interval=feed_interval,
             )
-            self.Cd_tracker = ScalarTracker(
+            self.Cd_tracker = CauchyTracker(
                 name='Cd',
                 epsilon=epsilon_Cd,
                 window_size=window_samples,
+                n_required=n_required,
                 is_criterion=True,           # sole convergence criterion
                 feed_interval=feed_interval,
             )
-            self.Cl_tracker = ScalarTracker(
+            self.Cl_tracker = CauchyTracker(
                 name='Cl',
                 epsilon=epsilon_Cd,
                 window_size=window_samples,
-                is_criterion=False,          # monitoring only
+                n_required=n_required,
+                is_criterion=False,          # monitoring only (Cl oscillates ±)
                 feed_interval=feed_interval,
             )
         else:
             # Path A: Energy is the sole criterion
-            self.energy_tracker = ScalarTracker(
+            self.energy_tracker = CauchyTracker(
                 name='avg_energy',
                 epsilon=epsilon_energy,
                 window_size=window_samples,
+                n_required=n_required,
                 is_criterion=True,
                 feed_interval=feed_interval,
             )
         
         self._status = ConvergenceStatus.RUNNING
         self._init_csv_logger()
-        self._print_config(char_length, u_ref, feed_interval, window_samples)
+        self._print_config(char_length, u_ref, feed_interval,
+                           window_samples, n_required)
     
     def _print_config(self, char_length: float, u_ref: float,
-                      feed_interval: int, window_samples: int) -> None:
-        path = "B (Cd-based, SU2)" if self.has_obstacle else "A (Energy-based, Palabos)"
+                      feed_interval: int, window_samples: int,
+                      n_required: int) -> None:
+        """Print initialization summary."""
+        path = "B (Cd-based, SU2 Cauchy)" if self.has_obstacle \
+               else "A (Energy-based, Palabos Cauchy)"
         fill_steps = window_samples * feed_interval
         
         print(f"\n  Convergence Monitor: ENABLED — Path {path}")
+        print(f"    Method: Cauchy (window-mean drift)")
         print(f"    T_conv = D/U = {char_length}/{u_ref} = {self._T_conv:.1f} steps")
         print(f"    Window = {window_samples} samples × {feed_interval} steps "
               f"= {fill_steps:,} steps to fill")
+        print(f"    Half-window = {window_samples // 2} samples "
+              f"(μ_old vs μ_new comparison)")
+        print(f"    n_required = {n_required} consecutive passes")
         
         for tracker in [self.energy_tracker, self.Cd_tracker, self.Cl_tracker]:
             if tracker is not None:
@@ -492,13 +598,18 @@ class ConvergenceMonitor:
               f"diverged → {self.on_diverged}")
     
     def _init_csv_logger(self) -> None:
+        """Initialize CSV logger for convergence history."""
         os.makedirs(self.csv_dir, exist_ok=True)
         csv_path = os.path.join(self.csv_dir, 'convergence_history.csv')
         self._csv_file = open(csv_path, 'w', newline='')
         
-        headers = ['step', 'energy_cv', 'energy_mean']
+        headers = ['step',
+                    'energy_cauchy', 'energy_mean', 'energy_cv',
+                    'energy_consecutive']
         if self.has_obstacle:
-            headers += ['Cd_cv', 'Cd_mean', 'Cd_converged', 'Cl_cv', 'Cl_mean']
+            headers += ['Cd_cauchy', 'Cd_mean', 'Cd_cv', 'Cd_consecutive',
+                        'Cd_converged',
+                        'Cl_cauchy', 'Cl_mean', 'Cl_cv']
         headers.append('all_converged')
         
         self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=headers)
@@ -509,7 +620,9 @@ class ConvergenceMonitor:
     # -------------------------------------------------------------------------
     
     def feed_energy(self, step: int, rho: Any, u: Any) -> None:
-        """Feed domain-averaged kinetic energy: E = (1/N) Σ 0.5ρ|u|²  [Δx²/Δt²]
+        """Feed domain-averaged kinetic energy: E = (1/N) Σ 0.5ρ|u|²
+        
+        Units: [Δx²/Δt²]  (lattice units)
         
         Call at feed_interval (= force_interval) in main.py.
         """
@@ -531,7 +644,8 @@ class ConvergenceMonitor:
         if self.Cl_tracker is not None:
             self.Cl_tracker.push(Cl)
     
-    def feed_divergence_check(self, rho: Any, u: Optional[Any] = None) -> Dict[str, Any]:
+    def feed_divergence_check(self, rho: Any,
+                              u: Optional[Any] = None) -> Dict[str, Any]:
         """Check for divergence. Call at check_interval."""
         if not self.enabled:
             return {'diverged': False, 'reason': None, 'details': {}}
@@ -546,10 +660,19 @@ class ConvergenceMonitor:
     # -------------------------------------------------------------------------
     
     def check(self, step: int) -> Dict[str, Any]:
-        """Evaluate convergence: all criterion trackers must have CV < ε"""
+        """Evaluate Cauchy convergence on all criterion trackers
+        
+        Each criterion tracker must satisfy:
+            |μ_new - μ_old| / |μ_old| < ε  for n_required consecutive checks
+        
+        Returns:
+            Dict with 'converged', 'diverged', 'action', 'trackers',
+            'diverge_reason'
+        """
         if not self.enabled:
             return {'converged': False, 'diverged': False,
-                    'action': 'continue', 'trackers': {}}
+                    'action': 'continue', 'trackers': {},
+                    'diverge_reason': None}
         
         self._check_count += 1
         
@@ -558,11 +681,12 @@ class ConvergenceMonitor:
         
         for tracker in [self.energy_tracker, self.Cd_tracker, self.Cl_tracker]:
             if tracker is not None:
-                status = tracker.get_status()
+                status = tracker.evaluate()
                 trackers[tracker.name] = status
                 if tracker.is_criterion and not status['converged']:
                     all_criteria_met = False
         
+        # --- Determine action ---
         if self._status == ConvergenceStatus.DIVERGED:
             action = self.on_diverged
         elif all_criteria_met:
@@ -572,44 +696,55 @@ class ConvergenceMonitor:
         else:
             action = 'continue'
         
+        # --- Log to CSV ---
         self._log_csv(step, trackers, all_criteria_met)
         
         return {
-            'converged': all_criteria_met and self._status == ConvergenceStatus.CONVERGED,
-            'diverged': self._status == ConvergenceStatus.DIVERGED,
-            'diverge_reason': self._diverge_reason,
+            'converged': (self._status == ConvergenceStatus.CONVERGED),
+            'diverged': (self._status == ConvergenceStatus.DIVERGED),
             'action': action,
             'trackers': trackers,
+            'diverge_reason': self._diverge_reason,
         }
     
     def _log_csv(self, step: int, trackers: Dict, converged: bool) -> None:
+        """Write one row to convergence CSV."""
         if self._csv_writer is None:
             return
-        row = {'step': step, 'all_converged': converged}
+        
+        row: Dict[str, Any] = {'step': step}
+        
+        # Energy (always present)
         if 'avg_energy' in trackers:
-            t = trackers['avg_energy']
-            row['energy_cv'] = f"{t['cv']:.6e}"
-            row['energy_mean'] = f"{t['mean']:.6e}"
+            e = trackers['avg_energy']
+            row['energy_cauchy'] = f"{e['cauchy']:.6e}"
+            row['energy_mean'] = f"{e['mean']:.8e}"
+            row['energy_cv'] = f"{e['cv']:.6e}"
+            row['energy_consecutive'] = e['consecutive']
+        
+        # Force trackers (Path B only)
         if 'Cd' in trackers:
-            t = trackers['Cd']
-            row['Cd_cv'] = f"{t['cv']:.6e}"
-            row['Cd_mean'] = f"{t['mean']:.6e}"
-            row['Cd_converged'] = t['converged']
+            cd = trackers['Cd']
+            row['Cd_cauchy'] = f"{cd['cauchy']:.6e}"
+            row['Cd_mean'] = f"{cd['mean']:.6f}"
+            row['Cd_cv'] = f"{cd['cv']:.6e}"
+            row['Cd_consecutive'] = cd['consecutive']
+            row['Cd_converged'] = cd['converged']
+        
         if 'Cl' in trackers:
-            t = trackers['Cl']
-            row['Cl_cv'] = f"{t['cv']:.6e}"
-            row['Cl_mean'] = f"{t['mean']:.6e}"
+            cl = trackers['Cl']
+            row['Cl_cauchy'] = f"{cl['cauchy']:.6e}"
+            row['Cl_mean'] = f"{cl['mean']:.6f}"
+            row['Cl_cv'] = f"{cl['cv']:.6e}"
+        
+        row['all_converged'] = converged
+        
         self._csv_writer.writerow(row)
         self._csv_file.flush()
     
     # -------------------------------------------------------------------------
-    # Status
+    # Status & Properties
     # -------------------------------------------------------------------------
-    
-    def get_status(self) -> ConvergenceStatus:
-        if not self.enabled:
-            return ConvergenceStatus.DISABLED
-        return self._status
     
     @property
     def converged(self) -> bool:
@@ -623,38 +758,25 @@ class ConvergenceMonitor:
     def converged_step(self) -> Optional[int]:
         return self._converged_step
     
-    def get_status_string(self, step: int) -> str:
-        """One-line status for optional verbose use"""
-        parts = []
-        for tracker in [self.energy_tracker, self.Cd_tracker]:
-            if tracker is not None and tracker.buffer.is_full:
-                cv = tracker.cv
-                mark = '✓' if tracker.has_converged() else ''
-                label = 'E' if tracker.name == 'avg_energy' else tracker.name
-                parts.append(f"{label}={cv:.1e}{mark}")
-        if not parts:
-            return "filling buffers..."
-        return " | ".join(parts)
+    def get_status(self) -> ConvergenceStatus:
+        return self._status
     
     def mark_max_steps(self) -> None:
+        """Called when max_steps reached without convergence."""
         if self._status == ConvergenceStatus.RUNNING:
             self._status = ConvergenceStatus.MAX_STEPS
     
     def print_summary(self) -> None:
-        print("\n" + "=" * 70)
-        print(" Convergence Summary")
-        print("=" * 70)
-        
-        if not self.enabled:
-            print("  Convergence monitor: disabled")
-            return
+        """Print convergence summary table."""
+        print("\n" + "=" * 78)
+        print("  Convergence Summary (Cauchy Criterion)")
+        print("=" * 78)
         
         status_str = {
-            ConvergenceStatus.CONVERGED: "CONVERGED ✓",
-            ConvergenceStatus.DIVERGED: f"DIVERGED ✗ ({self._diverge_reason})",
-            ConvergenceStatus.RUNNING: "NOT CONVERGED (still running)",
-            ConvergenceStatus.MAX_STEPS: "NOT CONVERGED (max steps reached)",
-            ConvergenceStatus.NOT_STARTED: "NOT STARTED",
+            ConvergenceStatus.CONVERGED: "✅ CONVERGED",
+            ConvergenceStatus.DIVERGED: "❌ DIVERGED",
+            ConvergenceStatus.RUNNING: "🔄 RUNNING",
+            ConvergenceStatus.MAX_STEPS: "⚠️  MAX STEPS",
         }.get(self._status, str(self._status))
         
         print(f"  Status: {status_str}")
@@ -662,32 +784,44 @@ class ConvergenceMonitor:
             print(f"  Converged at step: {self._converged_step}")
         print(f"  Checks performed: {self._check_count}")
         
+        print(f"\n  {'Tracker':>12s}  {'ε_cauchy':>12s}  {'ε_thresh':>10s}  "
+              f"{'Pass':>6s}  {'μ':>12s}  {'CV':>10s}  "
+              f"{'Fill':>12s}  {'Role'}")
+        print(f"  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*6}  {'-'*12}  "
+              f"{'-'*10}  {'-'*12}  {'-'*10}")
+        
         for tracker in [self.energy_tracker, self.Cd_tracker, self.Cl_tracker]:
             if tracker is not None:
                 s = tracker.get_status()
                 role = "[criterion]" if s['is_criterion'] else "[monitor] "
-                conv_mark = '✓' if s['converged'] else '✗'
+                conv_mark = f"{s['consecutive']}/{s['n_required']}"
                 fill = f"{s['samples']}/{s['window_size']}"
-                print(f"  {s['name']:>12s}: CV = {s['cv']:.4e} "
-                      f"(ε = {s['epsilon']:.1e}) [{conv_mark}]  "
-                      f"μ = {s['mean']:.6f}, σ = {s['std']:.6e}  "
-                      f"({fill} samples)  {role}")
+                
+                print(f"  {s['name']:>12s}  {s['cauchy']:>12.4e}  "
+                      f"{s['epsilon']:>10.1e}  {conv_mark:>6s}  "
+                      f"{s['mean']:>12.6f}  {s['cv']:>10.4e}  "
+                      f"{fill:>12s}  {role}")
         
-        print("=" * 70)
+        print("=" * 78)
     
     def get_info(self) -> str:
+        """One-line info string."""
         if not self.enabled:
             return "Convergence monitor: disabled"
+        method = "Cauchy"
         if self.has_obstacle:
-            return (f"Convergence: Path B (Cd criterion), "
-                    f"window={self._window_samples} samples")
-        return (f"Convergence: Path A (Energy criterion), "
-                f"window={self._window_samples} samples")
+            return (f"Convergence: Path B (Cd {method}), "
+                    f"window={self._window_samples} samples, "
+                    f"n_required={self.Cd_tracker.n_required}")
+        return (f"Convergence: Path A (Energy {method}), "
+                f"window={self._window_samples} samples, "
+                f"n_required={self.energy_tracker.n_required}")
     
     def __bool__(self) -> bool:
         return self.enabled
     
     def close(self) -> None:
+        """Close CSV file."""
         if self._csv_file is not None:
             self._csv_file.close()
             self._csv_file = None

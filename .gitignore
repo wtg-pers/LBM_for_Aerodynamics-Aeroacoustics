@@ -1,6 +1,19 @@
-results/*
-!results/.gitkeep
-__pycache__/
-md/*
-checkpoints/*
-note.md
+# 1. 모든 파일과 디렉토리를 무시
+*
+
+# 2. 무시 대상에서 제외할 디렉토리 (디렉토리 자체를 허용)
+!configs/
+!src/
+
+# 3. 무시 대상에서 제외할 파일
+!main.py
+!.gitignore
+!README.md
+
+# 4. 제외된 디렉토리 내부의 모든 파일은 다시 허용
+!configs/**
+!src/**
+
+# (선택 사항) 특정 디렉토리 내에서 원치 않는 파일이 있다면 다시 무시
+**/__pycache__/
+**/.DS_Store
