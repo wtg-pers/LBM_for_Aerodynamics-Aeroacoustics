@@ -3,7 +3,7 @@
 # =============================================================================
 # Cylinder parameters
 diameter = 20      # [lattice units]
-Nx = diameter * 30
+Nx = diameter * 15
 Ny = diameter * 15
 Nz = 3
 size = Nx*Ny*Nz / 10000

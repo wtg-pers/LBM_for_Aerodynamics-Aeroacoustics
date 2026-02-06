@@ -76,10 +76,6 @@ class LatticeValidator:
             Tuple of:
                 - bool: True if all conditions satisfied
                 - dict: Detailed results for each check
-                
-        Example:
-            >>> validator = LatticeValidator()
-            >>> passed, details = validator.validate_all(lattice.c, lattice.w, 1/3)
         """
         xp = self.xp
         c = xp.asarray(c, dtype=xp.float64)
@@ -112,66 +108,58 @@ class LatticeValidator:
             print(f"    Status: {'✓ PASS' if passed else '✗ FAIL'}")
         
         # =====================================================================
-        # Check 2: Zero First Moment (Zero Momentum at Rest)
-        #   Σ w_i c_iα = 0  for all α
+        # Check 2: Zero First Moment (rest state has zero momentum)
+        #   Σ w_i c_iα = 0
         # =====================================================================
-        # Using Einstein summation: w_i * c_iα → sum over i
-        first_moment = xp.einsum('i,di->d', w, c)  # shape: (dim,)
-        results['first_moment'] = first_moment
+        first_moment = xp.einsum('i,ai->a', w, c)
         max_err = float(xp.max(xp.abs(first_moment)))
+        results['first_moment_max_error'] = max_err
         passed = max_err < tol
         all_passed &= passed
         
         if verbose:
-            print(f"\n[2] Zero First Moment: Σw_i·c_iα = 0")
-            print(f"    Computed: [{', '.join([f'{v:.2e}' for v in first_moment])}]")
+            print(f"\n[2] First Moment: Σw_i·c_iα = 0")
             print(f"    Max error: {max_err:.2e}")
             print(f"    Status: {'✓ PASS' if passed else '✗ FAIL'}")
         
         # =====================================================================
-        # Check 3: Second Moment Isotropy (Pressure Tensor)
+        # Check 3: Second Moment Isotropy (pressure tensor)
         #   Σ w_i c_iα c_iβ = c_s² δ_αβ
         # =====================================================================
-        # This ensures isotropic pressure in the equilibrium distribution
-        second_moment = xp.einsum('i,di,ei->de', w, c, c)  # shape: (dim, dim)
+        second_moment = xp.einsum('i,ai,bi->ab', w, c, c)
         expected_second = cs2 * xp.eye(dim)
         second_error = xp.abs(second_moment - expected_second)
-        results['second_moment'] = second_moment
-        results['second_moment_expected'] = expected_second
         max_err = float(xp.max(second_error))
+        results['second_moment_max_error'] = max_err
         passed = max_err < tol
         all_passed &= passed
         
         if verbose:
             print(f"\n[3] Second Moment Isotropy: Σw_i·c_iα·c_iβ = c_s²·δ_αβ")
             print(f"    c_s² = {cs2:.10f}")
-            diag = [float(second_moment[i, i]) for i in range(dim)]
-            print(f"    Diagonal elements: [{', '.join([f'{v:.10f}' for v in diag])}]")
             print(f"    Max error: {max_err:.2e}")
             print(f"    Status: {'✓ PASS' if passed else '✗ FAIL'}")
         
         # =====================================================================
-        # Check 4: Third Moment Vanishes (Odd Moment)
-        #   Σ w_i c_iα c_iβ c_iγ = 0  for all α, β, γ
+        # Check 4: Third Moment Vanishes (odd moments are zero)
+        #   Σ w_i c_iα c_iβ c_iγ = 0
         # =====================================================================
-        # Odd moments must vanish due to lattice symmetry
-        third_moment = xp.einsum('i,ai,bi,ci->abc', w, c, c, c)  # shape: (dim, dim, dim)
+        third_moment = xp.einsum('i,ai,bi,ci->abc', w, c, c, c)
         max_err = float(xp.max(xp.abs(third_moment)))
-        results['third_moment_max'] = max_err
+        results['third_moment_max_error'] = max_err
         passed = max_err < tol
         all_passed &= passed
         
         if verbose:
             print(f"\n[4] Third Moment Vanishes: Σw_i·c_iα·c_iβ·c_iγ = 0")
-            print(f"    Max absolute value: {max_err:.2e}")
+            print(f"    Max error: {max_err:.2e}")
             print(f"    Status: {'✓ PASS' if passed else '✗ FAIL'}")
         
         # =====================================================================
-        # Check 5: Fourth Moment Isotropy (Viscous Stress Tensor)
+        # Check 5: Fourth Moment Isotropy (viscous stress)
         #   Σ w_i c_iα c_iβ c_iγ c_iδ = c_s⁴ · Δ_αβγδ
         #   where Δ_αβγδ = δ_αβδ_γδ + δ_αγδ_βδ + δ_αδδ_βγ
         # =====================================================================
-        # This is crucial for correct viscous stress calculation
         fourth_moment = xp.einsum('i,ai,bi,ci,di->abcd', w, c, c, c, c)
         
         # Construct expected fourth moment tensor
@@ -256,6 +244,39 @@ class LatticeValidator:
         return all_correct, {'errors': errors}
 
 
+def validate_d2q9(xp: Optional['ModuleType'] = None, 
+                  verbose: bool = True) -> Tuple[bool, Dict]:
+    """Convenience function to validate D2Q9 lattice
+    
+    Args:
+        xp: Array module (defaults to numpy)
+        verbose: Print detailed results
+        
+    Returns:
+        Tuple of (passed, details_dict)
+    """
+    if xp is None:
+        xp = np
+    
+    from src.lattice.d2q9 import D2Q9
+    
+    lattice = D2Q9(xp)
+    validator = LatticeValidator(xp)
+    
+    passed, results = validator.validate_all(
+        lattice.c, lattice.w, lattice.cs2, verbose
+    )
+    
+    opp_passed, opp_results = validator.validate_opposite_indices(
+        lattice.c, lattice.opp, verbose
+    )
+    
+    results['opposite_indices_valid'] = opp_passed
+    results['opposite_indices_errors'] = opp_results.get('errors', [])
+    
+    return passed and opp_passed, results
+
+
 def validate_d3q27(xp: Optional['ModuleType'] = None, 
                    verbose: bool = True) -> Tuple[bool, Dict]:
     """Convenience function to validate D3Q27 lattice
@@ -266,23 +287,19 @@ def validate_d3q27(xp: Optional['ModuleType'] = None,
         
     Returns:
         Tuple of (passed, details_dict)
-        
-    Example:
-        >>> passed, details = validate_d3q27(verbose=True)
     """
     if xp is None:
-        import numpy as xp
+        xp = np
     
-    # Import here to avoid circular imports
     from src.lattice.d3q27 import D3Q27
     
     lattice = D3Q27(xp)
     validator = LatticeValidator(xp)
     
-    # Validate isotropy
-    passed, results = validator.validate_all(lattice.c, lattice.w, lattice.cs2, verbose)
+    passed, results = validator.validate_all(
+        lattice.c, lattice.w, lattice.cs2, verbose
+    )
     
-    # Also validate opposite indices
     opp_passed, opp_results = validator.validate_opposite_indices(
         lattice.c, lattice.opp, verbose
     )
@@ -301,14 +318,16 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Validate LBM lattice model")
-    parser.add_argument('--lattice', type=str, default='D3Q27',
-                        choices=['D3Q27', 'D3Q19', 'D2Q9'],
+    parser.add_argument('--lattice', type=str, default='D2Q9',
+                        choices=['D2Q9', 'D3Q27', 'D3Q19'],
                         help='Lattice model to validate')
     args = parser.parse_args()
     
     print(f"\nValidating {args.lattice} lattice model...\n")
     
-    if args.lattice == 'D3Q27':
+    if args.lattice == 'D2Q9':
+        passed, _ = validate_d2q9(verbose=True)
+    elif args.lattice == 'D3Q27':
         passed, _ = validate_d3q27(verbose=True)
     else:
         print(f"Validation for {args.lattice} not yet implemented.")

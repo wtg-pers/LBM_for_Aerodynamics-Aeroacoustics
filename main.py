@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 # =============================================================================
 # Core LBM Components
 # =============================================================================
-from src.lattice.d3q27 import D3Q27
+from src.lattice import get_lattice
 from src.domain.domain import Domain
 from src.equilibrium.equilibrium import Maxwellian
 from src.macroscopic.compute import Macroscopic
@@ -66,6 +66,7 @@ def main():
     sim_params = config_loader.get_simulation_params()
     device_mode = sim_params.get('device_mode')
     device_id = args.gpu if args.gpu is not None else sim_params.get('device_id', 0)
+
     domain_config = sim_params.get('domain', {})
     physics_config = sim_params.get('physics', {})
     time_config = sim_params.get('time', {})
@@ -82,12 +83,14 @@ def main():
     force_config = config_loader.config.get('force_calculation', {})
 
     xp = setup_library(device_mode, device_id=device_id)
-    lattice = D3Q27(xp)
+
+    lattice_model = sim_params.get('lattice_model', 'D3Q27')
+    lattice = get_lattice(lattice_model, xp)
 
     # =========================================================================
     # Lattice Validation
     # =========================================================================
-    print("\n[0] Validating Lattice Model...")
+    print(f"\n[0] Validating Lattice Model ({lattice_model})...")
     validator = LatticeValidator(xp)
     is_valid, _ = validator.validate_all(
         lattice.c, lattice.w, lattice.cs2, verbose=True
@@ -100,13 +103,19 @@ def main():
     # =========================================================================
     Nx = domain_config.get('Nx')
     Ny = domain_config.get('Ny')
-    Nz = domain_config.get('Nz')
-    domain = Domain(lattice, xp, Nx, Ny, Nz)
-    domain_shape = (Nx, Ny, Nz)
-
-    print(f"\n[1] Domain Setup")
-    print(f"  Grid: {Nx} x {Ny} x {Nz}")
-    print(f"  Total cells: {Nx*Ny*Nz:,}")
+    Nz = domain_config.get('Nz')  # None for 2D
+    if lattice.dim == 2:
+        domain = Domain(lattice, xp, Nx, Ny, None)
+        domain_shape = (Nx, Ny)
+        print(f"\n[1] Domain Setup (2D)")
+        print(f"  Grid: {Nx} x {Ny}")
+        print(f"  Total cells: {Nx*Ny:,}")
+    else:
+        domain = Domain(lattice, xp, Nx, Ny, Nz)
+        domain_shape = (Nx, Ny, Nz)
+        print(f"\n[1] Domain Setup (3D)")
+        print(f"  Grid: {Nx} x {Ny} x {Nz}")
+        print(f"  Total cells: {Nx*Ny*Nz:,}")
 
     # =========================================================================
     # Physics Parameters
