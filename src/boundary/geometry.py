@@ -114,6 +114,35 @@ def create_cylinder_mask(xp: 'ModuleType',
     return radial_mask & axial_mask
 
 
+def create_circle_mask(xp: 'ModuleType',
+                       shape: Tuple[int, int],
+                       center: Tuple[float, float],
+                       radius: float) -> 'npt.NDArray':
+    """Create a 2D circular solid mask
+    
+    For 2D simulations, creates a circle (cross-section of infinite cylinder).
+    
+    Args:
+        xp: Array module (numpy or cupy)
+        shape: Domain shape (Nx, Ny)  [lattice units]
+        center: Circle center (cx, cy)  [lattice units]
+        radius: Circle radius  [lattice units]
+        
+    Returns:
+        Boolean mask, shape (Nx, Ny), True inside circle
+    """
+    Nx, Ny = shape
+    cx, cy = center
+    
+    x = xp.arange(Nx, dtype=xp.float64)
+    y = xp.arange(Ny, dtype=xp.float64)
+    X, Y = xp.meshgrid(x, y, indexing='ij')
+    
+    distance = xp.sqrt((X - cx)**2 + (Y - cy)**2)
+    
+    return distance <= radius
+
+
 def create_box_mask(xp: 'ModuleType', 
                     shape: Tuple[int, int, int],
                     corner_min: Tuple[int, int, int],

@@ -30,7 +30,12 @@ from src.boundary.base import (
 )
 from src.boundary.wall import HalfwayBounceBack
 from src.boundary.domain_wall import DomainWallManager
-from src.boundary.geometry import create_cylinder_mask, create_sphere_mask
+
+from src.boundary.geometry import (
+    create_cylinder_mask, 
+    create_sphere_mask, 
+    create_circle_mask
+)
 
 # =============================================================================
 # Utilities
@@ -224,20 +229,27 @@ def main():
     if cylinder_config.get('enabled', False):
         center = cylinder_config.get('center', (Nx//5, Ny//2))
         radius = cylinder_config.get('radius', char_length//2)
-        axis = cylinder_config.get('axis', 'z')
-        axis_range = cylinder_config.get('axis_range', (0, Nz-1))
         
-        mask = create_cylinder_mask(
-            xp, domain_shape,
-            center=center,
-            radius=radius,
-            axis=axis,
-            axis_range=axis_range
-        )
-        obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-        print(f"  Internal Obstacle (Cylinder):")
-        print(f"    center={center}, R={radius}, axis={axis}")
-        print(f"    {obstacle_bc.get_info()}")
+        if lattice.dim == 2:
+            # 2D: Use circle mask
+            mask = create_circle_mask(xp, domain_shape, center=center, radius=radius)
+            obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
+            print(f"  Internal Obstacle (Circle, 2D):")
+            print(f"    center={center}, R={radius}")
+            print(f"    {obstacle_bc.get_info()}")
+        else:
+            # 3D: Use cylinder mask
+            axis = cylinder_config.get('axis', 'z')
+            axis_range = cylinder_config.get('axis_range', (0, Nz-1))
+            mask = create_cylinder_mask(
+                xp, domain_shape,
+                center=center, radius=radius,
+                axis=axis, axis_range=axis_range
+            )
+            obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
+            print(f"  Internal Obstacle (Cylinder, 3D):")
+            print(f"    center={center}, R={radius}, axis={axis}")
+            print(f"    {obstacle_bc.get_info()}")
         
     elif sphere_config.get('enabled', False):
         center = sphere_config.get('center', (Nx//5, Ny//2, Nz//2))
