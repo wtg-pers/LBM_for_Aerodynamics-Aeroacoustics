@@ -1,58 +1,25 @@
 """
-Domain Wall Boundary Condition (Half-way Bounce-Back) for LBM
+Domain Wall Boundary Conditions for LBM
 
-This module implements the half-way bounce-back scheme for domain boundaries
-(south, north, bottom, top walls). Essential for internal flow simulations
-like channel flow or DFG cylinder benchmark.
+This module implements half-way bounce-back boundary conditions
+at domain walls (ymin, ymax for 2D; ymin, ymax, zmin, zmax for 3D).
+
+Supports both 2D and 3D simulations.
 
 Physical Principle:
-    The wall is located halfway between the boundary node and the ghost node.
-    For a node at y=0 (SOUTH wall), the wall is at y=-0.5.
-    
-    Half-way bounce-back:
-        f_ī(x_boundary, t+Δt) = f_i*(x_boundary, t)
-    
-    where ī is the opposite direction of i, and f_i* is post-collision.
+    No-slip wall boundary using half-way bounce-back scheme.
+    The wall is assumed to be located halfway between fluid and solid nodes.
 
-Boundary Overlap Strategy (exclude_inlet_outlet=True):
-    To avoid conflicts between wall BC and inlet/outlet BC at domain edges:
-    
-    ┌─────────────────────────────────────────────────────────┐
-    │                     TOP (z=Nz-1)                        │
-    │   ┌─────────────────────────────────────────────────┐   │
-    │   │                                                 │   │
-    │ I │     Wall BC applied to x ∈ [1, Nx-2]           │ O │
-    │ n │     (excludes inlet/outlet columns)             │ u │
-    │ l │                                                 │ t │
-    │ e │                                                 │ l │
-    │ t │                                                 │ e │
-    │   │                                                 │ t │
-    │ x │                                                 │   │
-    │ = │                                                 │ x │
-    │ 0 │                                                 │ = │
-    │   │                                                 │ N │
-    │   │                                                 │ x │
-    │   │                                                 │ - │
-    │   │                                                 │ 1 │
-    │   └─────────────────────────────────────────────────┘   │
-    │                    BOTTOM (z=0)                         │
-    └─────────────────────────────────────────────────────────┘
-    
-    This ensures:
-    - Inlet (x=0): handles all y, z  
-    - Outlet (x=Nx-1): handles all y, z
-    - Wall: handles x ∈ [1, Nx-2] only → NO OVERLAP
-
-Accuracy:
-    - Second-order accurate when wall is exactly at q = 0.5
-    - Standard choice for rectangular channel boundaries
+Key Feature - BC Application Order:
+    Wall BCs should be applied BEFORE inlet/outlet BCs.
+    This allows inlet/outlet to overwrite wall values at corners.
 
 References:
     - Ladd, J. Fluid Mech. 271, 1994
     - Kruger et al., "The Lattice Boltzmann Method", Springer 2017, Ch. 5
 
 Author: LBM Development Team
-Date: 2026-01
+Date: 2026-02
 """
 
 from typing import TYPE_CHECKING, Optional, Tuple, List
@@ -68,49 +35,34 @@ from .base import BoundaryCondition, BoundaryLocation
 class DomainWallBounceBack(BoundaryCondition):
     """Half-way Bounce-Back for Domain Wall Boundaries
     
-    Implements no-slip wall boundary condition at domain faces
-    (ymin, ymax, zmin, zmax). Uses the half-way bounce-back scheme.
+    Implements no-slip wall boundary condition at domain faces.
+    Uses the half-way bounce-back scheme.
     
-    Key Feature - BC Application Order:
-        Wall BCs should be applied BEFORE inlet/outlet BCs.
-        This allows inlet/outlet to overwrite wall values at corners,
-        ensuring proper handling of all directions without gaps.
-    
-    Attributes:
-        xp: Array module (numpy or cupy)
-        lattice: Lattice model
-        location: Which domain face (ymin, ymax, zmin, zmax)
-        shape: Domain shape (Nx, Ny, Nz)
-        
-    Note:
-        This BC should NOT be used for xmin/xmax faces in typical
-        inlet-outlet configurations. Use inlet/outlet BCs instead.
+    Supports both 2D and 3D domains.
     """
     
     def __init__(self, xp: 'ModuleType', lattice: 'Lattice',
                  location: BoundaryLocation,
-                 shape: Tuple[int, int, int],
+                 shape: tuple,
                  exclude_inlet_outlet: bool = False) -> None:
         """Initialize domain wall bounce-back
         
         Args:
             xp: Array module (numpy or cupy)
-            lattice: Lattice model (D2Q9, D3Q19, D3Q27)
+            lattice: Lattice model (D2Q9, D3Q27, etc.)
             location: Boundary location (ymin, ymax, zmin, zmax)
-            shape: Domain shape (Nx, Ny, Nz)  [lattice units]
-            exclude_inlet_outlet: If True, wall BC excludes x=0 and x=Nx-1.
-                                  Default is False - apply to full boundary,
-                                  and let inlet/outlet overwrite as needed.
+            shape: Domain shape (Nx, Ny) or (Nx, Ny, Nz)  [lattice units]
+            exclude_inlet_outlet: If True, wall BC excludes x=0 and x=Nx-1
         """
-        # Store lattice info before super().__init__() for _get_incoming_indices
+        # Store lattice info before super().__init__()
         self._lattice = lattice
         self._location_str = location.value if hasattr(location, 'value') else str(location).lower()
         
         super().__init__(xp, lattice, location)
         
         self.shape = shape
-        self.opp = xp.asarray(lattice.opp)
         self.dim = lattice.dim
+        self.opp = xp.asarray(lattice.opp)
         self.exclude_inlet_outlet = exclude_inlet_outlet
         
         # Store opposite indices for incoming directions
@@ -122,56 +74,41 @@ class DomainWallBounceBack(BoundaryCondition):
     def _get_incoming_indices(self) -> 'npt.NDArray':
         """Get indices of distributions entering the domain at this boundary
         
-        IMPORTANT: For domain walls, we use NON-OVERLAPPING direction sets
-        to avoid duplicate bounce-back at edges/corners.
-        
-        Direction assignment strategy:
-            - ymin/ymax walls: handle ALL directions with c_y != 0
-            - zmin/zmax walls: handle ONLY directions with c_y == 0 AND c_z != 0
-            - xmin/xmax walls: handle ONLY directions with c_y == 0 AND c_z == 0 AND c_x != 0
-        
-        This ensures each direction is handled by EXACTLY ONE wall,
-        preventing mass creation/destruction at edges and corners.
-        
-        Returns:
-            Array of velocity direction indices
+        Uses NON-OVERLAPPING direction sets to avoid duplicate bounce-back
+        at edges/corners.
         """
         xp = self.xp
         c = self.c
+        loc_value = self._location_str
         
-        # Get location string
-        if hasattr(self, '_location_str'):
-            loc_value = self._location_str
+        if self.dim == 2:
+            # 2D: Only handle y directions for lateral walls
+            if loc_value in ['ymin', 'south']:
+                mask = c[1, :] > 0
+            elif loc_value in ['ymax', 'north']:
+                mask = c[1, :] < 0
+            elif loc_value in ['xmin', 'west']:
+                mask = (c[0, :] > 0) & (c[1, :] == 0)
+            elif loc_value in ['xmax', 'east']:
+                mask = (c[0, :] < 0) & (c[1, :] == 0)
+            else:
+                raise ValueError(f"Invalid 2D wall location: {loc_value}")
         else:
-            loc_value = self.location.value
-        
-        if loc_value in ['ymin', 'south']:
-            # y=0 wall: handle ALL c_y > 0 directions (including edges/corners)
-            mask = c[1, :] > 0
-            
-        elif loc_value in ['ymax', 'north']:
-            # y=Ny-1 wall: handle ALL c_y < 0 directions
-            mask = c[1, :] < 0
-            
-        elif loc_value in ['zmin', 'bottom']:
-            # z=0 wall: handle c_z > 0 directions, but ONLY those with c_y == 0
-            # (directions with c_y != 0 are already handled by ymin/ymax walls)
-            mask = (c[2, :] > 0) & (c[1, :] == 0)
-            
-        elif loc_value in ['zmax', 'top']:
-            # z=Nz-1 wall: handle c_z < 0 directions, but ONLY those with c_y == 0
-            mask = (c[2, :] < 0) & (c[1, :] == 0)
-            
-        elif loc_value in ['xmin', 'west']:
-            # x=0 wall (rare for walls): c_x > 0 with c_y == 0 and c_z == 0
-            mask = (c[0, :] > 0) & (c[1, :] == 0) & (c[2, :] == 0)
-            
-        elif loc_value in ['xmax', 'east']:
-            # x=Nx-1 wall (rare for walls): c_x < 0 with c_y == 0 and c_z == 0
-            mask = (c[0, :] < 0) & (c[1, :] == 0) & (c[2, :] == 0)
-            
-        else:
-            raise ValueError(f"Unknown location value: {loc_value}")
+            # 3D: Non-overlapping direction assignment
+            if loc_value in ['ymin', 'south']:
+                mask = c[1, :] > 0
+            elif loc_value in ['ymax', 'north']:
+                mask = c[1, :] < 0
+            elif loc_value in ['zmin', 'bottom']:
+                mask = (c[2, :] > 0) & (c[1, :] == 0)
+            elif loc_value in ['zmax', 'top']:
+                mask = (c[2, :] < 0) & (c[1, :] == 0)
+            elif loc_value in ['xmin', 'west']:
+                mask = (c[0, :] > 0) & (c[1, :] == 0) & (c[2, :] == 0)
+            elif loc_value in ['xmax', 'east']:
+                mask = (c[0, :] < 0) & (c[1, :] == 0) & (c[2, :] == 0)
+            else:
+                raise ValueError(f"Unknown location value: {loc_value}")
         
         return xp.where(mask)[0]
     
@@ -179,16 +116,13 @@ class DomainWallBounceBack(BoundaryCondition):
         """Setup x-axis slice based on exclude_inlet_outlet option"""
         Nx = self.shape[0]
         
-        # Only apply exclusion for y/z boundary walls (ymin, ymax, zmin, zmax)
-        # These are walls that could overlap with inlet (xmin) and outlet (xmax)
-        is_yz_wall = self.location.value in ['ymin', 'ymax', 'zmin', 'zmax']
+        is_lateral_wall = self.location.value in ['ymin', 'ymax', 'zmin', 'zmax',
+                                                    'south', 'north', 'bottom', 'top']
         
-        if self.exclude_inlet_outlet and is_yz_wall:
-            # Exclude x=0 (inlet) and x=Nx-1 (outlet)
+        if self.exclude_inlet_outlet and is_lateral_wall:
             self.x_slice = slice(1, Nx - 1)
             self.x_range_desc = f"[1, {Nx-2}]"
         else:
-            # Full x range
             self.x_slice = slice(None)
             self.x_range_desc = f"[0, {Nx-1}]"
     
@@ -196,102 +130,75 @@ class DomainWallBounceBack(BoundaryCondition):
               **kwargs) -> None:
         """Apply half-way bounce-back at domain wall
         
-        IMPORTANT: Must be called AFTER streaming.
-        
-        The bounce-back operation:
-            f[i, boundary] = f_post[opp[i], boundary]
-            
-        Where i is an incoming direction (would have come from outside domain).
-        The outgoing distribution (opp[i]) bounces back to become incoming.
-        
-        Args:
-            f: Distribution function after streaming, shape (Q, Nx, Ny, Nz)
-               Modified in-place.
-            f_post: Post-collision distribution from before streaming.
-                   If None, uses f itself (approximation for steady flows).
-            **kwargs: Additional parameters (unused)
-        """
-        # Use f_post if provided
-        f_source = f_post if f_post is not None else f
-        
-        incoming = self.incoming_indices
-        incoming_opp = self.incoming_opp
-        x_sl = self.x_slice
-        
-        Nx, Ny, Nz = self.shape
-        loc = self.location.value  # Get string value for comparison
-        
-        # Apply bounce-back based on wall location
-        # Key: f[incoming] = f_source[outgoing] (outgoing bounces back to incoming)
-        if loc == 'ymin':
-            # Wall at y=0, incoming directions have c_y > 0
-            # Particles going out (c_y < 0) bounce back to incoming (c_y > 0)
-            for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, 0, :] = f_source[i_opp, x_sl, 0, :]
-                
-        elif loc == 'ymax':
-            # Wall at y=Ny-1, incoming directions have c_y < 0
-            for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, Ny-1, :] = f_source[i_opp, x_sl, Ny-1, :]
-                
-        elif loc == 'zmin':
-            # Wall at z=0, incoming directions have c_z > 0
-            for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, :, 0] = f_source[i_opp, x_sl, :, 0]
-                
-        elif loc == 'zmax':
-            # Wall at z=Nz-1, incoming directions have c_z < 0
-            for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, :, Nz-1] = f_source[i_opp, x_sl, :, Nz-1]
-                
-        elif loc == 'xmin':
-            # Wall at x=0 (not typical, but supported)
-            for i, i_opp in zip(incoming, incoming_opp):
-                f[i, 0, :, :] = f_source[i_opp, 0, :, :]
-                
-        elif loc == 'xmax':
-            # Wall at x=Nx-1 (not typical, but supported)
-            for i, i_opp in zip(incoming, incoming_opp):
-                f[i, Nx-1, :, :] = f_source[i_opp, Nx-1, :, :]
-    
-    def apply_vectorized(self, f: 'npt.NDArray', 
-                         f_post: Optional['npt.NDArray'] = None) -> None:
-        """Fully vectorized bounce-back using advanced indexing
-        
-        Alternative implementation with potentially better GPU performance.
-        
         Args:
             f: Distribution after streaming (modified in-place)
             f_post: Post-collision distribution (optional)
         """
+        if self.dim == 2:
+            self._apply_2d(f, f_post)
+        else:
+            self._apply_3d(f, f_post)
+    
+    def _apply_2d(self, f: 'npt.NDArray', f_post: Optional['npt.NDArray']) -> None:
+        """Apply for 2D domain"""
         f_source = f_post if f_post is not None else f
         
         incoming = self.incoming_indices
         incoming_opp = self.incoming_opp
         x_sl = self.x_slice
         
-        Nx, Ny, Nz = self.shape
+        Nx, Ny = f.shape[1], f.shape[2]
         loc = self.location.value
         
-        # Key: f[incoming] = f_source[outgoing]
-        if loc == 'ymin':
-            f[incoming, x_sl, 0, :] = f_source[incoming_opp, x_sl, 0, :]
-        elif loc == 'ymax':
-            f[incoming, x_sl, Ny-1, :] = f_source[incoming_opp, x_sl, Ny-1, :]
-        elif loc == 'zmin':
-            f[incoming, x_sl, :, 0] = f_source[incoming_opp, x_sl, :, 0]
-        elif loc == 'zmax':
-            f[incoming, x_sl, :, Nz-1] = f_source[incoming_opp, x_sl, :, Nz-1]
-        elif loc == 'xmin':
-            f[incoming, 0, :, :] = f_source[incoming_opp, 0, :, :]
-        elif loc == 'xmax':
-            f[incoming, Nx-1, :, :] = f_source[incoming_opp, Nx-1, :, :]
+        if loc in ['ymin', 'south']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, x_sl, 0] = f_source[i_opp, x_sl, 0]
+        elif loc in ['ymax', 'north']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, x_sl, Ny-1] = f_source[i_opp, x_sl, Ny-1]
+        elif loc in ['xmin', 'west']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, 0, :] = f_source[i_opp, 0, :]
+        elif loc in ['xmax', 'east']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, Nx-1, :] = f_source[i_opp, Nx-1, :]
+    
+    def _apply_3d(self, f: 'npt.NDArray', f_post: Optional['npt.NDArray']) -> None:
+        """Apply for 3D domain"""
+        f_source = f_post if f_post is not None else f
+        
+        incoming = self.incoming_indices
+        incoming_opp = self.incoming_opp
+        x_sl = self.x_slice
+        
+        Nx, Ny, Nz = f.shape[1], f.shape[2], f.shape[3]
+        loc = self.location.value
+        
+        if loc in ['ymin', 'south']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, x_sl, 0, :] = f_source[i_opp, x_sl, 0, :]
+        elif loc in ['ymax', 'north']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, x_sl, Ny-1, :] = f_source[i_opp, x_sl, Ny-1, :]
+        elif loc in ['zmin', 'bottom']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, x_sl, :, 0] = f_source[i_opp, x_sl, :, 0]
+        elif loc in ['zmax', 'top']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, x_sl, :, Nz-1] = f_source[i_opp, x_sl, :, Nz-1]
+        elif loc in ['xmin', 'west']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, 0, :, :] = f_source[i_opp, 0, :, :]
+        elif loc in ['xmax', 'east']:
+            for i, i_opp in zip(incoming, incoming_opp):
+                f[i, Nx-1, :, :] = f_source[i_opp, Nx-1, :, :]
     
     def get_info(self) -> str:
-        """Return information string about this boundary condition"""
+        """Return information string"""
         n_incoming = len(self.incoming_indices)
+        dim_str = "2D" if self.dim == 2 else "3D"
         
-        info = f"Domain Wall (HWBB) at {self.location.value}:"
+        info = f"Domain Wall (HWBB, {dim_str}) at {self.location.value}:"
         info += f"\n    Incoming directions: {n_incoming}"
         info += f"\n    X-range: {self.x_range_desc}"
         
@@ -304,22 +211,16 @@ class DomainWallBounceBack(BoundaryCondition):
 class DomainWallManager:
     """Manager for multiple domain wall boundaries
     
-    Convenience class to handle all four walls (ymin, ymax, zmin, zmax)
-    in a channel flow configuration.
+    Convenience class to handle all walls in a channel flow configuration.
     
-    Important: BC Application Order
-        Wall BCs should be applied BEFORE inlet/outlet BCs in main.py:
-        
-        domain_walls.apply_all(f_new, f_post)  # First
-        bc_manager.apply_all(f_new)            # Second (overwrites corners)
+    For 2D: ymin, ymax (default)
+    For 3D: ymin, ymax, zmin, zmax (default)
     
-    Example:
-        >>> wall_mgr = DomainWallManager(xp, lattice, shape)
-        >>> wall_mgr.apply_all(f, f_post)
+    Supports both 2D and 3D simulations.
     """
     
     def __init__(self, xp: 'ModuleType', lattice: 'Lattice',
-                 shape: Tuple[int, int, int],
+                 shape: tuple,
                  walls: Optional[List[str]] = None,
                  exclude_inlet_outlet: bool = False) -> None:
         """Initialize wall manager
@@ -327,19 +228,22 @@ class DomainWallManager:
         Args:
             xp: Array module
             lattice: Lattice model
-            shape: Domain shape (Nx, Ny, Nz)
-            walls: List of wall locations. Default: ['ymin', 'ymax', 'zmin', 'zmax']
-                   Accepts both coordinate ('ymin') and legacy ('south') names.
+            shape: Domain shape (Nx, Ny) or (Nx, Ny, Nz)
+            walls: List of wall locations. Default depends on dimension.
             exclude_inlet_outlet: If True, walls exclude x=0 and x=Nx-1.
-                                  Default is False - let inlet/outlet overwrite.
         """
         self.xp = xp
         self.shape = shape
+        self.dim = lattice.dim
         self.exclude_inlet_outlet = exclude_inlet_outlet
         self.walls: List[DomainWallBounceBack] = []
         
+        # Default walls based on dimension
         if walls is None:
-            walls = ['ymin', 'ymax', 'zmin', 'zmax']
+            if self.dim == 2:
+                walls = ['ymin', 'ymax']
+            else:
+                walls = ['ymin', 'ymax', 'zmin', 'zmax']
         
         for wall_name in walls:
             location = BoundaryLocation.from_string(wall_name)
@@ -363,9 +267,10 @@ class DomainWallManager:
     def get_info(self) -> str:
         """Return information about all walls"""
         Nx = self.shape[0]
+        dim_str = "2D" if self.dim == 2 else "3D"
         
         info_lines = [
-            "Domain Wall Manager:",
+            f"Domain Wall Manager ({dim_str}):",
             f"  Walls: {[w.location.value for w in self.walls]}",
         ]
         

@@ -34,7 +34,8 @@ from src.boundary.domain_wall import DomainWallManager
 from src.boundary.geometry import (
     create_cylinder_mask, 
     create_sphere_mask, 
-    create_circle_mask
+    create_circle_mask,
+    get_geometry_info
 )
 
 # =============================================================================
@@ -44,7 +45,8 @@ from src.utilities.device import setup_library
 from src.utilities.lattice_validation import LatticeValidator
 from src.utilities.directory_utils import setup_output_directories
 from src.utilities.flux_utils import ConservationManager
-from src.utilities.force_calculator import ForceManager  # NEW: Force calculation
+from src.utilities.force_calculator import ForceManager
+from src.utilities.convergence import ConvergenceMonitor, ConvergenceStatus
 
 
 # =============================================================================
@@ -87,10 +89,13 @@ def main():
     # Force calculation configuration
     force_config = config_loader.config.get('force_calculation', {})
 
+    conv_config = config_loader.config.get('convergence', {})
+
     xp = setup_library(device_mode, device_id=device_id)
 
     lattice_model = sim_params.get('lattice_model', 'D3Q27')
     lattice = get_lattice(lattice_model, xp)
+    dimension = sim_params.get('dimension')
 
     # =========================================================================
     # Lattice Validation
@@ -224,51 +229,63 @@ def main():
     
     # Check for cylinder first, then sphere
     cylinder_config = internal_geom.get('cylinder', {})
+    circle_config = internal_geom.get('circle', {})  # NEW: 2D circle
     sphere_config = internal_geom.get('sphere', {})
     
-    if cylinder_config.get('enabled', False):
-        center = cylinder_config.get('center', (Nx//5, Ny//2))
-        radius = cylinder_config.get('radius', char_length//2)
-        
-        if lattice.dim == 2:
-            # 2D: Use circle mask
+    if lattice.dim == 2:
+        # 2D: Use circle (or cylinder interpreted as circle)
+        if circle_config.get('enabled', False) or cylinder_config.get('enabled', False):
+            # Get config from circle or cylinder
+            geom_config = circle_config if circle_config.get('enabled', False) else cylinder_config
+            center = geom_config.get('center', (Nx//5, Ny//2))
+            radius = geom_config.get('radius', char_length//2)
+            
             mask = create_circle_mask(xp, domain_shape, center=center, radius=radius)
             obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
             print(f"  Internal Obstacle (Circle, 2D):")
             print(f"    center={center}, R={radius}")
             print(f"    {obstacle_bc.get_info()}")
         else:
-            # 3D: Use cylinder mask
+            mask = xp.zeros(domain_shape, dtype=bool)
+            obstacle_bc = None
+            print("  Internal Obstacle: (none)")
+    else:
+        # 3D: Use cylinder or sphere
+        if cylinder_config.get('enabled', False):
+            center = cylinder_config.get('center', (Nx//5, Ny//2))
+            radius = cylinder_config.get('radius', char_length//2)
             axis = cylinder_config.get('axis', 'z')
             axis_range = cylinder_config.get('axis_range', (0, Nz-1))
+            
             mask = create_cylinder_mask(
                 xp, domain_shape,
-                center=center, radius=radius,
-                axis=axis, axis_range=axis_range
+                center=center,
+                radius=radius,
+                axis=axis,
+                axis_range=axis_range
             )
             obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-            print(f"  Internal Obstacle (Cylinder, 3D):")
+            print(f"  Internal Obstacle (Cylinder):")
             print(f"    center={center}, R={radius}, axis={axis}")
             print(f"    {obstacle_bc.get_info()}")
-        
-    elif sphere_config.get('enabled', False):
-        center = sphere_config.get('center', (Nx//5, Ny//2, Nz//2))
-        radius = sphere_config.get('radius', char_length//2)
-        
-        mask = create_sphere_mask(
-            xp, domain_shape,
-            center=center,
-            radius=radius
-        )
-        obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-        print(f"  Internal Obstacle (Sphere):")
-        print(f"    center={center}, R={radius}")
-        print(f"    {obstacle_bc.get_info()}")
-    else:
-        # Default: no obstacle
-        mask = xp.zeros(domain_shape, dtype=bool)
-        obstacle_bc = None
-        print("  Internal Obstacle: (none)")
+            
+        elif sphere_config.get('enabled', False):
+            center = sphere_config.get('center', (Nx//5, Ny//2, Nz//2))
+            radius = sphere_config.get('radius', char_length//2)
+            
+            mask = create_sphere_mask(
+                xp, domain_shape,
+                center=center,
+                radius=radius
+            )
+            obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
+            print(f"  Internal Obstacle (Sphere):")
+            print(f"    center={center}, R={radius}")
+            print(f"    {obstacle_bc.get_info()}")
+        else:
+            mask = xp.zeros(domain_shape, dtype=bool)
+            obstacle_bc = None
+            print("  Internal Obstacle: (none)")
 
     solid_mask_np = mask.get() if hasattr(mask, 'get') else mask
 
@@ -320,7 +337,11 @@ def main():
             keep_last_n=checkpoint_config.get('keep_last_n', 3),
             xp=xp
         )
-        ckpt_est = checkpoint_mgr.get_size_estimate((lattice.Q, Nx, Ny, Nz))
+
+        if dimension == 2:
+            ckpt_est = checkpoint_mgr.get_size_estimate((lattice.Q, Nx, Ny))
+        else:
+            ckpt_est = checkpoint_mgr.get_size_estimate((lattice.Q, Nx, Ny, Nz))
         print(f"  Checkpoint: enabled ({ckpt_est['estimated_MB']:.2f} MB/file)")
     else:
         checkpoint_mgr = None
@@ -365,9 +386,15 @@ def main():
     else:
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")
         
-        rho0 = xp.ones((Nx, Ny, Nz), dtype=xp.float64)
-        u0 = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64)
-        u0[0] = u_init
+        # 2D/3D compatible initialization
+        if lattice.dim == 2:
+            rho0 = xp.ones((Nx, Ny), dtype=xp.float64)
+            u0 = xp.zeros((2, Nx, Ny), dtype=xp.float64)
+            u0[0] = u_init  # x-velocity
+        else:
+            rho0 = xp.ones((Nx, Ny, Nz), dtype=xp.float64)
+            u0 = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64)
+            u0[0] = u_init  # x-velocity
         
         f_old = eq.compute(rho0, u0)
         print(f"  Initial total mass: {float(xp.sum(f_old)):.6f}")
@@ -431,6 +458,13 @@ def main():
     if force_enabled and not args.no_force:
         # Build force config with reference values
         ref_config = force_config.get('reference', {})
+
+        # 2D/3D compatible span length
+        if lattice.dim == 2:
+            default_span = 1  # 2D: unit span
+        else:
+            default_span = Nz
+
         force_calc_config = {
             'enabled': True,
             'interval': force_interval,
@@ -439,7 +473,7 @@ def main():
                 'rho': ref_config.get('rho', 1.0),
                 'velocity': ref_config.get('velocity', u_init),
                 'char_length': ref_config.get('char_length', char_length),
-                'span_length': ref_config.get('span_length', Nz),
+                'span_length': ref_config.get('span_length', default_span),
             },
             'log': {
                 'enabled': True,
@@ -465,6 +499,27 @@ def main():
         else:
             print("  Force calculation: disabled (config)")
     
+
+    # =============================================================================
+    # [3] CONVERGENCE MONITOR INITIALIZATION
+    # =============================================================================
+    print(f"\n[5.3] Convergence Monitor Setup")
+
+    has_obstacle = (obstacle_bc is not None) and (force_mgr is not None)
+    conv_monitor = ConvergenceMonitor(
+        config=conv_config,
+        has_obstacle=has_obstacle,
+        csv_dir=csv_dir,
+    )
+
+    if conv_monitor.enabled:
+        conv_monitor.initialize(
+            char_length=char_length,
+            u_ref=u_init,
+        )
+    else:
+        print("  Convergence monitor: disabled")
+        
     # =========================================================================
     # Time Loop
     # =========================================================================
@@ -472,10 +527,10 @@ def main():
     print("="*70)
 
     start_time = time.perf_counter()
-    custom_format = "{l_bar}{bar:15}|{n_fmt} [{elapsed}{postfix}]"
+    custom_format = "{l_bar}{bar:10}|{n_fmt}/{total_fmt} {rate_fmt} [{elapsed}{postfix}]"
     pbar = tqdm(range(start_step, end_step), 
                 unit="step",
-                ncols=70, bar_format=custom_format)
+                ncols=99, bar_format=custom_format)
     
     last_drift = 0.0
     last_Cd = 0.0
@@ -511,6 +566,9 @@ def main():
             if force_result:
                 last_Cd = force_result['Cd']
                 last_Cl = force_result['Cl']
+
+                # --- Feed to convergence monitor ---
+                conv_monitor.feed_force(step, last_Cd, last_Cl)
         
         # Step 6: Swap buffers
         f_old, f_new = f_new, f_old
@@ -518,10 +576,11 @@ def main():
         # Output / Monitoring
         if step % 10 == 0:
             if force_mgr is not None:
-                pbar.set_postfix({
+                postfix = {
                     'Cd': f"{last_Cd:.3f}",
-                    'Cl': f"{last_Cl:.3f}"
-                })
+                    'Cl': f"{last_Cl:.3f}",
+                }                       
+                pbar.set_postfix(postfix)
             else:
                 pbar.set_postfix({
                     'ρ': f"{float(rho.mean()):.4f}",
@@ -539,13 +598,55 @@ def main():
             if results.get('domain'):
                 last_drift = results['domain']['mass_drift_percent']
 
+            # --- Convergence check ---                            
+            if conv_monitor.enabled:                                
+                conv_monitor.feed_energy(step, rho, u)               
+                conv_monitor.feed_divergence_check(rho, u)          
+                conv_status = conv_monitor.check(step)            
+                                                                    
+                # Handle convergence/divergence actions              
+                if conv_status['diverged']:                      
+                    print(f"\n  ⚠ DIVERGENCE at step {step}: "      
+                            f"{conv_status['diverge_reason']}")        
+                    if conv_monitor.on_diverged == 'stop_with_checkpoint':
+                        if checkpoint_mgr is not None:               
+                            checkpoint_mgr.save(step=step, f=f_old,  
+                                                rho=rho, u=u,         
+                                                tau=tau, config=sim_params)
+                    break                                            
+                                                                    
+                if conv_status['converged']:                       
+                    print(f"\n  ✓ CONVERGED at step {step}")         
+                    conv_monitor.print_summary()                     
+                    if conv_monitor.on_converged == 'checkpoint_and_stop':
+                        if checkpoint_mgr is not None:               
+                            checkpoint_mgr.save(step=step, f=f_old,  
+                                                rho=rho, u=u,         
+                                                tau=tau, config=sim_params)
+                    if conv_monitor.on_converged != 'continue':     
+                        break                                        
+
         # Checkpoint
         if checkpoint_mgr is not None and step > 0 and step % checkpoint_interval == 0:
             checkpoint_mgr.save(step=step, f=f_old, rho=rho, u=u, 
                                tau=tau, config=sim_params)
 
     elapsed = time.perf_counter() - start_time
-    mlups = (Nx * Ny * Nz * total_steps) / elapsed / 1e6
+
+    # --- Max steps 도달 체크 ---
+    if conv_monitor.enabled and not conv_monitor.converged and not conv_monitor.diverged:
+        conv_monitor.mark_max_steps()
+        if conv_monitor.on_max_steps == 'warn':
+            print(f"\n  ⚠ Max steps reached without convergence")
+        elif conv_monitor.on_max_steps == 'error':
+            print(f"\n  ✗ ERROR: Max steps without convergence")
+    
+    # 2D/3D compatible MLUPS
+    if lattice.dim == 2:
+        total_cells = Nx * Ny
+    else:
+        total_cells = Nx * Ny * Nz
+    mlups = (total_cells * total_steps) / elapsed / 1e6
 
     # =========================================================================
     # Final Output
@@ -585,7 +686,7 @@ def main():
         from src.utilities.force_calculator import compute_strouhal_number
         
         St = compute_strouhal_number(
-            force_history=force_mgr.calculator.force_history,
+            force_history=force_mgr.history,
             char_length=char_length,
             u_ref=u_init,
             component='Cl',
@@ -594,21 +695,45 @@ def main():
         
         if St is not None:
             print(f"\n  Strouhal number: St = {St:.4f}")
-            print(f"    (Expected for Re=150: St ≈ 0.18-0.19)")
+            print(f"  (Expected for Re=100: St ≈ 0.16-0.17)")
+            print(f"  (Expected for Re=150: St ≈ 0.18-0.19)")
         else:
             print(f"\n  Strouhal number: insufficient data for FFT")
 
         force_mgr.close()
     
-    # Stability check
-    if xp.isnan(rho_final).any() or xp.isinf(rho_final).any():
-        print("\n  ❌ INSTABILITY DETECTED!")
-        return False
     
-    print("\n" + "="*70)
-    print(" ✓ Simulation completed successfully!")
-    print("="*70)
-    print(f"\nTo continue: python main.py --restart-latest --extend 10000")
+    # =========================================================================
+    # Convergence Summary
+    # =========================================================================
+    if conv_monitor.enabled:
+        conv_monitor.print_summary()
+        conv_monitor.close()
+
+    # =========================================================================
+    # Final Status Message (updated)
+    # =========================================================================
+    final_status = conv_monitor.get_status() if conv_monitor else None
+    
+    if final_status == ConvergenceStatus.CONVERGED:
+        print("\n" + "="*70)
+        print(f" ✅ Simulation CONVERGED at step {conv_monitor.converged_step}!")
+        print("="*70)
+    elif final_status == ConvergenceStatus.DIVERGED:
+        print("\n" + "="*70)
+        print(" ❌ Simulation DIVERGED!")
+        print("="*70)
+        return False
+    else:
+        # Check legacy NaN/Inf (fallback if convergence monitor is disabled)
+        if xp.isnan(rho_final).any() or xp.isinf(rho_final).any():
+            print("\n  ❌ INSTABILITY DETECTED!")
+            return False
+        
+        print("\n" + "="*70)
+        print(" ✓ Simulation completed.")
+        print("="*70)
+        print(f"\nTo continue: python main.py --restart-latest --extend 10000")
     
     return True
 

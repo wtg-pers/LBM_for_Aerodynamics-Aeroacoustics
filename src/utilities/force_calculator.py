@@ -4,6 +4,8 @@ Force Calculation Module using Momentum Exchange Method (MEM)
 This module implements the Momentum Exchange Method for computing
 hydrodynamic forces on solid obstacles in LBM simulations.
 
+Supports both 2D and 3D domains.
+
 Physical Principle:
 ==================
 The momentum exchange method calculates forces by summing the momentum
@@ -22,13 +24,15 @@ Total force on obstacle:
 
 Force Coefficients:
 ==================
-Drag coefficient: C_D = F_x / (0.5 * ρ * U² * A)
-Lift coefficient: C_L = F_y / (0.5 * ρ * U² * A)
+2D:
+    Drag coefficient: C_D = F_x / (0.5 * ρ * U² * D)
+    Lift coefficient: C_L = F_y / (0.5 * ρ * U² * D)
+    Reference area: D (per unit span)
 
-where:
-    A = reference area (D * L_z for 2D cylinder)  [Δx²]
-    U = freestream velocity  [Δx/Δt]
-    ρ = reference density  [dimensionless]
+3D:
+    Drag coefficient: C_D = F_x / (0.5 * ρ * U² * A)
+    Lift coefficient: C_L = F_y / (0.5 * ρ * U² * A)
+    Reference area: A = D * L_z
 
 References:
 ==========
@@ -43,7 +47,7 @@ Date: 2026-02
 import os
 import csv
 from datetime import datetime
-from typing import TYPE_CHECKING, Tuple, Optional, Dict, List, Any
+from typing import TYPE_CHECKING, Tuple, Optional, Dict, List, Any, Union
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -56,6 +60,8 @@ class MomentumExchangeForce:
     Computes hydrodynamic forces on solid obstacles using the momentum
     exchange at fluid-solid boundary links.
     
+    Supports both 2D and 3D domains.
+    
     Algorithm:
     ----------
     1. Identify boundary links: fluid nodes with solid neighbors
@@ -63,16 +69,10 @@ class MomentumExchangeForce:
        F_link = 2 * c_i * f_i^post(x_f)
     3. Sum all F_link to get total force
     
-    Attributes:
-        xp: Array module (numpy or cupy)
-        lattice: Lattice model
-        solid_mask: Boolean mask (True = solid)
-        needs_bounce: Pre-computed boundary link mask from HalfwayBounceBack
-    
     Example:
         >>> force_calc = MomentumExchangeForce(xp, lattice, solid_mask)
-        >>> Fx, Fy, Fz = force_calc.compute(f_post)
-        >>> Cd, Cl = force_calc.get_coefficients(Fx, Fy, u_inf=0.1, D=20, Lz=4)
+        >>> Fx, Fy = force_calc.compute(f_post)  # 2D
+        >>> Fx, Fy, Fz = force_calc.compute(f_post)  # 3D
     """
     
     def __init__(self, xp: 'ModuleType', 
@@ -83,14 +83,15 @@ class MomentumExchangeForce:
         
         Args:
             xp: Array module (numpy or cupy)
-            lattice: Lattice model (D3Q27, D3Q19, etc.)
-            solid_mask: Boolean solid mask (Nx, Ny, Nz), True = solid
+            lattice: Lattice model (D2Q9, D3Q27, etc.)
+            solid_mask: Boolean solid mask, True = solid
             wall_bc: Optional HalfwayBounceBack instance (reuses precomputed links)
         """
         self.xp = xp
         self.lattice = lattice
+        self.dim = lattice.dim
         self.Q = lattice.Q
-        self.c = xp.asarray(lattice.c, dtype=xp.float64)  # (3, Q) [Δx/Δt]
+        self.c = xp.asarray(lattice.c, dtype=xp.float64)  # (dim, Q)
         self.opp = xp.asarray(lattice.opp)
         self.solid_mask = xp.asarray(solid_mask, dtype=bool)
         self.shape = solid_mask.shape
@@ -113,36 +114,61 @@ class MomentumExchangeForce:
         For each direction i, identify fluid nodes whose neighbor
         in direction i is solid. These are the boundary links.
         
-        needs_bounce[i, x, y, z] = True means:
-            - (x, y, z) is a fluid node
-            - (x + c_x[i], y + c_y[i], z + c_z[i]) is a solid node
-            - Distribution f_i at (x,y,z) bounces back
+        needs_bounce[i, x, y(, z)] = True means:
+            - (x, y(, z)) is a fluid node
+            - neighbor in direction i is a solid node
+            - Distribution f_i at this node bounces back
         """
         xp = self.xp
         c = self.c.astype(xp.int32)
         solid = self.solid_mask
         
+        if self.dim == 2:
+            self._precompute_boundary_links_2d(c, solid)
+        else:
+            self._precompute_boundary_links_3d(c, solid)
+    
+    def _precompute_boundary_links_2d(self, c: 'npt.NDArray', solid: 'npt.NDArray') -> None:
+        """Precompute boundary links for 2D domain"""
+        xp = self.xp
+        Nx, Ny = self.shape
+        self.needs_bounce = xp.zeros((self.Q,) + self.shape, dtype=bool)
+        
+        for i in range(self.Q):
+            if i == 0:  # Rest direction
+                continue
+            
+            cx, cy = int(c[0, i]), int(c[1, i])
+            
+            # Shift solid mask by -c_i
+            shifted_solid = xp.roll(
+                xp.roll(solid, -cx, axis=0),
+                -cy, axis=1)
+            
+            # Boundary link: fluid node where neighbor is solid
+            self.needs_bounce[i] = (~solid) & shifted_solid
+    
+    def _precompute_boundary_links_3d(self, c: 'npt.NDArray', solid: 'npt.NDArray') -> None:
+        """Precompute boundary links for 3D domain"""
+        xp = self.xp
         Nx, Ny, Nz = self.shape
         self.needs_bounce = xp.zeros((self.Q,) + self.shape, dtype=bool)
         
         for i in range(self.Q):
-            if i == 0:  # Rest direction, no streaming/bounce-back
+            if i == 0:
                 continue
             
             cx, cy, cz = int(c[0, i]), int(c[1, i]), int(c[2, i])
             
-            # Shift solid mask by -c_i to check if neighbor is solid
-            # shifted_solid[x,y,z] = solid[x+cx, y+cy, z+cz] (with periodic wrap)
             shifted_solid = xp.roll(
                 xp.roll(
                     xp.roll(solid, -cx, axis=0),
                     -cy, axis=1),
                 -cz, axis=2)
             
-            # Boundary link: fluid node where neighbor in direction i is solid
             self.needs_bounce[i] = (~solid) & shifted_solid
     
-    def compute(self, f_post: 'npt.NDArray') -> Tuple[float, float, float]:
+    def compute(self, f_post: 'npt.NDArray') -> Tuple:
         """Compute total force on solid using momentum exchange
         
         Mathematical Formula:
@@ -150,264 +176,81 @@ class MomentumExchangeForce:
         F = Σ_{boundary links} 2 * c_i * f_i^post(x_fluid)
         
         Args:
-            f_post: Post-collision distribution, shape (Q, Nx, Ny, Nz)
+            f_post: Post-collision distribution, shape (Q, Nx, Ny) or (Q, Nx, Ny, Nz)
                    [dimensionless] - MUST be post-collision, pre-streaming!
         
         Returns:
-            Tuple (Fx, Fy, Fz): Force components in lattice units
-                               [ρ₀ Δx⁴/Δt²] in LBM units
-        
-        Note:
-            The sign convention: positive force = force ON the solid FROM fluid
+            (Fx, Fy) for 2D or (Fx, Fy, Fz) for 3D  [lattice units]
         """
         xp = self.xp
-        c = self.c  # (3, Q) [Δx/Δt]
+        c = self.c
         
-        # Initialize force components
-        Fx = 0.0  # [ρ₀ Δx⁴/Δt²]
-        Fy = 0.0
-        Fz = 0.0
+        # Force in each direction
+        forces = []
+        for d in range(self.dim):
+            # F_d = Σ_i Σ_x (2 * c_i[d] * f_i(x)) where needs_bounce[i,x] is True
+            F_d = 0.0
+            for i in range(1, self.Q):  # Skip rest direction
+                # f_i at boundary links
+                f_boundary = f_post[i] * self.needs_bounce[i]
+                # Momentum exchange: 2 * c_i * f_i
+                F_d += 2.0 * float(c[d, i]) * float(xp.sum(f_boundary))
+            forces.append(F_d)
         
-        # Sum over all directions (skip rest direction i=0)
-        for i in range(1, self.Q):
-            # Get boundary link mask for this direction
-            mask = self.needs_bounce[i]  # (Nx, Ny, Nz)
-            
-            if xp.any(mask):
-                # Extract f_post values at boundary links
-                f_boundary = f_post[i][mask]  # [dimensionless]
-                
-                # Momentum exchange: F_link = 2 * c_i * f_i
-                # Sum over all links for this direction
-                n_links = float(xp.sum(mask))
-                f_sum = float(xp.sum(f_boundary))
-                
-                Fx += 2.0 * float(c[0, i]) * f_sum
-                Fy += 2.0 * float(c[1, i]) * f_sum
-                Fz += 2.0 * float(c[2, i]) * f_sum
-        
-        return Fx, Fy, Fz
+        return tuple(forces)
     
-    def compute_vectorized(self, f_post: 'npt.NDArray') -> Tuple[float, float, float]:
-        """Fully vectorized force computation (potentially faster on GPU)
-        
-        Args:
-            f_post: Post-collision distribution (Q, Nx, Ny, Nz) [dimensionless]
-        
-        Returns:
-            Tuple (Fx, Fy, Fz): Force components [lattice units]
-        """
-        xp = self.xp
-        c = self.c  # (3, Q)
-        
-        # Mask f_post at boundary links: set non-boundary to 0
-        # needs_bounce: (Q, Nx, Ny, Nz), f_post: (Q, Nx, Ny, Nz)
-        f_boundary = xp.where(self.needs_bounce, f_post, 0.0)  # (Q, Nx, Ny, Nz)
-        
-        # Sum over spatial dimensions to get f_sum per direction: (Q,)
-        f_sum = xp.sum(f_boundary, axis=(1, 2, 3))  # [dimensionless]
-        
-        # Compute force: F = 2 * Σ_i (c_i * f_sum[i])
-        # c: (3, Q), f_sum: (Q,) -> F: (3,)
-        F = 2.0 * xp.dot(c, f_sum)  # [lattice units]
-        
-        return float(F[0]), float(F[1]), float(F[2])
-    
-    def get_coefficients(self, Fx: float, Fy: float,
+    def get_coefficients(self, forces: Tuple, 
                          rho_ref: float = 1.0,
                          u_ref: float = 0.1,
                          char_length: float = 20.0,
-                         span_length: float = 1.0) -> Tuple[float, float]:
-        """Compute drag and lift coefficients
-        
-        Mathematical Formula:
-        ---------------------
-        C_D = F_x / (0.5 * ρ * U² * A)
-        C_L = F_y / (0.5 * ρ * U² * A)
-        
-        where A = D * L_z (reference area for 2D cylinder)
+                         span_length: float = 1.0) -> Dict[str, float]:
+        """Convert forces to dimensionless coefficients
         
         Args:
-            Fx, Fy: Force components [lattice units]
-            rho_ref: Reference density  [dimensionless, typically 1.0]
-            u_ref: Reference velocity (freestream)  [Δx/Δt]
-            char_length: Characteristic length (diameter D)  [Δx]
-            span_length: Span length in z-direction  [Δx]
+            forces: (Fx, Fy) or (Fx, Fy, Fz)  [lattice units]
+            rho_ref: Reference density  [dimensionless]
+            u_ref: Reference velocity  [Δx/Δt]
+            char_length: Characteristic length D  [Δx]
+            span_length: Span length (for 3D, use Lz)  [Δx]
         
         Returns:
-            Tuple (Cd, Cl): Drag and lift coefficients [dimensionless]
+            Dictionary with Cd, Cl (and Cz for 3D)
         """
-        # Reference area: A = D * Lz  [Δx²]
-        A_ref = char_length * span_length
+        # Reference area: D for 2D, D*Lz for 3D
+        if self.dim == 2:
+            A_ref = char_length  # Per unit span
+        else:
+            A_ref = char_length * span_length
         
-        # Dynamic pressure: q = 0.5 * ρ * U²  [ρ₀ Δx²/Δt²]
+        # Dynamic pressure: q = 0.5 * ρ * U²
         q = 0.5 * rho_ref * u_ref**2
         
-        # Avoid division by zero
-        if abs(q * A_ref) < 1e-15:
-            return 0.0, 0.0
+        # Force coefficients
+        Cd = forces[0] / (q * A_ref) if abs(q * A_ref) > 1e-10 else 0.0
+        Cl = forces[1] / (q * A_ref) if abs(q * A_ref) > 1e-10 else 0.0
         
-        # Coefficients [dimensionless]
-        Cd = Fx / (q * A_ref)
-        Cl = Fy / (q * A_ref)
+        result = {'Cd': Cd, 'Cl': Cl}
         
-        return Cd, Cl
-    
-    def record_force(self, step: int, Fx: float, Fy: float, Fz: float,
-                     Cd: Optional[float] = None, Cl: Optional[float] = None) -> None:
-        """Record force data for time history
+        if self.dim == 3 and len(forces) > 2:
+            Cz = forces[2] / (q * A_ref) if abs(q * A_ref) > 1e-10 else 0.0
+            result['Cz'] = Cz
         
-        Args:
-            step: Time step number
-            Fx, Fy, Fz: Force components [lattice units]
-            Cd, Cl: Optional drag/lift coefficients
-        """
-        record = {
-            'step': step,
-            'Fx': Fx,
-            'Fy': Fy,
-            'Fz': Fz,
-        }
-        if Cd is not None:
-            record['Cd'] = Cd
-        if Cl is not None:
-            record['Cl'] = Cl
-        
-        self.force_history.append(record)
-    
-    def get_statistics(self, window: Optional[int] = None) -> Dict[str, float]:
-        """Compute force statistics from history
-        
-        Args:
-            window: Number of recent steps to average (None = all)
-        
-        Returns:
-            Dictionary with mean, std, min, max for each component
-        """
-        if not self.force_history:
-            return {}
-        
-        # Get recent data
-        data = self.force_history[-window:] if window else self.force_history
-        
-        import numpy as np  # Use numpy for statistics even if main array is cupy
-        
-        Fx = np.array([d['Fx'] for d in data])
-        Fy = np.array([d['Fy'] for d in data])
-        Fz = np.array([d['Fz'] for d in data])
-        
-        stats = {
-            'Fx_mean': float(np.mean(Fx)),
-            'Fx_std': float(np.std(Fx)),
-            'Fy_mean': float(np.mean(Fy)),
-            'Fy_std': float(np.std(Fy)),
-            'Fz_mean': float(np.mean(Fz)),
-            'Fz_std': float(np.std(Fz)),
-        }
-        
-        if 'Cd' in data[0]:
-            Cd = np.array([d['Cd'] for d in data])
-            Cl = np.array([d['Cl'] for d in data])
-            stats['Cd_mean'] = float(np.mean(Cd))
-            stats['Cd_std'] = float(np.std(Cd))
-            stats['Cl_mean'] = float(np.mean(Cl))
-            stats['Cl_std'] = float(np.std(Cl))
-            stats['Cl_rms'] = float(np.sqrt(np.mean(Cl**2)))
-        
-        return stats
+        return result
     
     def get_info(self) -> str:
-        """Return information string about the force calculator"""
-        solid_count = int(self.xp.sum(self.solid_mask))
-        
-        return (f"Momentum Exchange Force Calculator:\n"
-                f"  Solid nodes: {solid_count:,}\n"
-                f"  Boundary links: {self.n_boundary_links:,}\n"
-                f"  History length: {len(self.force_history)}")
-
-
-class ForceLogger:
-    """CSV Logger for Force Time History
-    
-    Logs force data to CSV file for post-processing and analysis.
-    
-    Example:
-        >>> logger = ForceLogger('./results/csv', 'force_history')
-        >>> logger.log(step=1000, Fx=0.01, Fy=0.001, Cd=1.5, Cl=0.1)
-        >>> logger.close()
-    """
-    
-    def __init__(self, output_dir: str, 
-                 filename: str = 'force_history',
-                 include_coefficients: bool = True) -> None:
-        """Initialize force logger
-        
-        Args:
-            output_dir: Directory for CSV file
-            filename: Base filename (without extension)
-            include_coefficients: Include Cd, Cl columns
-        """
-        self.output_dir = output_dir
-        self.include_coefficients = include_coefficients
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create filename with timestamp
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.filepath = os.path.join(output_dir, f'{filename}_{timestamp}.csv')
-        
-        # Build header
-        headers = ['step', 'time', 'Fx', 'Fy', 'Fz']
-        if include_coefficients:
-            headers.extend(['Cd', 'Cl'])
-        
-        # Open file and write header
-        self.file = open(self.filepath, 'w', newline='')
-        self.writer = csv.writer(self.file)
-        self.writer.writerow(headers)
-        self.file.flush()
-        
-        print(f"    Force log: {self.filepath}")
-    
-    def log(self, step: int, 
-            Fx: float, Fy: float, Fz: float,
-            time: Optional[float] = None,
-            Cd: Optional[float] = None, 
-            Cl: Optional[float] = None) -> None:
-        """Log force data for one time step
-        
-        Args:
-            step: Time step number
-            Fx, Fy, Fz: Force components [lattice units]
-            time: Physical time (defaults to step)
-            Cd, Cl: Drag and lift coefficients
-        """
-        if time is None:
-            time = float(step)
-        
-        row = [step, time, Fx, Fy, Fz]
-        
-        if self.include_coefficients:
-            row.extend([Cd if Cd is not None else 0.0,
-                       Cl if Cl is not None else 0.0])
-        
-        self.writer.writerow(row)
-        self.file.flush()
-    
-    def close(self) -> None:
-        """Close the CSV file"""
-        if self.file is not None:
-            self.file.close()
-            self.file = None
-    
-    def __del__(self):
-        self.close()
+        """Return information about the force calculator"""
+        dim_str = "2D" if self.dim == 2 else "3D"
+        return (f"MomentumExchangeForce ({dim_str}):\n"
+                f"  Boundary links: {self.n_boundary_links:,}")
 
 
 class ForceManager:
     """High-level manager for force calculation and logging
     
-    Combines MomentumExchangeForce with logging and analysis.
+    Combines MomentumExchangeForce with logging, statistics,
+    and coefficient computation.
+    
+    Supports both 2D and 3D domains.
     
     Example:
         >>> force_mgr = ForceManager(xp, lattice, solid_mask, config)
@@ -429,18 +272,15 @@ class ForceManager:
         Args:
             xp: Array module
             lattice: Lattice model
-            solid_mask: Solid mask (Nx, Ny, Nz)
-            config: Force configuration dictionary:
-                    - enabled: bool
-                    - interval: int (compute every N steps)
-                    - start_step: int (start computing after N steps)
-                    - reference: {rho, velocity, char_length, span_length}
+            solid_mask: Solid mask
+            config: Force configuration dictionary
             wall_bc: Optional wall BC (reuses boundary link info)
             csv_dir: Directory for CSV output
         """
         self.xp = xp
         self.config = config
         self.csv_dir = csv_dir
+        self.dim = lattice.dim
         
         # Parse config
         self.enabled = config.get('enabled', True)
@@ -450,36 +290,49 @@ class ForceManager:
         ref_config = config.get('reference', {})
         self.rho_ref = ref_config.get('rho', 1.0)
         self.u_ref = ref_config.get('velocity', 0.1)
-        self.char_length = ref_config.get('char_length', ref_config.get('area', 20.0))
+        self.char_length = ref_config.get('char_length', 20.0)
         self.span_length = ref_config.get('span_length', 1.0)
         
-        # Initialize calculator
-        if self.enabled:
-            self.calculator = MomentumExchangeForce(xp, lattice, solid_mask, wall_bc)
-        else:
-            self.calculator = None
+        log_config = config.get('log', {})
+        self.log_enabled = log_config.get('enabled', True)
+        self.log_filename = log_config.get('filename', 'force_history')
         
-        self.logger: Optional[ForceLogger] = None
-        self.initialized = False
+        # Create force calculator
+        self.force_calc = MomentumExchangeForce(xp, lattice, solid_mask, wall_bc)
+        
+        # History storage
+        self.history: List[Dict[str, Any]] = []
+        
+        # CSV file handle
+        self._csv_file = None
+        self._csv_writer = None
     
     def initialize(self) -> None:
-        """Initialize logger and prepare for force computation"""
+        """Initialize force manager (setup CSV logging)"""
         if not self.enabled:
+            print("  Force calculation: disabled")
             return
         
-        # Create logger
-        log_config = self.config.get('log', {})
-        if log_config.get('enabled', True):
-            self.logger = ForceLogger(
-                self.csv_dir,
-                filename=log_config.get('filename', 'force_history'),
-                include_coefficients=True
-            )
+        # Print force calculator info
+        print(f"  {self.force_calc.get_info()}")
+        print(f"  Reference: ρ={self.rho_ref}, U={self.u_ref}, D={self.char_length}, Lz={self.span_length}")
+        print(f"  Interval: every {self.interval} steps (start from step {self.start_step})")
         
-        self.initialized = True
-        
-        print(f"  {self.calculator.get_info()}")
-        print(f"    Reference: ρ={self.rho_ref}, U={self.u_ref}, D={self.char_length}, Lz={self.span_length}")
+        if self.log_enabled:
+            os.makedirs(self.csv_dir, exist_ok=True)
+            csv_path = os.path.join(self.csv_dir, f"{self.log_filename}.csv")
+            
+            self._csv_file = open(csv_path, 'w', newline='')
+            
+            if self.dim == 2:
+                fieldnames = ['step', 'Fx', 'Fy', 'Cd', 'Cl']
+            else:
+                fieldnames = ['step', 'Fx', 'Fy', 'Fz', 'Cd', 'Cl', 'Cz']
+            
+            self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
+            self._csv_writer.writeheader()
+            
+            print(f"  CSV log: {csv_path}")
     
     def should_compute(self, step: int) -> bool:
         """Check if force should be computed at this step"""
@@ -487,100 +340,164 @@ class ForceManager:
             return False
         if step < self.start_step:
             return False
-        return (step - self.start_step) % self.interval == 0
+        return step % self.interval == 0
     
     def compute_and_log(self, step: int, f_post: 'npt.NDArray',
-                        verbose: bool = False) -> Optional[Dict[str, float]]:
-        """Compute force and log to CSV
+                        verbose: bool = False) -> Optional[Dict[str, Any]]:
+        """Compute forces and log to CSV
         
         Args:
             step: Current time step
-            f_post: Post-collision distribution (Q, Nx, Ny, Nz)
-            verbose: Print force values
+            f_post: Post-collision distribution
+            verbose: Print results to console
         
         Returns:
-            Dictionary with Fx, Fy, Fz, Cd, Cl (or None if not computed)
+            Dictionary with forces and coefficients, or None if skipped
         """
         if not self.should_compute(step):
             return None
         
         # Compute forces
-        Fx, Fy, Fz = self.calculator.compute_vectorized(f_post)
+        forces = self.force_calc.compute(f_post)
         
-        # Compute coefficients
-        Cd, Cl = self.calculator.get_coefficients(
-            Fx, Fy,
+        # Get coefficients
+        coeffs = self.force_calc.get_coefficients(
+            forces,
             rho_ref=self.rho_ref,
             u_ref=self.u_ref,
             char_length=self.char_length,
             span_length=self.span_length
         )
         
-        # Record to history
-        self.calculator.record_force(step, Fx, Fy, Fz, Cd, Cl)
+        # Build result dictionary
+        if self.dim == 2:
+            result = {
+                'step': step,
+                'Fx': forces[0],
+                'Fy': forces[1],
+                'Cd': coeffs['Cd'],
+                'Cl': coeffs['Cl']
+            }
+        else:
+            result = {
+                'step': step,
+                'Fx': forces[0],
+                'Fy': forces[1],
+                'Fz': forces[2],
+                'Cd': coeffs['Cd'],
+                'Cl': coeffs['Cl'],
+                'Cz': coeffs.get('Cz', 0.0)
+            }
         
-        # Log to CSV
-        if self.logger is not None:
-            self.logger.log(step, Fx, Fy, Fz, time=float(step), Cd=Cd, Cl=Cl)
+        # Store in history
+        self.history.append(result)
+        
+        # Write to CSV
+        if self._csv_writer is not None:
+            self._csv_writer.writerow(result)
+            self._csv_file.flush()
         
         if verbose:
-            print(f"  Step {step}: Fx={Fx:.6f}, Fy={Fy:.6f}, Cd={Cd:.4f}, Cl={Cl:.4f}")
+            print(f"  Step {step}: Cd={coeffs['Cd']:.4f}, Cl={coeffs['Cl']:.4f}")
         
-        return {
-            'Fx': Fx, 'Fy': Fy, 'Fz': Fz,
-            'Cd': Cd, 'Cl': Cl
-        }
+        return result
     
-    def get_final_statistics(self, window: Optional[int] = None) -> Dict[str, float]:
-        """Get final force statistics
-        
-        Args:
-            window: Number of recent steps to average (None = use last 50%)
+    def get_final_statistics(self) -> Dict[str, Any]:
+        """Compute final statistics from force history
         
         Returns:
-            Statistics dictionary
+            Dictionary with mean, std, min, max for each coefficient
         """
-        if not self.enabled or self.calculator is None:
+        import numpy as np
+        
+        if len(self.history) == 0:
             return {}
         
-        # Default: use last 50% of data for averaging (skip transient)
-        if window is None:
-            window = len(self.calculator.force_history) // 2
+        Cd_values = [h['Cd'] for h in self.history]
+        Cl_values = [h['Cl'] for h in self.history]
         
-        return self.calculator.get_statistics(window)
+        stats = {
+            'Cd_mean': float(np.mean(Cd_values)),
+            'Cd_std': float(np.std(Cd_values)),
+            'Cd_min': float(np.min(Cd_values)),
+            'Cd_max': float(np.max(Cd_values)),
+            'Cl_mean': float(np.mean(Cl_values)),
+            'Cl_std': float(np.std(Cl_values)),
+            'Cl_min': float(np.min(Cl_values)),
+            'Cl_max': float(np.max(Cl_values)),
+            'n_samples': len(self.history)
+        }
+        
+        if self.dim == 3 and 'Cz' in self.history[0]:
+            Cz_values = [h['Cz'] for h in self.history]
+            stats.update({
+                'Cz_mean': float(np.mean(Cz_values)),
+                'Cz_std': float(np.std(Cz_values)),
+            })
+        
+        return stats
     
     def print_summary(self, window: Optional[int] = None) -> None:
-        """Print force summary statistics"""
+        """Print force summary statistics
+        
+        Args:
+            window: Number of steps to average (None = last 50% of data)
+        """
         if not self.enabled:
             print("  Force calculation: disabled")
             return
         
-        stats = self.get_final_statistics(window)
-        
-        if not stats:
+        if len(self.history) == 0:
             print("  Force calculation: no data recorded")
             return
+        
+        # Use last 50% of data by default (skip transient)
+        if window is None:
+            window = max(1, len(self.history) // 2)
+        
+        # Get statistics from recent data
+        import numpy as np
+        recent = self.history[-window:]
+        
+        Cd_values = np.array([h['Cd'] for h in recent])
+        Cl_values = np.array([h['Cl'] for h in recent])
+        Fx_values = np.array([h['Fx'] for h in recent])
+        Fy_values = np.array([h['Fy'] for h in recent])
         
         print("\n" + "="*60)
         print(" Force Summary (time-averaged)")
         print("="*60)
-        print(f"  Drag coefficient: Cd = {stats.get('Cd_mean', 0):.4f} ± {stats.get('Cd_std', 0):.4f}")
-        print(f"  Lift coefficient: Cl = {stats.get('Cl_mean', 0):.4f} ± {stats.get('Cl_std', 0):.4f}")
-        print(f"  Lift RMS:         Cl_rms = {stats.get('Cl_rms', 0):.4f}")
-        print(f"  Force (mean):     Fx = {stats.get('Fx_mean', 0):.6f}, Fy = {stats.get('Fy_mean', 0):.6f}")
+        print(f"  Samples: {len(recent)} (last {window} of {len(self.history)} total)")
+        print(f"  Drag coefficient: Cd = {np.mean(Cd_values):.4f} ± {np.std(Cd_values):.4f}")
+        print(f"  Lift coefficient: Cl = {np.mean(Cl_values):.4f} ± {np.std(Cl_values):.4f}")
+        print(f"  Lift RMS:         Cl_rms = {np.sqrt(np.mean(Cl_values**2)):.4f}")
+        print(f"  Force (mean):     Fx = {np.mean(Fx_values):.6f}, Fy = {np.mean(Fy_values):.6f}")
+        
+        if self.dim == 3 and 'Fz' in recent[0]:
+            Fz_values = np.array([h['Fz'] for h in recent])
+            print(f"                    Fz = {np.mean(Fz_values):.6f}")
+        
         print("="*60)
     
     def close(self) -> None:
-        """Close logger"""
-        if self.logger is not None:
-            self.logger.close()
+        """Close CSV file"""
+        if self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file = None
+            self._csv_writer = None
     
-    def __del__(self):
-        self.close()
+    def get_info(self) -> str:
+        """Return information string"""
+        dim_str = "2D" if self.dim == 2 else "3D"
+        return (f"ForceManager ({dim_str}):\n"
+                f"  Enabled: {self.enabled}\n"
+                f"  Interval: {self.interval}\n"
+                f"  Start step: {self.start_step}\n"
+                f"  {self.force_calc.get_info()}")
 
 
 # =============================================================================
-# Strouhal Number Calculation (for vortex shedding frequency)
+# Strouhal Number Calculation
 # =============================================================================
 
 def compute_strouhal_number(force_history: List[Dict[str, Any]],
@@ -588,63 +505,84 @@ def compute_strouhal_number(force_history: List[Dict[str, Any]],
                             u_ref: float,
                             component: str = 'Cl',
                             min_periods: int = 3) -> Optional[float]:
-    """Compute Strouhal number from force time history
+    """Compute Strouhal number from force time history using FFT
     
-    St = f * D / U
+    The Strouhal number characterizes vortex shedding frequency:
+        St = f * D / U
     
-    where f is the dominant frequency of lift oscillation.
+    where:
+        f = dominant frequency of lift oscillation  [1/Δt]
+        D = characteristic length (diameter)  [Δx]
+        U = reference velocity  [Δx/Δt]
+    
+    Algorithm:
+        1. Extract force component time series
+        2. Apply FFT to find dominant frequency
+        3. Compute St = f * D / U
     
     Args:
         force_history: List of force records with 'step' and component
         char_length: Characteristic length D  [Δx]
         u_ref: Reference velocity U  [Δx/Δt]
-        component: Which force component to analyze ('Cl', 'Fy', etc.)
-        min_periods: Minimum periods required for reliable FFT
-    
+        component: Force component to analyze ('Cl', 'Fy', etc.)
+        min_periods: Minimum number of oscillation periods required
+        
     Returns:
-        Strouhal number, or None if cannot be computed
+        Strouhal number, or None if insufficient data
+        
+    Example:
+        >>> St = compute_strouhal_number(force_mgr.history, D=20, u_ref=0.1)
+        >>> print(f"Strouhal number: {St:.4f}")  # Expected ~0.16-0.21 for cylinder
     """
     import numpy as np
     
-    if len(force_history) < 10:
+    if len(force_history) < 100:
+        return None  # Not enough data
+    
+    # Extract component values
+    if component not in force_history[0]:
         return None
     
-    # Extract signal
-    if component not in force_history[0]:
-        component = 'Fy'  # Fallback to raw force
+    values = np.array([h[component] for h in force_history])
+    steps = np.array([h['step'] for h in force_history])
     
-    steps = np.array([d['step'] for d in force_history])
-    signal = np.array([d.get(component, d.get('Fy', 0)) for d in force_history])
+    # Determine time step (assume uniform spacing)
+    dt = 1.0  # In lattice units, one step = Δt = 1
+    if len(steps) > 1:
+        dt = float(steps[1] - steps[0])
+    
+    N = len(values)
     
     # Remove mean (DC component)
-    signal = signal - np.mean(signal)
+    values_centered = values - np.mean(values)
     
-    if np.std(signal) < 1e-10:
-        return None  # No oscillation
+    # Apply window function to reduce spectral leakage
+    window = np.hanning(N)
+    values_windowed = values_centered * window
     
     # FFT
-    n = len(signal)
-    dt = 1.0  # Assume uniform time step in lattice units
-    
-    # Compute FFT
-    fft_result = np.fft.rfft(signal)
-    freqs = np.fft.rfftfreq(n, d=dt)
+    fft_vals = np.fft.rfft(values_windowed)
+    freqs = np.fft.rfftfreq(N, d=dt)
     
     # Find dominant frequency (excluding DC)
-    magnitudes = np.abs(fft_result)
-    magnitudes[0] = 0  # Exclude DC
+    magnitudes = np.abs(fft_vals)
+    magnitudes[0] = 0  # Ignore DC
     
+    # Find peak
     peak_idx = np.argmax(magnitudes)
-    dominant_freq = freqs[peak_idx]  # [1/Δt]
+    if peak_idx == 0:
+        return None  # No oscillation detected
+    
+    f_dominant = freqs[peak_idx]  # [1/Δt]
     
     # Check if we have enough periods
-    period = 1.0 / (dominant_freq + 1e-10)
-    n_periods = n / period
+    T_period = 1.0 / f_dominant if f_dominant > 0 else float('inf')
+    n_periods = (N * dt) / T_period
     
     if n_periods < min_periods:
-        return None  # Not enough data for reliable frequency
+        return None  # Insufficient number of periods
     
-    # Strouhal number
-    St = dominant_freq * char_length / u_ref
+    # Strouhal number: St = f * D / U
+    St = f_dominant * char_length / u_ref
     
     return float(St)

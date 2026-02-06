@@ -6,11 +6,11 @@ the standard choice for 2D incompressible flow simulations.
 
 Lattice Structure:
     
-        6   2   5
-          \\ | /
+         6  2  5         y (North)
+          \ | /          |
         3 - 0 - 1    ->  x (East)
-          / | \\         |
-        7   4   8        y (North)
+          / | \          
+         7  4  8        
 
 Velocity Vectors (c_i):
     i = 0 : ( 0,  0)  - Rest

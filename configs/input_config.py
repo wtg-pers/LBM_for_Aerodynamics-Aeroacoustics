@@ -3,13 +3,13 @@
 # =============================================================================
 # Cylinder parameters
 diameter = 20      # [lattice units]
-Nx = diameter * 15
-Ny = diameter * 15
-Nz = 3
-size = Nx*Ny*Nz / 10000
+Nx = diameter * 25
+Ny = diameter * 20
+# Nz = 3
+
 center_x = Nx // 5  # Located at 25% from inlet
 center_y = Ny // 2  # Centered in y
-center_z = Nz // 2
+# center_z = Nz // 2
 
 MACH_INLET = 0.1
 RHO = 1.0
@@ -22,12 +22,12 @@ RE_TGT = 100.0
 simulation = {
     "device_mode": "gpu",
     "device_id": 0,
-    "dimension": 3,
-    "lattice_model": "D3Q27",
+    "dimension": 2,
+    "lattice_model": "D2Q9",
     "domain": {
         "Nx": Nx,
         "Ny": Ny,
-        "Nz": Nz
+        # "Nz": Nz
     },
     "physics": {
         "Re": RE_TGT,
@@ -35,9 +35,9 @@ simulation = {
         "characteristic_length": diameter
     },
     "time": {
-        "max_steps": 50000,
+        "max_steps": 30000,
         "output_interval": 100,
-        "checkpoint_interval": 10000,
+        "checkpoint_interval": 5000,
         "probe_interval": 10                  # Force/probe sampling
     }
 }
@@ -86,13 +86,13 @@ internal_geometry = {
         "center": (center_x, center_y),
         "radius": diameter // 2,
         "axis": "z",
-        "axis_range": (0, Nz - 1)
+        # "axis_range": (0, Nz - 1)
     },
-    "sphere": {
-        "enabled": False,
-        "center": (center_x, center_y, center_z),
-        "radius": diameter // 2
-    }
+    # "sphere": {
+    #     "enabled": False,
+    #     "center": (center_x, center_y, center_z),
+    #     "radius": diameter // 2
+    # }
 }
 
 
@@ -149,8 +149,8 @@ conservation = {
                 "xmax": center_x + 5 * diameter,
                 "ymin": center_y - 2 * diameter,
                 "ymax": center_y + 2 * diameter,
-                "zmin": 0,
-                "zmax": Nz - 1,
+                # "zmin": 0,
+                # "zmax": Nz - 1,
             }
         },
         
@@ -163,25 +163,54 @@ conservation = {
                 "xmax": center_x + 10 * diameter,
                 "ymin": center_y - 2 * diameter,
                 "ymax": center_y + 2 * diameter,
-                "zmin": 0,
-                "zmax": Nz - 1,
+                # "zmin": 0,
+                # "zmax": Nz - 1,
             }
         },
-        
-        # # CV 3: Example of disabled CV
-        # {
-        #     "name": "inlet_region",
-        #     "enabled": False,
-        #     "bounds": {
-        #         "xmin": 0,
-        #         "xmax": 50,
-        #         "ymin": 0,
-        #         "ymax": Ny - 1,
-        #         "zmin": 0,
-        #         "zmax": Nz - 1,
-        #     }
-        # },
     ],
+}
+
+
+# =============================================================================
+# Convergence Detection Configuration
+# =============================================================================
+# CV-based convergence: CV = σ/μ < ε within rolling window
+#
+# Path A (no obstacle): CV(avg_energy) < ε
+# Path B (with obstacle): CV(Cd) < ε_Cd  (energy & Cl are monitor-only)
+#
+# Window sizing (auto):
+#   T_conv = D / U  [timesteps]
+#   window_timesteps = T_conv × time_coverage
+#   window_samples = window_timesteps / feed_interval
+#
+#   Example (D=20, U=0.1, feed_interval=10):
+#     T_conv = 200, window = 200×50/10 = 1000 samples → fills at 10,000 steps
+
+convergence = {
+    "enabled": True,
+
+    "statistical": {
+        # --- Window Size ---
+        "window_size": "auto",           # "auto" (recommended) | int (manual samples)
+
+        # --- CV Thresholds ---
+        "epsilon": 1e-4,                 # [dimensionless] avg kinetic energy
+        "Cd_epsilon": 0.01,              # [dimensionless] drag coefficient
+        #   Steady flow:     Cd_epsilon = 1e-3 ~ 1e-2
+        #   Periodic flow:   Cd_epsilon = 0.02 ~ 0.05  (natural CV ≈ 0.01)
+
+        # --- Auto Window Tuning ---
+        "auto_window": {
+            "time_coverage": 50.0,       # window spans this many T_conv [dimensionless]
+            "min_samples": 50,           # minimum buffer size [samples]
+        },
+    },
+
+    # --- Termination Actions ---
+    "on_converged": "checkpoint_and_stop",   # "checkpoint_and_stop" | "stop" | "continue"
+    "on_max_steps": "warn",                  # "warn" | "error"
+    "on_diverged": "stop_with_checkpoint",   # "stop_with_checkpoint" | "stop"
 }
 
 
@@ -198,21 +227,17 @@ conservation = {
 #   C_L = F_y / (0.5 * ρ * U² * A)
 #   where A = D * Lz (reference area)
 #
-# Expected values for Re=150 cylinder:
-#   C_D ≈ 1.3 - 1.4
-#   C_L oscillates around 0 with amplitude ~ 0.3-0.5
-#   St ≈ 0.18 - 0.19
 
 force_calculation = {
     "enabled": True,                   # Enable force calculation
     "interval": 10,                    # Compute every N steps
-    "start_step": 1000,                # Skip initial transient
+    "start_step": 100,                # Skip initial transient
     
     "reference": {
         "rho": RHO,                    # Reference density [dimensionless]
         "velocity": MACH_INLET,        # Reference velocity [Δx/Δt]
         "char_length": diameter,       # Characteristic length D [Δx]
-        "span_length": Nz,             # Span length Lz [Δx] (for 2D: Nz)
+        "span_length": 1,             # Span length Lz [Δx] (for 2D: Nz)
     },
     
     "log": {
@@ -225,10 +250,14 @@ force_calculation = {
 # =============================================================================
 # Output Configuration
 # =============================================================================
+d_str = str(int(diameter))
+re_str = str(int(RE_TGT))
+folder_name = f"result_D{d_str}_Re{re_str}"
+
 output = {
-    "output_dir": "./results/vtk",
-    "checkpoint_dir": "./checkpoints",
-    "csv_dir": "./results/csv",
+    "output_dir": f"./{folder_name}/vtk",
+    "checkpoint_dir": f"./{folder_name}/checkpoints",
+    "csv_dir": f"./{folder_name}/csv",
     
     "clear_previous": True,          # Set True for fresh start
     
@@ -246,15 +275,15 @@ output = {
         "enabled": True,
         "force_on_obstacle": True,    # Compute drag/lift
         "wake_probes": [              # Velocity probes for Strouhal
-            (center_x + 2 * diameter, center_y, center_z),
-            (center_x + 5 * diameter, center_y, center_z)
+            (center_x + 2 * diameter, center_y),# center_z),
+            (center_x + 5 * diameter, center_y),# center_z)
         ]
     }
 }
 
 
 # =============================================================================
-# Final Config Dictionary
+# Final Config Dictionary (UPDATED - add convergence)
 # =============================================================================
 config = {
     "simulation": simulation,
@@ -262,5 +291,6 @@ config = {
     "internal_geometry": internal_geometry,
     "conservation": conservation,
     "force_calculation": force_calculation,
+    "convergence": convergence,            
     "output": output
 }

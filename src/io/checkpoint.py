@@ -4,6 +4,8 @@ Checkpoint Module for LBM Solver (Restart Functionality)
 This module provides save/load functionality for simulation checkpoints,
 enabling restart from a saved state.
 
+Supports both 2D and 3D simulations.
+
 Saved Data:
     - Distribution function f (essential for restart)
     - Macroscopic fields (rho, u) for verification
@@ -14,23 +16,14 @@ File Format:
     Uses NumPy's compressed .npz format for efficient storage.
     Typical compression ratio: 50-80% reduction.
 
-Usage:
-    # Save checkpoint
-    checkpoint.save(step=5000, f=f, rho=rho, u=u, config=sim_params)
-    
-    # Load and restart
-    state = checkpoint.load('checkpoint_005000.npz')
-    f = state['f']
-    start_step = state['step']
-
 Author: LBM Development Team
-Date: 2026-01
+Date: 2026-02
 """
 
 import os
 import json
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional, Dict, Any, Union
+from typing import TYPE_CHECKING, Optional, Dict, Any, Union, Tuple
 import numpy as np
 
 if TYPE_CHECKING:
@@ -41,19 +34,7 @@ if TYPE_CHECKING:
 class CheckpointManager:
     """Manages simulation checkpoints for restart capability
     
-    Saves the complete simulation state to compressed NumPy files,
-    allowing restart from any saved checkpoint.
-    
-    Attributes:
-        output_dir: Directory for checkpoint files
-        prefix: Filename prefix
-        keep_last_n: Number of recent checkpoints to keep (0=keep all)
-        
-    Example:
-        >>> ckpt = CheckpointManager('./checkpoints', keep_last_n=3)
-        >>> ckpt.save(step=1000, f=f_old, rho=rho, u=u)
-        >>> state = ckpt.load_latest()
-        >>> f_restart = xp.asarray(state['f'])
+    Supports both 2D and 3D simulations.
     """
     
     def __init__(self, 
@@ -67,7 +48,7 @@ class CheckpointManager:
             output_dir: Directory for checkpoint files
             prefix: Filename prefix
             keep_last_n: Keep only last N checkpoints (0=keep all)
-            xp: Array module (numpy or cupy), for loading
+            xp: Array module (numpy or cupy)
         """
         self.output_dir = output_dir
         self.prefix = prefix
@@ -75,13 +56,11 @@ class CheckpointManager:
         self.xp = xp if xp is not None else np
         
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Track saved checkpoints
         self.saved_files: list = []
     
     def _to_numpy(self, arr: 'npt.NDArray') -> np.ndarray:
         """Convert CuPy array to NumPy if necessary"""
-        if hasattr(arr, 'get'):  # CuPy array
+        if hasattr(arr, 'get'):
             return arr.get()
         return np.asarray(arr)
     
@@ -96,11 +75,11 @@ class CheckpointManager:
         """Save simulation checkpoint
         
         Args:
-            step: Current time step  [dimensionless]
-            f: Distribution function (Q, Nx, Ny, Nz)  [dimensionless]
-            rho: Density field (Nx, Ny, Nz)  [dimensionless, optional]
-            u: Velocity field (3, Nx, Ny, Nz)  [lattice units, optional]
-            tau: Relaxation time  [dimensionless, optional]
+            step: Current time step
+            f: Distribution function (Q, Nx, Ny) or (Q, Nx, Ny, Nz)
+            rho: Density field (optional)
+            u: Velocity field (optional)
+            tau: Relaxation time (optional)
             config: Simulation configuration dictionary
             extra_data: Additional data to save
             
@@ -110,7 +89,6 @@ class CheckpointManager:
         filename = f"{self.prefix}_{step:08d}.npz"
         filepath = os.path.join(self.output_dir, filename)
         
-        # Prepare data dictionary
         save_dict = {
             'f': self._to_numpy(f),
             'step': np.array(step),
@@ -127,7 +105,6 @@ class CheckpointManager:
             save_dict['tau'] = np.array(tau)
         
         if config is not None:
-            # Store config as JSON string
             save_dict['config_json'] = np.array(json.dumps(config))
         
         if extra_data is not None:
@@ -137,18 +114,13 @@ class CheckpointManager:
                 else:
                     save_dict[f'extra_{key}'] = np.array(value)
         
-        # Save compressed
         np.savez_compressed(filepath, **save_dict)
-        
         self.saved_files.append(filepath)
         
-        # Cleanup old checkpoints
         if self.keep_last_n > 0:
             self._cleanup_old_checkpoints()
         
-        # Get file size
         file_size_mb = os.path.getsize(filepath) / 1e6
-        
         print(f"  Checkpoint saved: {filename} ({file_size_mb:.2f} MB)")
         
         return filepath
@@ -164,21 +136,7 @@ class CheckpointManager:
             self.saved_files = self.saved_files[-self.keep_last_n:]
     
     def load(self, filepath: str) -> Dict[str, Any]:
-        """Load checkpoint from file
-        
-        Args:
-            filepath: Path to checkpoint file
-            
-        Returns:
-            Dictionary containing:
-                - 'f': Distribution function (numpy array)
-                - 'step': Time step
-                - 'rho': Density (if saved)
-                - 'u': Velocity (if saved)
-                - 'tau': Relaxation time (if saved)
-                - 'config': Configuration dict (if saved)
-                - 'timestamp': When checkpoint was created
-        """
+        """Load checkpoint from file"""
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Checkpoint not found: {filepath}")
         
@@ -204,10 +162,9 @@ class CheckpointManager:
         if 'config_json' in data:
             result['config'] = json.loads(str(data['config_json']))
         
-        # Load extra data
         for key in data.files:
             if key.startswith('extra_'):
-                result[key[6:]] = data[key]  # Remove 'extra_' prefix
+                result[key[6:]] = data[key]
         
         print(f"  Checkpoint loaded: {os.path.basename(filepath)}")
         print(f"    Step: {result['step']}")
@@ -217,58 +174,39 @@ class CheckpointManager:
         return result
     
     def load_latest(self) -> Dict[str, Any]:
-        """Load the most recent checkpoint
-        
-        Returns:
-            Checkpoint data dictionary
-            
-        Raises:
-            FileNotFoundError: If no checkpoints exist
-        """
+        """Load the most recent checkpoint"""
         checkpoints = self.list_checkpoints()
         
         if not checkpoints:
             raise FileNotFoundError(f"No checkpoints found in {self.output_dir}")
         
-        # Sort by step number and get latest
         latest = sorted(checkpoints, key=lambda x: x['step'])[-1]
-        
         return self.load(latest['filepath'])
     
     def load_by_step(self, step: int) -> Dict[str, Any]:
-        """Load checkpoint for specific step
-        
-        Args:
-            step: Time step to load
-            
-        Returns:
-            Checkpoint data dictionary
-        """
+        """Load checkpoint for specific step"""
         filename = f"{self.prefix}_{step:08d}.npz"
         filepath = os.path.join(self.output_dir, filename)
-        
         return self.load(filepath)
     
     def list_checkpoints(self) -> list:
-        """List all available checkpoints
-        
-        Returns:
-            List of dictionaries with checkpoint info
-        """
+        """List all available checkpoints"""
         checkpoints = []
+        
+        if not os.path.exists(self.output_dir):
+            return checkpoints
         
         for f in os.listdir(self.output_dir):
             if f.startswith(self.prefix) and f.endswith('.npz'):
                 filepath = os.path.join(self.output_dir, f)
                 
-                # Extract step from filename
                 try:
                     step_str = f.replace(self.prefix + '_', '').replace('.npz', '')
                     step = int(step_str)
                 except ValueError:
                     continue
                 
-                file_size = os.path.getsize(filepath) / 1e6  # MB
+                file_size = os.path.getsize(filepath) / 1e6
                 
                 checkpoints.append({
                     'filename': f,
@@ -296,25 +234,34 @@ class CheckpointManager:
     def get_size_estimate(self, f_shape: tuple, include_macros: bool = True) -> Dict[str, float]:
         """Estimate checkpoint file size
         
+        Supports both 2D (Q, Nx, Ny) and 3D (Q, Nx, Ny, Nz) shapes.
+        
         Args:
-            f_shape: Shape of distribution function (Q, Nx, Ny, Nz)
+            f_shape: Shape of distribution function
             include_macros: Include rho and u in estimate
             
         Returns:
             Size estimates in MB
         """
-        Q, Nx, Ny, Nz = f_shape
-        n_points = Nx * Ny * Nz
+        # Handle both 2D and 3D
+        if len(f_shape) == 3:
+            # 2D: (Q, Nx, Ny)
+            Q, Nx, Ny = f_shape
+            n_points = Nx * Ny
+            dim = 2
+        else:
+            # 3D: (Q, Nx, Ny, Nz)
+            Q, Nx, Ny, Nz = f_shape
+            n_points = Nx * Ny * Nz
+            dim = 3
         
         # f: float64
         f_size = Q * n_points * 8
         
-        # macros: rho (1) + u (3) = 4 fields
-        macro_size = 4 * n_points * 8 if include_macros else 0
+        # macros: rho (1) + u (dim) = (dim+1) fields
+        macro_size = (dim + 1) * n_points * 8 if include_macros else 0
         
         total_raw = f_size + macro_size
-        
-        # Compression ratio (typical for LBM data)
         compressed_size = total_raw * 0.4  # ~60% reduction typical
         
         return {
@@ -327,16 +274,7 @@ class CheckpointManager:
 def create_restart_info(checkpoint_path: str, 
                         original_max_steps: int,
                         new_max_steps: int) -> Dict:
-    """Create restart information summary
-    
-    Args:
-        checkpoint_path: Path to loaded checkpoint
-        original_max_steps: Original simulation max steps
-        new_max_steps: New total max steps
-        
-    Returns:
-        Info dictionary for logging
-    """
+    """Create restart information summary"""
     return {
         'restart_from': checkpoint_path,
         'original_max_steps': original_max_steps,
