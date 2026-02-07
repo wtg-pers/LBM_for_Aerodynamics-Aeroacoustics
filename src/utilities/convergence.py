@@ -248,24 +248,29 @@ class CauchyTracker:
     def evaluate(self) -> Dict[str, Any]:
         """Evaluate Cauchy criterion
         
+        Cauchy convergence:
+            ε_cauchy = |μ_new - μ_old| / |μ_old|  [dimensionless]
+        
+        where μ_old = mean(first half),  μ_new = mean(second half)
+        of the rolling window in chronological order.
+        
+        Optimization: Single buffer.values call instead of separate
+        first_half_mean() + second_half_mean() (avoids 2x np.roll+copy).
+        
         Returns:
-            Dict with:
-                converged: bool
-                cauchy: current ε_cauchy value
-                mean: current window mean
-                std: current window std (for monitoring)
-                cv: current CV (for monitoring/logging)
-                consecutive: number of consecutive passes
-                samples: current sample count
-                window_size: buffer capacity
+            Dict with: converged, cauchy, epsilon, consecutive,
+            n_required, mean, std, cv, samples, window_size, is_criterion
         """
         if not self.buffer.is_full:
             self._cauchy_value = float('inf')
             return self._build_status()
         
         # --- Cauchy criterion: compare first-half mean vs second-half mean ---
-        mu_old = self.buffer.first_half_mean()
-        mu_new = self.buffer.second_half_mean()
+        # Single buffer read: avoid redundant np.roll + copy  [optimized]
+        vals = self.buffer.values                    # one np.roll + copy
+        half = len(vals) // 2
+        mu_old = float(np.mean(vals[:half]))         # older half  [same unit as input]
+        mu_new = float(np.mean(vals[half:]))         # newer half  [same unit as input]
         
         if abs(mu_old) < 1e-30:
             # Denominator near zero: use absolute difference
@@ -766,43 +771,88 @@ class ConvergenceMonitor:
         if self._status == ConvergenceStatus.RUNNING:
             self._status = ConvergenceStatus.MAX_STEPS
     
+    _TRACKER_DISPLAY_NAMES = {
+        'Cd': 'Drag Coefficient',
+        'Cl': 'Lift Coefficient',
+        'avg_energy': 'Avg Kinetic Energy',
+    }
     def print_summary(self) -> None:
-        """Print convergence summary table."""
-        print("\n" + "=" * 78)
+        """Print convergence summary in simplified horizontal-line format.
+        
+        Output format (═/─ lines only, no box-drawing borders):
+        ════════════════════════════════════════
+          Convergence Summary (Cauchy Criterion)
+        ════════════════════════════════════════
+          Status: ✅ CONVERGED  (step 42000)
+          Checks: 15
+        ────────────────────────────────────────
+          Drag Coefficient         [CRITERION]
+          ε = 3.90e-04  (ε < 1e-03)  ✓
+          Pass 3/3  │  μ = 1.5213  │  Fill 1000/1000
+        ════════════════════════════════════════
+        
+        Design note:
+            No major open-source CFD solver (SU2, OpenFOAM, Palabos, OpenLB)
+            provides a structured end-of-run convergence summary.
+            Criterion trackers listed first, then monitors.
+        """
+        W = 40  # line width  [characters]
+        
+        # --- Collect & sort trackers: criterion first, then monitors ---
+        trackers = []
+        for t in [self.energy_tracker, self.Cd_tracker, self.Cl_tracker]:
+            if t is not None:
+                trackers.append(t.get_status())
+        trackers.sort(key=lambda s: (0 if s['is_criterion'] else 1, s['name']))
+        
+        # --- Status string ---
+        status_map = {
+            ConvergenceStatus.CONVERGED:   "✅ CONVERGED",
+            ConvergenceStatus.DIVERGED:    "❌ DIVERGED",
+            ConvergenceStatus.RUNNING:     "🔄 RUNNING",
+            ConvergenceStatus.MAX_STEPS:   "⚠️  MAX STEPS",
+            ConvergenceStatus.NOT_STARTED: "NOT STARTED",
+            ConvergenceStatus.DISABLED:    "DISABLED",
+        }
+        status_str = status_map.get(self._status, str(self._status))
+        
+        # --- Header ---
+        print()
+        print("═" * W)
         print("  Convergence Summary (Cauchy Criterion)")
-        print("=" * 78)
+        print("═" * W)
         
-        status_str = {
-            ConvergenceStatus.CONVERGED: "✅ CONVERGED",
-            ConvergenceStatus.DIVERGED: "❌ DIVERGED",
-            ConvergenceStatus.RUNNING: "🔄 RUNNING",
-            ConvergenceStatus.MAX_STEPS: "⚠️  MAX STEPS",
-        }.get(self._status, str(self._status))
-        
-        print(f"  Status: {status_str}")
+        # --- Status ---
         if self._converged_step is not None:
-            print(f"  Converged at step: {self._converged_step}")
-        print(f"  Checks performed: {self._check_count}")
+            print(f"  Status: {status_str}  (step {self._converged_step})")
+        else:
+            print(f"  Status: {status_str}")
+        print(f"  Checks: {self._check_count}")
         
-        print(f"\n  {'Tracker':>12s}  {'ε_cauchy':>12s}  {'ε_thresh':>10s}  "
-              f"{'Pass':>6s}  {'μ':>12s}  {'CV':>10s}  "
-              f"{'Fill':>12s}  {'Role'}")
-        print(f"  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*6}  {'-'*12}  "
-              f"{'-'*10}  {'-'*12}  {'-'*10}")
+        # --- Tracker blocks ---
+        for s in trackers:
+            print("─" * W)
+            
+            # Line 1: human-readable name + role
+            display_name = self._TRACKER_DISPLAY_NAMES.get(s['name'], s['name'])
+            role_tag = "[CRITERION]" if s['is_criterion'] else "[MONITOR]"
+            print(f"  {display_name:<24s} {role_tag}")
+            
+            # Line 2: ε_cauchy + threshold + pass/fail  [dimensionless]
+            cauchy_val = s['cauchy']
+            cauchy_str = "     inf" if cauchy_val == float('inf') else f"{cauchy_val:.2e}"
+            eps_str = f"{s['epsilon']:.0e}"
+            mark = "✓" if cauchy_val < s['epsilon'] else "✗"
+            print(f"  ε = {cauchy_str}  (ε < {eps_str})  {mark}")
+            
+            # Line 3: consecutive pass | mean | fill
+            mu = s['mean']
+            mu_str = f"{mu:.4f}" if 1e-6 < abs(mu) < 100 else f"{mu:.4e}"
+            print(f"  Pass {s['consecutive']}/{s['n_required']}  │  "
+                  f"μ = {mu_str}  │  Fill {s['samples']}/{s['window_size']}")
         
-        for tracker in [self.energy_tracker, self.Cd_tracker, self.Cl_tracker]:
-            if tracker is not None:
-                s = tracker.get_status()
-                role = "[criterion]" if s['is_criterion'] else "[monitor] "
-                conv_mark = f"{s['consecutive']}/{s['n_required']}"
-                fill = f"{s['samples']}/{s['window_size']}"
-                
-                print(f"  {s['name']:>12s}  {s['cauchy']:>12.4e}  "
-                      f"{s['epsilon']:>10.1e}  {conv_mark:>6s}  "
-                      f"{s['mean']:>12.6f}  {s['cv']:>10.4e}  "
-                      f"{fill:>12s}  {role}")
-        
-        print("=" * 78)
+        # --- Footer ---
+        print("═" * W)
     
     def get_info(self) -> str:
         """One-line info string."""

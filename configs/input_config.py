@@ -2,7 +2,7 @@
 # Domain Configuration
 # =============================================================================
 # Cylinder parameters
-diameter = 20      # [lattice units]
+diameter = 40      # [lattice units]
 Nx = diameter * 25
 Ny = diameter * 20
 # Nz = 3
@@ -13,7 +13,7 @@ center_y = Ny // 2  # Centered in y
 
 MACH_INLET = 0.1
 RHO = 1.0
-RE_TGT = 100.0
+RE_TGT = 2000.0
 
 
 # =============================================================================
@@ -21,7 +21,7 @@ RE_TGT = 100.0
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
-    "device_id": 0,
+    # "device_id": 0,
     "dimension": 2,
     "lattice_model": "D2Q9",
     "domain": {
@@ -35,7 +35,7 @@ simulation = {
         "characteristic_length": diameter
     },
     "time": {
-        "max_steps": 30000,
+        "max_steps": 100000,
         "output_interval": 100,
         "checkpoint_interval": 5000,
         "probe_interval": 10                  # Force/probe sampling
@@ -118,7 +118,7 @@ conservation = {
     # -------------------------------------------------------------------------
     "enabled": True,
     "check_interval": 1000,           # 0 = use output_interval
-    "verbose": 1,                  # 0: silent, 1: summary, 2: detailed
+    "verbose": 0,                  # 0: silent, 1: summary, 2: detailed
     "log_to_csv": True,
     
     "tolerance": {
@@ -209,7 +209,7 @@ convergence = {
         #   (Unlike CV where periodic flows need ε ≈ 0.02~0.05)
 
         # --- Consecutive passes ---
-        "n_required": 3,                 # Must pass N consecutive checks
+        "n_required": 2,                 # Must pass N consecutive checks
         #   Prevents false convergence during transient "quiet" periods.
         #   3 checks × check_interval gives robust confirmation.
 

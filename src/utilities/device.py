@@ -51,9 +51,17 @@ def setup_library(MODE: str, device_id: Optional[int] = None) -> 'ModuleType':
             # Verify GPU is accessible
             xp.cuda.Device(actual_device).compute_capability
             
-            # Get GPU name for informative output
+            # Get GPU name for informative output (version-safe method)
+            device_props = xp.cuda.runtime.getDeviceProperties(actual_device)
+            device_name_raw = device_props['name']
+            
+            # Handle both bytes (old CuPy) and str (new CuPy)
+            if isinstance(device_name_raw, bytes):
+                device_name = device_name_raw.decode('utf-8')
+            else:
+                device_name = device_name_raw
+            
             device = xp.cuda.Device(actual_device)
-            device_name = device.attributes.get('name', 'Unknown').decode('utf-8')
             total_memory = device.mem_info[1] / 1e9  # Total memory in GB
             
             print(f"MODE: GPU")
@@ -96,8 +104,17 @@ def get_available_gpus() -> Tuple[int, list]:
         gpu_info = []
         
         for i in range(num_gpus):
+            # Use getDeviceProperties for better compatibility
+            device_props = cp.cuda.runtime.getDeviceProperties(i)
+            device_name_raw = device_props['name']
+            
+            # Handle both bytes (old CuPy) and str (new CuPy)
+            if isinstance(device_name_raw, bytes):
+                name = device_name_raw.decode('utf-8')
+            else:
+                name = device_name_raw
+            
             device = cp.cuda.Device(i)
-            name = device.attributes.get('name', 'Unknown').decode('utf-8')
             total_memory = device.mem_info[1] / 1e9  # GB
             gpu_info.append((i, name, total_memory))
         
