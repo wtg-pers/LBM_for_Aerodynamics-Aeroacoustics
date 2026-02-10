@@ -2,18 +2,18 @@
 # Domain Configuration
 # =============================================================================
 # Cylinder parameters
-chord = 100      # [lattice units]
-Nx = chord * 25
-Ny = chord * 16
+diameter = 40      # [lattice units]
+Nx = diameter * 25
+Ny = diameter * 20
 # Nz = 3
 
-center_x = Nx // 4  # Located at 25% from inlet
+center_x = Nx // 5  # Located at 25% from inlet
 center_y = Ny // 2  # Centered in y
 # center_z = Nz // 2
 
 MACH_INLET = 0.1
 RHO = 1.0
-RE_TGT = 1000.0
+RE_TGT = 2000.0
 
 
 # =============================================================================
@@ -21,16 +21,18 @@ RE_TGT = 1000.0
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
+    # "device_id": 0,
     "dimension": 2,
     "lattice_model": "D2Q9",
     "domain": {
         "Nx": Nx,
         "Ny": Ny,
+        # "Nz": Nz
     },
     "physics": {
         "Re": RE_TGT,
         "u_init": MACH_INLET,
-        "characteristic_length": chord
+        "characteristic_length": diameter
     },
     "time": {
         "max_steps": 100000,
@@ -40,6 +42,19 @@ simulation = {
     }
 }
 
+
+# =============================================================================
+# Boundary Conditions (Method-Based Configuration)
+# =============================================================================
+# Available methods:
+#   - 'non_equilibrium': Inlet with velocity specification (preserves f_neq)
+#   - 'equilibrium': Simple inlet (may cause mass drift)
+#   - 'characteristic': Non-reflecting open BC (outlet/far-field)
+#   - 'convective': Advective outlet
+#   - 'extrapolation': Zero-gradient outlet
+#   - 'bounce_back': Half-way bounce-back wall
+#   - 'periodic': No BC (handled by streaming)
+#
 
 boundaries = {
     "inlet": {"location": "xmin", 
@@ -54,20 +69,30 @@ boundaries = {
     "ymax": {"location": "ymax", 
                "method": "pressure_relaxation", 
                "rho": RHO, "k":0.1},
+    # "zmin": {"location": "zmin", 
+    #          "method": "pressure_relaxation", 
+    #          "rho": RHO, "k": 0.3},
+    # "zmax": {"location": "zmax", 
+    #          "method": "pressure_relaxation", 
+    #          "rho": RHO, "k": 0.3},
 }
 
 # =============================================================================
 # Internal Geometry (Obstacle)
 # =============================================================================
 internal_geometry = {
-    "airfoil": {
+    "cylinder": {
         "enabled": True,
-        "naca": "0012",
-        "chord": chord,
-        "angle_of_attack": -10.0,
         "center": (center_x, center_y),
-        "num_points": 150,
-    }
+        "radius": diameter // 2,
+        "axis": "z",
+        # "axis_range": (0, Nz - 1)
+    },
+    # "sphere": {
+    #     "enabled": False,
+    #     "center": (center_x, center_y, center_z),
+    #     "radius": diameter // 2
+    # }
 }
 
 
@@ -120,10 +145,12 @@ conservation = {
             "name": "obstacle_region",
             "enabled": True,
             "bounds": {
-                "xmin": center_x - 3 * chord,
-                "xmax": center_x + 5 * chord,
-                "ymin": center_y - 2 * chord,
-                "ymax": center_y + 2 * chord,
+                "xmin": center_x - 3 * diameter,
+                "xmax": center_x + 5 * diameter,
+                "ymin": center_y - 2 * diameter,
+                "ymax": center_y + 2 * diameter,
+                # "zmin": 0,
+                # "zmax": Nz - 1,
             }
         },
         
@@ -132,10 +159,12 @@ conservation = {
             "name": "wake_region",
             "enabled": True,
             "bounds": {
-                "xmin": center_x + chord,
-                "xmax": center_x + 10 * chord,
-                "ymin": center_y - 2 * chord,
-                "ymax": center_y + 2 * chord,
+                "xmin": center_x + diameter,
+                "xmax": center_x + 10 * diameter,
+                "ymin": center_y - 2 * diameter,
+                "ymax": center_y + 2 * diameter,
+                # "zmin": 0,
+                # "zmax": Nz - 1,
             }
         },
     ],
@@ -220,7 +249,7 @@ force_calculation = {
     "reference": {
         "rho": RHO,                    # Reference density [dimensionless]
         "velocity": MACH_INLET,        # Reference velocity [Δx/Δt]
-        "char_length": chord,       # Characteristic length D [Δx]
+        "char_length": diameter,       # Characteristic length D [Δx]
         "span_length": 1,             # Span length Lz [Δx] (for 2D: Nz)
     },
     
@@ -234,9 +263,9 @@ force_calculation = {
 # =============================================================================
 # Output Configuration
 # =============================================================================
-d_str = str(int(chord))
+d_str = str(int(diameter))
 re_str = str(int(RE_TGT))
-folder_name = f"result_c{d_str}_Re{re_str}"
+folder_name = f"result_D{d_str}_Re{re_str}"
 
 output = {
     "output_dir": f"./{folder_name}/vtk",
@@ -255,14 +284,14 @@ output = {
         "enabled": True,
         "keep_last_n": 3
     },
-    # "probes": {
-    #     "enabled": True,
-    #     "force_on_obstacle": True,    # Compute drag/lift
-    #     "wake_probes": [              # Velocity probes for Strouhal
-    #         (center_x + 2 * chord, center_y),# center_z),
-    #         (center_x + 5 * chord, center_y),# center_z)
-    #     ]
-    # }
+    "probes": {
+        "enabled": True,
+        "force_on_obstacle": True,    # Compute drag/lift
+        "wake_probes": [              # Velocity probes for Strouhal
+            (center_x + 2 * diameter, center_y),# center_z),
+            (center_x + 5 * diameter, center_y),# center_z)
+        ]
+    }
 }
 
 

@@ -31,12 +31,7 @@ from src.boundary.base import (
 from src.boundary.wall import HalfwayBounceBack
 from src.boundary.domain_wall import DomainWallManager
 
-from src.boundary.geometry import (
-    create_cylinder_mask, 
-    create_sphere_mask, 
-    create_circle_mask,
-    get_geometry_info
-)
+from src.boundary.geometry_manager import create_geometry_mask, validate_geometry_config
 
 # =============================================================================
 # Utilities
@@ -226,66 +221,21 @@ def main():
 
     # Internal obstacle
     internal_geom = config_loader.config.get('internal_geometry', {})
+    is_valid, msg = validate_geometry_config(internal_geom, domain_shape, lattice.dim)
+    if not is_valid:
+        raise ValueError(f"Invalid geometry configuration: {msg}")
     
-    # Check for cylinder first, then sphere
-    cylinder_config = internal_geom.get('cylinder', {})
-    circle_config = internal_geom.get('circle', {})  # NEW: 2D circle
-    sphere_config = internal_geom.get('sphere', {})
-    
-    if lattice.dim == 2:
-        # 2D: Use circle (or cylinder interpreted as circle)
-        if circle_config.get('enabled', False) or cylinder_config.get('enabled', False):
-            # Get config from circle or cylinder
-            geom_config = circle_config if circle_config.get('enabled', False) else cylinder_config
-            center = geom_config.get('center', (Nx//5, Ny//2))
-            radius = geom_config.get('radius', char_length//2)
-            
-            mask = create_circle_mask(xp, domain_shape, center=center, radius=radius)
-            obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-            print(f"  Internal Obstacle (Circle, 2D):")
-            print(f"    center={center}, R={radius}")
-            print(f"    {obstacle_bc.get_info()}")
-        else:
-            mask = xp.zeros(domain_shape, dtype=bool)
-            obstacle_bc = None
-            print("  Internal Obstacle: (none)")
+    mask, geom_info = create_geometry_mask(
+        xp, lattice, domain_shape, 
+        internal_geom, 
+        characteristic_length=char_length,
+        verbose=True
+    )
+
+    if geom_info['type'] != 'none':
+        obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
     else:
-        # 3D: Use cylinder or sphere
-        if cylinder_config.get('enabled', False):
-            center = cylinder_config.get('center', (Nx//5, Ny//2))
-            radius = cylinder_config.get('radius', char_length//2)
-            axis = cylinder_config.get('axis', 'z')
-            axis_range = cylinder_config.get('axis_range', (0, Nz-1))
-            
-            mask = create_cylinder_mask(
-                xp, domain_shape,
-                center=center,
-                radius=radius,
-                axis=axis,
-                axis_range=axis_range
-            )
-            obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-            print(f"  Internal Obstacle (Cylinder):")
-            print(f"    center={center}, R={radius}, axis={axis}")
-            print(f"    {obstacle_bc.get_info()}")
-            
-        elif sphere_config.get('enabled', False):
-            center = sphere_config.get('center', (Nx//5, Ny//2, Nz//2))
-            radius = sphere_config.get('radius', char_length//2)
-            
-            mask = create_sphere_mask(
-                xp, domain_shape,
-                center=center,
-                radius=radius
-            )
-            obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-            print(f"  Internal Obstacle (Sphere):")
-            print(f"    center={center}, R={radius}")
-            print(f"    {obstacle_bc.get_info()}")
-        else:
-            mask = xp.zeros(domain_shape, dtype=bool)
-            obstacle_bc = None
-            print("  Internal Obstacle: (none)")
+        obstacle_bc = None
 
     solid_mask_np = mask.get() if hasattr(mask, 'get') else mask
 
