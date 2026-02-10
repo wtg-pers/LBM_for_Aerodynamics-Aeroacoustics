@@ -42,4 +42,6 @@ __all__ = [
     'load_airfoil_from_csv', 'load_airfoil_sections_from_csv',
     'create_flat_plate_polar', 'create_naca0012_polar',
     'create_nrel_s826_database',
+    # Blade geometry
+    'Blade', 'BladeSection',
 ]
