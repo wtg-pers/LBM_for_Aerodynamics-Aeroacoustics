@@ -9,6 +9,7 @@
 !main.py
 !.gitignore
 !README.md
+!**Zone.Identifier
 
 # 4. 제외된 디렉토리 내부의 모든 파일은 다시 허용
 !configs/**

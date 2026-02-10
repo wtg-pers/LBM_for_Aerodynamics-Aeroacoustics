@@ -2,7 +2,7 @@
 # Domain Configuration
 # =============================================================================
 # Cylinder parameters
-chord = 100      # [lattice units]
+chord = 20      # [lattice units]
 Nx = chord * 25
 Ny = chord * 16
 # Nz = 3
@@ -33,7 +33,7 @@ simulation = {
         "characteristic_length": chord
     },
     "time": {
-        "max_steps": 100000,
+        "max_steps": 10000,
         "output_interval": 100,
         "checkpoint_interval": 5000,
         "probe_interval": 10                  # Force/probe sampling
@@ -249,7 +249,7 @@ output = {
         "enabled": True,
         "precision": "float32",
         "compression_level": 6,
-        "variables": ["density", "pressure", "velocity", "velocity_magnitude", "solid_mask"]
+        "variables": ["density", "velocity", "solid_mask"]  # pressure: density/3
     },
     "checkpoint": {
         "enabled": True,

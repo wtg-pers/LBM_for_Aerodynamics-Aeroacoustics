@@ -12,6 +12,7 @@ from src.equilibrium.equilibrium import Maxwellian
 from src.macroscopic.compute import Macroscopic
 from src.collision.bgk import BGK
 from src.streaming.stream import StreamingPull
+from src.forcing import GuoForcing, get_forcing_scheme
 
 # =============================================================================
 # I/O Modules
@@ -304,6 +305,10 @@ def main():
     eq = Maxwellian(xp, lattice, domain)
     macro = Macroscopic(xp, lattice)
     collision = BGK(xp)
+
+    forcing_scheme = GuoForcing(xp, lattice)
+    body_force = None  # shape: (dim, Nx, Ny[, Nz]) when active [lattice force units]
+
     
     # =========================================================================
     # Initial Condition
@@ -492,14 +497,20 @@ def main():
 
         # Step 2: Compute Equilibrium Distribution
         f_eq = eq.compute(rho, u)
+
+        # step 3: Compute Forcing Source Term
+        if body_force is not None:
+            S_i = forcing_scheme.compute_source_term(body_force, rho, u, tau)
+        else:
+            S_i = None
         
-        # Step 3: Collision (BGK)
+        # Step 4: Collision (BGK)
         f_post[:] = collision.collide(f_old, f_eq, tau)
 
-        # Step 4: Streaming (Pull scheme)
+        # Step 5: Streaming (Pull scheme)
         streaming.compute(f_post, f_new)
 
-        # Step 5: Boundary Conditions
+        # Step 6: Boundary Conditions
         if domain_walls is not None:
             domain_walls.apply_all(f_new, f_post)
         bc_manager.apply_all(f_new)

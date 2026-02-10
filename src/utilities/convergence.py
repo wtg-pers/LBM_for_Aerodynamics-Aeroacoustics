@@ -581,7 +581,7 @@ class ConvergenceMonitor:
                       feed_interval: int, window_samples: int,
                       n_required: int) -> None:
         """Print initialization summary."""
-        path = "B (Cd-based, SU2 Cauchy)" if self.has_obstacle \
+        path = "B (Cd-based, Cauchy)" if self.has_obstacle \
                else "A (Energy-based, Palabos Cauchy)"
         fill_steps = window_samples * feed_interval
         
