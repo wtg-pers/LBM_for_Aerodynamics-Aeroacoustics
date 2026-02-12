@@ -1,69 +1,141 @@
 # =============================================================================
-# LBM Solver — General Purpose Configuration
+# LBM Solver — Hover Rotor Configuration (NTNU BT1)
 # =============================================================================
 #
-# This config supports all simulation types:
-#   - External flow (cylinder, airfoil)  → internal_geometry + force_calculation
-#   - Channel flow (Poiseuille)          → wall BCs, no obstacle
-#   - Wind turbine (AL)                  → actuator_line.enabled = True
+# Actuator Line Model test case: hovering rotor in quiescent air.
+# Ground effect included (Zmin = wall).
 #
 # Usage:
-#   python main.py --config configs/input_config.py
-#   python main.py --config configs/input_config.py --max-steps 5000
+#   python main.py --config configs/hover_config.py
+#   python main.py --config configs/hover_config.py --max-steps 5000
 #
-# Available BC Methods (DomainBCManager):
-# ──────────────────────────────────────────────────────────────────────
-#   Velocity Inlet:   'regularized_inlet' (reg_inlet), 'equilibrium' (eq)
-#   Pressure Outlet:  'regularized_outlet' (reg_outlet)
-#   Domain Wall:      'regularized_wall' (reg_wall), 'bounce_back' (hwbb)
-#   Zero-Gradient:    'neumann' (zero_gradient)
-#   Sponge Layer:     'sponge' (sponge_layer)
-#   Periodic:         'periodic' (or omit from config)
-# ──────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Parameter Derivation
+# =============================================================================
+#
+# Physical:
+#   Rotor D = 0.894 m,  R = 0.447 m,  3 × NREL S826 blades
+#   c_75 = 0.035 m            (75% span chord, BEM Re characteristic length)
+#   ω = 134.23 rad/s          (TSR=6 × U=10 / R)
+#   V_tip = 60.00 m/s
+#   ν_air = 1.5e-5 m²/s
+#
+# Grid (D/Δx = 40):
+#   Δx = D / 40 = 0.02235 m
+#   c_75/Δx = 1.57 lu         (chord not resolved — expected for ALM)
+#   R/Δx = 20.0 lu
+#
+# Lattice (Ma_tip = 0.05):
+#   V_tip_lu = 0.05 Δx/Δt
+#   Δt = V_tip_lu × Δx / V_tip = 1.8625e-05 s
+#   ω_lu = ω × Δt = 0.002500 rad/lt
+#   1 revolution = 2π / ω_lu ≈ 2513 steps
+#
+# Viscosity (τ = 0.55):
+#   ν_lu = (τ − 0.5) / 3 = 0.01667 lu²/lt     → wake diffusion (Grid Re)
+#   Re_D,grid = V_tip_lu × D_lu / ν_lu = 120   → wake retained ~2D downstream
+#   Note: BEM Re uses ν_air = 1.5e-5 separately → Re_c ≈ 105,000
+#
+# Domain (3D × 3D × 4D):
+#   120 × 120 × 160 = 2,304,000 cells (2.3M)
+#   Hub at 65% height → 2.6D below (wake + ground), 1.4D above (clearance)
+#
+# Force Spreading:
+#   ε = max(c/4, 2Δx) = 2.0 lu for all markers (lower bound dominates)
+#
+# =============================================================================
+
+import numpy as np
 
 # =============================================================================
-# Geometry & Domain Configuration
+# §1. Physical Parameters
 # =============================================================================
-# L: characteristic length — the single reference scale for the simulation.
-#    cylinder → diameter,  airfoil → chord,  sphere → diameter, etc.
-#    All spatial dimensions are expressed in multiples of L.
-L = 100              # [lu] characteristic length
-
-Nx = L * 25         # [lu] streamwise
-Ny = L * 16         # [lu] crosswise
-# Nz = 3            # [lu] spanwise (uncomment for 3D)
-
-center_x = Nx // 4  # [lu] obstacle at 25% from inlet
-center_y = Ny // 2  # [lu] centered in y
-# center_z = Nz // 2
-
-U_INF = 0.1          # [Δx/Δt] freestream velocity (≡ lattice Mach number)
-RHO = 1.0            # [dimensionless] reference density
-RE = 1000.0          # [dimensionless] Reynolds number = U_INF * L / ν
-
+D_PHYS    = 0.894          # [m]     rotor diameter
+R_PHYS    = D_PHYS / 2     # [m]     rotor radius
+C_75_PHYS = 0.035          # [m]     75% span chord (char. length for BEM Re)
+OMEGA     = 134.23         # [rad/s] angular velocity (= TSR × U∞ / R)
+V_TIP     = OMEGA * R_PHYS # [m/s]   tip speed = 60.00 m/s
+NU_AIR    = 1.5e-5         # [m²/s]  kinematic viscosity of air at ~20°C
+U_INF = 10.0                # [m/s] Freestream velocity
+RHO_PHYS = 1.205            # [kg/m³] Air density at 20°C
+NU_PHYS = 1.512e-5          # [m²/s] Kinematic viscosity at 20°C
+TSR = 6.0                   # [dimensionless] Tip speed ratio (design)
 
 # =============================================================================
-# Simulation Parameters
+# §2. Grid Resolution
+# =============================================================================
+D_PER_DX  = 40             # [dimensionless] D / Δx
+DX_PHYS   = D_PHYS / D_PER_DX  # [m/lu] = 0.02235 m
+
+# =============================================================================
+# §3. Lattice Scaling
+# =============================================================================
+MA_TIP    = 0.05                           # [dimensionless] lattice Mach at tip
+V_TIP_LU  = MA_TIP                         # [Δx/Δt]
+DT_PHYS   = V_TIP_LU * DX_PHYS / V_TIP    # [s/lt] = 1.8625e-05 s
+
+# Relaxation time → grid viscosity (wake diffusion control)
+TAU       = 0.55                           # [dimensionless]
+NU_LU     = (TAU - 0.5) / 3               # [lu²/lt] = 0.01667
+
+# =============================================================================
+# §4. Domain
+# =============================================================================
+Nx = 4 * D_PER_DX    # 120 [lu]  — 3D streamwise (X-Y plane for hover)
+Ny = 3 * D_PER_DX    # 120 [lu]  — 3D crosswise
+Nz = 3 * D_PER_DX    # 160 [lu]  — 4D vertical (wake + ground)
+
+# Hub position: centered in X-Y, 65% height in Z
+HUB_X = int(Nx * 0.65)      # 60 [lu]
+HUB_Y = Ny // 2      # 60 [lu]
+HUB_Z = Nz // 2  # 104 [lu] — 2.6D below (ground + wake), 1.4D above
+
+# Physical hub (for Rotor factory)
+HUB_PHYS = (HUB_X * DX_PHYS, HUB_Y * DX_PHYS, HUB_Z * DX_PHYS)  # [m]
+
+# =============================================================================
+# §5. Derived Quantities (for reference / assertions)
+# =============================================================================
+_OMEGA_LU      = OMEGA * DT_PHYS         # [rad/lt] = 0.002500
+_STEPS_PER_REV = int(2 * np.pi / _OMEGA_LU)  # ≈ 2513
+_RE_D_GRID     = V_TIP_LU * D_PER_DX / NU_LU  # ≈ 120
+_RE_C_PHYS     = V_TIP * C_75_PHYS / NU_AIR    # ≈ 140,000
+
+# ── Characteristic length is c_75 in lattice units ──
+# Used for Re definition in physics config:
+#   Re = u_init × CHAR_LENGTH / ν → ν = u_init × CHAR_LENGTH / Re
+# But for hover, this is secondary — τ directly controls ν_lu.
+CHAR_LENGTH_LU = C_75_PHYS / DX_PHYS     # [lu] ≈ 1.57
+
+# Re defined so that ν_lu = (τ-0.5)/3 is consistent:
+#   ν_lu = u_init × CHAR_LENGTH / Re  →  Re = u_init × CHAR_LENGTH / ν_lu
+# Here u_init is the reference velocity for ν derivation.
+# For hover: use V_tip_lu as reference velocity.
+RE = V_TIP_LU * CHAR_LENGTH_LU / NU_LU   # ≈ 4.7 (Grid Re based on c_75)
+# Note: This is the "grid Re" on c_75 scale. The BEM Re (~105k) is separate.
+
+# =============================================================================
+# §6. Config Assembly
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
-    "dimension": 2,
-    "lattice_model": "D2Q9",
+    "dimension": 3,
+    "lattice_model": "D3Q27",
     "domain": {
         "Nx": Nx,
         "Ny": Ny,
-        # "Nz": Nz,                       # uncomment for 3D
+        "Nz": Nz,
     },
     "physics": {
-        "Re": RE,                           # [dimensionless]
-        "u_init": U_INF,                    # [Δx/Δt] freestream / initial velocity
-        # "u_ref": U_INF,                   # [Δx/Δt] override for Re calc (default = u_init)
-        "characteristic_length": L,         # [Δx] for Re = u_ref * L / ν
+        "Re": RE,                           # [dimensionless] grid Re (→ ν_lu → τ)
+        "u_init": V_TIP_LU,                # [Δx/Δt] reference velocity for ν calc
+        "initial_flow_velocity": 0.0,       # [Δx/Δt] IC = quiescent air (hover)
+        "characteristic_length": CHAR_LENGTH_LU,  # [lu] c_75 in lattice
     },
     "time": {
-        "max_steps": 100000,
-        "output_interval": 100,
-        "checkpoint_interval": 5000,
+        "max_steps": _STEPS_PER_REV * 40,   # 5 revolutions ≈ 12,565 steps
+        "output_interval": _STEPS_PER_REV // 360,   # ~5 outputs per rev
+        "checkpoint_interval": _STEPS_PER_REV * 2, # every 2 revs
         "probe_interval": 10,               # [steps] force/probe sampling
     }
 }
@@ -72,177 +144,93 @@ simulation = {
 # =============================================================================
 # Boundary Conditions
 # =============================================================================
-# External flow (eq + neumann): Latt et al. 2020 style
-#   3-face Dirichlet + outlet Neumann → automatic mass conservation
+# Hover rotor:
+#   Zmin = ground wall (ground effect)
+#   Zmax = open (pressure relaxation, quiescent ρ=1.0)
+#   X/Y faces = open (pressure relaxation, quiescent ρ=1.0)
+#
+# No freestream velocity — rotor induces all flow.
 boundaries = {
-    "inlet":  {"location": "xmin", "method": "equilibrium",  "velocity": U_INF},
-    "outlet": {"location": "xmax", "method": "neumann"},
-    "south":  {"location": "ymin", "method": "equilibrium",  "velocity": U_INF},
-    "north":  {"location": "ymax", "method": "equilibrium",  "velocity": U_INF},
+    "ground":  {"location": "xmax", "method": "regularized_wall"},
+    "top":     {"location": "xmin", "method": "regularized_outlet",
+                "density": 1.0},
+    "zmin":    {"location": "zmin", "method": "regularized_outlet",
+                "density": 1.0},
+    "zmax":    {"location": "zmax", "method": "regularized_outlet",
+                "density": 1.0},
+    "ymin":    {"location": "ymin", "method": "regularized_outlet",
+                "density": 1.0},
+    "ymax":    {"location": "ymax", "method": "regularized_outlet",
+                "density": 1.0},
 }
 
-# ── Alternative BC sets (uncomment one block) ──
-#
-# Regularized set (best accuracy for channel / external flow):
-# boundaries = {
-#     "inlet":  {"location": "xmin", "method": "regularized_inlet",
-#                "velocity": U_INF, "rho": RHO},
-#     "outlet": {"location": "xmax", "method": "regularized_outlet",
-#                "rho": RHO, "k": 0.1},
-#     "south":  {"location": "ymin", "method": "regularized_outlet",
-#                "rho": RHO, "k": 0.1},
-#     "north":  {"location": "ymax", "method": "regularized_outlet",
-#                "rho": RHO, "k": 0.1},
-# }
-#
-# Channel flow (walls + inlet/outlet):
-# boundaries = {
-#     "inlet":  {"location": "xmin", "method": "regularized_inlet",
-#                "velocity": U_INF, "rho": RHO},
-#     "outlet": {"location": "xmax", "method": "regularized_outlet",
-#                "rho": RHO, "k": 0.1},
-#     "south":  {"location": "ymin", "method": "regularized_wall"},
-#     "north":  {"location": "ymax", "method": "regularized_wall"},
-# }
+
+# =============================================================================
+# Internal Geometry (none for hover — body force only)
+# =============================================================================
+internal_geometry = {}
 
 
 # =============================================================================
-# Internal Geometry (Obstacle)
+# Actuator Line Model
 # =============================================================================
-# Each geometry type interprets L as its own reference scale:
-#   cylinder → L = diameter
-#   airfoil  → L = chord
-#   sphere   → L = diameter
-#
-# Only one geometry should be enabled at a time.
-
-internal_geometry = {
-    "airfoil": {
-        "enabled": True,
-        "naca": "0012",
-        "chord": L,                         # [Δx] = L
-        "angle_of_attack": -28.0,           # [degrees]
-        "center": (center_x, center_y),     # [Δx, Δx]
-        "num_points": 150,
-    }
-}
-
-# internal_geometry = {
-#     "cylinder": {
-#         "enabled": True,
-#         "center": (center_x, center_y),   # [Δx, Δx]
-#         "diameter": L,                     # [Δx] = L
-#     }
-# }
-
-# internal_geometry = {
-#     "sphere": {
-#         "enabled": True,
-#         "center": (center_x, center_y, center_z),   # [Δx, Δx, Δx]
-#         "diameter": L,                               # [Δx] = L
-#     }
-# }
-
-# No obstacle (channel flow or pure AL simulation):
-# internal_geometry = {}
-
-
-# =============================================================================
-# Actuator Line Configuration (disabled — template for wind turbine sims)
-# =============================================================================
-# To enable: set "enabled": True and configure rotor/units.
-# Requires 3D domain (D3Q27) with physical unit conversion.
-#
-# See configs/NTNU_BT1_config.py for a complete working example.
 actuator_line = {
-    "enabled": False,
+    "enabled": True,
 
     # --- Rotor ---
-    # "rotor": {
-    #     "preset": "ntnu_bt1",               # predefined blade geometry
-    #     "tsr": 6.0,                          # [dimensionless] tip speed ratio
-    #     "u_inf": 10.0,                       # [m/s] freestream for ω calc
-    #     "hub_center": [3.66, 1.341, 0.817],  # [m] physical coordinates
-    #     "resolution": 32,                     # [dimensionless] D/Δx
-    #     "theta_0": 0.0,                       # [rad] initial azimuth
-    # },
+    "rotor": {
+        "preset": "ntnu_bt1",
+        "tsr": TSR,                     # [dimensionless]
+        "u_inf": U_INF,                 # [m/s] for ω calculation
+        "hub_center": [HUB_X, HUB_Y, HUB_Z],  # [m] physical coordinates
+        "resolution": 40,       # [dimensionless] D/Δx
+        "theta_0": 0.0,                # [rad] initial azimuth
+    },
 
     # --- Physical → Lattice unit conversion ---
-    # "units": {
-    #     "dx_phys": 0.02794,                  # [m/lu]
-    #     "dt_phys": 4.19e-5,                  # [s/lt]
-    # },
+    "units": {
+        "dx_phys": DX_PHYS,            # [m/lu]
+        "dt_phys": DT_PHYS,            # [s/lt]
+        "nu_phys": NU_PHYS,
+    },
 
     # --- Gaussian regularization (Eq. 13) ---
-    # "gaussian_cutoff": 3.0,                  # [dimensionless] cutoff at n_cut × ε
-    # "rho_ref": 1.0,                          # [dimensionless]
+    #   ε = max(c_a/4, 2Δx), cutoff at n_cut × ε
+    "gaussian_cutoff": 3.0,         # [dimensionless]
+
+    # Reference density for force non-dimensionalization
+    "rho_ref": 1.0,                 # [dimensionless]
 }
 
 
 # =============================================================================
-# Conservation Check Configuration
+# Conservation & Convergence
 # =============================================================================
 conservation = {
     "enabled": True,
-    "check_interval": 1000,                 # [steps] 0 = use output_interval
-    "verbose": 0,                           # 0: silent, 1: summary, 2: detailed
+    "check_interval": _STEPS_PER_REV // 2,  # twice per revolution
+    "verbose": 1,
     "log_to_csv": True,
-
     "tolerance": {
-        "mass_drift_percent": 1.0,          # [%] warning threshold
+        "mass_drift_percent": 2.0,           # [%] hover may have larger drift
         "warn_on_exceed": True,
     },
-
-    "domain": {
-        "enabled": True,
-    },
-
-    "control_volumes": [
-        {
-            "name": "obstacle_region",
-            "enabled": True,
-            "bounds": {
-                "xmin": center_x - 3 * L,
-                "xmax": center_x + 5 * L,
-                "ymin": center_y - 2 * L,
-                "ymax": center_y + 2 * L,
-            }
-        },
-        {
-            "name": "wake_region",
-            "enabled": True,
-            "bounds": {
-                "xmin": center_x + L,
-                "xmax": center_x + 10 * L,
-                "ymin": center_y - 2 * L,
-                "ymax": center_y + 2 * L,
-            }
-        },
-    ],
+    "domain": {"enabled": True},
+    "control_volumes": [],                   # no obstacle-based CV
 }
 
-
-# =============================================================================
-# Convergence Detection (Cauchy Criterion)
-# =============================================================================
-# Cauchy convergence: |μ_new - μ_old| / |μ_old| < ε
-#   Path A (no obstacle): Cauchy(avg_energy) < ε
-#   Path B (with obstacle): Cauchy(Cd) < ε_Cd
 convergence = {
     "enabled": True,
-
     "cauchy": {
-        "window_size": "auto",
-        "epsilon": 1e-5,                    # [dimensionless] avg kinetic energy
-        "Cd_epsilon": 1e-3,                 # [dimensionless] drag coefficient
+        "window_size": _STEPS_PER_REV * 2,  # 2 revolutions
+        "epsilon": 1e-4,                     # [dimensionless] avg kinetic energy
+        "Cd_epsilon": 1e-2,                  # relaxed (no Cd in hover)
         "n_required": 2,
-
         "auto_window": {
-            "time_coverage": 10.0,          # [T_conv] window span (default: 50)
-            "min_samples": 100,
+            "time_coverage": 2.0,            # [T_conv] (revolutions)
+            "min_samples": 50,
         },
     },
-
     "on_converged": "checkpoint_and_stop",
     "on_max_steps": "warn",
     "on_diverged": "stop_with_checkpoint",
@@ -250,79 +238,28 @@ convergence = {
 
 
 # =============================================================================
-# Force Calculation (Momentum Exchange Method)
+# Force Calculation (disabled — no solid body)
 # =============================================================================
 force_calculation = {
-    "enabled": True,
-    "interval": 10,                         # [steps]
-    "start_step": 100,                      # [steps] skip initial transient
-
-    "reference": {
-        "rho": RHO,                         # [dimensionless]
-        "velocity": U_INF,                  # [Δx/Δt]
-        "char_length": L,                   # [Δx]
-        "span_length": 1,                   # [Δx] (2D: 1, 3D: Nz)
-    },
-
-    "log": {
-        "enabled": True,
-        "filename": "force_history",
-    },
+    "enabled": False,
 }
 
 
 # =============================================================================
-# Output — Auto-generated folder name
+# Output
 # =============================================================================
-# Naming convention:
-#   result_{geometry}[_ALM]_L{L}_Re{Re}
-#
-# Examples:
-#   result_naca0012_L20_Re1000
-#   result_naca0012_ALM_L20_Re50
-#   result_cylinder_L40_Re100
-#   result_none_ALM_L32_Re200
-
-def _make_folder_name(geom_cfg, al_cfg, L_val, Re_val):
-    """Generate output folder name from config (config-internal helper)."""
-    # --- Obstacle tag ---
-    tag = "none"
-    for geom_type, geom_params in geom_cfg.items():
-        if not geom_params.get("enabled", False):
-            continue
-        if geom_type == "airfoil":
-            naca = geom_params.get("naca", "airfoil")
-            tag = f"naca{naca}"             # → "naca0012"
-        elif geom_type == "cylinder":
-            tag = "cylinder"
-        elif geom_type == "sphere":
-            tag = "sphere"
-        else:
-            tag = geom_type                 # user-defined name
-        break                               # first enabled geometry wins
-
-    # --- AL tag ---
-    al_tag = "_ALM" if al_cfg.get("enabled", False) else ""
-
-    # --- Re: int if whole, else float ---
-    Re_str = str(int(Re_val)) if Re_val == int(Re_val) else f"{Re_val:.1f}"
-
-    return f"result_{tag}{al_tag}_L{int(L_val)}_Re{Re_str}"
-
-folder_name = _make_folder_name(internal_geometry, actuator_line, L, RE)
+_folder = f"result_hover_ALM_D{D_PER_DX}_tau{TAU:.2f}"
 
 output = {
-    "output_dir": f"./{folder_name}/vtk",
-    "checkpoint_dir": f"./{folder_name}/checkpoints",
-    "csv_dir": f"./{folder_name}/csv",
-
+    "output_dir": f"./{_folder}/vtk",
+    "checkpoint_dir": f"./{_folder}/checkpoints",
+    "csv_dir": f"./{_folder}/csv",
     "clear_previous": True,
-
     "vtk": {
         "enabled": True,
         "precision": "float32",
         "compression_level": 6,
-        "variables": ["density", "velocity", "solid_mask"],
+        "variables": ["density", "velocity"],
     },
     "checkpoint": {
         "enabled": True,

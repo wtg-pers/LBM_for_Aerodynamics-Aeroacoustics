@@ -329,14 +329,24 @@ def main():
     else:
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")
         
+        # Initial flow velocity:
+        #   - Default: u_init (used as reference velocity for ν calculation)
+        #   - Override: initial_flow_velocity (e.g., 0.0 for hover/quiescent)
+        flow_vel = physics_config.get('initial_flow_velocity', u_init)
+        
         if lattice.dim == 2:
             rho0 = xp.ones((Nx, Ny), dtype=xp.float64)
             u0 = xp.zeros((2, Nx, Ny), dtype=xp.float64)
-            u0[0] = u_init  # x-velocity  [Δx/Δt]
+            u0[0] = flow_vel  # x-velocity  [Δx/Δt]
         else:
             rho0 = xp.ones((Nx, Ny, Nz), dtype=xp.float64)
             u0 = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64)
-            u0[0] = u_init  # x-velocity  [Δx/Δt]
+            u0[0] = flow_vel  # x-velocity  [Δx/Δt]
+        
+        if flow_vel != u_init:
+            print(f"  Initial velocity: {flow_vel} [Δx/Δt] (u_init={u_init} used for ν only)")
+        else:
+            print(f"  Initial velocity: {flow_vel} [Δx/Δt]")
         
         f_old = eq.compute(rho0, u0)
         print(f"  Initial total mass: {float(xp.sum(f_old)):.6f}")
