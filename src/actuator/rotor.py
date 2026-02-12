@@ -12,38 +12,27 @@ the Actuator Line (AL) model, responsible for:
 
 Physical Model:
 ===============
-A horizontal-axis wind turbine rotor with N_b blades. Each blade is
-represented by a line of marker particles (see blade.py). The rotor
-rotates at angular velocity ω about the hub center.
+A wind turbine rotor with N_b blades. Each blade is represented by a line
+of marker particles (see blade.py). The rotor rotates at angular velocity
+ω about the hub center.
 
     Azimuth angle for blade k at time t:
-        θ_k(t) = θ_0 + ω·t + 2πk/N_b     [rad]        (*)
-
-    where:
-        θ_0:   Initial azimuth of blade 0   [rad]
-        ω:     Angular velocity              [rad/s]
-        N_b:   Number of blades              [dimensionless]
+        θ_k(t) = θ_0 + ω·t + 2πk/N_b     [rad]
 
     Angular velocity from operating conditions:
-        ω = TSR · U_∞ / R                   [rad/s]
+        ω = TSR · U_∞ / R                 [rad/s]
 
-    where:
-        TSR:   Tip speed ratio               [dimensionless]
-        U_∞:   Freestream velocity           [m/s]
-        R:     Rotor radius (= r_tip)        [m]
+Coordinate System Support:
+==========================
+This module now supports arbitrary rotation axes via RotorCoordinateSystem.
 
-Coordinate Convention (Watanabe et al., Fig. 2):
-=================================================
-    Global: (x, y, z) — x: streamwise, y: spanwise, z: vertical up
-    Hub center: (x_hub, y_hub, z_hub) in global coordinates
+    Presets:
+        - "hawt_x":  Standard HAWT, rotation about X-axis (Watanabe et al.)
+        - "hawt_z":  HAWT with vertical tower, rotation about Z-axis
+        - "vawt":    Vertical-axis wind turbine
+        - "custom":  User-defined rotation axis
 
-    θ = 0:  blade points in +y direction (horizontal right)
-    θ = π/2: blade points in +z direction (vertical up)
-    Rotation: CCW when viewed from upstream (+x direction)
-
-    For NTNU BT1:
-        Hub center = (3.66, 1.341, 0.817) m   (paper Fig. 2)
-        Hub height above floor = 0.817 m
+    The coordinate system is automatically propagated to all blades.
 
 Data Flow in AL Simulation:
 ============================
@@ -78,6 +67,11 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
 from .blade import Blade, BladeSection
+from .coordinates import (
+    RotorCoordinateSystem, 
+    RotorAxisPreset,
+    create_coordinate_system
+)
 
 
 # =============================================================================
@@ -93,25 +87,35 @@ class Rotor:
     Physical Process:
     =================
     1. User creates a prototype Blade (geometry definition)
-    2. Rotor replicates it N_b times with azimuthal offsets 2πk/N_b
-    3. Each timestep: advance θ_k, compute marker positions, aggregate forces
-    4. The rotor provides a unified interface for the actuator_line controller
+    2. Rotor creates a RotorCoordinateSystem and assigns it to all blades
+    3. Rotor replicates blade N_b times with azimuthal offsets 2πk/N_b
+    4. Each timestep: advance θ_k, compute marker positions, aggregate forces
+
+    Coordinate System:
+    ==================
+    The rotor manages a RotorCoordinateSystem that defines:
+        - Rotation axis (n̂)
+        - Hub center position
+        - Inflow direction (for wake tracking)
+        - Reference axis for θ=0
+
+    All blades share this coordinate system, ensuring consistent
+    position and force transformations.
 
     Attributes:
-        n_blades:    Number of blades                    [dimensionless]
-        blades:      List of Blade instances
-        hub_center:  Rotor center (x, y, z)              [m or lu]
-        radius:      Rotor radius R = r_tip              [m or lu]
-        omega:       Angular velocity                    [rad/s or rad/lu_time]
-        theta:       Array of current azimuth angles     [rad]
-        time:        Current simulation time              [s or lu_time]
+        n_blades:       Number of blades                   [dimensionless]
+        blades:         List of Blade instances
+        coord_system:   RotorCoordinateSystem for transformations
+        radius:         Rotor radius R = r_tip             [m or lu]
+        omega:          Angular velocity                   [rad/s or rad/lu_time]
+        theta:          Array of current azimuth angles    [rad]
+        time:           Current simulation time            [s or lu_time]
 
     Example:
-        >>> blade = Blade.from_ntnu_bt1()
         >>> rotor = Rotor.from_ntnu_bt1(tsr=6.0, u_inf=10.0)
+        >>> print(rotor.coord_system.preset)  # hawt_x
         >>> rotor.advance(dt=8.38e-6)
         >>> positions = rotor.get_all_marker_positions()
-        >>> print(positions.shape)  # (N_b * n_markers, 3)
     """
 
     def __init__(
@@ -120,12 +124,14 @@ class Rotor:
         n_blades: int,
         hub_center: Tuple[float, float, float],
         omega: float,
-        theta_0: float = 0.0
+        theta_0: float = 0.0,
+        rotation_axis: str = "hawt_x",
+        inflow_direction: Optional[Tuple[float, float, float]] = None
     ) -> None:
         """Initialize rotor from a prototype blade
 
         Creates n_blades copies of the prototype, each offset by 2π/n_blades
-        in azimuth angle.
+        in azimuth angle. Also creates and assigns a coordinate system.
 
         Physical Setup:
             θ_k(0) = θ_0 + 2πk/N_b   for k = 0, 1, ..., N_b-1
@@ -135,9 +141,13 @@ class Rotor:
             n_blades: Number of blades  [dimensionless]
             hub_center: Rotor center position (x, y, z)  [m or lu]
             omega: Angular velocity  [rad/s or rad/lu_time]
-                   Positive = CCW when viewed from upstream (+x)
+                   Positive = CCW when viewed from upstream
             theta_0: Initial azimuth of blade 0  [rad]
-                     Default 0.0 = blade 0 in +y direction
+                     Default 0.0 = blade 0 in reference direction
+            rotation_axis: Rotation axis preset or "custom"
+                           Options: "hawt_x", "hawt_z", "vawt", "custom"
+            inflow_direction: Wind approach direction (required if rotation_axis="custom")
+                              For presets, this is automatically determined.
 
         Raises:
             ValueError: If n_blades < 1 or blade has no markers
@@ -152,21 +162,39 @@ class Rotor:
             )
 
         self.n_blades: int = n_blades                         # [dimensionless]
-        self.hub_center: Tuple[float, float, float] = hub_center  # [m or lu]
         self.omega: float = omega                             # [rad/s or rad/lu_time]
         self.radius: float = blade_prototype.r_tip            # [m or lu]
 
+        # --- Create coordinate system ---
+        if rotation_axis == "custom":
+            if inflow_direction is None:
+                raise ValueError(
+                    "inflow_direction is required when rotation_axis='custom'"
+                )
+            # For custom, we need more parameters - use a default reference axis
+            # User should use the explicit constructor for full custom control
+            raise ValueError(
+                "For custom rotation axis, create RotorCoordinateSystem manually "
+                "and use Rotor.from_coordinate_system() factory method."
+            )
+        
+        self._coord_system = create_coordinate_system(
+            hub_center=hub_center,
+            preset=rotation_axis
+        )
+
         # --- Create blade copies with azimuthal offset ---
-        # θ_k(0) = θ_0 + 2πk/N_b
         delta_theta = 2.0 * np.pi / n_blades  # [rad] blade spacing
         self.theta: np.ndarray = np.array([
             theta_0 + k * delta_theta for k in range(n_blades)
         ], dtype=np.float64)  # [rad]
 
-        # Deep-copy blade for each blade slot
+        # Deep-copy blade for each blade slot and assign coordinate system
         self.blades: List[Blade] = []
         for _ in range(n_blades):
-            self.blades.append(copy.deepcopy(blade_prototype))
+            blade_copy = copy.deepcopy(blade_prototype)
+            blade_copy.coord_system = self._coord_system
+            self.blades.append(blade_copy)
 
         # --- Derived quantities ---
         self.markers_per_blade: int = blade_prototype.n_markers  # [dimensionless]
@@ -175,6 +203,39 @@ class Rotor:
         # --- Time tracking ---
         self.time: float = 0.0      # [s or lu_time]
         self.n_revolutions: float = 0.0  # [dimensionless] accumulated revolutions
+
+    # -----------------------------------------------------------------
+    # §1.0 Coordinate System Access
+    # -----------------------------------------------------------------
+
+    @property
+    def coord_system(self) -> RotorCoordinateSystem:
+        """Get the rotor coordinate system"""
+        return self._coord_system
+
+    @property
+    def hub_center(self) -> Tuple[float, float, float]:
+        """Get hub center position (for backward compatibility)
+        
+        Returns:
+            (x, y, z) hub center position
+        """
+        return tuple(self._coord_system.hub_center)
+
+    @property
+    def rotation_axis(self) -> np.ndarray:
+        """Get rotation axis unit vector"""
+        return self._coord_system.n_axis
+
+    @property
+    def inflow_direction(self) -> np.ndarray:
+        """Get inflow direction unit vector"""
+        return self._coord_system.inflow_direction
+
+    @property
+    def wake_direction(self) -> np.ndarray:
+        """Get wake propagation direction"""
+        return self._coord_system.wake_direction
 
     # -----------------------------------------------------------------
     # §1.1 Time Advancement
@@ -235,9 +296,9 @@ class Rotor:
             positions: shape (n_markers, 3) — global (x, y, z)
                        [m or lu]
         """
+        # Blade has coord_system, so no hub_center needed
         return self.blades[blade_idx].get_marker_positions(
-            theta=self.theta[blade_idx],
-            hub_center=self.hub_center
+            theta=self.theta[blade_idx]
         )  # [m or lu]
 
     def get_all_marker_positions(self) -> np.ndarray:
@@ -259,8 +320,7 @@ class Rotor:
             i_start = k * self.markers_per_blade
             i_end = i_start + self.markers_per_blade
             all_pos[i_start:i_end, :] = self.blades[k].get_marker_positions(
-                theta=self.theta[k],
-                hub_center=self.hub_center
+                theta=self.theta[k]
             )  # [m or lu]
 
         return all_pos  # [m or lu]
@@ -277,12 +337,11 @@ class Rotor:
     ) -> np.ndarray:
         """Project forces on a single blade to global frame
 
-        Uses Watanabe et al. Eq. 11-12 projection:
-            F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))
+        Uses the blade's coordinate system for projection.
 
         Args:
             blade_idx: Blade index
-            F_n:     Normal (streamwise) forces, shape (n_markers,)  [N or lu_force]
+            F_n:     Normal (axial) forces, shape (n_markers,)  [N or lu_force]
             F_theta: Tangential (rotational) forces, shape (n_markers,) [N or lu_force]
 
         Returns:
@@ -354,80 +413,54 @@ class Rotor:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Decompose global velocity into normal and tangential components
 
-        From Watanabe et al. Eq. 5:
-            u_θ = u_y · cos(θ) + u_z · sin(θ)    [m/s or lu/lt]
-
-        And the normal (streamwise) component:
-            u_n = u_x                              [m/s or lu/lt]
-
-        These are needed for the BEM force calculation (Eq. 6-8):
-            u_rel = √(u_n² + (ω·r - u_θ)²)
-            φ = atan2(u_n, ω·r - u_θ)
-            α = φ - γ
+        Uses the coordinate system's decomposition method.
 
         Args:
             blade_idx: Blade index
-            u_global: Velocity at markers, shape (n_markers, 3)
-                      — (u_x, u_y, u_z)  [m/s or lu/lt]
+            u_global: Global velocity vectors, shape (n_markers, 3)  [m/s or lu/lt]
 
         Returns:
-            (u_n, u_theta): Each shape (n_markers,)
-                u_n:     Normal (streamwise) velocity     [m/s or lu/lt]
-                u_theta: Tangential (rotational) velocity [m/s or lu/lt]
+            (u_n, u_theta): Each shape (n_markers,)  [m/s or lu/lt]
         """
-        theta = self.theta[blade_idx]     # [rad]
-        cos_t = np.cos(theta)             # [dimensionless]
-        sin_t = np.sin(theta)             # [dimensionless]
-
-        # Normal component (streamwise = x)
-        u_n = u_global[:, 0]              # [m/s or lu/lt]
-
-        # Tangential component (Eq. 5)
-        u_theta = (
-            u_global[:, 1] * cos_t +     # u_y · cos(θ)
-            u_global[:, 2] * sin_t        # u_z · sin(θ)
-        )                                  # [m/s or lu/lt]
-
-        return u_n, u_theta
+        return self._coord_system.decompose_velocity(
+            u_global=u_global,
+            theta=self.theta[blade_idx]
+        )
 
     def compute_relative_velocity(
         self,
         blade_idx: int,
         u_global: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute relative velocity, flow angle, and angle of attack
+        """Compute relative velocity components for BEM calculation
 
-        Full BEM velocity triangle (Watanabe et al. Eq. 6-8):
-
-            u_rel = √(u_n² + (ω·r - u_θ)²)       [m/s or lu/lt]   (Eq. 6)
-            φ = atan2(u_n, ω·r - u_θ)              [rad]            (Eq. 7)
-            α = φ - γ                               [rad → deg]     (Eq. 8)
-
-        where:
-            u_n:   Normal (streamwise) velocity at marker   [m/s]
-            u_θ:   Tangential (rotational) velocity at marker [m/s]
-            ω·r:   Local blade speed (solid-body rotation)  [m/s]
-            γ:     Local twist/pitch angle                  [degrees]
+        From Watanabe et al. Eq. 5-8:
+            u_rel = √(u_n² + (ω·r - u_θ)²)       [Eq. 6]
+            φ = atan2(u_n, ω·r - u_θ)            [Eq. 7]
+            α = φ - γ                             [Eq. 8]
 
         Args:
             blade_idx: Blade index
-            u_global: Velocity at markers, shape (n_markers, 3)
-                      [m/s or lu/lt]
+            u_global: Global velocity at markers, shape (n_markers, 3)  [m/s or lu/lt]
 
         Returns:
-            (u_rel, phi, alpha):
-                u_rel: Relative velocity magnitude, shape (n_markers,) [m/s or lu/lt]
-                phi:   Flow angle, shape (n_markers,)                  [degrees]
-                alpha: Angle of attack, shape (n_markers,)             [degrees]
+            (u_rel, phi_deg, alpha_deg):
+                u_rel:     Relative velocity magnitude, shape (n_markers,)  [m/s or lu/lt]
+                phi_deg:   Flow angle, shape (n_markers,)                   [degrees]
+                alpha_deg: Angle of attack, shape (n_markers,)              [degrees]
         """
         blade = self.blades[blade_idx]
-        u_n, u_theta = self.decompose_velocity(blade_idx, u_global)
 
-        # Local blade tangential speed: ω·r  [m/s or lu/lt]
+        # Decompose velocity using coordinate system
+        u_n, u_theta = self._coord_system.decompose_velocity(
+            u_global=u_global,
+            theta=self.theta[blade_idx]
+        )
+
+        # Blade rotation velocity (Eq. 6 setup)
         omega_r = self.omega * blade.marker_r  # [m/s or lu/lt]
 
-        # Relative velocity in rotational direction
-        # (ω·r - u_θ) is the velocity of the blade relative to the fluid
+        # Tangential velocity relative to blade (Eq. 6)
         u_tangential_rel = omega_r - u_theta   # [m/s or lu/lt]
 
         # Relative velocity magnitude (Eq. 6)
@@ -438,7 +471,6 @@ class Rotor:
         phi_deg = np.degrees(phi_rad)                    # [degrees]
 
         # Angle of attack (Eq. 8)  [degrees]
-        # α = φ - γ, where γ is the local twist (stored in degrees)
         alpha_deg = phi_deg - blade.marker_twist         # [degrees]
 
         return u_rel, phi_deg, alpha_deg
@@ -515,51 +547,27 @@ class Rotor:
         """Compute total rotor torque and thrust from marker forces
 
         Physical Definitions:
-            Thrust T = Σ F_n,j           [N or lu_force]    (streamwise)
+            Thrust T = Σ F_n,j           [N or lu_force]    (along rotation axis)
             Torque Q = Σ F_θ,j · r_j     [N·m or lu_torque] (about rotation axis)
 
         Only active markers contribute to these sums.
 
         Args:
-            F_n_all:     Normal forces, shape (N_b * n_markers,)  [N or lu_force]
+            F_n_all:     Normal forces, shape (N_b * n_markers,) [N or lu_force]
             F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
 
         Returns:
-            (thrust, torque):
-                thrust: Total axial (streamwise) force  [N or lu_force]
-                torque: Total torque about rotation axis [N·m or lu_torque]
+            (thrust, torque): Total rotor thrust and torque
         """
-        r_all = self.get_all_marker_radii()       # [m or lu]
-        active = self.get_all_marker_active()      # [bool]
+        active = self.get_all_marker_active()  # [bool]
+        radii = self.get_all_marker_radii()    # [m or lu]
 
-        # Sum only active markers
-        thrust = np.sum(F_n_all[active])           # [N or lu_force]
-        torque = np.sum(F_theta_all[active] * r_all[active])  # [N·m or lu_torque]
+        thrust = np.sum(F_n_all[active])                    # [N or lu_force]
+        torque = np.sum(F_theta_all[active] * radii[active])  # [N·m or lu_torque]
 
         return thrust, torque
 
-    def compute_power(
-        self,
-        F_theta_all: np.ndarray
-    ) -> float:
-        """Compute aerodynamic power from tangential forces
-
-        Physical Definition:
-            P = Q · ω = ω · Σ F_θ,j · r_j    [W or lu_power]
-
-        Args:
-            F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
-
-        Returns:
-            power: Aerodynamic power  [W or lu_power]
-        """
-        _, torque = self.compute_torque_thrust(
-            F_n_all=np.zeros_like(F_theta_all),
-            F_theta_all=F_theta_all
-        )
-        return self.omega * torque  # [W or lu_power]
-
-    def compute_ct_cp(
+    def compute_coefficients(
         self,
         F_n_all: np.ndarray,
         F_theta_all: np.ndarray,
@@ -568,11 +576,10 @@ class Rotor:
     ) -> Tuple[float, float]:
         """Compute thrust and power coefficients
 
-        Dimensionless Coefficients:
-            C_T = T / (0.5 · ρ · U_∞² · A)     [dimensionless]
-            C_P = P / (0.5 · ρ · U_∞³ · A)     [dimensionless]
-
-        where A = π·R² is the rotor swept area.
+        Definitions:
+            C_T = T / (0.5 · ρ · U_∞² · A)       [dimensionless]
+            C_P = P / (0.5 · ρ · U_∞³ · A)       [dimensionless]
+                = ω · Q / (0.5 · ρ · U_∞³ · A)
 
         Args:
             F_n_all:     Normal forces, shape (N_b * n_markers,) [N or lu_force]
@@ -606,14 +613,15 @@ class Rotor:
         """Human-readable rotor summary"""
         omega_rpm = self.omega * 60.0 / (2.0 * np.pi)  # [RPM]
         period = (2.0 * np.pi / self.omega) if self.omega > 0 else float('inf')
+        hub = self.hub_center
 
         lines = [
             "Rotor Summary",
             "=" * 60,
             f"  Blades:           {self.n_blades}",
             f"  Radius:           {self.radius:.4f}",
-            f"  Hub center:       ({self.hub_center[0]:.3f}, "
-            f"{self.hub_center[1]:.3f}, {self.hub_center[2]:.3f})",
+            f"  Hub center:       ({hub[0]:.3f}, {hub[1]:.3f}, {hub[2]:.3f})",
+            f"  Rotation axis:    {self._coord_system.preset.value}",
             f"  ω:                {self.omega:.4f} rad/s  ({omega_rpm:.2f} RPM)",
             f"  Period:           {period:.6f} s",
             f"  Markers/blade:    {self.markers_per_blade}",
@@ -621,6 +629,11 @@ class Rotor:
             f"  Current θ:        {np.degrees(self.theta)} deg",
             f"  Time:             {self.time:.6f} s",
             f"  Revolutions:      {self.n_revolutions:.4f}",
+            "",
+            "  --- Coordinate System ---",
+            f"  n̂ (rotation):     {self._coord_system.n_axis}",
+            f"  Inflow:           {self._coord_system.inflow_direction}",
+            f"  Wake:             {self._coord_system.wake_direction}",
         ]
 
         # Add blade info (from blade 0 since all identical)
@@ -642,13 +655,70 @@ class Rotor:
     def __repr__(self) -> str:
         return (
             f"Rotor(n_blades={self.n_blades}, R={self.radius:.3f}, "
-            f"ω={self.omega:.2f} rad/s, "
-            f"markers={self.total_markers}, θ={np.degrees(self.theta)}°)"
+            f"ω={self.omega:.2f} rad/s, axis={self._coord_system.preset.value}, "
+            f"markers={self.total_markers})"
         )
 
     # =================================================================
     # §2. Factory Methods — Preset Rotor Configurations
     # =================================================================
+
+    @classmethod
+    def from_coordinate_system(
+        cls,
+        blade_prototype: Blade,
+        n_blades: int,
+        coord_system: RotorCoordinateSystem,
+        omega: float,
+        theta_0: float = 0.0
+    ) -> 'Rotor':
+        """Create rotor from an explicit coordinate system
+
+        This is the most flexible factory method, allowing full control
+        over the coordinate system configuration.
+
+        Args:
+            blade_prototype: Template blade (must have markers generated)
+            n_blades: Number of blades
+            coord_system: Pre-configured RotorCoordinateSystem
+            omega: Angular velocity  [rad/s]
+            theta_0: Initial azimuth of blade 0  [rad]
+
+        Returns:
+            Rotor instance with the given coordinate system
+        """
+        if blade_prototype.n_markers == 0:
+            raise ValueError(
+                "Blade prototype must have markers generated."
+            )
+
+        # Create instance without calling __init__
+        rotor = object.__new__(cls)
+        
+        rotor.n_blades = n_blades
+        rotor.omega = omega
+        rotor.radius = blade_prototype.r_tip
+        rotor._coord_system = coord_system
+
+        # Azimuth angles
+        delta_theta = 2.0 * np.pi / n_blades
+        rotor.theta = np.array([
+            theta_0 + k * delta_theta for k in range(n_blades)
+        ], dtype=np.float64)
+
+        # Create blade copies
+        rotor.blades = []
+        for _ in range(n_blades):
+            blade_copy = copy.deepcopy(blade_prototype)
+            blade_copy.coord_system = coord_system
+            rotor.blades.append(blade_copy)
+
+        rotor.markers_per_blade = blade_prototype.n_markers
+        rotor.total_markers = n_blades * blade_prototype.n_markers
+        rotor.time = 0.0
+        rotor.n_revolutions = 0.0
+
+        return rotor
 
     @classmethod
     def from_ntnu_bt1(
@@ -658,7 +728,8 @@ class Rotor:
         hub_center: Tuple[float, float, float] = (3.66, 1.341, 0.817),
         dx: Optional[float] = None,
         resolution: int = 160,
-        theta_0: float = 0.0
+        theta_0: float = 0.0,
+        rotation_axis: str = "hawt_x"
     ) -> 'Rotor':
         """Create the NTNU Blind Test 1 rotor (3 × NREL S826 blades)
 
@@ -671,13 +742,6 @@ class Rotor:
             - Hub radius: 0.045 m (90 mm nacelle)
             - Design TSR = 6, U_∞ = 10 m/s
 
-        Operating Conditions:
-            ω = TSR · U_∞ / R = 6 × 10 / 0.447 = 134.23 rad/s   (~1281 RPM)
-
-        Grid Setup:
-            Δx = D / resolution
-            Δr = Δx / 2         (marker spacing)
-
         Args:
             tsr: Tip speed ratio                         [dimensionless]
             u_inf: Freestream velocity                   [m/s]
@@ -685,6 +749,7 @@ class Rotor:
             dx: Lattice spacing (if None, computed from resolution)  [m]
             resolution: D/Δx grid cells per diameter     [dimensionless]
             theta_0: Initial azimuth of blade 0          [rad]
+            rotation_axis: Rotation axis preset          [default: "hawt_x"]
 
         Returns:
             Rotor instance with 3 blades and markers generated
@@ -704,14 +769,16 @@ class Rotor:
 
         # Create prototype blade
         blade = Blade.from_ntnu_bt1()
-        blade.generate_markers(dr=dr, dx=dx)
+        blade.generate_markers(dr=dr)
+        blade.set_lattice_spacing(dx=dx)
 
         return cls(
             blade_prototype=blade,
             n_blades=n_blades,
             hub_center=hub_center,
             omega=omega,
-            theta_0=theta_0
+            theta_0=theta_0,
+            rotation_axis=rotation_axis
         )
 
     @classmethod
@@ -727,14 +794,10 @@ class Rotor:
         hub_center: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         dr: float = 0.005,
         dx: Optional[float] = None,
-        theta_0: float = 0.0
+        theta_0: float = 0.0,
+        rotation_axis: str = "hawt_x"
     ) -> 'Rotor':
         """Create a simple constant-chord rotor for testing
-
-        Useful for:
-            - Framework debugging (all markers identical)
-            - Idealized rotor studies
-            - Unit tests
 
         Args:
             n_blades: Number of blades  [dimensionless]
@@ -748,11 +811,12 @@ class Rotor:
             dr: Marker spacing [m or lu]
             dx: Lattice spacing (for ε calculation) [m or lu]
             theta_0: Initial azimuth [rad]
+            rotation_axis: Rotation axis preset [default: "hawt_x"]
 
         Returns:
             Rotor instance
         """
-        blade = Blade.from_constant_chord(
+        blade = Blade.from_simple_blade(
             r_hub=hub_radius,
             r_tip=radius,
             chord=chord,
@@ -760,14 +824,17 @@ class Rotor:
             twist_tip=twist_tip,
             airfoil='flat_plate'
         )
-        blade.generate_markers(dr=dr, dx=dx)
+        blade.generate_markers(dr=dr)
+        if dx is not None:
+            blade.set_lattice_spacing(dx=dx)
 
         return cls(
             blade_prototype=blade,
             n_blades=n_blades,
             hub_center=hub_center,
             omega=omega,
-            theta_0=theta_0
+            theta_0=theta_0,
+            rotation_axis=rotation_axis
         )
 
     @classmethod
@@ -779,9 +846,10 @@ class Rotor:
                 "n_blades": 3,
                 "hub_center": [3.66, 1.341, 0.817],
                 "omega": 134.23,          # or use tsr + u_inf
-                "tsr": 6.0,              # alternative: compute ω
-                "u_inf": 10.0,           # required if tsr is given
+                "tsr": 6.0,               # alternative: compute ω
+                "u_inf": 10.0,            # required if tsr is given
                 "theta_0": 0.0,
+                "rotation_axis": "hawt_x",  # NEW: rotation axis preset
                 "blade": {
                     "preset": "ntnu_bt1"  # or explicit sections
                 },
@@ -806,6 +874,7 @@ class Rotor:
                 resolution=config.get('grid', {}).get('resolution', 160),
                 dx=config.get('grid', {}).get('dx', None),
                 theta_0=config.get('theta_0', 0.0),
+                rotation_axis=config.get('rotation_axis', 'hawt_x'),
             )
 
         # --- General construction ---
@@ -824,7 +893,8 @@ class Rotor:
             dx = D / resolution
 
         dr = dx / 2.0  # Δr = Δx/2
-        blade.generate_markers(dr=dr, dx=dx)
+        blade.generate_markers(dr=dr)
+        blade.set_lattice_spacing(dx=dx)
 
         # Hub center
         hub_center = tuple(config.get('hub_center', (0.0, 0.0, 0.0)))
@@ -837,12 +907,16 @@ class Rotor:
             R = blade.r_tip
             omega = tsr * u_inf / R
 
+        # Rotation axis
+        rotation_axis = config.get('rotation_axis', 'hawt_x')
+
         return cls(
             blade_prototype=blade,
             n_blades=config.get('n_blades', 3),
             hub_center=hub_center,
             omega=omega,
             theta_0=config.get('theta_0', 0.0),
+            rotation_axis=rotation_axis,
         )
 
     # =================================================================
@@ -862,13 +936,11 @@ class Rotor:
             Velocity: U_lu = U_phys · time_scale / length_scale  [lu/lt]
             ω_lu = ω_phys · time_scale                   [rad/lu_time]
 
-        In LBM, Δx = 1, Δt = 1 in lattice units.
+        The coordinate system is also converted to lattice units.
 
         Args:
             length_scale: Physical size of one lattice cell  [m/lu]
-                          Typically Δx = D / (D/Δx)
             time_scale: Physical size of one timestep        [s/lu_time]
-                        Typically Δt from Table 1
 
         Returns:
             New Rotor instance in lattice units
@@ -878,25 +950,22 @@ class Rotor:
 
         # Regenerate markers in lattice units
         dr_lu = self.blades[0].marker_dr / length_scale  # [lu]
-        dx_lu = 1.0  # Δx = 1 in lattice units
-        blade_lu.generate_markers(dr=dr_lu, dx=dx_lu)
+        blade_lu.generate_markers(dr=dr_lu)
+        blade_lu.set_lattice_spacing(dx=1.0)  # Δx = 1 in lattice units
 
-        # Convert hub center
-        hub_lu = (
-            self.hub_center[0] / length_scale,  # [lu]
-            self.hub_center[1] / length_scale,  # [lu]
-            self.hub_center[2] / length_scale,  # [lu]
-        )
+        # Convert coordinate system to lattice units
+        coord_lu = self._coord_system.to_lattice_units(length_scale)
 
         # Convert angular velocity: ω_lu = ω_phys · Δt
         omega_lu = self.omega * time_scale  # [rad/lu_time]
 
-        rotor_lu = Rotor(
+        # Use the coordinate system factory
+        rotor_lu = Rotor.from_coordinate_system(
             blade_prototype=blade_lu,
             n_blades=self.n_blades,
-            hub_center=hub_lu,
+            coord_system=coord_lu,
             omega=omega_lu,
-            theta_0=self.theta[0],
+            theta_0=self.theta[0]
         )
 
         return rotor_lu
