@@ -213,20 +213,18 @@ class CornerBC:
     # Target Resolution
     # =========================================================================
     
-    def _resolve_target(self, faces: List[FaceConfig],
-                        rho_ext: 'npt.NDArray',
-                        u_ext: 'npt.NDArray') -> Tuple['npt.NDArray', 'npt.NDArray']:
+    def _resolve_target(self, faces, rho_ext, u_ext):
         """Resolve target (ρ, u) when multiple faces meet.
         
         Priority rules (physical basis):
             1. WALL present → u = 0 (no-slip dominates velocity)
-            2. FREESTREAM present → use ρ∞ and U∞ (far-field overrides)
-            3. VELOCITY provides u; PRESSURE provides ρ
+            2. VELOCITY provides u; PRESSURE provides ρ
+            3. NEUMANN prescribes nothing → pure extrapolation
             4. Fallback: extrapolate from diagonal interior
         
         Args:
             faces: List of FaceConfig objects meeting at this node
-            rho_ext: Extrapolated density from diagonal interior  [density]
+            rho_ext: Extrapolated density from diagonal interior  [dimensionless]
             u_ext: Extrapolated velocity from diagonal interior  [Δx/Δt]
             
         Returns:
@@ -235,30 +233,6 @@ class CornerBC:
         xp = self.xp
         
         types = set(fc.bc_type for fc in faces)
-        
-        # --- Freestream overrides everything ---
-        if BCType.FREESTREAM in types:
-            fs = next(fc for fc in faces if fc.bc_type == BCType.FREESTREAM)
-            rho_t = xp.asarray(fs.density, dtype=xp.float64)
-            
-            # Build u from freestream velocity
-            if isinstance(rho_ext, (int, float)) or rho_ext.ndim == 0:
-                u_t = xp.zeros(self.dim, dtype=xp.float64)
-            else:
-                u_t = xp.zeros((self.dim,) + rho_ext.shape, dtype=xp.float64)
-            
-            vel = fs.velocity
-            if isinstance(vel, (int, float)):
-                u_t[0] = float(vel)
-            elif isinstance(vel, (list, tuple)):
-                for d in range(min(len(vel), self.dim)):
-                    u_t[d] = float(vel[d])
-            
-            # But if wall also present, force u = 0
-            if BCType.WALL in types:
-                u_t[...] = 0.0
-            
-            return rho_t, u_t
         
         # --- Wall present → u = 0 always ---
         has_wall = BCType.WALL in types
@@ -335,7 +309,10 @@ class CornerBC:
             
             return rho_t, u_ext
         
-        # --- Fallback: pure extrapolation ---
+        # --- Neumann / Fallback: pure extrapolation ---
+        # NEUMANN faces prescribe nothing (∂f/∂n = 0 is handled by face BC).
+        # At edge/corner nodes, we simply use the extrapolated values from
+        # the diagonal interior neighbor. This also serves as the general fallback.
         return rho_ext, u_ext
     
     # =========================================================================

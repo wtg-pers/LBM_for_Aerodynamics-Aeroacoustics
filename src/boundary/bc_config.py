@@ -16,15 +16,26 @@ At initialization time, every boundary node is classified as:
     - Corner: belongs to exactly 3 non-periodic faces → f = f_eq (3D only)
 This classification is immutable during the simulation.
 
-Config Compatibility:
-    Supports both new-style and legacy config formats:
+Supported Methods:
+    Velocity Inlets:
+        'regularized_inlet' / 'reg_inlet'   — f = f_eq + f^(1)(Π^neq)
+        'equilibrium' / 'eq'                — f = f_eq(ρ₀, u_target)
     
-    New style:
-        {'location': 'xmin', 'method': 'non_equilibrium', 'velocity': 0.1}
+    Pressure Outlets:
+        'regularized_outlet' / 'reg_outlet' — ρ relaxation + f^(1)
     
-    Legacy style:
-        {'type': 'inlet', 'location': 0, 'velocity': 0.1}
-        {'type': 'wall', 'method': 'bouzidi'}  ← unrecognized method, falls back to type
+    Domain Walls:
+        'regularized_wall' / 'reg_wall'     — f = f_eq(ρ_ext, 0) + f^(1)
+        'bounce_back' / 'hwbb'              — f_i = f_ī (half-way BB)
+    
+    Zero-Gradient:
+        'neumann' / 'zero_gradient'         — f[bdy] = f[interior]
+    
+    Sponge Layer:
+        'sponge' / 'sponge_layer'           — volume damping toward f_eq
+    
+    Periodic:
+        'periodic' / 'none'                 — no BC (streaming handles it)
 
 Author: LBM Development Team
 Date: 2026-02
@@ -49,17 +60,17 @@ class BCType(Enum):
         VELOCITY:   u is given (Dirichlet for velocity — inlet)
         PRESSURE:   ρ is given (Dirichlet for pressure — outlet)
         WALL:       u = 0 or u = u_wall (no-slip — domain wall)
-        FREESTREAM: both u and ρ are prescribed (far-field)
+        NEUMANN:    ∂f/∂n = 0 (zero-gradient — open boundary)
         SPONGE:     volumetric damping layer (not face-based)
         PERIODIC:   no explicit BC (handled by streaming periodicity)
     
     Edge/corner priority (highest → lowest):
-        FREESTREAM > WALL > VELOCITY > PRESSURE > PERIODIC
+        WALL > VELOCITY > PRESSURE > NEUMANN > PERIODIC
     """
     VELOCITY   = "velocity"
     PRESSURE   = "pressure"
     WALL       = "wall"
-    FREESTREAM = "freestream"
+    NEUMANN    = "neumann"
     SPONGE     = "sponge"
     PERIODIC   = "periodic"
 
@@ -188,43 +199,31 @@ class FaceConfig:
 # =============================================================================
 
 # Maps config 'method' strings to (BCType, use_regularized)
+#
+# use_regularized meaning:
+#   True  → f = f_eq + f^(1)(Π^neq)  (full regularized reconstruction)
+#   False → method-specific handling   (equilibrium, bounce-back, neumann, etc.)
+#
 _METHOD_MAP: Dict[str, Tuple[BCType, bool]] = {
     # ── Velocity inlets ──
+    'regularized_inlet':    (BCType.VELOCITY, True),    # f = f_eq + f^(1)
+    'reg_inlet':            (BCType.VELOCITY, True),
     'equilibrium':          (BCType.VELOCITY, False),   # f = f_eq only
     'eq':                   (BCType.VELOCITY, False),
-    'non_equilibrium':      (BCType.VELOCITY, True),    # f = f_eq + f^(1)
-    'non_eq':               (BCType.VELOCITY, True),
-    'neq':                  (BCType.VELOCITY, True),
-    'regularized_inlet':    (BCType.VELOCITY, True),
-    'regularized_velocity': (BCType.VELOCITY, True),
-    'reg_inlet':            (BCType.VELOCITY, True),
     
-    # ── Pressure outlets ──
-    'pressure_relaxation':  (BCType.PRESSURE, True),
-    'characteristic':       (BCType.PRESSURE, True),    # legacy name
-    'open':                 (BCType.PRESSURE, True),
-    'non_reflecting':       (BCType.PRESSURE, True),
-    'regularized_outlet':   (BCType.PRESSURE, True),
-    'regularized_pressure': (BCType.PRESSURE, True),
+    # ── Pressure outlets (regularized) ──
+    'regularized_outlet':   (BCType.PRESSURE, True),    # ρ relaxation + f^(1)
     'reg_outlet':           (BCType.PRESSURE, True),
-    'convective':           (BCType.PRESSURE, False),   # special handling
-    'advective':            (BCType.PRESSURE, False),
-    'neumann':              (BCType.PRESSURE, False),   # zero-gradient copy
-    'extrapolation':        (BCType.PRESSURE, False),
-    'zero_gradient':        (BCType.PRESSURE, False),
     
     # ── Domain walls ──
-    'bounce_back':          (BCType.WALL, True),
-    'hwbb':                 (BCType.WALL, True),
-    'halfway':              (BCType.WALL, True),
-    'wall':                 (BCType.WALL, True),
-    'regularized_wall':     (BCType.WALL, True),
+    'regularized_wall':     (BCType.WALL, True),        # f = f_eq(ρ_ext, 0) + f^(1)
     'reg_wall':             (BCType.WALL, True),
+    'bounce_back':          (BCType.WALL, False),       # f_i = f_ī (half-way BB)
+    'hwbb':                 (BCType.WALL, False),
     
-    # ── Far-field ──
-    'freestream':           (BCType.FREESTREAM, True),
-    'farfield':             (BCType.FREESTREAM, True),
-    'far_field':            (BCType.FREESTREAM, True),
+    # ── Zero-gradient outlet ──
+    'neumann':              (BCType.NEUMANN, False),    # f[bdy] = f[int]
+    'zero_gradient':        (BCType.NEUMANN, False),
     
     # ── Sponge (volume-based damping) ──
     'sponge':               (BCType.SPONGE, True),
@@ -237,10 +236,10 @@ _METHOD_MAP: Dict[str, Tuple[BCType, bool]] = {
 
 # Legacy 'type' field → default method mapping
 _LEGACY_TYPE_MAP: Dict[str, str] = {
-    'inlet':    'non_equilibrium',
-    'outlet':   'pressure_relaxation',
-    'wall':     'bounce_back',
-    'open':     'pressure_relaxation',
+    'inlet':    'regularized_inlet',
+    'outlet':   'regularized_outlet',
+    'wall':     'regularized_wall',
+    'open':     'regularized_outlet',
     'periodic': 'periodic',
 }
 
@@ -276,11 +275,11 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> Optional[FaceCon
     Handles both new-style and legacy config formats:
     
     New style:
-        {'location': 'xmin', 'method': 'non_equilibrium', 'velocity': 0.1, 'rho': 1.0}
+        {'location': 'xmin', 'method': 'regularized_inlet', 'velocity': 0.1, 'rho': 1.0}
     
     Legacy style (any of these):
         {'type': 'inlet', 'location': 0, 'velocity': 0.1}     ← numeric location → use bc_name
-        {'type': 'wall', 'method': 'bouzidi'}                  ← unknown method → fallback to type
+        {'type': 'wall', 'method': 'bounce_back'}
         {'type': 'outlet', 'pressure': 1.0}                    ← 'pressure' key → density
     
     Args:
@@ -293,20 +292,16 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> Optional[FaceCon
     # =====================================================================
     # Step 1: Determine location
     # =====================================================================
-    # Priority: config['location'] (if string) → bc_name
     location_str = bc_dict.get('location')
     
     if isinstance(location_str, (int, float)):
-        # Legacy: location is grid index (e.g., 0, 99), use bc_name instead
         location_str = bc_name
     elif location_str is None:
         location_str = bc_name
     
-    # Try parsing the determined location string
     try:
         location = FaceLocation.from_string(str(location_str))
     except ValueError:
-        # location_str failed → try bc_name as fallback
         try:
             location = FaceLocation.from_string(bc_name)
         except ValueError:
@@ -320,14 +315,11 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> Optional[FaceCon
     bc_type_str = bc_dict.get('type', '').lower().strip()
     
     if not method:
-        # No method specified → infer from legacy 'type' field
         method = _LEGACY_TYPE_MAP.get(bc_type_str, '')
     elif method not in _METHOD_MAP:
-        # Method specified but unrecognized (e.g., 'bouzidi') → fallback to type
         fallback = _LEGACY_TYPE_MAP.get(bc_type_str, '')
         if fallback:
             method = fallback
-        # else: keep original method → classify_method will raise error below
     
     if not method:
         print(f"  Warning: No 'method'/'type' specified for boundary '{bc_name}', skipping")
@@ -342,7 +334,7 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> Optional[FaceCon
         print(f"  Warning: {e}")
         return None
     
-    # Periodic faces → return minimal FaceConfig (NodeMap needs to know they exist)
+    # Periodic → return minimal FaceConfig
     if bc_type == BCType.PERIODIC:
         return FaceConfig(
             location=location,
@@ -353,29 +345,23 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> Optional[FaceCon
     # =====================================================================
     # Step 4: Extract physical parameters
     # =====================================================================
-    # Velocity: config['velocity'] or config['u_inf']  [Δx/Δt]
+    # Velocity  [Δx/Δt]
     velocity_raw = bc_dict.get('velocity', bc_dict.get('u_inf', 0.0))
     if isinstance(velocity_raw, (list, tuple)):
         velocity: Union[float, List[float]] = [float(v) for v in velocity_raw]
     else:
         velocity = float(velocity_raw)
     
-    # Density: config['rho'] or config['density'] or config['rho_inf']
-    #          or config['pressure'] (legacy outlet key)  [dimensionless]
+    # Density  [dimensionless]
     density = float(bc_dict.get('rho', bc_dict.get('density',
                     bc_dict.get('rho_inf', bc_dict.get('pressure', 1.0)))))
     
-    # Relaxation coefficient: config['k'] or config['relax_coeff']  [dimensionless]
+    # Relaxation coefficient  [dimensionless]
     relax_coeff = float(bc_dict.get('k', bc_dict.get('relax_coeff', 0.1)))
     
     # Extra parameters for special methods
     extra: Dict[str, Any] = {}
-    if method in ('convective', 'advective'):
-        extra['u_conv'] = bc_dict.get('u_conv', velocity)
-        extra['method_variant'] = 'convective'
-    elif method in ('neumann', 'extrapolation', 'zero_gradient'):
-        extra['method_variant'] = 'neumann'
-    elif method in ('sponge', 'sponge_layer'):
+    if method in ('sponge', 'sponge_layer'):
         extra['thickness'] = bc_dict.get('thickness', 20)
         extra['sigma_max'] = bc_dict.get('strength', bc_dict.get('sigma_max', 0.5))
     
@@ -406,8 +392,8 @@ def parse_all_boundaries(boundaries_config: Dict[str, Dict[str, Any]]) -> List[F
         
     Example:
         >>> configs = parse_all_boundaries({
-        ...     'inlet':  {'location': 'xmin', 'method': 'non_equilibrium', 'velocity': 0.1},
-        ...     'outlet': {'location': 'xmax', 'method': 'pressure_relaxation', 'rho': 1.0},
+        ...     'inlet':  {'location': 'xmin', 'method': 'regularized_inlet', 'velocity': 0.1},
+        ...     'outlet': {'location': 'xmax', 'method': 'regularized_outlet', 'rho': 1.0},
         ...     'ymin':   {'location': 'ymin', 'method': 'bounce_back'},
         ...     'ymax':   {'location': 'ymax', 'method': 'bounce_back'},
         ... })

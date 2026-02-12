@@ -72,7 +72,7 @@ RESOLUTION = 32              # [dimensionless] D/Δx
 DX_PHYS = D_ROTOR / RESOLUTION   # [m/lu] = 0.02794 m
 
 # Lattice Mach / Courant number (Watanabe: Co = 0.015)
-MACH_INLET = 0.015          # [dimensionless] u_lu = U_∞ × Δt / Δx
+MACH_INLET = 0.1          # [dimensionless] u_lu = U_∞ × Δt / Δx
 DT_PHYS = MACH_INLET * DX_PHYS / U_INF   # [s/lt] ≈ 4.19e-5 s
 
 # Domain size (Watanabe Fig. 2)
@@ -158,12 +158,12 @@ print(f"  [Config] ν_lu   = {_nu_lu:.6f},  τ = {_tau:.4f}")
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
-    "dimension": 3,
-    "lattice_model": "D3Q27",
+    "dimension": 2,
+    "lattice_model": "D2Q9",
     "domain": {
         "Nx": Nx,
         "Ny": Ny,
-        "Nz": Nz,
+        # "Nz": Nz,
     },
     "physics": {
         "Re": RE_REF,                        # [dimensionless] Re at 75% span
@@ -172,7 +172,7 @@ simulation = {
         "characteristic_length": C_75_LU,    # [lu] chord at 75% span
     },
     "time": {
-        "max_steps": 50000,
+        "max_steps": 20000,
         "output_interval": 100,
         "checkpoint_interval": 10000,
         "probe_interval": 50,
@@ -185,39 +185,52 @@ simulation = {
 # =============================================================================
 # Watanabe: Uniform inflow, outflow BC behind turbine,
 #           no-slip walls on all other boundaries.
+# boundaries = {
+#     "inlet":  {"location": "xmin", "method": "regularized_inlet", "velocity": MACH_INLET},
+#     "outlet": {"location": "xmax", "method": "neumann", "rho": 1.0},
+#     "south":  {"location": "ymin", "method": "bounce_back"},    # ← 이것만 변경
+#     "north":  {"location": "ymax", "method": "bounce_back"},    # ← 이것만 변경
+# }
 boundaries = {
-    "inlet": {
-        "location": "xmin",
-        "method": "regularized_inlet",
-        "velocity": MACH_INLET,
-        "rho": 1.0,
-    },
-    "outlet": {
-        "location": "xmax",
-        "method": "regularized_outlet",
-        # "velocity": MACH_INLET,      # U_c = 0.015 [lu/lt]
-        "rho": RHO,
-        "k": 0.1,
-    },
-    #       Using pressure_relaxation as open-boundary approximation.
-    "ymin": {
-        "location": "ymin",
-        "method": "regularized_wall",
-    },
-    "ymax": {
-        "location": "ymax",
-        "method": "regularized_outlet", 
-               "rho": RHO, 
-               "k":0.1},
-    "floor": {
-        "location": "zmin",
-        "method": "regularized_outlet", 
-               "rho": RHO, "k":0.1},
-    "ceiling": {
-        "location": "zmax",
-        "method": "regularized_outlet", 
-               "rho": RHO, "k":0.1},
+    "inlet":  {"location": "xmin", "method": "equilibrium", "velocity": 0.1},
+    "outlet": {"location": "xmax", "method": "neumann"},
+    "south":  {"location": "ymin", "method": "equilibrium", "velocity": 0.1},
+    "north":  {"location": "ymax", "method": "equilibrium", "velocity": 0.1},
 }
+# boundaries = {
+#     "inlet": {
+#         "location": "xmin",
+#         "method": "regularized_inlet",
+#         "velocity": MACH_INLET,
+#         "rho": 1.0,
+#     },
+#     "outlet": {
+#         "location": "xmax",
+#         "method": "regularized_outlet",
+#         "velocity": MACH_INLET,
+#         "rho": RHO, 
+#         "k":0.1,
+#     },
+#     "ymin": {
+#         "location": "ymin",
+#         "method": "regularized_wall", 
+#         "rho": RHO, 
+#         "k":0.1,
+#     },
+#     "ymax": {
+#         "location": "ymax",
+#         "method": "regularized_outlet", 
+#                "rho": RHO, 
+#                "k":0.1},
+    # "floor": {
+    #     "location": "zmin",
+    #     "method": "regularized_outlet", 
+    #            "rho": RHO, "k":0.1},
+    # "ceiling": {
+    #     "location": "zmax",
+    #     "method": "regularized_outlet", 
+    #            "rho": RHO, "k":0.1},
+# }
 
 
 # =============================================================================
@@ -233,7 +246,7 @@ internal_geometry = {}
 # Actuator Line Configuration
 # =============================================================================
 actuator_line = {
-    "enabled": True,
+    "enabled": False,
 
     # --- Rotor ---
     "rotor": {

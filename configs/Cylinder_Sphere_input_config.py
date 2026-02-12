@@ -13,7 +13,7 @@ center_y = Ny // 2  # Centered in y
 
 MACH_INLET = 0.1
 RHO = 1.0
-RE_TGT = 2000.0
+RE_TGT = 1000.0
 
 
 # =============================================================================
@@ -55,27 +55,37 @@ simulation = {
 #   - 'bounce_back': Half-way bounce-back wall
 #   - 'periodic': No BC (handled by streaming)
 #
-
 boundaries = {
-    "inlet": {"location": "xmin", 
-              "method": "non_equilibrium", 
-              "velocity": MACH_INLET},
-    "outlet": {"location": "xmax", 
-               "method": "pressure_relaxation", 
-               "rho": RHO, "k":0.1},
-    "ymin": {"location": "ymin", 
-               "method": "pressure_relaxation", 
-               "rho": RHO, "k":0.1},
-    "ymax": {"location": "ymax", 
-               "method": "pressure_relaxation", 
-               "rho": RHO, "k":0.1},
-    # "zmin": {"location": "zmin", 
-    #          "method": "pressure_relaxation", 
-    #          "rho": RHO, "k": 0.3},
-    # "zmax": {"location": "zmax", 
-    #          "method": "pressure_relaxation", 
-    #          "rho": RHO, "k": 0.3},
+    "inlet":  {"location": "xmin", "method": "equilibrium", "velocity": 0.1},
+    "outlet": {"location": "xmax", "method": "neumann"},
+    "south":  {"location": "ymin", "method": "equilibrium", "velocity": 0.1},
+    "north":  {"location": "ymax", "method": "equilibrium", "velocity": 0.1},
 }
+# boundaries = {
+#     "inlet": {"location": "xmin", 
+#               "method": "regularized_inlet", 
+#               "velocity": MACH_INLET,
+#               "rho": 1.0,
+#               },
+#     "outlet": {"location": "xmax", 
+#             #    "method": "pressure_relaxation", 
+#                "method": "regularized_outlet",
+#                "rho": RHO, "k":0.1},
+#     "ymin": {"location": "ymin", 
+#             #    "method": "pressure_relaxation", 
+#                "method": "regularized_outlet",
+#                "rho": RHO, "k":0.1},
+#     "ymax": {"location": "ymax", 
+#             #    "method": "pressure_relaxation", 
+#                "method": "regularized_outlet",
+#                "rho": RHO, "k":0.1},
+#     # "zmin": {"location": "zmin", 
+#     #          "method": "pressure_relaxation", 
+#     #          "rho": RHO, "k": 0.3},
+#     # "zmax": {"location": "zmax", 
+#     #          "method": "pressure_relaxation", 
+#     #          "rho": RHO, "k": 0.3},
+# }
 
 # =============================================================================
 # Internal Geometry (Obstacle)

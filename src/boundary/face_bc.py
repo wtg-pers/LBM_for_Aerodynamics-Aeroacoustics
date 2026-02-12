@@ -14,13 +14,14 @@ Available Face BCs:
         - ρ_bc = ρ_target + (1-K)(ρ_int - ρ_target)  [pressure relaxation]
         - f = f_eq(ρ_bc, u_int) + f^(1)(Π^neq_int)
     
-    WallBC:  No-slip wall (domain boundary)
+    WallBC:  No-slip wall via regularized reconstruction (domain boundary)
         - f = f_eq(ρ_ext, u=0) + f^(1)(Π^neq_int)
-        - Replaces DomainWallBounceBack for domain walls
     
-    FreestreamDirichletBC:  Far-field (both ρ and u prescribed)
-        - ρ_bc = ρ∞ + (1-K)(ρ_int - ρ∞),  u = U∞
-        - f = f_eq(ρ_bc, U∞) + f^(1)(Π^neq_int)
+    DomainBounceBackBC:  No-slip wall via half-way bounce-back (domain boundary)
+        - f_i(bdy) = f_ī(bdy) from post-collision state
+    
+    NeumannBC:  Zero-gradient extrapolation (open boundary)
+        - f[:, boundary] = f[:, interior_neighbor]
 
 All BCs receive their slice from NodeMap at initialization, ensuring
 they never touch edge/corner nodes.
@@ -28,6 +29,8 @@ they never touch edge/corner nodes.
 References:
     - Latt & Chopard, Math. Comp. Sim. 72, 2006
     - Malaspinas, Chopard, Latt, Comp. Fluids 49, 2011
+    - Ladd, J. Fluid Mech. 271, 1994 (bounce-back)
+    - Yang, Z., Comp. Math. Appl. 65, 2013 (Neumann outflow)
 
 Author: LBM Development Team
 Date: 2026-02
@@ -52,7 +55,7 @@ from .regularized_utils import compute_f_eq, compute_Pi_neq, reconstruct_f_regul
 class FaceBC:
     """Base class for face boundary conditions.
     
-    All face BCs share the pattern:
+    Standard (regularized) face BCs share the pattern:
         1. Read interior neighbor distributions
         2. Determine target (ρ, u)
         3. Reconstruct f (equilibrium or regularized)
@@ -60,6 +63,9 @@ class FaceBC:
     
     Subclasses implement _get_target_rho_u() to define what ρ and u
     to prescribe at the boundary.
+    
+    Non-standard BCs (DomainBounceBackBC, NeumannBC) override apply()
+    directly, as their physics does not fit the reconstruct pattern.
     
     Attributes:
         xp: Array module (numpy or cupy)
@@ -89,7 +95,7 @@ class FaceBC:
         
         Args:
             f: Distribution after streaming, modified in-place. shape (Q, Nx, Ny[, Nz])
-            f_post: Post-collision distribution (unused by most BCs)
+            f_post: Post-collision distribution (needed by bounce-back BCs)
         """
         if self.dim == 2:
             self._apply_2d(f)
@@ -148,7 +154,7 @@ class FaceBC:
     def _get_target_rho_u(self, f_int: 'npt.NDArray') -> Tuple['npt.NDArray', 'npt.NDArray']:
         """Determine target (ρ, u) at this boundary.
         
-        Must be implemented by subclasses.
+        Must be implemented by subclasses that use the regularized framework.
         
         Args:
             f_int: Interior neighbor distribution, shape (Q, ...)
@@ -198,7 +204,6 @@ class VelocityDirichletBC(FaceBC):
         xp = self.xp
         velocity = self.config.velocity
         
-        # Determine flat node shape by indexing a dummy array
         if self.dim == 2:
             face_sl = self.node_map.get_face_slice_2d(self.location)
             dummy = xp.zeros(self.node_map.domain_shape)
@@ -208,31 +213,24 @@ class VelocityDirichletBC(FaceBC):
             dummy = xp.zeros(self.node_map.domain_shape)
             flat_shape = dummy[face_sl[0], face_sl[1], face_sl[2]].shape
         
-        # Create velocity array: shape (dim, *flat_shape)
         self.u_target = xp.zeros((self.dim,) + flat_shape, dtype=xp.float64)
+        self.rho_target = xp.full(flat_shape, self.config.density, dtype=xp.float64)
         
         if isinstance(velocity, (int, float)):
-            # Scalar → x-direction (streamwise default)
-            self.u_target[0, ...] = float(velocity)
+            self.u_target[0, ...] = float(velocity)       # [Δx/Δt]
         elif isinstance(velocity, (list, tuple)):
             for d in range(min(len(velocity), self.dim)):
-                self.u_target[d, ...] = float(velocity[d])
-        
-        self.rho_target = self.config.density
+                self.u_target[d, ...] = float(velocity[d])  # [Δx/Δt]
     
     def _get_target_rho_u(self, f_int: 'npt.NDArray') -> Tuple['npt.NDArray', 'npt.NDArray']:
         """Target: ρ = ρ₀ (prescribed), u = u_target (prescribed)."""
-        xp = self.xp
-        spatial_shape = f_int.shape[1:]
-        
-        rho = xp.full(spatial_shape, self.rho_target, dtype=xp.float64)
-        return rho, self.u_target
+        return self.rho_target, self.u_target
     
     def get_info(self) -> str:
         u_mag = float(self.xp.max(self.xp.abs(self.u_target)))
         mode = "regularized" if self.use_regularized else "equilibrium"
         return (f"VelocityDirichletBC at {self.location.value}: "
-                f"u={u_mag:.4f}, ρ={self.rho_target:.4f}, mode={mode}")
+                f"u={u_mag:.4f}, ρ₀={self.config.density:.4f} ({mode})")
 
 
 # =============================================================================
@@ -242,10 +240,11 @@ class VelocityDirichletBC(FaceBC):
 class PressureDirichletBC(FaceBC):
     """Pressure Dirichlet Boundary Condition (Outlet)
     
-    Prescribes density ρ = ρ_target with pressure relaxation:
-        ρ_bc = ρ_target + (1 - K)(ρ_int - ρ_target)
-    
+    Prescribes density ρ (= pressure / cs²) at the boundary.
     Velocity is extrapolated from the interior neighbor.
+    
+    Pressure relaxation:
+        ρ_bc = ρ_target + (1 - K)(ρ_int - ρ_target)  [dimensionless]
     
     Pressure relaxation parameter K:
         K = 0:   Pure extrapolation (fully non-reflecting)
@@ -282,20 +281,22 @@ class PressureDirichletBC(FaceBC):
 
 
 # =============================================================================
-# Wall BC (Domain Boundary No-Slip)
+# Wall BC (Regularized Domain Wall)
 # =============================================================================
 
 class WallBC(FaceBC):
-    """No-Slip Wall Boundary Condition (Domain Boundary)
+    """No-Slip Wall Boundary Condition — Regularized (Domain Boundary)
     
     Prescribes u = 0 (or u = u_wall for moving walls).
     Density is extrapolated from the interior neighbor.
     
-    Replaces the old DomainWallBounceBack with a regularized approach:
+    Reconstruction:
         f = f_eq(ρ_ext, u_wall) + f^(1)(Π^neq from interior)
     
     For internal obstacles (cylinders, airfoils), use HalfwayBounceBack
     from wall.py instead — it correctly handles curved boundaries.
+    
+    For standard bounce-back at domain walls, use DomainBounceBackBC.
     """
     
     def __init__(self, xp: 'ModuleType', lattice: 'object',
@@ -330,68 +331,228 @@ class WallBC(FaceBC):
     def get_info(self) -> str:
         u_mag = float(self.xp.max(self.xp.abs(self.u_wall)))
         wall_type = "moving" if u_mag > 0 else "no-slip"
-        return (f"WallBC ({wall_type}) at {self.location.value}")
+        return (f"WallBC ({wall_type}, regularized) at {self.location.value}")
 
 
 # =============================================================================
-# Freestream Dirichlet (Far-field)
+# Domain Bounce-Back (Standard Half-way Bounce-Back for Domain Walls)
 # =============================================================================
 
-class FreestreamDirichletBC(FaceBC):
-    """Freestream Boundary Condition
+class DomainBounceBackBC(FaceBC):
+    """Standard Half-way Bounce-Back for Domain Wall Boundaries
     
-    Both velocity and density are prescribed, with density relaxation:
-        ρ_bc = ρ∞ + (1 - K)(ρ_int - ρ∞)
-        u_bc = U∞ (fixed)
+    Physics:
+        f_i(x_b, t+Δt) = f_ī(x_b, t)    for incoming directions i
+        
+    where ī = opposite(i), and f_ī(x_b, t) comes from post-collision
+    state (f_post, before streaming).
     
-    Suitable for far-field boundaries in external aerodynamics.
+    The wall is located at Δx/2 outside the boundary node,
+    giving exact no-slip for Poiseuille flow.
+    
+    Unlike WallBC (regularized), this does NOT reconstruct f.
+    It simply reflects incoming populations from f_post.
+    
+    Note:
+        - ONLY overwrites incoming populations; outgoing remain as streamed.
+        - Edge/corner nodes are handled by CornerBC (not touched here).
+    
+    For internal obstacles (cylinders, airfoils), use HalfwayBounceBack
+    from wall.py — it handles curved boundaries with link-wise q values.
+    
+    References:
+        - Ladd, J. Fluid Mech. 271, 1994
+        - Kruger et al., "The Lattice Boltzmann Method", Ch. 5
     """
     
     def __init__(self, xp: 'ModuleType', lattice: 'object',
                  config: FaceConfig, node_map: NodeMap) -> None:
         super().__init__(xp, lattice, config, node_map)
-        
-        self.rho_inf = config.density
-        self.K = config.relax_coeff
-        
-        # Build velocity array
-        self._setup_velocity()
+        self._setup_bounce_back()
     
-    def _setup_velocity(self) -> None:
-        """Setup freestream velocity array."""
+    def _setup_bounce_back(self) -> None:
+        """Precompute incoming direction indices and their opposites.
+        
+        Incoming directions: those whose lattice velocity points
+        INTO the domain at this boundary face.
+            - For min face (xmin): c[axis, i] > 0  (entering from left)
+            - For max face (xmax): c[axis, i] < 0  (entering from right)
+        """
         xp = self.xp
-        velocity = self.config.velocity
+        c = self.lattice.c           # (dim, Q) numpy array
+        opp = self.lattice.opp       # (Q,) opposite index array
+        axis = self.location.axis
+        is_min = self.location.is_min
+        
+        # Incoming = populations arriving FROM outside the domain
+        incoming = []
+        opposites = []
+        
+        for i in range(self.Q):
+            c_normal = c[axis, i]    # component along face normal  [lattice velocity]
+            if (is_min and c_normal > 0) or (not is_min and c_normal < 0):
+                incoming.append(i)
+                opposites.append(opp[i])
+        
+        # Store as arrays for vectorized indexing
+        self.incoming = xp.asarray(incoming, dtype=xp.int64)    # populations TO fill
+        self.opposites = xp.asarray(opposites, dtype=xp.int64)  # populations TO read
+    
+    def apply(self, f: 'npt.NDArray',
+              f_post: Optional['npt.NDArray'] = None) -> None:
+        """Apply bounce-back on flat nodes of this wall face.
+        
+        For each incoming direction i with opposite ī:
+            f[i, face_nodes] = f_post[ī, face_nodes]
+        
+        This overwrites ONLY the incoming populations, leaving
+        outgoing populations (which streamed correctly) untouched.
+        
+        Physical process:
+            1. Pre-streaming: population ī was heading toward the wall
+            2. At the wall (Δx/2 outside): it bounces back
+            3. Post-streaming: population i at boundary node = bounced ī
+        
+        Args:
+            f: Post-streaming distribution, modified in-place (Q, Nx, Ny[, Nz])
+            f_post: Post-collision distribution (Q, Nx, Ny[, Nz])
+                    Required for correct half-way bounce-back.
+                    Falls back to f if None (on-node BB, less accurate).
+        """
+        if f_post is None:
+            f_src = f       # Fallback: on-node BB (less accurate)
+        else:
+            f_src = f_post  # Correct: half-way BB from pre-streaming state
         
         if self.dim == 2:
             face_sl = self.node_map.get_face_slice_2d(self.location)
-            dummy = xp.zeros(self.node_map.domain_shape)
-            flat_shape = dummy[face_sl[0], face_sl[1]].shape
+            for k in range(len(self.incoming)):
+                i_in = int(self.incoming[k])
+                i_opp = int(self.opposites[k])
+                f[i_in, face_sl[0], face_sl[1]] = \
+                    f_src[i_opp, face_sl[0], face_sl[1]]
         else:
             face_sl = self.node_map.get_face_slice_3d(self.location)
-            dummy = xp.zeros(self.node_map.domain_shape)
-            flat_shape = dummy[face_sl[0], face_sl[1], face_sl[2]].shape
-        
-        self.u_inf = xp.zeros((self.dim,) + flat_shape, dtype=xp.float64)
-        
-        if isinstance(velocity, (int, float)):
-            self.u_inf[0, ...] = float(velocity)
-        elif isinstance(velocity, (list, tuple)):
-            for d in range(min(len(velocity), self.dim)):
-                self.u_inf[d, ...] = float(velocity[d])
-    
-    def _get_target_rho_u(self, f_int: 'npt.NDArray') -> Tuple['npt.NDArray', 'npt.NDArray']:
-        """Target: ρ = relaxed toward ρ∞, u = U∞ (fixed)."""
-        xp = self.xp
-        
-        rho_int = xp.sum(f_int, axis=0)
-        rho_bc = self.rho_inf + (1.0 - self.K) * (rho_int - self.rho_inf)
-        
-        return rho_bc, self.u_inf
+            for k in range(len(self.incoming)):
+                i_in = int(self.incoming[k])
+                i_opp = int(self.opposites[k])
+                f[i_in, face_sl[0], face_sl[1], face_sl[2]] = \
+                    f_src[i_opp, face_sl[0], face_sl[1], face_sl[2]]
     
     def get_info(self) -> str:
-        u_mag = float(self.xp.max(self.xp.abs(self.u_inf)))
-        return (f"FreestreamDirichletBC at {self.location.value}: "
-                f"u∞={u_mag:.4f}, ρ∞={self.rho_inf:.4f}, K={self.K:.3f}")
+        n_inc = len(self.incoming)
+        return (f"DomainBounceBackBC at {self.location.value}: "
+                f"{n_inc} incoming directions, half-way BB")
+
+
+# =============================================================================
+# Neumann (Zero-Gradient Extrapolation) — INCOMING ONLY
+# =============================================================================
+
+class NeumannBC(FaceBC):
+    """Zero-Gradient (Neumann) Boundary Condition
+    
+    Physics:
+        ∂f_i/∂n = 0  at the boundary, for incoming directions only.
+        
+    Implementation:
+        f[i, boundary] = f[i, interior_neighbor]   for incoming i only
+        
+    "Incoming" = populations arriving from outside the domain:
+        - min face (e.g. xmin): c[axis, i] < 0  (coming from left/outside)
+        - max face (e.g. xmax): c[axis, i] > 0  (coming from right/outside)
+        
+    Wait — careful with the convention!
+    After streaming (pull scheme), boundary nodes have:
+        - Outgoing pops (pointing away from domain): correctly pulled from interior ✓
+        - Tangential pops (parallel to face): correctly pulled ✓
+        - Incoming pops (pointing into domain): pulled via periodic wrap → garbage ✗
+    
+    "Incoming to the boundary node from outside" means:
+        - For xmax face: c_x < 0 populations (they would come from x > N-1, outside)
+        - For xmin face: c_x > 0 populations (they would come from x < 0, outside)
+    
+    So incoming = populations whose lattice velocity points INTO the domain
+    (same definition as DomainBounceBackBC).
+    
+    Why only incoming?
+        - Outgoing populations were correctly streamed from interior → preserve them
+        - Overwriting outgoing would distort the mass flux leaving the domain
+        - This causes cumulative mass drift → divergence
+    
+    Best suited for:
+        - Low-Re outflows where reflected waves are weak
+        - Quick validation runs  
+        - Situations where PressureDirichletBC is too reflective
+    
+    Limitation:
+        - Does not control outlet pressure → mass may drift slowly over time
+        - More reflective than pressure relaxation at high Ma
+    
+    References:
+        - Yang, Z., "Lattice Boltzmann outflow treatments...",
+          Comp. Math. Appl. 65, 2013
+        - Latt et al., "Efficient supersonic flows through high-order
+          guided equilibrium with lattice Boltzmann", Phil. Trans. R. Soc. A, 2020
+    """
+    
+    def __init__(self, xp: 'ModuleType', lattice: 'object',
+                 config: FaceConfig, node_map: NodeMap) -> None:
+        super().__init__(xp, lattice, config, node_map)
+        self._setup_incoming()
+    
+    def _setup_incoming(self) -> None:
+        """Precompute incoming direction indices.
+        
+        Incoming = populations that would arrive from OUTSIDE the domain.
+        After streaming with periodic wrap, these contain garbage values.
+        
+        Convention (same as DomainBounceBackBC):
+            min face (xmin): c[axis, i] > 0  → population enters from left
+            max face (xmax): c[axis, i] < 0  → population enters from right
+        """
+        c = self.lattice.c           # (dim, Q) numpy/cupy array
+        axis = self.location.axis
+        is_min = self.location.is_min
+        
+        incoming = []
+        for i in range(self.Q):
+            c_normal = c[axis, i]    # velocity component along face normal
+            if (is_min and c_normal > 0) or (not is_min and c_normal < 0):
+                incoming.append(i)
+        
+        self.incoming = incoming     # list of int indices
+    
+    def apply(self, f: 'npt.NDArray',
+              f_post: Optional['npt.NDArray'] = None) -> None:
+        """Copy incoming distributions from interior neighbor to boundary.
+        
+        For each incoming direction i:
+            f[i, face] = f[i, interior]
+        
+        Outgoing and tangential populations are left untouched — they were
+        correctly populated by streaming.
+        
+        Args:
+            f: Post-streaming distribution, modified in-place
+            f_post: Unused (Neumann doesn't need pre-streaming state)
+        """
+        if self.dim == 2:
+            face_sl = self.node_map.get_face_slice_2d(self.location)
+            int_sl = self.node_map.get_interior_slice_2d(self.location)
+            for i in self.incoming:
+                f[i, face_sl[0], face_sl[1]] = f[i, int_sl[0], int_sl[1]]
+        else:
+            face_sl = self.node_map.get_face_slice_3d(self.location)
+            int_sl = self.node_map.get_interior_slice_3d(self.location)
+            for i in self.incoming:
+                f[i, face_sl[0], face_sl[1], face_sl[2]] = \
+                    f[i, int_sl[0], int_sl[1], int_sl[2]]
+    
+    def get_info(self) -> str:
+        n_inc = len(self.incoming)
+        return (f"NeumannBC (zero-gradient, {n_inc} incoming) "
+                f"at {self.location.value}")
 
 
 # =============================================================================
@@ -401,6 +562,11 @@ class FreestreamDirichletBC(FaceBC):
 def create_face_bc(xp: 'ModuleType', lattice: 'object',
                    config: FaceConfig, node_map: NodeMap) -> FaceBC:
     """Create the appropriate FaceBC subclass from FaceConfig.
+    
+    Routing logic:
+        1. Method-first: check for special BCs (bounce_back, neumann)
+           that bypass the regularized reconstruction framework.
+        2. BCType-based: route to regularized BC classes.
     
     Args:
         xp: Array module
@@ -412,9 +578,20 @@ def create_face_bc(xp: 'ModuleType', lattice: 'object',
         FaceBC subclass instance
         
     Raises:
-        ValueError: If bc_type is not supported as a face BC
+        ValueError: If bc_type/method combination is not supported
     """
+    method = config.method.lower()
     bc_type = config.bc_type
+    
+    # ── Special BCs: bypass regularized framework ──
+    
+    if method in ('bounce_back', 'hwbb'):
+        return DomainBounceBackBC(xp, lattice, config, node_map)
+    
+    if bc_type == BCType.NEUMANN:
+        return NeumannBC(xp, lattice, config, node_map)
+    
+    # ── Standard regularized framework ──
     
     if bc_type == BCType.VELOCITY:
         return VelocityDirichletBC(xp, lattice, config, node_map)
@@ -425,15 +602,11 @@ def create_face_bc(xp: 'ModuleType', lattice: 'object',
     elif bc_type == BCType.WALL:
         return WallBC(xp, lattice, config, node_map)
     
-    elif bc_type == BCType.FREESTREAM:
-        return FreestreamDirichletBC(xp, lattice, config, node_map)
-    
     elif bc_type == BCType.SPONGE:
-        # Sponge is handled separately (volume-based, not face-based)
         raise ValueError(
-            "Sponge layer is not a face BC. "
-            "It should be handled separately as a volume-based damping layer."
+            "Sponge layer is volume-based, not a face BC. "
+            "It is handled separately by DomainBCManager."
         )
     
     else:
-        raise ValueError(f"Unsupported BCType for face BC: {bc_type}")
+        raise ValueError(f"Unsupported BCType: {bc_type} (method='{method}')")

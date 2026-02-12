@@ -9,16 +9,13 @@ Architecture:
     2. Build NodeMap → classify every boundary node (flat/edge/corner)
     3. Create FaceBCs → each operates ONLY on flat nodes
     4. Create CornerBC → applies f = f_eq at edge/corner nodes
+    5. Create SpongeLayerBCs → volume-based damping (if configured)
 
 Time Loop:
     bc_manager.apply_all(f, f_post)
-        Phase 1: Face BCs on flat nodes  (regularized or equilibrium)
+        Phase 1: Face BCs on flat nodes  (regularized, equilibrium, BB, neumann)
         Phase 2: CornerBC on edge/corner nodes  (pure equilibrium)
-
-This replaces the old 3-step dance:
-    domain_walls.apply_all()   ← deleted
-    bc_manager.apply_all()     ← merged
-    edge_corner_mgr.apply()    ← merged
+        Phase 3: Sponge layers on buffer zone volumes  (damping toward f_eq)
 
 Usage:
     from src.boundary.domain_bc_manager import DomainBCManager
@@ -45,6 +42,7 @@ from .bc_config import (
 from .node_map import NodeMap
 from .face_bc import FaceBC, create_face_bc
 from .corner_bc import CornerBC
+from .sponge import SpongeLayerBC
 
 
 class DomainBCManager:
@@ -54,9 +52,11 @@ class DomainBCManager:
         - Node classification (NodeMap)
         - Face BCs (flat nodes only)
         - Edge/corner BC (pure equilibrium)
+        - Sponge layers (volume damping)
     
     Guarantees "One Node, One Dynamics": every boundary node is written
-    to by exactly one BC, exactly once per time step.
+    to by exactly one BC, exactly once per time step (Phase 1+2).
+    Sponge layers in Phase 3 further modify the buffer zone.
     
     Args:
         xp: Array module (numpy or cupy)
@@ -94,17 +94,20 @@ class DomainBCManager:
             print(self.node_map.summary())
         
         # =====================================================================
-        # Phase 3: Create face BCs (flat nodes only)
+        # Phase 3: Create face BCs (flat nodes only) + sponge layers
         # =====================================================================
         self.face_bcs: List[FaceBC] = []
+        self.sponge_layers: List[SpongeLayerBC] = []
         
         for fc in self.face_configs:
+            if fc.bc_type == BCType.PERIODIC:
+                continue
+            
             if fc.bc_type == BCType.SPONGE:
-                # Sponge layers are volume-based, not face-based
-                # They should be handled separately
+                sponge = SpongeLayerBC(xp, lattice, fc, domain_shape)
+                self.sponge_layers.append(sponge)
                 if verbose:
-                    print(f"    Note: Sponge layer at {fc.location.value} "
-                          f"must be added separately")
+                    print(f"    {sponge.get_info()}")
                 continue
             
             face_bc = create_face_bc(xp, lattice, fc, self.node_map)
@@ -114,6 +117,8 @@ class DomainBCManager:
             print(f"  Face BCs created: {len(self.face_bcs)}")
             for fbc in self.face_bcs:
                 print(f"    {fbc.get_info()}")
+            if self.sponge_layers:
+                print(f"  Sponge layers: {len(self.sponge_layers)}")
         
         # =====================================================================
         # Phase 4: Create corner BC (edge/corner → f = f_eq)
@@ -140,13 +145,15 @@ class DomainBCManager:
         """Apply all domain BCs in correct order.
         
         Phase 1: Face BCs write to flat nodes only
-        Phase 2: CornerBC writes to edge/corner nodes
+        Phase 2: CornerBC writes to edge/corner nodes (f = f_eq)
+        Phase 3: Sponge layers damp buffer zone volumes
         
-        Each boundary node is written EXACTLY ONCE.
+        Each boundary node is written EXACTLY ONCE by Phase 1+2.
+        Sponge in Phase 3 further modifies the buffer zone.
         
         Args:
             f: Distribution after streaming, modified in-place
-            f_post: Post-collision distribution (for bounce-back compatibility)
+            f_post: Post-collision distribution (needed for bounce-back BCs)
         """
         # Phase 1: Face BCs (flat nodes only)
         for face_bc in self.face_bcs:
@@ -155,6 +162,10 @@ class DomainBCManager:
         # Phase 2: Edge/corner nodes → f = f_eq
         if self.corner_bc is not None:
             self.corner_bc.apply(f)
+        
+        # Phase 3: Sponge layers (volume damping, applied last)
+        for sponge in self.sponge_layers:
+            sponge.apply(f)
     
     # =========================================================================
     # Query Interface
@@ -164,6 +175,11 @@ class DomainBCManager:
     def n_face_bcs(self) -> int:
         """Number of face BCs."""
         return len(self.face_bcs)
+    
+    @property
+    def n_sponge_layers(self) -> int:
+        """Number of sponge layers."""
+        return len(self.sponge_layers)
     
     @property
     def n_edges(self) -> int:
@@ -202,11 +218,14 @@ class DomainBCManager:
             parts.append(f"ρ_target={fc.density}")
             parts.append(f"K={fc.relax_coeff}")
         elif fc.bc_type == BCType.WALL:
-            parts.append("(no-slip)")
-        elif fc.bc_type == BCType.FREESTREAM:
-            parts.append(f"U∞={fc.velocity}")
-            parts.append(f"ρ∞={fc.density}")
-            parts.append(f"K={fc.relax_coeff}")
+            mode = "bounce-back" if not fc.use_regularized else "regularized"
+            parts.append(f"({mode})")
+        elif fc.bc_type == BCType.NEUMANN:
+            parts.append("(zero-gradient)")
+        elif fc.bc_type == BCType.SPONGE:
+            L = fc.extra.get('thickness', 20)
+            sigma = fc.extra.get('sigma_max', 0.5)
+            parts.append(f"L={L}, σ_max={sigma}")
         
         print(', '.join(parts))
     
@@ -218,6 +237,11 @@ class DomainBCManager:
         ]
         for fbc in self.face_bcs:
             lines.append(f"    {fbc.get_info()}")
+        
+        if self.sponge_layers:
+            lines.append(f"  Sponge layers: {self.n_sponge_layers}")
+            for sl in self.sponge_layers:
+                lines.append(f"    {sl.get_info()}")
         
         if self.corner_bc:
             lines.append(f"  {self.corner_bc.get_info()}")

@@ -44,12 +44,8 @@ from src.io.marker_vtk_writer import MarkerVTPWriter
 # =============================================================================
 # Boundary Conditions
 # =============================================================================
-from src.boundary.base import (
-    BoundaryManager,
-    create_boundary_from_config,
-)
+from src.boundary.domain_bc_manager import DomainBCManager
 from src.boundary.wall import HalfwayBounceBack
-from src.boundary.domain_wall import DomainWallManager
 
 from src.boundary.geometry_manager import create_geometry_mask, validate_geometry_config
 
@@ -182,85 +178,19 @@ def main():
         print(f"  Δx = {dx_phys*1000:.2f} mm, Δt = {dt_phys*1e6:.2f} μs")
 
     # =========================================================================
-    # Boundary Conditions
+    # Boundary Conditions — "One Node, One Dynamics" (Palabos architecture)
     # =========================================================================
-    print(f"\n[3] Boundary Conditions")
+    print(f"\n[3] Domain Boundary Conditions")
     
     boundaries_config = config_loader.config.get('boundaries', {})
     
-    # Separate boundaries by method
-    inlet_boundaries = {}
-    farfield_boundaries = {}
-    wall_boundaries = {}
-    
-    inlet_methods = ['non_equilibrium', 'neq', 'equilibrium', 'eq',
-                     'regularized_inlet', 'regularized_velocity', 'reg_inlet']
-    wall_methods = ['bounce_back', 'hwbb', 'halfway', 'wall',
-                    'regularized_wall', 'reg_wall']
-    skip_methods = ['periodic', 'none', '']
-    
-    for bc_name, bc_config in boundaries_config.items():
-        method = bc_config.get('method', '').lower()
-        
-        if not method:
-            bc_type = bc_config.get('type', '').lower()
-            if bc_type == 'wall':
-                method = 'bounce_back'
-            elif bc_type == 'inlet':
-                method = bc_config.get('method', 'non_equilibrium').lower()
-            elif bc_type in ['outlet', 'open']:
-                method = bc_config.get('method', 'characteristic').lower()
-        
-        if method in wall_methods:
-            wall_boundaries[bc_name] = bc_config
-        elif method in inlet_methods:
-            inlet_boundaries[bc_name] = bc_config
-        elif method not in skip_methods:
-            farfield_boundaries[bc_name] = bc_config
-    
-    bc_manager = BoundaryManager()
-    print("  Boundaries (in application order):")
-    
-    # Add farfield/outlet BCs first
-    for bc_name, bc_config in farfield_boundaries.items():
-        bc = create_boundary_from_config(xp, lattice, bc_name, bc_config, domain_shape)
-        if bc is not None:
-            bc_manager.add(bc)
-            loc = bc_config.get('location', bc_name)
-            method = bc_config.get('method', 'characteristic')
-            rho = bc_config.get('rho', 1.0)
-            k = bc_config.get('k', bc_config.get('relax_coeff', 0.1))
-            print(f"    {bc_name}: {method} at {loc}, ρ={rho}, k={k}")
-    
-    # Add inlet BCs last (corner priority)
-    for bc_name, bc_config in inlet_boundaries.items():
-        bc = create_boundary_from_config(xp, lattice, bc_name, bc_config, domain_shape)
-        if bc is not None:
-            bc_manager.add(bc)
-            loc = bc_config.get('location', bc_name)
-            method = bc_config.get('method', 'non_equilibrium')
-            velocity = bc_config.get('velocity', 0.1)
-            rho = bc_config.get('rho', 1.0)
-            print(f"    {bc_name}: {method} at {loc}, u={velocity}, ρ={rho} [corner priority]")
-    
-    if len(bc_manager) == 0:
-        print("    (none)")
-    
-    # Domain wall BCs
-    print("  Domain Walls:")
-    wall_locations = [bc_config.get('location') for bc_config in wall_boundaries.values()]
-    if wall_locations:
-        domain_walls = DomainWallManager(
-            xp, lattice, domain_shape,
-            walls=wall_locations,
-            exclude_inlet_outlet=True
-        )
-        print(f"    {domain_walls.get_info()}")
-        bc_manager.set_wall_info_all(wall_locations, domain_shape)
-        print(f"  Corner Safety: wall_faces={wall_locations} applied to {len(bc_manager)} BCs")
-    else:
-        domain_walls = None
-        print("    (none - using periodic for unlisted boundaries)")
+    domain_bc_mgr = DomainBCManager(
+        xp=xp,
+        lattice=lattice,
+        boundaries_config=boundaries_config,
+        domain_shape=domain_shape,
+        verbose=True,
+    )
 
     # Internal obstacle
     internal_geom = config_loader.config.get('internal_geometry', {})
@@ -620,13 +550,13 @@ def main():
         streaming.compute(f_post, f_new)
 
         # Step 6: Boundary Conditions
-        bc_manager.apply_all(f_new)
-
-        if domain_walls is not None:
-            domain_walls.apply_all(f_new, f_post)
+        #   Phase 1: Domain faces (flat nodes) + edge/corner (f = f_eq)
+        domain_bc_mgr.apply_all(f_new, f_post)
         
+        #   Phase 2: Internal obstacles — nacelle/tower (HalfwayBounceBack)
         if obstacle_bc is not None:
             obstacle_bc.apply_with_reset(f_new, f_post)
+
         
         # =====================================================================
         # Force Calculation (using f_post, before BC application)
