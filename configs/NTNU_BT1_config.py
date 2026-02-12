@@ -158,8 +158,8 @@ print(f"  [Config] ν_lu   = {_nu_lu:.6f},  τ = {_tau:.4f}")
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
-    "dimension": 2,
-    "lattice_model": "D2Q9",
+    "dimension": 3,
+    "lattice_model": "D3Q27",
     "domain": {
         "Nx": Nx,
         "Ny": Ny,
@@ -209,14 +209,14 @@ boundaries = {
         "method": "regularized_outlet", 
                "rho": RHO, 
                "k":0.1},
-    # "floor": {
-    #     "location": "zmin",
-    #     "method": "pressure_relaxation", 
-    #            "rho": RHO, "k":0.1},
-    # "ceiling": {
-    #     "location": "zmax",
-    #     "method": "pressure_relaxation", 
-    #            "rho": RHO, "k":0.1},
+    "floor": {
+        "location": "zmin",
+        "method": "regularized_outlet", 
+               "rho": RHO, "k":0.1},
+    "ceiling": {
+        "location": "zmax",
+        "method": "regularized_outlet", 
+               "rho": RHO, "k":0.1},
 }
 
 
@@ -233,7 +233,7 @@ internal_geometry = {}
 # Actuator Line Configuration
 # =============================================================================
 actuator_line = {
-    "enabled": False,
+    "enabled": True,
 
     # --- Rotor ---
     "rotor": {
