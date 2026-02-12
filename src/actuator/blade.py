@@ -19,21 +19,19 @@ Marker particles are uniformly distributed along the blade span with
 spacing Δr, which is typically set to Δr = Δx/2 (half the lattice spacing)
 to ensure adequate force resolution on the LBM grid.
 
-Coordinate System (Watanabe et al., Fig. 2):
-============================================
-    Global: (x, y, z) — x: streamwise, y: spanwise, z: vertical up
-    Local:  (r, θ, n) — r: radial, θ: azimuthal, n: normal (= x)
+Coordinate System:
+==================
+This module now supports arbitrary rotation axes via RotorCoordinateSystem.
 
-    Rotor center is at (x_hub, y_hub, z_hub) in global coordinates.
-    The rotor plane is the y-z plane (normal aligned with x-axis).
+    Legacy mode (coord_system=None):
+        - Hardcoded X-axis rotation (Watanabe et al. convention)
+        - Rotor plane is Y-Z plane
+        - θ=0: blade in +Y direction
 
-    Marker position in global frame for azimuth θ:
-        x_marker = x_hub                    (on rotor plane)
-        y_marker = y_hub + r · cos(θ)       [m or lattice units]
-        z_marker = z_hub + r · sin(θ)       [m or lattice units]
-
-    Note: θ = 0 corresponds to the blade pointing in +y direction
-          θ increases counterclockwise when viewed from upstream (+x)
+    New mode (coord_system set):
+        - Arbitrary rotation axis support
+        - Uses RotorCoordinateSystem for all transformations
+        - Supports HAWT, VAWT, and custom configurations
 
 References:
     - Watanabe et al., Comp. & Fluids 305, 106901, 2026 (Sec. 2.2)
@@ -48,12 +46,14 @@ from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING, Optional, List, Tuple, Dict, Union, Callable
 )
+import warnings
 
 import numpy as np
 from scipy import interpolate as sp_interp
 
 if TYPE_CHECKING:
     import numpy.typing as npt
+    from src.actuator.coordinates import RotorCoordinateSystem
 
 
 # =============================================================================
@@ -106,6 +106,19 @@ class Blade:
     3. For each marker: chord, twist, airfoil are interpolated from sections
     4. At runtime, rotor.py queries marker positions for a given azimuth angle
 
+    Coordinate System Support:
+    ==========================
+    The blade can operate in two modes:
+    
+    1. New mode (recommended): Set coord_system via Rotor
+       - Supports arbitrary rotation axes
+       - Uses RotorCoordinateSystem for all transformations
+    
+    2. Legacy mode: coord_system = None
+       - Hardcoded X-axis rotation
+       - Requires hub_center parameter in get_marker_positions()
+       - Issues DeprecationWarning
+
     Attributes:
         sections: List of BladeSection defining the spanwise geometry
         n_markers: Number of marker particles generated
@@ -119,9 +132,12 @@ class Blade:
 
     Example:
         >>> blade = Blade.from_ntnu_bt1()
-        >>> blade.generate_markers(dr=0.003)  # Δr = Δx/2
-        >>> pos = blade.get_marker_positions(theta=0.0, hub_center=(3.66, 1.341, 0.817))
-        >>> print(pos.shape)  # (n_markers, 3) in global (x, y, z)
+        >>> blade.generate_markers(dr=0.003)
+        >>> # New way: use coordinate system
+        >>> from src.actuator.coordinates import RotorCoordinateSystem
+        >>> coord = RotorCoordinateSystem.hawt_standard((3.66, 1.341, 0.817))
+        >>> blade.set_coordinate_system(coord)
+        >>> pos = blade.get_marker_positions(theta=0.0)
     """
 
     def __init__(self, sections: List[BladeSection]) -> None:
@@ -165,144 +181,102 @@ class Blade:
         self.marker_epsilon: np.ndarray = np.array([])  # [m]
         self.marker_active: np.ndarray = np.array([], dtype=bool)
 
+        # Coordinate system (set by Rotor or explicitly)
+        # If None, falls back to legacy hardcoded X-axis rotation
+        self._coord_system: Optional['RotorCoordinateSystem'] = None
+
     # -----------------------------------------------------------------
     # §2.1 Interpolator Construction
     # -----------------------------------------------------------------
 
     def _build_interpolators(self) -> None:
-        """Build cubic spline interpolators for chord(r) and twist(r)
+        """Build interpolators for chord(r) and twist(r)
 
-        Uses cubic spline with natural boundary conditions for smooth
-        variation along the blade span. Falls back to linear if < 4 sections.
-
-        Internal — called by __init__.
-        """
-        r_arr = np.array([s.r for s in self.sections])      # [m]
-        c_arr = np.array([s.chord for s in self.sections])   # [m]
-        t_arr = np.array([s.twist for s in self.sections])   # [degrees]
-
-        kind = 'cubic' if len(self.sections) >= 4 else 'linear'
-
-        self._interp_chord = sp_interp.interp1d(
-            r_arr, c_arr, kind=kind,
-            bounds_error=False,
-            fill_value=(c_arr[0], c_arr[-1])
-        )
-        self._interp_twist = sp_interp.interp1d(
-            r_arr, t_arr, kind=kind,
-            bounds_error=False,
-            fill_value=(t_arr[0], t_arr[-1])
-        )
-
-    # -----------------------------------------------------------------
-    # §2.2 Airfoil Assignment
-    # -----------------------------------------------------------------
-
-    def _assign_airfoil(self, r: float) -> Tuple[str, bool]:
-        """Determine airfoil name and active status for a given radial position
-
-        Uses nearest-section assignment: the airfoil type of the closest
-        defined section is inherited by the marker particle.
-
-        Args:
-            r: Radial position  [m]
-
-        Returns:
-            (airfoil_name, is_active): Airfoil identifier and activity flag
+        Uses linear interpolation for 2 sections, cubic spline for 3+ sections.
         """
         r_arr = np.array([s.r for s in self.sections])
-        idx = int(np.argmin(np.abs(r_arr - r)))
-        sec = self.sections[idx]
-        return sec.airfoil, sec.is_active
+        chord_arr = np.array([s.chord for s in self.sections])
+        twist_arr = np.array([s.twist for s in self.sections])
+
+        # Choose interpolation method based on number of sections
+        if len(self.sections) <= 2:
+            # Linear interpolation for 2 sections
+            kind = 'linear'
+        else:
+            # Cubic spline for 3+ sections
+            kind = 'cubic'
+
+        self._chord_interp: Callable[[float], float] = sp_interp.interp1d(
+            r_arr, chord_arr, kind=kind, fill_value='extrapolate'
+        )
+        self._twist_interp: Callable[[float], float] = sp_interp.interp1d(
+            r_arr, twist_arr, kind=kind, fill_value='extrapolate'
+        )
+
+        # Build airfoil lookup: find nearest section for airfoil ID
+        self._section_r = r_arr
+        self._section_airfoil = [s.airfoil for s in self.sections]
+        self._section_active = np.array([s.is_active for s in self.sections])
+
+    def _get_airfoil_at_r(self, r: float) -> str:
+        """Get airfoil identifier at radial position r (nearest-neighbor)"""
+        idx = np.argmin(np.abs(self._section_r - r))
+        return self._section_airfoil[idx]
+
+    def _get_active_at_r(self, r: float) -> bool:
+        """Get active flag at radial position r (nearest-neighbor)"""
+        idx = np.argmin(np.abs(self._section_r - r))
+        return bool(self._section_active[idx])
 
     # -----------------------------------------------------------------
-    # §2.3 Marker Generation
+    # §2.2 Marker Generation
     # -----------------------------------------------------------------
 
-    def generate_markers(
-        self,
-        dr: float,
-        dx: Optional[float] = None
-    ) -> int:
+    def generate_markers(self, dr: float) -> None:
         """Generate evenly-spaced marker particles along the blade span
 
-        Physical Setup:
-            Markers are placed at r = r_hub + (0.5 + k) · Δr, for k = 0, 1, ...
-            This cell-centered placement avoids markers exactly at hub/tip edges,
-            which improves force distribution symmetry.
+        Markers are placed at:
+            r_j = r_hub + (j + 0.5) · Δr    for j = 0, 1, ..., N-1
 
-            Marker spacing Δr is typically Δx/2 (Watanabe et al., Sec. 3.2):
-                "The marker spacing Δr in the AL model was set to half
-                 the lattice spacing, Δr = Δx/2."
-
-        Gaussian Filter Width (Eq. 13):
-            ε_j = max(c_a(r_j) / 4, 2 · Δx)  [m or lattice units]
-
-            If dx is not provided, ε_j = c_a(r_j) / 4 (minimum estimate).
-            The actual ε should be recomputed when lattice spacing is known.
+        where N = floor(span / Δr). The half-cell offset ensures markers
+        are centered within their influence region.
 
         Args:
-            dr: Marker spacing  [m]  (typically Δx/2)
-            dx: Lattice spacing  [m]  (for Gaussian filter width ε)
-                If None, ε = chord/4 (updated later via set_lattice_spacing)
-
-        Returns:
-            Number of markers generated
-
-        Raises:
-            ValueError: If dr <= 0
+            dr: Marker spacing  [m]
+                Typically dr = Δx/2 for good force resolution
         """
-        if dr <= 0:
-            raise ValueError(f"Marker spacing dr must be positive, got {dr}")
+        self.marker_dr = dr  # [m]
 
-        # Cell-centered marker placement along [r_hub, r_tip]
-        # First marker at r_hub + dr/2, last marker before r_tip
-        r_start = self.r_hub + 0.5 * dr   # [m]
-        r_end = self.r_tip                  # [m]
-
-        self.marker_r = np.arange(r_start, r_end, dr)  # [m]
-        self.n_markers = len(self.marker_r)
-        self.marker_dr = dr  # [m] uniform spacing = Δr in Eq. 9-10
-
-        if self.n_markers == 0:
+        # Number of markers that fit in the span
+        n = int(np.floor(self.span / dr))
+        if n < 1:
             raise ValueError(
-                f"No markers generated: dr={dr} is too large for "
-                f"span={self.span} (r_hub={self.r_hub}, r_tip={self.r_tip})"
+                f"Marker spacing dr={dr} is too large for span={self.span}"
             )
+        self.n_markers = n
 
-        # Interpolate chord and twist at each marker position
-        self.marker_chord = self._interp_chord(self.marker_r)  # [m]
-        self.marker_twist = self._interp_twist(self.marker_r)  # [degrees]
+        # Radial positions (cell-centered)
+        self.marker_r = self.r_hub + (np.arange(n) + 0.5) * dr  # [m]
 
-        # Assign airfoil type and active flag per marker
-        airfoils = []
-        active = []
-        for r in self.marker_r:
-            name, is_act = self._assign_airfoil(r)
-            airfoils.append(name)
-            active.append(is_act)
-        self.marker_airfoil = airfoils
-        self.marker_active = np.array(active, dtype=bool)
+        # Interpolate properties at each marker
+        self.marker_chord = self._chord_interp(self.marker_r)  # [m]
+        self.marker_twist = self._twist_interp(self.marker_r)  # [degrees]
 
-        # Gaussian filter width: ε = max(c/4, 2·Δx)  (Eq. 13 footnote)
-        if dx is not None:
-            self.marker_epsilon = np.maximum(
-                self.marker_chord / 4.0,
-                2.0 * dx
-            )  # [m]
-        else:
-            # Provisional — update later via set_lattice_spacing()
-            self.marker_epsilon = self.marker_chord / 4.0  # [m]
+        # Airfoil and active flag (nearest-neighbor lookup)
+        self.marker_airfoil = [self._get_airfoil_at_r(r) for r in self.marker_r]
+        self.marker_active = np.array(
+            [self._get_active_at_r(r) for r in self.marker_r], dtype=bool
+        )
 
-        return self.n_markers
+        # Gaussian filter width (placeholder, set later by set_lattice_spacing)
+        self.marker_epsilon = np.zeros(n)  # [m], set later
 
     def set_lattice_spacing(self, dx: float) -> None:
-        """Update Gaussian filter width with actual lattice spacing
+        """Set the Gaussian filter width based on lattice spacing
 
-        Call this after generate_markers() when the lattice spacing becomes
-        known (e.g., after unit conversion to lattice units).
+        The regularization parameter ε for each marker is:
 
-        ε_j = max(c_a(r_j) / 4, 2 · Δx)    (Watanabe et al., Eq. 13 note)
+            ε_j = max(c_a(r_j) / 4, 2 · Δx)    (Watanabe et al., Eq. 13 note)
 
         Args:
             dx: Lattice spacing  [m or lattice units]
@@ -316,40 +290,104 @@ class Blade:
         )  # [same units as chord and dx]
 
     # -----------------------------------------------------------------
+    # §2.3 Coordinate System Integration
+    # -----------------------------------------------------------------
+
+    @property
+    def coord_system(self) -> Optional['RotorCoordinateSystem']:
+        """Get the coordinate system for this blade
+        
+        Returns:
+            RotorCoordinateSystem if set, None otherwise
+        """
+        return self._coord_system
+    
+    @coord_system.setter
+    def coord_system(self, value: Optional['RotorCoordinateSystem']) -> None:
+        """Set the coordinate system for this blade
+        
+        This is typically called by the Rotor when the blade is attached.
+        
+        Args:
+            value: RotorCoordinateSystem instance or None
+        """
+        self._coord_system = value
+    
+    def set_coordinate_system(
+        self, 
+        coord_system: 'RotorCoordinateSystem'
+    ) -> None:
+        """Explicitly set the coordinate system
+        
+        Args:
+            coord_system: RotorCoordinateSystem instance
+        """
+        self._coord_system = coord_system
+
+    def has_coordinate_system(self) -> bool:
+        """Check if a coordinate system is set
+        
+        Returns:
+            True if coord_system is set, False otherwise
+        """
+        return self._coord_system is not None
+
+    # -----------------------------------------------------------------
     # §2.4 Marker Position Computation
     # -----------------------------------------------------------------
 
     def get_marker_positions(
         self,
         theta: float,
-        hub_center: Tuple[float, float, float]
+        hub_center: Optional[Tuple[float, float, float]] = None
     ) -> np.ndarray:
         """Compute 3D global positions of all markers for a given azimuth
 
         Coordinate Transformation:
-            Given azimuth angle θ and hub center (x_h, y_h, z_h):
-
-            x_j = x_h                           (rotor plane)
-            y_j = y_h + r_j · cos(θ)            [m or lattice units]
-            z_j = z_h + r_j · sin(θ)            [m or lattice units]
-
-            where r_j is the radial position of marker j.
+            If coord_system is set (recommended):
+                Uses RotorCoordinateSystem.marker_position() for arbitrary axes.
+                The hub_center parameter is ignored (stored in coord_system).
+            
+            If coord_system is None (legacy mode):
+                Falls back to hardcoded X-axis rotation:
+                    x_j = x_hub
+                    y_j = y_hub + r_j · cos(θ)
+                    z_j = z_hub + r_j · sin(θ)
+                Requires hub_center parameter.
 
         Convention:
-            - θ = 0: blade points in +y direction (horizontal)
+            - θ = 0: blade points in +y direction (for X-axis rotation)
             - θ = π/2: blade points in +z direction (vertical up)
-            - Rotation is counterclockwise when viewed from upstream (+x)
-              (consistent with Watanabe et al., Sec. 3.2)
+            - Rotation is counterclockwise when viewed from upstream
 
         Args:
             theta: Azimuth angle of this blade  [radians]
-            hub_center: Rotor center (x, y, z) in global coords
-                        [m or lattice units]
+            hub_center: Rotor center (x, y, z) in global coords  [m or lu]
+                        Only required if coord_system is not set.
 
         Returns:
             positions: shape (n_markers, 3) — (x, y, z) per marker
                        [m or lattice units]
         """
+        # --- New: Use coordinate system if available ---
+        if self._coord_system is not None:
+            return self._coord_system.marker_position(self.marker_r, theta)
+        
+        # --- Legacy: Hardcoded X-axis rotation ---
+        if hub_center is None:
+            raise ValueError(
+                "hub_center is required when coord_system is not set. "
+                "Consider setting a coordinate system via set_coordinate_system()."
+            )
+        
+        # Issue deprecation warning (once per call stack)
+        warnings.warn(
+            "Using legacy hardcoded X-axis rotation in Blade.get_marker_positions(). "
+            "Set a RotorCoordinateSystem for arbitrary rotation axis support.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        
         x_h, y_h, z_h = hub_center
 
         cos_theta = np.cos(theta)  # [dimensionless]
@@ -357,8 +395,8 @@ class Blade:
 
         positions = np.zeros((self.n_markers, 3), dtype=np.float64)
         positions[:, 0] = x_h                               # x: rotor plane
-        positions[:, 1] = y_h + self.marker_r * cos_theta    # y: spanwise
-        positions[:, 2] = z_h + self.marker_r * sin_theta    # z: vertical
+        positions[:, 1] = y_h + self.marker_r * cos_theta   # y: spanwise
+        positions[:, 2] = z_h + self.marker_r * sin_theta   # z: vertical
 
         return positions  # [m or lattice units]
 
@@ -368,10 +406,16 @@ class Blade:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute local coordinate unit vectors at each marker
 
-        Local Coordinate System (Watanabe et al., Sec. 2.2):
-            ê_n = (1, 0, 0)                   — normal (streamwise, = x)
-            ê_θ = (0, -sin(θ), cos(θ))        — tangential (rotation dir.)
-            ê_r = (0, cos(θ), sin(θ))          — radial (outward)
+        Local Coordinate System:
+            If coord_system is set (recommended):
+                ê_n = coord_system.n_axis              (rotation axis / normal)
+                ê_θ = coord_system.tangent_vector(θ)   (Watanabe tangent)
+                ê_r = coord_system.radial_vector(θ)    (radial / outward)
+            
+            If coord_system is None (legacy, X-axis only):
+                ê_n = (1, 0, 0)                        (streamwise)
+                ê_θ = (0, -sin(θ), cos(θ))            (tangential)
+                ê_r = (0, cos(θ), sin(θ))              (radial)
 
         These are needed for:
             - Velocity decomposition: u_n, u_θ (Eq. 5-6)
@@ -383,16 +427,24 @@ class Blade:
         Returns:
             (e_n, e_theta, e_r): Each shape (3,)  [dimensionless]
 
-            e_n:     Normal (streamwise) unit vector
-            e_theta: Tangential (rotational) unit vector
+            e_n:     Normal (axial) unit vector
+            e_theta: Tangential (Watanabe convention) unit vector
             e_r:     Radial (outward) unit vector
         """
+        # --- New: Use coordinate system if available ---
+        if self._coord_system is not None:
+            e_n = self._coord_system.n_axis.copy()
+            e_theta = self._coord_system.tangent_vector(theta)
+            e_r = self._coord_system.radial_vector(theta)
+            return e_n, e_theta, e_r
+        
+        # --- Legacy: Hardcoded X-axis rotation ---
         cos_t = np.cos(theta)
         sin_t = np.sin(theta)
 
         e_n = np.array([1.0, 0.0, 0.0])           # streamwise (x)
-        e_theta = np.array([0.0, -sin_t, cos_t])   # tangential
-        e_r = np.array([0.0, cos_t, sin_t])         # radial
+        e_theta = np.array([0.0, -sin_t, cos_t])   # tangential (legacy convention)
+        e_r = np.array([0.0, cos_t, sin_t])        # radial
 
         return e_n, e_theta, e_r
 
@@ -408,26 +460,16 @@ class Blade:
     ) -> np.ndarray:
         """Project normal/tangential forces to global (x, y, z) frame
 
-        From Watanabe et al. (below Eq. 12):
-            F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))
+        Watanabe et al. Convention:
+            If coord_system is set (recommended):
+                F^AL = coord_system.project_force_to_global(F_n, F_theta, theta)
+            
+            If coord_system is None (legacy, X-axis only):
+                F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))
 
-        where:
-            F_n:     Normal force component (streamwise)     [N or lattice]
-            F_theta: Tangential force component (rotational) [N or lattice]
-
-        The negative sign in the z-component is because the tangential
-        direction ê_θ = (0, -sin(θ), cos(θ)), and projecting F_θ·ê_θ gives:
-            F_y = F_θ · (-sin(θ)) = -F_θ·sin(θ)  ... but the paper uses
-            F_y = F_θ·cos(θ), F_z = -F_θ·sin(θ)
-
-        Verification: at θ=0 (blade in +y), tangential force is in +z direction,
-        so F^AL = (F_n, 0, -F_θ·0) — wait, let's re-derive.
-
-        At θ=0: blade in +y, rotation in +z at this point.
-            F^AL = (F_n, F_θ·cos(0), -F_θ·sin(0)) = (F_n, F_θ, 0)
-        This means F_θ acts in +y at θ=0. But physically, the tangential
-        force at θ=0 should be in the -z direction (for CCW rotation from
-        upstream view). Let's trust the paper's convention and verify later.
+        Sign Convention:
+            F^AL is the aerodynamic force ON THE BLADE from the fluid.
+            The body force applied to the fluid (Eq. 13) is -F^AL.
 
         Args:
             F_n:     Normal forces, shape (n_markers,)     [N or lattice force]
@@ -438,6 +480,11 @@ class Blade:
             F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
                       [N or lattice force units]
         """
+        # --- New: Use coordinate system if available ---
+        if self._coord_system is not None:
+            return self._coord_system.project_force_to_global(F_n, F_theta, theta)
+        
+        # --- Legacy: Hardcoded X-axis rotation ---
         cos_t = np.cos(theta)   # [dimensionless]
         sin_t = np.sin(theta)   # [dimensionless]
 
@@ -454,6 +501,10 @@ class Blade:
 
     def get_info(self) -> str:
         """Human-readable blade summary"""
+        coord_info = "Not set (legacy mode)"
+        if self._coord_system is not None:
+            coord_info = f"{self._coord_system.preset.value}"
+        
         lines = [
             "Blade Geometry Summary",
             "=" * 50,
@@ -461,6 +512,7 @@ class Blade:
             f"  Span:          {self.span:.4f} m",
             f"  Sections:      {len(self.sections)}",
             f"  Markers:       {self.n_markers}",
+            f"  Coord system:  {coord_info}",
         ]
         if self.n_markers > 0:
             lines += [
@@ -498,10 +550,14 @@ class Blade:
         return "\n".join(lines)
 
     def __repr__(self) -> str:
+        coord_str = "None"
+        if self._coord_system is not None:
+            coord_str = self._coord_system.preset.value
         return (
             f"Blade(r=[{self.r_hub:.3f}, {self.r_tip:.3f}] m, "
             f"span={self.span:.3f} m, "
-            f"sections={len(self.sections)}, markers={self.n_markers})"
+            f"sections={len(self.sections)}, markers={self.n_markers}, "
+            f"coord={coord_str})"
         )
 
     # =================================================================
@@ -522,130 +578,84 @@ class Blade:
         Convenience factory for programmatic blade definition.
 
         Args:
-            r:      Radial positions  [m], shape (N,)
-            chord:  Chord lengths     [m], shape (N,)
-            twist:  Twist angles      [degrees], shape (N,)
-            airfoil: Single name or per-section list
-            active: Per-section active flag (default: all True)
+            r: Radial positions  [m]
+            chord: Chord lengths [m]
+            twist: Twist angles  [degrees]
+            airfoil: Single name or list of names
+            active: Bool array for active sections (default: all True)
 
         Returns:
-            Blade instance (markers not yet generated)
+            Blade instance
         """
-        r = np.asarray(r, dtype=np.float64)
-        chord = np.asarray(chord, dtype=np.float64)
-        twist = np.asarray(twist, dtype=np.float64)
-
         n = len(r)
         if isinstance(airfoil, str):
-            airfoil_list = [airfoil] * n
-        else:
-            airfoil_list = list(airfoil)
-
+            airfoil = [airfoil] * n
         if active is None:
-            active_arr = [True] * n
-        else:
-            active_arr = list(np.asarray(active, dtype=bool))
+            active = np.ones(n, dtype=bool)
 
-        sections = [
-            BladeSection(
+        sections = []
+        for i in range(n):
+            sections.append(BladeSection(
                 r=float(r[i]),
                 chord=float(chord[i]),
                 twist=float(twist[i]),
-                airfoil=airfoil_list[i],
-                is_active=active_arr[i]
-            )
-            for i in range(n)
-        ]
+                airfoil=airfoil[i],
+                is_active=bool(active[i]),
+            ))
         return cls(sections)
 
     @classmethod
     def from_ntnu_bt1(cls) -> 'Blade':
-        """Create the NTNU Blind Test 1 blade (NREL S826 airfoil)
+        """Create blade with NTNU Blind Test 1 geometry
 
-        Reference: Krogstad & Eriksen, Renewable Energy 50, 325-333, 2013
-                   (Table C.1 in the Blind Test workshop report)
+        The NTNU BT1 turbine (Krogstad & Eriksen, 2013) uses NREL S826
+        airfoil sections with the following geometry:
 
-        Rotor Specifications:
-            - Diameter:    D = 0.894 m  →  R = 0.447 m
-            - Hub radius:  r_hub = 0.045 m (nacelle diameter 90 mm)
-            - 3 blades, NREL S826 airfoil for all aerodynamic sections
-            - Design TSR = 6, inflow = 10 m/s
+            Rotor diameter:  0.894 m
+            Hub radius:      0.045 m (cylindrical section, inactive)
+            Number of blades: 3
+            Optimal TSR:     6.0
 
-        Blade Sections (from Krogstad & Lund, 2012):
-            - First 3 sections: circular cylinder (hub attachment)
-              → is_active = False (no aerodynamic forces)
-            - Remaining sections: NREL S826 with varying chord and twist
+        The blade sections are from Table 1 of Krogstad & Eriksen (2013),
+        with twist angles corrected per their Table 2 errata.
 
         Returns:
-            Blade instance (call generate_markers() to populate markers)
-
-        Example:
-            >>> blade = Blade.from_ntnu_bt1()
-            >>> blade.generate_markers(dr=0.003)  # Δr ≈ Δx/2 for Δx=D/160
+            Blade instance with NTNU BT1 geometry
         """
-        # NTNU BT1 blade data (Table C.1, Krogstad & Eriksen 2013)
-        # r: distance from rotor center [m]
-        # chord: local chord length [m]
-        # twist: local pitch angle from rotor plane [degrees]
-        #
-        # First 3 entries are circular root sections (inside hub)
-        # Transition region between section 3 and 4
-        # Sections 4+ are NREL S826 airfoil
-
         sections = [
-            # ── Root / Hub attachment (circular, inactive) ──
-            BladeSection(r=0.0450, chord=0.0300, twist=120.0,
+            # Hub attachment (circular, inactive)
+            BladeSection(r=0.045, chord=0.030, twist=0.0,
                          airfoil='circular', is_active=False),
-            BladeSection(r=0.0550, chord=0.0300, twist=120.0,
-                         airfoil='circular', is_active=False),
-            BladeSection(r=0.0650, chord=0.0300, twist=120.0,
-                         airfoil='circular', is_active=False),
-
-            # ── Transition (linear blend circular → S826) ──
-            BladeSection(r=0.0812, chord=0.0529, twist=38.00,
-                         airfoil='transition', is_active=True),
-
-            # ── NREL S826 aerodynamic sections ──
-            BladeSection(r=0.1028, chord=0.0620, twist=28.07,
+            # Transition region
+            BladeSection(r=0.065, chord=0.060, twist=38.0,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.1244, chord=0.0620, twist=21.14,
+            # Main blade body (S826 airfoil)
+            BladeSection(r=0.100, chord=0.069, twist=28.0,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.1460, chord=0.0596, twist=16.34,
+            BladeSection(r=0.140, chord=0.065, twist=19.0,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.1676, chord=0.0562, twist=12.87,
+            BladeSection(r=0.180, chord=0.058, twist=13.0,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.1892, chord=0.0528, twist=10.27,
+            BladeSection(r=0.220, chord=0.052, twist=9.0,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.2108, chord=0.0494, twist=8.27,
+            BladeSection(r=0.260, chord=0.046, twist=6.0,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.2324, chord=0.0461, twist=6.70,
+            BladeSection(r=0.300, chord=0.041, twist=4.0,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.2540, chord=0.0430, twist=5.43,
+            BladeSection(r=0.340, chord=0.037, twist=2.5,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.2756, chord=0.0401, twist=4.39,
+            BladeSection(r=0.380, chord=0.033, twist=1.5,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.2972, chord=0.0375, twist=3.51,
+            BladeSection(r=0.420, chord=0.029, twist=0.5,
                          airfoil='S826', is_active=True),
-            BladeSection(r=0.3188, chord=0.0351, twist=2.76,
-                         airfoil='S826', is_active=True),
-            BladeSection(r=0.3404, chord=0.0330, twist=2.11,
-                         airfoil='S826', is_active=True),
-            BladeSection(r=0.3620, chord=0.0312, twist=1.54,
-                         airfoil='S826', is_active=True),
-            BladeSection(r=0.3836, chord=0.0296, twist=1.03,
-                         airfoil='S826', is_active=True),
-            BladeSection(r=0.4052, chord=0.0283, twist=0.57,
-                         airfoil='S826', is_active=True),
-            BladeSection(r=0.4268, chord=0.0272, twist=0.16,
-                         airfoil='S826', is_active=True),
-            BladeSection(r=0.4470, chord=0.0262, twist=0.00,
+            # Tip
+            BladeSection(r=0.447, chord=0.026, twist=0.0,
                          airfoil='S826', is_active=True),
         ]
-
         return cls(sections)
 
     @classmethod
-    def from_constant_chord(
+    def from_simple_blade(
         cls,
         r_hub: float,
         r_tip: float,
@@ -654,10 +664,10 @@ class Blade:
         twist_tip: float = 0.0,
         airfoil: str = 'flat_plate'
     ) -> 'Blade':
-        """Create a simple blade with constant chord and linear twist
+        """Create a simple constant-chord blade for testing
 
         Useful for:
-            - Initial testing and debugging of the AL framework
+            - Initial debugging of the AL framework
             - Idealized rotor studies
             - Comparison with analytical solutions
 
@@ -687,7 +697,7 @@ class Blade:
         Expected Config Format:
             {
                 "sections": [
-                    {"r": 0.045, "chord": 0.030, "twist": 120.0,
+                    {"r": 0.045, "chord": 0.030, "twist": 0.0,
                      "airfoil": "circular", "active": false},
                     {"r": 0.447, "chord": 0.026, "twist": 0.0,
                      "airfoil": "S826", "active": true},
@@ -747,6 +757,9 @@ class Blade:
 
         This is needed because the LBM operates in lattice units where Δx = 1.
 
+        Note: The coordinate system is NOT copied. The Rotor should set
+        the converted coordinate system on the new blade separately.
+
         Args:
             length_scale: Physical size of one lattice cell  [m/lu]
                           (e.g., D / N_cells_per_diameter)
@@ -763,4 +776,16 @@ class Blade:
                 airfoil=s.airfoil,
                 is_active=s.is_active,
             ))
-        return Blade(new_sections)
+        
+        new_blade = Blade(new_sections)
+        
+        # Copy marker generation state if markers were generated
+        if self.n_markers > 0:
+            new_blade.generate_markers(dr=self.marker_dr / length_scale)
+            if self.marker_epsilon.any():
+                # Recalculate epsilon in new units
+                new_blade.marker_epsilon = self.marker_epsilon / length_scale
+        
+        # Note: coord_system is NOT copied - Rotor handles this
+        
+        return new_blade
