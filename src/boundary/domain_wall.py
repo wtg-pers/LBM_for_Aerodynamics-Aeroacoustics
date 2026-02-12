@@ -55,13 +55,15 @@ class DomainWallBounceBack(BoundaryCondition):
             exclude_inlet_outlet: If True, wall BC excludes x=0 and x=Nx-1
         """
         # Store lattice info before super().__init__()
+        # NOTE: self.dim must be set BEFORE super().__init__() because
+        # _get_incoming_indices() is called during base class init and needs self.dim
         self._lattice = lattice
         self._location_str = location.value if hasattr(location, 'value') else str(location).lower()
+        self.dim = lattice.dim
         
         super().__init__(xp, lattice, location)
         
         self.shape = shape
-        self.dim = lattice.dim
         self.opp = xp.asarray(lattice.opp)
         self.exclude_inlet_outlet = exclude_inlet_outlet
         

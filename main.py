@@ -44,6 +44,12 @@ from src.utilities.flux_utils import ConservationManager
 from src.utilities.force_calculator import ForceManager
 from src.utilities.convergence import ConvergenceMonitor, ConvergenceStatus
 
+# =============================================================================
+# === AL === Actuator Line Modules
+# =============================================================================
+from src.actuator.actuator_line import create_actuator_line_from_config
+from src.actuator.airfoil_data import create_nrel_s826_database
+
 
 # =============================================================================
 # Main Simulation

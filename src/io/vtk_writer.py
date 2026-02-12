@@ -163,15 +163,28 @@ class VTKWriter:
               rho: Optional['npt.NDArray'] = None,
               u: Optional['npt.NDArray'] = None,
               solid_mask: Optional['npt.NDArray'] = None,
+              extra_scalars: Optional[Dict[str, 'npt.NDArray']] = None,
+              extra_vectors: Optional[Dict[str, 'npt.NDArray']] = None,
               time: Optional[float] = None,
               prefix: str = 'lbm') -> str:
         """Write VTK file for current time step
         
+        Standard fields:
+            - density (ρ)        ← from rho
+            - velocity (u)       ← from u
+            - solid_mask         ← from solid_mask
+
+        Derived fields removed (use ParaView Calculator):
+            - pressure:           p = density / 3
+            - velocity_magnitude: mag(velocity)
+
         Args:
             step: Time step number
             rho: Density field (Nx, Ny[, Nz])  [dimensionless]
             u: Velocity field (dim, Nx, Ny[, Nz])  [lattice units]
             solid_mask: Solid mask (Nx, Ny[, Nz]), True=solid
+            extra_scalars: Additional scalar fields {name: array(Nx,Ny,Nz)}
+            extra_vectors: Additional vector fields {name: array(3,Nx,Ny,Nz)}
             time: Physical time (optional, for PVD)
             prefix: Filename prefix
             
@@ -199,10 +212,7 @@ class VTKWriter:
             # Transpose (Nx, Ny, Nz) -> (Nz, Ny, Nx) then flatten
             rho_vtk = np.ascontiguousarray(rho_np.transpose(2, 1, 0)).ravel()
             data_arrays.append(('density', self.vtk_type, 1, rho_vtk.tobytes()))
-            
             # Pressure: p = ρ * c_s² = ρ / 3
-            pressure = (rho_vtk / 3.0).astype(self.dtype)
-            data_arrays.append(('pressure', self.vtk_type, 1, pressure.tobytes()))
         
         if u is not None:
             u_np = self._to_numpy(u).astype(self.dtype)
@@ -217,11 +227,6 @@ class VTKWriter:
             # Interleave components: (Nz, Ny, Nx, 3)
             u_interleaved = np.ascontiguousarray(u_transposed.transpose(1, 2, 3, 0))
             data_arrays.append(('velocity', self.vtk_type, 3, u_interleaved.ravel().tobytes()))
-            
-            # Velocity magnitude
-            u_mag = np.sqrt(np.sum(u_np**2, axis=0))
-            u_mag_vtk = np.ascontiguousarray(u_mag.transpose(2, 1, 0)).ravel()
-            data_arrays.append(('velocity_magnitude', self.vtk_type, 1, u_mag_vtk.astype(self.dtype).tobytes()))
         
         if solid_mask is not None:
             mask_np = self._to_numpy(solid_mask).astype(np.int8)
@@ -232,6 +237,33 @@ class VTKWriter:
             
             mask_vtk = np.ascontiguousarray(mask_np.transpose(2, 1, 0)).ravel()
             data_arrays.append(('solid_mask', 'Int8', 1, mask_vtk.tobytes()))
+        
+        # --- Extra scalar fields ---
+        if extra_scalars is not None:
+            for name, field in extra_scalars.items():
+                field_np = self._to_numpy(field).astype(self.dtype)
+                if self.dim == 2:
+                    field_np = self._expand_2d_to_3d(field_np, is_vector=False)
+                field_vtk = np.ascontiguousarray(
+                    field_np.transpose(2, 1, 0)
+                ).ravel()
+                data_arrays.append(
+                    (name, self.vtk_type, 1, field_vtk.tobytes())
+                )
+
+        # --- Extra vector fields ---
+        if extra_vectors is not None:
+            for name, field in extra_vectors.items():
+                field_np = self._to_numpy(field).astype(self.dtype)
+                if self.dim == 2:
+                    field_np = self._expand_2d_to_3d(field_np, is_vector=True)
+                field_t = field_np.transpose(0, 3, 2, 1)  # (3,Nx,Ny,Nz) → (3,Nz,Ny,Nx)
+                field_interleaved = np.ascontiguousarray(
+                    field_t.transpose(1, 2, 3, 0)  # → (Nz,Ny,Nx,3)
+                )
+                data_arrays.append(
+                    (name, self.vtk_type, 3, field_interleaved.ravel().tobytes())
+                )
         
         # Build XML with correct extent
         xml_lines = [
@@ -326,7 +358,9 @@ class VTKWriter:
     def get_file_size_estimate(self, 
                                include_rho: bool = True,
                                include_u: bool = True,
-                               include_mask: bool = True) -> Dict[str, float]:
+                               include_mask: bool = True,
+                               n_extra_scalars: int = 0,
+                               n_extra_vectors: int = 0) -> Dict[str, float]:
         """Estimate output file size
         
         Args:
@@ -345,14 +379,17 @@ class VTKWriter:
         
         total_raw = 0
         if include_rho:
-            # Density + Pressure (2 scalar fields)
-            total_raw += n_points * bytes_per_float * 2
+            # Density only (pressure removed — derivable in ParaView)
+            total_raw += n_points * bytes_per_float * 1
         if include_u:
-            # Velocity (3 components) + Magnitude (1 scalar)
-            total_raw += n_points * bytes_per_float * 4
+            # Velocity (3 components) only (magnitude removed — derivable)
+            total_raw += n_points * bytes_per_float * 3
         if include_mask:
             # Solid mask (1 byte per point)
             total_raw += n_points * 1
+        # Extra fields
+        total_raw += n_points * bytes_per_float * n_extra_scalars
+        total_raw += n_points * bytes_per_float * 3 * n_extra_vectors
         
         return {
             'raw_MB': total_raw / 1e6,

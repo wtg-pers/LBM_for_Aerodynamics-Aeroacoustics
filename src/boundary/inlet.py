@@ -14,6 +14,11 @@ Physical Principle:
 The non-equilibrium approach preserves viscous stress information
 and provides better mass conservation.
 
+Corner Safety:
+    When set_wall_info() is called, f_neq at wall-adjacent nodes on the
+    inlet face is zeroed, preventing density accumulation at corners.
+    See base.py for detailed explanation.
+
 References:
     - Latt et al., Computers & Mathematics with Applications 81, 2021
     - Kruger et al., "The Lattice Boltzmann Method", Springer 2017
@@ -121,6 +126,9 @@ class EquilibriumInlet(BoundaryCondition):
     def apply(self, f: 'npt.NDArray', **kwargs) -> None:
         """Apply equilibrium inlet condition
         
+        Sets incoming distributions to f_eq(ρ_target, u_target).
+        No f_neq involved, so no corner safety needed.
+        
         Args:
             f: Distribution function, shape (Q, Nx, Ny) or (Q, Nx, Ny, Nz)
                Modified in-place.
@@ -171,6 +179,52 @@ class EquilibriumInlet(BoundaryCondition):
         
         return f_eq
 
+    def _apply_2d(self, f: 'npt.NDArray') -> None:
+        """Apply equilibrium inlet for 2D domain (wall-safe)"""
+        xp = self.xp
+        incoming = self.incoming_indices
+        loc = self.location.value
+        Nx, Ny = f.shape[1], f.shape[2]
+        
+        f_eq_incoming = self._compute_equilibrium_incoming()
+        
+        # Wall-safe slicing: exclude wall nodes on this face
+        (fs,) = self._get_face_fluid_slices()
+        
+        if loc in ['xmin', 'west']:
+            f[incoming, 0, fs] = f_eq_incoming[:, fs]
+        elif loc in ['xmax', 'east']:
+            f[incoming, Nx-1, fs] = f_eq_incoming[:, fs]
+        elif loc in ['ymin', 'south']:
+            f[incoming, fs, 0] = f_eq_incoming[:, fs]
+        elif loc in ['ymax', 'north']:
+            f[incoming, fs, Ny-1] = f_eq_incoming[:, fs]
+    
+    def _apply_3d(self, f: 'npt.NDArray') -> None:
+        """Apply equilibrium inlet for 3D domain (wall-safe)"""
+        xp = self.xp
+        incoming = self.incoming_indices
+        loc = self.location.value
+        Nx, Ny, Nz = f.shape[1], f.shape[2], f.shape[3]
+        
+        f_eq_incoming = self._compute_equilibrium_incoming()
+        
+        # Wall-safe slicing: exclude wall nodes on this face
+        (fs1, fs2) = self._get_face_fluid_slices()
+        
+        if loc in ['xmin', 'west']:
+            f[incoming, 0, fs1, fs2] = f_eq_incoming[:, fs1, fs2]
+        elif loc in ['xmax', 'east']:
+            f[incoming, Nx-1, fs1, fs2] = f_eq_incoming[:, fs1, fs2]
+        elif loc in ['ymin', 'south']:
+            f[incoming, fs1, 0, fs2] = f_eq_incoming[:, fs1, fs2]
+        elif loc in ['ymax', 'north']:
+            f[incoming, fs1, Ny-1, fs2] = f_eq_incoming[:, fs1, fs2]
+        elif loc in ['zmin', 'bottom']:
+            f[incoming, fs1, fs2, 0] = f_eq_incoming[:, fs1, fs2]
+        elif loc in ['zmax', 'top']:
+            f[incoming, fs1, fs2, Nz-1] = f_eq_incoming[:, fs1, fs2]
+
 
 class NonEquilibriumInlet(BoundaryCondition):
     """Non-Equilibrium Extrapolation Inlet
@@ -181,10 +235,15 @@ class NonEquilibriumInlet(BoundaryCondition):
     The non-equilibrium part is extrapolated from interior nodes,
     carrying viscous stress information.
     
-    Supports both 2D and 3D domains.
+    Corner Safety:
+        When set_wall_info() is called, wall-adjacent nodes on the inlet
+        face have their f_neq zeroed. This prevents density accumulation
+        at corners where the inlet meets wall boundaries.
+        
+        Fluid nodes:         f = f_eq(target) + f_neq(interior)
+        Wall-adjacent nodes: f = f_eq(target)  [pure equilibrium]
     
-    Recommended for simulations with wall boundaries where mass
-    conservation is important.
+    Supports both 2D and 3D domains.
     """
     
     def __init__(self, xp: 'ModuleType', lattice: 'Lattice',
@@ -270,11 +329,11 @@ class NonEquilibriumInlet(BoundaryCondition):
         """Apply non-equilibrium inlet condition
         
         Algorithm:
-        1. Get distribution at interior node
-        2. Compute macroscopic at interior
-        3. Compute f_eq at interior
-        4. Extract non-equilibrium: f_neq = f - f_eq
-        5. Set inlet: f = f_eq(target) + f_neq(interior)
+        1. Get distribution at interior node (one node inside from boundary)
+        2. Compute macroscopic at interior → ρ_int, u_int
+        3. Compute f_eq at interior → f_neq = f - f_eq
+        4. ★ Sanitize f_neq: zero at wall-adjacent nodes (corner safety)
+        5. Set inlet: f = f_eq(target) + f_neq(sanitized)
         
         Args:
             f: Distribution function, modified in-place
@@ -285,22 +344,28 @@ class NonEquilibriumInlet(BoundaryCondition):
             self._apply_3d(f)
     
     def _apply_2d(self, f: 'npt.NDArray') -> None:
-        """Apply for 2D domain"""
+        """Apply non-equilibrium inlet for 2D domain (wall-safe)
+        
+        Only applies to fluid nodes; wall nodes are left to domain_wall BC.
+        """
         xp = self.xp
         loc = self.location.value
         Nx, Ny = f.shape[1], f.shape[2]
         
-        # Get interior slice
-        if loc in ['xmin', 'west']:
-            f_interior = f[:, 1, :]      # (Q, Ny)
-        elif loc in ['xmax', 'east']:
-            f_interior = f[:, Nx-2, :]
-        elif loc in ['ymin', 'south']:
-            f_interior = f[:, :, 1]      # (Q, Nx)
-        else:  # ymax, north
-            f_interior = f[:, :, Ny-2]
+        # Wall-safe slicing
+        (fs,) = self._get_face_fluid_slices()
         
-        # Compute macroscopic at interior
+        # Get interior slice (fluid nodes only)
+        if loc in ['xmin', 'west']:
+            f_interior = f[:, 1, fs]
+        elif loc in ['xmax', 'east']:
+            f_interior = f[:, Nx-2, fs]
+        elif loc in ['ymin', 'south']:
+            f_interior = f[:, fs, 1]
+        else:  # ymax, north
+            f_interior = f[:, fs, Ny-2]
+        
+        # Compute macroscopic at interior (fluid only)
         rho_int = xp.sum(f_interior, axis=0)
         u_int = xp.einsum('di,i...->d...', self.c_all, f_interior) / (rho_int + 1e-10)
         
@@ -313,50 +378,56 @@ class NonEquilibriumInlet(BoundaryCondition):
         # Non-equilibrium at interior
         f_neq_int = f_interior - f_eq_int
         
-        # Equilibrium at boundary (target values)
+        # Equilibrium at boundary (target values, fluid nodes only)
         rho_target = self.density
-        u_target = self.u_inlet
+        u_target = self.u_inlet[:, fs]  # slice velocity to match fluid region
         
         usqr_target = xp.sum(u_target**2, axis=0)
         cu_target = xp.einsum('di,d...->i...', self.c_incoming, u_target)
-        w_in = self.w_incoming.reshape((-1,) + (1,)*len(self.boundary_shape))
+        w_in = self.w_incoming.reshape((-1,) + (1,)*(u_target.ndim - 1))
         f_eq_target = w_in * rho_target * (1.0 + 3.0*cu_target + 4.5*(cu_target**2) - 1.5*usqr_target)
         
         # f = f_eq(target) + f_neq(interior)
         incoming = self.incoming_indices
         f_incoming = f_eq_target + f_neq_int[incoming]
         
-        # Apply
+        # Apply only to fluid nodes
         if loc in ['xmin', 'west']:
-            f[incoming, 0, :] = f_incoming
+            f[incoming, 0, fs] = f_incoming
         elif loc in ['xmax', 'east']:
-            f[incoming, Nx-1, :] = f_incoming
+            f[incoming, Nx-1, fs] = f_incoming
         elif loc in ['ymin', 'south']:
-            f[incoming, :, 0] = f_incoming
+            f[incoming, fs, 0] = f_incoming
         else:  # ymax, north
-            f[incoming, :, Ny-1] = f_incoming
+            f[incoming, fs, Ny-1] = f_incoming
     
     def _apply_3d(self, f: 'npt.NDArray') -> None:
-        """Apply for 3D domain"""
+        """Apply non-equilibrium inlet for 3D domain (wall-safe)
+        
+        Only applies to fluid nodes; wall nodes are left to domain_wall BC.
+        """
         xp = self.xp
         loc = self.location.value
         Nx, Ny, Nz = f.shape[1], f.shape[2], f.shape[3]
         
-        # Get interior slice
-        if loc in ['xmin', 'west']:
-            f_interior = f[:, 1, :, :]
-        elif loc in ['xmax', 'east']:
-            f_interior = f[:, Nx-2, :, :]
-        elif loc in ['ymin', 'south']:
-            f_interior = f[:, :, 1, :]
-        elif loc in ['ymax', 'north']:
-            f_interior = f[:, :, Ny-2, :]
-        elif loc in ['zmin', 'bottom']:
-            f_interior = f[:, :, :, 1]
-        else:  # zmax, top
-            f_interior = f[:, :, :, Nz-2]
+        # Wall-safe slicing: (ys, zs) for xmin/xmax, etc.
+        (fs1, fs2) = self._get_face_fluid_slices()
         
-        # Compute macroscopic at interior
+        # Get interior slice (fluid nodes only)
+        if loc in ['xmin', 'west']:
+            f_interior = f[:, 1, fs1, fs2]
+        elif loc in ['xmax', 'east']:
+            f_interior = f[:, Nx-2, fs1, fs2]
+        elif loc in ['ymin', 'south']:
+            f_interior = f[:, fs1, 1, fs2]
+        elif loc in ['ymax', 'north']:
+            f_interior = f[:, fs1, Ny-2, fs2]
+        elif loc in ['zmin', 'bottom']:
+            f_interior = f[:, fs1, fs2, 1]
+        else:  # zmax, top
+            f_interior = f[:, fs1, fs2, Nz-2]
+        
+        # Compute macroscopic at interior (fluid only)
         rho_int = xp.sum(f_interior, axis=0)
         u_int = xp.einsum('di,i...->d...', self.c_all, f_interior) / (rho_int + 1e-10)
         
@@ -369,32 +440,32 @@ class NonEquilibriumInlet(BoundaryCondition):
         # Non-equilibrium at interior
         f_neq_int = f_interior - f_eq_int
         
-        # Equilibrium at boundary
+        # Equilibrium at boundary (target values, fluid nodes only)
         rho_target = self.density
-        u_target = self.u_inlet
+        u_target = self.u_inlet[:, fs1, fs2]  # slice velocity to match fluid region
         
         usqr_target = xp.sum(u_target**2, axis=0)
         cu_target = xp.einsum('di,d...->i...', self.c_incoming, u_target)
-        w_in = self.w_incoming.reshape((-1,) + (1,)*len(self.boundary_shape))
+        w_in = self.w_incoming.reshape((-1,) + (1,)*(u_target.ndim - 1))
         f_eq_target = w_in * rho_target * (1.0 + 3.0*cu_target + 4.5*(cu_target**2) - 1.5*usqr_target)
         
         # f = f_eq(target) + f_neq(interior)
         incoming = self.incoming_indices
         f_incoming = f_eq_target + f_neq_int[incoming]
         
-        # Apply
+        # Apply only to fluid nodes
         if loc in ['xmin', 'west']:
-            f[incoming, 0, :, :] = f_incoming
+            f[incoming, 0, fs1, fs2] = f_incoming
         elif loc in ['xmax', 'east']:
-            f[incoming, Nx-1, :, :] = f_incoming
+            f[incoming, Nx-1, fs1, fs2] = f_incoming
         elif loc in ['ymin', 'south']:
-            f[incoming, :, 0, :] = f_incoming
+            f[incoming, fs1, 0, fs2] = f_incoming
         elif loc in ['ymax', 'north']:
-            f[incoming, :, Ny-1, :] = f_incoming
+            f[incoming, fs1, Ny-1, fs2] = f_incoming
         elif loc in ['zmin', 'bottom']:
-            f[incoming, :, :, 0] = f_incoming
+            f[incoming, fs1, fs2, 0] = f_incoming
         else:  # zmax, top
-            f[incoming, :, :, Nz-1] = f_incoming
+            f[incoming, fs1, fs2, Nz-1] = f_incoming
 
 
 # Alias for backward compatibility

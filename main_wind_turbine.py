@@ -39,6 +39,7 @@ from src.io.config_loader import ConfigLoader
 from src.io.vtk_writer import VTKWriter
 from src.io.checkpoint import CheckpointManager
 from src.io.args_parser import parse_args
+from src.io.marker_vtk_writer import MarkerVTPWriter
 
 # =============================================================================
 # Boundary Conditions
@@ -158,7 +159,8 @@ def main():
     u_init = physics_config.get('u_init')
     char_length = physics_config.get('characteristic_length')
 
-    nu = u_init * char_length / Re
+    u_ref = physics_config.get('u_ref', u_init)
+    nu = u_ref * char_length / Re
     tau = 3.0 * nu + 0.5
 
     config_max_steps = time_config.get('max_steps', 10000)
@@ -168,7 +170,8 @@ def main():
 
     print(f"\n[2] Physics Parameters")
     print(f"  Re = {Re}")
-    print(f"  u_init = {u_init} [Δx/Δt], L_char = {char_length} [Δx]")
+    print(f"  u_init = {u_init} [Δx/Δt], u_ref = {u_ref} [Δx/Δt]")
+    print(f"  L_char = {char_length} [Δx]")
     print(f"  ν = {nu:.6f} [Δx²/Δt], τ = {tau:.6f}")
 
     # === AL === Physical unit conversion info
@@ -190,8 +193,10 @@ def main():
     farfield_boundaries = {}
     wall_boundaries = {}
     
-    inlet_methods = ['equilibrium', 'non_equilibrium', 'eq', 'neq', 'non_eq']
-    wall_methods = ['bounce_back', 'wall', 'hwbb', 'halfway']
+    inlet_methods = ['non_equilibrium', 'neq', 'equilibrium', 'eq',
+                     'regularized_inlet', 'regularized_velocity', 'reg_inlet']
+    wall_methods = ['bounce_back', 'hwbb', 'halfway', 'wall',
+                    'regularized_wall', 'reg_wall']
     skip_methods = ['periodic', 'none', '']
     
     for bc_name, bc_config in boundaries_config.items():
@@ -248,9 +253,11 @@ def main():
         domain_walls = DomainWallManager(
             xp, lattice, domain_shape,
             walls=wall_locations,
-            exclude_inlet_outlet=False
+            exclude_inlet_outlet=True
         )
         print(f"    {domain_walls.get_info()}")
+        bc_manager.set_wall_info_all(wall_locations, domain_shape)
+        print(f"  Corner Safety: wall_faces={wall_locations} applied to {len(bc_manager)} BCs")
     else:
         domain_walls = None
         print("    (none - using periodic for unlisted boundaries)")
@@ -313,6 +320,16 @@ def main():
     else:
         vtk_writer = None
         print("  VTK: disabled")
+    
+    # Marker VTP Writer (for actuator line diagnostics)
+    marker_vtk_writer = None
+    if vtk_enabled and al_enabled:
+        marker_dir = os.path.join(output_dir, 'markers')
+        marker_vtk_writer = MarkerVTPWriter(
+            output_dir=marker_dir,
+            precision=vtk_config.get('precision', 'float32')
+        )
+        print(f"  Marker VTP: enabled ({marker_dir})")
     
     # Checkpoint Manager
     checkpoint_enabled = checkpoint_config.get('enabled', True)
@@ -603,9 +620,11 @@ def main():
         streaming.compute(f_post, f_new)
 
         # Step 6: Boundary Conditions
+        bc_manager.apply_all(f_new)
+
         if domain_walls is not None:
             domain_walls.apply_all(f_new, f_post)
-        bc_manager.apply_all(f_new)
+        
         if obstacle_bc is not None:
             obstacle_bc.apply_with_reset(f_new, f_post)
         
@@ -646,8 +665,23 @@ def main():
         
         # VTK output
         if vtk_writer is not None and step % output_interval == 0:
-            vtk_writer.write(step=step, rho=rho, u=u, 
-                                solid_mask=solid_mask_np, time=float(step))
+            # Build extra fields for VTK
+            extra_vectors_vtk = {}
+            if body_force is not None:
+                extra_vectors_vtk['body_force'] = body_force  # (3, Nx, Ny, Nz) [lattice force/lu³]
+
+            vtk_writer.write(
+                step=step, rho=rho, u=u,
+                solid_mask=solid_mask_np,
+                extra_vectors=extra_vectors_vtk if extra_vectors_vtk else None,
+                time=float(step),
+            )
+
+            # Marker VTP output (actuator line diagnostics)
+            if marker_vtk_writer is not None and al_model is not None:
+                marker_vtk_writer.write_from_al_model(
+                    step=step, al_model=al_model, time=float(step)
+                )
 
         if step % check_interval == 0 and step > start_step:
             # Conservation check
@@ -732,9 +766,24 @@ def main():
     rho_final, u_final = macro.compute(f_old)
     
     if vtk_writer is not None:
-        vtk_writer.write(step=final_step, rho=rho_final, u=u_final,
-                         solid_mask=solid_mask_np, time=float(final_step))
+        extra_vectors_vtk = {}
+        if body_force is not None:
+            extra_vectors_vtk['body_force'] = body_force
+
+        vtk_writer.write(
+            step=final_step, rho=rho_final, u=u_final,
+            solid_mask=solid_mask_np,
+            extra_vectors=extra_vectors_vtk if extra_vectors_vtk else None,
+            time=float(final_step),
+        )
         vtk_writer.write_pvd('simulation.pvd')
+
+        # 마커 VTP 최종 출력 + PVD
+        if marker_vtk_writer is not None and al_model is not None:
+            marker_vtk_writer.write_from_al_model(
+                step=final_step, al_model=al_model, time=float(final_step)
+            )
+            marker_vtk_writer.write_pvd()
     
     if checkpoint_mgr is not None:
         checkpoint_mgr.save(step=final_step, f=f_old, rho=rho_final, 
