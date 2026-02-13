@@ -147,12 +147,13 @@ def main():
     # [2] Physics Parameters
     # =========================================================================
     Re = physics_config.get('Re')
-    u_init = physics_config.get('u_init')
-    char_length = physics_config.get('characteristic_length')
+    u_init = physics_config.get('u_ref_lu')
+    char_length = physics_config.get('L_ref_lu')
 
     u_ref = physics_config.get('u_ref', u_init)
-    nu = u_ref * char_length / Re       # [Δx²/Δt]  kinematic viscosity
-    tau = 3.0 * nu + 0.5                # [Δt]       relaxation time
+    nu_lu = physics_config.get('nu_lu')
+    nu = nu_lu 
+    tau = physics_config.get('tau')
 
     config_max_steps = time_config.get('max_steps', 10000)
     output_interval = time_config.get('output_interval', 500)
@@ -584,7 +585,6 @@ def main():
         #
         #   AL Pipeline: rotor rotation → BEM → Gaussian spreading → F(x)
         # ─────────────────────────────────────────────────────────────
-        body_force = None
         if al_model is not None:
             if xp != np:
                 u_np = xp.asnumpy(u)

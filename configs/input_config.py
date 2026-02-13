@@ -1,120 +1,163 @@
-# =============================================================================
-# LBM Solver — Hover Rotor Configuration (NTNU BT1 based)
-# =============================================================================
-#
-# Actuator Line Model test: hovering rotor with ground effect.
-#
-# Usage:
-#   python main.py --config configs/input_config.py
-#   python main.py --config configs/input_config.py --max-steps 10000
-#
-# =============================================================================
-
 import numpy as np
+import warnings
+
+
+L_REF      = 0.025           # [m]      Characteristic length (= rotor diameter D)
+RHO_REF    = 1.205           # [kg/m³]  Reference density (air at 20°C)
+
+# -----------------------------------------------------------------------------
+# Rotor operating condition (for ALM)
+# -----------------------------------------------------------------------------
+RPM        = 1000            # [rpm]    Rotor rotational speed (USER INPUT)
+R_ROTOR    = L_REF / 2       # [m]      Rotor radius = D/2
+OMEGA_ROTOR = RPM * 2.0 * np.pi / 60.0   # [rad/s]  Angular velocity
+
+# -----------------------------------------------------------------------------
+# Reference velocity (for Re calculation) vs Inlet velocity
+# -----------------------------------------------------------------------------
+U_REF      = OMEGA_ROTOR * (R_ROTOR * 0.75)  # [m/s]    Reference velocity
+U_INF      = 0.0             # [m/s]    Freestream/inlet velocity (0 for hover)
+
+# -----------------------------------------------------------------------------
+# Reynolds number OR viscosity (choose ONE, Re takes priority)
+# -----------------------------------------------------------------------------
+RE         = 100             # [-]      Reynolds number (PRIORITY)
+NU_PHYS    = None            # [m²/s]   Kinematic viscosity (set if RE=None)
+
+# --- Auto-calculate: Re ↔ ν_phys ---
+if RE is not None and NU_PHYS is not None:
+    _nu_computed = U_REF * L_REF / RE
+    warnings.warn(
+        f"Both RE and NU_PHYS defined. Using RE={RE} (priority).\n"
+        f"  Computed ν = {_nu_computed:.6e} m²/s\n"
+        f"  Provided ν = {NU_PHYS:.6e} m²/s (ignored)"
+    )
+    NU_PHYS = _nu_computed
+elif RE is not None:
+    NU_PHYS = U_REF * L_REF / RE
+elif NU_PHYS is not None:
+    RE = U_REF * L_REF / NU_PHYS
+else:
+    raise ValueError("Either 'RE' or 'NU_PHYS' must be defined!")
 
 # =============================================================================
-# §1. Physical Constants
+# §2. NUMERICAL PARAMETERS (User Input - Discretization)
 # =============================================================================
-R_PHYS     = 0.125          # [m]      Rotor radius
-D_PHYS     = 2 * R_PHYS     # [m]      Diameter = 0.25 m
-CHORD      = 0.025          # [m]      Constant chord
-PITCH      = 10.0           # [deg]    Collective pitch (blade twist = -10° in code)
-N_BLADES   = 2              # [-]      Number of blades
 
-ROOT_CUT   = 0.20           # [-]  20%
-R_ROOT     = R_PHYS * ROOT_CUT  # [m] = 0.025 m (inactive region ends here)
-
-# Operating conditions
-TSR      = 6.0             # [-]      Tip speed ratio
-U_INF    = 10.0            # [m/s]    Reference velocity (for ω calculation)
-RPM        = 3000           # [RPM]    Rotation speed
-OMEGA      = RPM * 2 * np.pi / 60  # [rad/s] = 314.16 rad/s
-V_TIP      = OMEGA * R_PHYS # [m/s]    Tip speed = 39.27 m/s
-
-# Air properties
-NU_AIR     = 1.512e-5       # [m²/s]   Kinematic viscosity (20°C)
-RHO_AIR    = 1.205          # [kg/m³]  Air density
+RESOLUTION = 40              # [-]  Grid cells per L_REF (N = L_REF / Δx)
+LATTICE_VELOCITY = 0.05      # [-]  u_lu (controls accuracy, recommend 0.02~0.1)
 
 # =============================================================================
-# §2. Grid & Lattice Scaling
+# §3. AUTO-CALCULATED LATTICE PARAMETERS
 # =============================================================================
-RESOLUTION = 32            # [-]      D/Δx (grid cells per diameter)
-L = RESOLUTION
-DX_PHYS    = D_PHYS / RESOLUTION  # [m/lu] = 0.02235 m
+# DO NOT MODIFY - These are derived from user inputs above.
 
-MA_TIP     = 0.05          # [-]      Lattice Mach number at tip
-U_TIP_LU   = MA_TIP        # [lu/lt]  Tip velocity in lattice units
-DT_PHYS    = U_TIP_LU * DX_PHYS / V_TIP  # [s/lt] = 1.86e-5 s
+# --- Conversion factors ---
+DX_PHYS    = L_REF / RESOLUTION                      # [m/lu]
+DT_PHYS    = LATTICE_VELOCITY * DX_PHYS / U_REF      # [s/lt]
 
-TAU        = 0.55          # [-]      Relaxation time
-NU_LU      = (TAU - 0.5) / 3  # [lu²/lt] Lattice viscosity
+OMEGA_LU = OMEGA_ROTOR * DT_PHYS
+STEPS_PER_REV = int(2 * np.pi / OMEGA_LU)
 
-# Derived quantities
-D_LU       = RESOLUTION    # [lu]     Rotor diameter in lattice units
-R_LU       = D_LU / 2      # [lu]     Rotor radius in lattice units
-OMEGA_LU   = OMEGA * DT_PHYS  # [rad/lt] Angular velocity in lattice
-STEPS_PER_REV = int(2 * np.pi / OMEGA_LU)  # ≈ 2513 steps/revolution
+# --- Lattice parameters ---
+L_REF_LU   = RESOLUTION                              # [lu]
+U_REF_LU   = LATTICE_VELOCITY                        # [lu/lt]
+U_INF_LU   = U_INF / U_REF * LATTICE_VELOCITY        # [lu/lt] inlet velocity in LU
+NU_LU      = NU_PHYS * DT_PHYS / (DX_PHYS ** 2)      # [lu²/lt]
+TAU        = 0.5 + 3.0 * NU_LU                       # [-]
+OMEGA_LBM  = 1.0 / TAU                               # [-] relaxation frequency (NOT rotor omega!)
+
+# --- Lattice Mach number (for reference) ---
+CS = 1.0 / np.sqrt(3.0)      # Lattice sound speed ≈ 0.577
+MA_LATTICE = LATTICE_VELOCITY / CS
+
+# --- Stability checks ---
+_stability_warnings = []
+if TAU <= 0.5:
+    raise ValueError(f"CRITICAL: τ = {TAU:.4f} ≤ 0.5 → UNSTABLE!")
+if TAU < 0.52:
+    _stability_warnings.append(f"⚠️  τ = {TAU:.4f} < 0.52 → marginally stable")
+if TAU > 2.0:
+    _stability_warnings.append(f"⚠️  τ = {TAU:.4f} > 2.0 → accuracy degradation")
+if MA_LATTICE > 0.3:
+    raise ValueError(f"CRITICAL: Ma_lattice = {MA_LATTICE:.3f} > 0.3 → compressibility error!")
+if MA_LATTICE > 0.1:
+    _stability_warnings.append(f"⚠️  Ma_lattice = {MA_LATTICE:.3f} > 0.1 → ~{MA_LATTICE**2*100:.1f}% density error")
+
+for _w in _stability_warnings:
+    print(_w)
 
 # =============================================================================
-# §3. Domain Configuration
+# §4. DOMAIN CONFIGURATION
 # =============================================================================
-# Domain size: 3D × 3D × 3D
+# Domain size in lattice units, or as multiples of L_REF
+
+# DOMAIN_MULTIPLE_X = 10       # [-]  Domain = 10 × L_REF in x
+# DOMAIN_MULTIPLE_Y = 5        # [-]  Domain = 5 × L_REF in y
+# DOMAIN_MULTIPLE_Z = 5        # [-]  Domain = 5 × L_REF in z
+
+# Nx = DOMAIN_MULTIPLE_X * RESOLUTION    # [lu]
+# Ny = DOMAIN_MULTIPLE_Y * RESOLUTION    # [lu]
+# Nz = DOMAIN_MULTIPLE_Z * RESOLUTION    # [lu]
 Nx = 200
 Ny = 200
-Nz = 200
-
-# Hub position in LATTICE UNITS (domain coordinates)
-HUB_X_LU = Nx // 2       # 40 [lu]  - 1D from inlet
-HUB_Y_LU = Ny // 2          # 60 [lu]  - centered
-HUB_Z_LU = int(Nz * 0.4)          # 60 [lu]  - centered
-
-# Hub position in PHYSICAL UNITS (for Rotor factory)
-# This is what gets passed to Rotor, then converted back to lattice units
-HUB_X_PHYS = HUB_X_LU * DX_PHYS  # [m]
-HUB_Y_PHYS = HUB_Y_LU * DX_PHYS  # [m]
-HUB_Z_PHYS = HUB_Z_LU * DX_PHYS  # [m]
+Nz = 100
 
 # =============================================================================
-# §4. Physics (for LBM)
-# =============================================================================
-# Reference length and Re for viscosity calculation
-CHAR_LENGTH = CHORD / DX_PHYS  # [lu] chord in lattice units
-RE = U_TIP_LU * CHAR_LENGTH / NU_LU  # Grid Reynolds number
-
-# =============================================================================
-# §5. Simulation Config
+# §4. SIMULATION SETTINGS
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
     "dimension": 3,
     "lattice_model": "D3Q27",
-    "domain": {"Nx": Nx, "Ny": Ny, "Nz": Nz},
+    
+    "domain": {"Nx": Nx, "Ny": Ny, "Nz": Nz,},
+    
     "physics": {
-        "Re": RE,
-        "u_init": U_TIP_LU,
-        "u_ref": U_TIP_LU,
-        "characteristic_length": CHAR_LENGTH,
+        # Physical (SI)
+        "L_ref": L_REF,            # [m]
+        "U_ref": U_REF,            # [m/s]
+        "U_inf": U_INF,            # [m/s]
+        "rho_ref": RHO_REF,        # [kg/m³]
+        "nu_phys": NU_PHYS,        # [m²/s]
+        "Re": RE,                  # [-]
+        
+        # Lattice (auto-calculated)
+        "tau": TAU,
+        "omega": OMEGA_LBM,
+        "nu_lu": NU_LU,
+        "u_ref_lu": U_REF_LU,
+        "L_ref_lu": L_REF_LU,
+        
+        # Conversion factors
+        "dx": DX_PHYS,             # [m/lu]
+        "dt": DT_PHYS,             # [s/lt]
     },
+    
     "time": {
-        "max_steps": STEPS_PER_REV * 40,
-        "output_interval": STEPS_PER_REV // 360,
-        "checkpoint_interval": STEPS_PER_REV * 5,
+        "max_steps": STEPS_PER_REV * 50,
+        "output_interval": STEPS_PER_REV // 180,
+        "checkpoint_interval": STEPS_PER_REV * 2,
         "probe_interval": 10,
     },
 }
 
 # =============================================================================
-# §6. Boundary Conditions
+# §5. BOUNDARY CONDITIONS
 # =============================================================================
-# X-axis = rotation axis (wind direction for HAWT)
-# xmin = inlet (upstream), xmax = outlet (downstream/ground for hover)
+# Adjust based on your case type
+
 # boundaries = {
-#     "inlet":  {"location": "xmin", "method": "equilibrium", "velocity": 0.1},
+#     # Example: External flow (cylinder, airfoil)
+#     "inlet":  {"location": "xmin", "method": "equilibrium", 
+#                "velocity": U_REF_LU, "density": 1.0},
 #     "outlet": {"location": "xmax", "method": "neumann"},
-#     "ymin":   {"location": "ymin", "method": "regularized_wall", "density": 1.0},
-#     "ymax":   {"location": "ymax", "method": "equilibrium", "velocity": 0.1},
-#     "zmin":   {"location": "zmin", "method": "equilibrium", "velocity": 0.1},
-#     "zmax":   {"location": "zmax", "method": "equilibrium", "velocity": 0.1},
+#     "top":    {"location": "ymax", "method": "equilibrium", 
+#                "velocity": U_REF_LU, "density": 1.0},
+#     "bottom": {"location": "ymin", "method": "equilibrium", 
+#                "velocity": U_REF_LU, "density": 1.0},
+#     "front":  {"location": "zmin", "method": "periodic"},
+#     "back":   {"location": "zmax", "method": "periodic"},
 # }
 
 boundaries = {
@@ -133,165 +176,144 @@ boundaries = {
 }
 
 # =============================================================================
-# §7. Internal Geometry (none for AL-only simulation)
+# §6. INTERNAL GEOMETRY (Optional Module)
 # =============================================================================
-internal_geometry = {}
+# Enable/disable objects in the flow domain
+
+internal_geometry = {
+    # Example: Cylinder
+    # "cylinder": {
+    #     "enabled": True,
+    #     "center": [Nx // 4, Ny // 2, Nz // 2],  # [lu]
+    #     "diameter": RESOLUTION,                   # [lu] = L_REF
+    #     "axis": "z",
+    # },
+    
+    # Example: Airfoil
+    # "airfoil": {
+    #     "enabled": True,
+    #     "naca": "0012",
+    #     "chord": RESOLUTION,                      # [lu] = L_REF
+    #     "center": [Nx // 4, Ny // 2, Nz // 2],
+    #     "angle_of_attack": 5.0,                   # [deg]
+    # },
+}
 
 # =============================================================================
-# §8. Actuator Line Model
+# §7. ACTUATOR LINE MODEL (Optional Module)
 # =============================================================================
-airfoil_polar = {
-    # ─────────────────────────────────────────────────────────────────────
-    # Method: "neuralfoil" | "flat_plate" | "database" | "csv"
-    # ─────────────────────────────────────────────────────────────────────
-    "method": "neuralfoil",
+ALM_ENABLED = True
+
+if ALM_ENABLED:
+    # Rotor geometry (R_ROTOR, OMEGA_ROTOR defined in §1)
+    CHORD_BLADE = 0.025             # [m]  Blade chord
+    PITCH       = 10.0              # [deg] Collective pitch
+    N_BLADES    = 2                 # [-]
+    ROOT_CUT    = 0.20              # [-]
     
-    # ─────────────────────────────────────────────────────────────────────
-    # For method="neuralfoil" or "flat_plate"
-    # ─────────────────────────────────────────────────────────────────────
-    "airfoil_name": "naca0012",      # aerosandbox 내장 이름 또는 사용자 정의
-    "Re_target": 300,                 # [dimensionless] 타겟 Re
-    "mode": "asb",                    # "asb" | "user" | "dat"
-    "ncrit": 9.0,                     # 천이 N-factor
-    # "dat_path": "data/my_airfoil.dat",  # mode="dat"일 때
-    # "coordinates": None,                 # mode="user"일 때 (N,2) array
+    # Hub position
+    HUB_X_LU    = Nx // 2
+    HUB_Y_LU    = Ny // 2
+    HUB_Z_LU    = Nz // 3
     
-    # ─────────────────────────────────────────────────────────────────────
-    # For method="database" (built-in presets)
-    # ─────────────────────────────────────────────────────────────────────
-    # "preset": "nrel_s826",          # "nrel_s826" | "naca0012_approx"
+    HUB_X_PHYS  = HUB_X_LU * DX_PHYS   # [m]
+    HUB_Y_PHYS  = HUB_Y_LU * DX_PHYS   # [m]
+    HUB_Z_PHYS  = HUB_Z_LU * DX_PHYS   # [m]
     
-    # ─────────────────────────────────────────────────────────────────────
-    # For method="csv"
-    # ─────────────────────────────────────────────────────────────────────
-    # "csv_path": "data/airfoil_polar.csv",
-    # "alpha_col": "AoA(deg)",
-    # "Re_col": "Re",
-    # "CL_col": "cl",
-    # "CD_col": "cd",
-}
+    # Polar Re range
+    RE_POLAR_MIN    = max(1.0, RE * 0.15)
+    RE_POLAR_MAX    = RE * 2.5
+    RE_POLAR_TARGET = RE
 
 actuator_line = {
-    "enabled": True,
-    
-    "rotor": {
-        "n_blades": N_BLADES,
-        "hub_center": [HUB_X_PHYS, HUB_Y_PHYS, HUB_Z_PHYS],  # [m]
-        "omega": OMEGA,               # [rad/s] NEGATIVE for CW from +Z
-        "theta_0": 0.0,                # [rad]
-        "rotation_axis": "hawt_z",     # Z-axis rotation
-        
-        # Blade geometry
-        "blade": {
-            "sections": [
-                # Root region (inactive) - 0% to 20%
-                {"r": 0.0,              "chord": CHORD, "twist": -PITCH, 
-                 "airfoil": "NACA0012", "active": False},
-                {"r": R_ROOT,           "chord": CHORD, "twist": -PITCH, 
-                 "airfoil": "NACA0012", "active": False},
-                # Active region - 20% to 100%
-                {"r": R_ROOT + 1e-6,    "chord": CHORD, "twist": -PITCH, 
-                 "airfoil": "NACA0012", "active": True},
-                {"r": R_PHYS,           "chord": CHORD, "twist": -PITCH, 
-                 "airfoil": "NACA0012", "active": True},
-            ],
-        },
-        
-        "grid": {
-            "resolution": RESOLUTION,
-            "dx": DX_PHYS,
-        },
-    },
-    
-    "units": {
-        "dx_phys": DX_PHYS,
-        "dt_phys": DT_PHYS,
-        "nu_phys": NU_AIR,
-    },
-    
-    "gaussian_cutoff": 3.0,
-    "rho_ref": 1.0,
+    "enabled": ALM_ENABLED,
 }
-# actuator_line = {
-#     "enabled": True,
-    
-#     "rotor": {
-#         "preset": "ntnu_bt1",
-#         "tsr": TSR,
-#         "u_inf": U_INF,
-#         # Hub center in PHYSICAL UNITS [m]
-#         # Will be converted to lattice units by Rotor.to_lattice_units()
-#         "hub_center": [HUB_X_PHYS, HUB_Y_PHYS, HUB_Z_PHYS],
-#         "resolution": RESOLUTION,
-#         "theta_0": 0.0,
-#         "rotation_axis": "hawt_x",
-#     },
-    
-#     "units": {
-#         "dx_phys": DX_PHYS,
-#         "dt_phys": DT_PHYS,
-#         "nu_phys": NU_AIR,
-#     },
-    
-#     "gaussian_cutoff": 3.0,
-#     "rho_ref": 1.0,
-# }
+
+if ALM_ENABLED:
+    actuator_line.update({
+        "rotor": {
+            "n_blades": N_BLADES,
+            "hub_center": [HUB_X_PHYS, HUB_Y_PHYS, HUB_Z_PHYS],  # [m]
+            "omega": OMEGA_ROTOR,      # [rad/s] rotor angular velocity
+            "theta_0": 0.0,            # [rad]
+            "rotation_axis": "hawt_z",
+            
+            "blade": {
+                "sections": [
+                    {"r": 0.0,                       "chord": CHORD_BLADE, 
+                     "twist": -PITCH, "airfoil": "naca0012", "active": False},
+                    {"r": R_ROTOR * ROOT_CUT,        "chord": CHORD_BLADE, 
+                     "twist": -PITCH, "airfoil": "naca0012", "active": False},
+                    {"r": R_ROTOR * ROOT_CUT + 1e-6, "chord": CHORD_BLADE, 
+                     "twist": -PITCH, "airfoil": "naca0012", "active": True},
+                    {"r": R_ROTOR,                   "chord": CHORD_BLADE, 
+                     "twist": -PITCH, "airfoil": "naca0012", "active": True},
+                ],
+            },
+        },
+        
+        "units": {
+            "dx_phys": DX_PHYS,        # [m/lu]
+            "dt_phys": DT_PHYS,        # [s/lt]
+            "nu_phys": NU_PHYS,        # [m²/s]
+        },
+        
+        "rho_ref": RHO_REF,            # [kg/m³]
+        "gaussian_cutoff": 3.0,
+    })
 
 # =============================================================================
-# §9. Conservation & Convergence
+# §9. AIRFOIL POLAR (Only if ALM enabled)
+# =============================================================================
+if ALM_ENABLED:
+    airfoil_polar = {
+        "method": "neuralfoil",
+        "airfoil_name": "naca0012",
+        "Re_target": RE_POLAR_TARGET,
+        "Re_min": RE_POLAR_MIN,
+        "Re_max": RE_POLAR_MAX,
+        "mode": "asb",
+        "ncrit": 9.0,
+    }
+else:
+    airfoil_polar = {}
+
+# =============================================================================
+# §9. FORCE CALCULATION (Optional Module)
+# =============================================================================
+# Enable for drag/lift measurement on internal geometry
+
+force_calculation = {
+    "enabled": False,
+    # "object": "cylinder",
+    # "method": "momentum_exchange",
+}
+
+# =============================================================================
+# §10. CONSERVATION & CONVERGENCE
 # =============================================================================
 conservation = {
     "enabled": True,
-    "check_interval": STEPS_PER_REV // 360,
-    "verbose": 0,  # 0 : silent, 1 : simple, 2: detail
+    "check_interval": 100,
+    "verbose": 0,
     "log_to_csv": True,
 }
 
 convergence = {
     "enabled": True,
     "monitor": {
-        "energy": {"enabled": True, "threshold": 1e-5, "window": 500},
+        "energy": {"enabled": True, "threshold": 1e-6, "window": 1000},
     },
     "on_converged": "checkpoint_and_stop",
     "on_diverged": "stop_with_checkpoint",
-    "on_max_steps": "warn",
+    "on_max_steps": "continue",
 }
 
 # =============================================================================
-# §10. Force Calculation (disabled for AL simulation)
+# §11. OUTPUT
 # =============================================================================
-force_calculation = {"enabled": False}
-
-# =============================================================================
-# §11. Output
-# =============================================================================
-def _make_folder_name(geom_cfg, al_cfg, L_val, Re_val):
-    """Generate output folder name from config (config-internal helper)."""
-    # --- Obstacle tag ---
-    tag = "none"
-    for geom_type, geom_params in geom_cfg.items():
-        if not geom_params.get("enabled", False):
-            continue
-        if geom_type == "airfoil":
-            naca = geom_params.get("naca", "airfoil")
-            tag = f"naca{naca}"             # → "naca0012"
-        elif geom_type == "cylinder":
-            tag = "cylinder"
-        elif geom_type == "sphere":
-            tag = "sphere"
-        else:
-            tag = geom_type                 # user-defined name
-        break                               # first enabled geometry wins
-
-    # --- AL tag ---
-    al_tag = "_ALM" if al_cfg.get("enabled", False) else ""
-
-    # --- Re: int if whole, else float ---
-    Re_str = str(int(Re_val)) if Re_val == int(Re_val) else f"{Re_val:.1f}"
-
-    return f"result_{tag}{al_tag}_L{int(L_val)}_Re{Re_str}"
-
-_folder = _make_folder_name(internal_geometry, actuator_line, L, RE)
+_case_tag = "ALM" if ALM_ENABLED else "base"
+_folder = f"result_{_case_tag}_Re{int(RE)}_L{RESOLUTION}"
 
 output = {
     "output_dir": f"./{_folder}/vtk",
@@ -308,14 +330,14 @@ output = {
 }
 
 # =============================================================================
-# §12. Final Config Dictionary
+# §12. FINAL CONFIG DICTIONARY
 # =============================================================================
 config = {
     "simulation": simulation,
     "boundaries": boundaries,
     "internal_geometry": internal_geometry,
-    "airfoil_polar": airfoil_polar,
     "actuator_line": actuator_line,
+    "airfoil_polar": airfoil_polar,
     "conservation": conservation,
     "convergence": convergence,
     "force_calculation": force_calculation,
@@ -323,20 +345,60 @@ config = {
 }
 
 # =============================================================================
-# §13. Summary (printed when config is loaded)
+# §13. SUMMARY
 # =============================================================================
+def print_summary():
+    """Print configuration summary."""
+    print()
+    print("=" * 70)
+    print(" LBM Solver Configuration Summary")
+    print("=" * 70)
+    print()
+    print(" §1. Physical Parameters (User Input):")
+    print(f"      L_ref   = {L_REF} m")
+    print(f"      U_ref   = {U_REF} m/s")
+    print(f"      ρ_ref   = {RHO_REF} kg/m³")
+    print(f"      Re      = {RE}")
+    print(f"      ν_phys  = {NU_PHYS:.6e} m²/s")
+    print()
+    print(" §2. Discretization (User Input):")
+    print(f"      Resolution       = {RESOLUTION} (N = L_ref/Δx)")
+    print(f"      Lattice velocity = {LATTICE_VELOCITY} (u_lu)")
+    print()
+    print(" §3. Lattice Parameters (Auto-calculated):")
+    print(f"      Δx      = {DX_PHYS:.6e} m")
+    print(f"      Δt      = {DT_PHYS:.6e} s")
+    print(f"      ν_lu    = {NU_LU:.6f}")
+    print(f"      τ       = {TAU:.6f}")
+    print(f"      ω       = {OMEGA_LBM:.6f}")
+    print(f"      Ma_lu   = {MA_LATTICE:.4f}")
+    print()
+    print(" §4. Domain:")
+    print(f"      Grid    = {Nx} × {Ny} × {Nz} = {Nx*Ny*Nz:,} cells")
+    print(f"      Size    = {Nx*DX_PHYS:.4f} × {Ny*DX_PHYS:.4f} × {Nz*DX_PHYS:.4f} m")
+    print()
+    print(" §5. Time:")
+    max_steps = simulation['time']['max_steps']
+    print(f"      Max steps      = {max_steps:,}")
+    print(f"      Physical time  = {max_steps * DT_PHYS:.4f} s")
+    print(f"      Convective t*  = {max_steps * DT_PHYS * U_REF / L_REF:.1f}")
+    print()
+    print(" §6. Modules:")
+    print(f"      ALM             = {ALM_ENABLED}")
+    print(f"      Force calc      = {force_calculation['enabled']}")
+    print()
+    print("=" * 70)
+    
+    # Stability indicator
+    if TAU <= 0.5:
+        print("❌ UNSTABLE: τ ≤ 0.5")
+    elif TAU < 0.52:
+        print(f"⚠️  MARGINAL: τ = {TAU:.4f}")
+    else:
+        print(f"✅ STABLE: τ = {TAU:.4f}, Ma_lu = {MA_LATTICE:.4f}")
+    
+    print("=" * 70)
+
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print(" Hover Rotor Configuration Summary")
-    print("=" * 60)
-    print(f"  Domain:        {Nx} × {Ny} × {Nz} = {Nx*Ny*Nz:,} cells")
-    print(f"  Resolution:    D/Δx = {RESOLUTION}")
-    print(f"  Δx = {DX_PHYS*1000:.3f} mm,  Δt = {DT_PHYS*1e6:.3f} μs")
-    print(f"  τ = {TAU},  ν_lu = {NU_LU:.5f}")
-    print(f"  Ma_tip = {MA_TIP},  ω_lu = {OMEGA_LU:.6f} rad/lt")
-    print(f"  Steps/rev ≈ {STEPS_PER_REV}")
-    print("-" * 60)
-    print(f"  Hub (lu):      ({HUB_X_LU:.1f}, {HUB_Y_LU:.1f}, {HUB_Z_LU:.1f})")
-    print(f"  Hub (phys):    ({HUB_X_PHYS:.4f}, {HUB_Y_PHYS:.4f}, {HUB_Z_PHYS:.4f}) m")
-    print(f"  Rotor R (lu):  {R_LU:.1f}")
-    print("=" * 60)
+    print_summary()
