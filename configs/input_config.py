@@ -15,17 +15,25 @@ import numpy as np
 # =============================================================================
 # §1. Physical Constants
 # =============================================================================
-D_PHYS   = 0.894           # [m]      Rotor diameter (NTNU BT1)
-R_PHYS   = D_PHYS / 2      # [m]      Rotor radius
-C_REF    = 0.035           # [m]      Reference chord (75% span)
-NU_AIR   = 1.512e-5        # [m²/s]   Kinematic viscosity (air, 20°C)
-RHO_AIR  = 1.205           # [kg/m³]  Air density (20°C)
+R_PHYS     = 0.125          # [m]      Rotor radius
+D_PHYS     = 2 * R_PHYS     # [m]      Diameter = 0.25 m
+CHORD      = 0.025          # [m]      Constant chord
+PITCH      = 10.0           # [deg]    Collective pitch (blade twist = -10° in code)
+N_BLADES   = 2              # [-]      Number of blades
+
+ROOT_CUT   = 0.20           # [-]  20%
+R_ROOT     = R_PHYS * ROOT_CUT  # [m] = 0.025 m (inactive region ends here)
 
 # Operating conditions
 TSR      = 6.0             # [-]      Tip speed ratio
 U_INF    = 10.0            # [m/s]    Reference velocity (for ω calculation)
-OMEGA    = TSR * U_INF / R_PHYS  # [rad/s] = 134.23 rad/s
-V_TIP    = OMEGA * R_PHYS  # [m/s]    Tip speed = 60.0 m/s
+RPM        = 3000           # [RPM]    Rotation speed
+OMEGA      = RPM * 2 * np.pi / 60  # [rad/s] = 314.16 rad/s
+V_TIP      = OMEGA * R_PHYS # [m/s]    Tip speed = 39.27 m/s
+
+# Air properties
+NU_AIR     = 1.512e-5       # [m²/s]   Kinematic viscosity (20°C)
+RHO_AIR    = 1.205          # [kg/m³]  Air density
 
 # =============================================================================
 # §2. Grid & Lattice Scaling
@@ -51,14 +59,14 @@ STEPS_PER_REV = int(2 * np.pi / OMEGA_LU)  # ≈ 2513 steps/revolution
 # §3. Domain Configuration
 # =============================================================================
 # Domain size: 3D × 3D × 3D
-Nx = 400
-Ny = 96
-Nz = 64
+Nx = 200
+Ny = 200
+Nz = 200
 
 # Hub position in LATTICE UNITS (domain coordinates)
-HUB_X_LU = Nx // 4       # 40 [lu]  - 1D from inlet
+HUB_X_LU = Nx // 2       # 40 [lu]  - 1D from inlet
 HUB_Y_LU = Ny // 2          # 60 [lu]  - centered
-HUB_Z_LU = Nz // 2          # 60 [lu]  - centered
+HUB_Z_LU = int(Nz * 0.4)          # 60 [lu]  - centered
 
 # Hub position in PHYSICAL UNITS (for Rotor factory)
 # This is what gets passed to Rotor, then converted back to lattice units
@@ -70,7 +78,7 @@ HUB_Z_PHYS = HUB_Z_LU * DX_PHYS  # [m]
 # §4. Physics (for LBM)
 # =============================================================================
 # Reference length and Re for viscosity calculation
-CHAR_LENGTH = C_REF / DX_PHYS  # [lu] chord in lattice units
+CHAR_LENGTH = CHORD / DX_PHYS  # [lu] chord in lattice units
 RE = U_TIP_LU * CHAR_LENGTH / NU_LU  # Grid Reynolds number
 
 # =============================================================================
@@ -100,13 +108,28 @@ simulation = {
 # =============================================================================
 # X-axis = rotation axis (wind direction for HAWT)
 # xmin = inlet (upstream), xmax = outlet (downstream/ground for hover)
+# boundaries = {
+#     "inlet":  {"location": "xmin", "method": "equilibrium", "velocity": 0.1},
+#     "outlet": {"location": "xmax", "method": "neumann"},
+#     "ymin":   {"location": "ymin", "method": "regularized_wall", "density": 1.0},
+#     "ymax":   {"location": "ymax", "method": "equilibrium", "velocity": 0.1},
+#     "zmin":   {"location": "zmin", "method": "equilibrium", "velocity": 0.1},
+#     "zmax":   {"location": "zmax", "method": "equilibrium", "velocity": 0.1},
+# }
+
 boundaries = {
-    "inlet":  {"location": "xmin", "method": "equilibrium", "velocity": 0.1},
-    "outlet": {"location": "xmax", "method": "neumann"},
-    "ymin":   {"location": "ymin", "method": "regularized_wall", "density": 1.0},
-    "ymax":   {"location": "ymax", "method": "equilibrium", "velocity": 0.1},
-    "zmin":   {"location": "zmin", "method": "equilibrium", "velocity": 0.1},
-    "zmax":   {"location": "zmax", "method": "equilibrium", "velocity": 0.1},
+    "ground": {"location": "zmin", "method": "regularized_wall",},
+
+    "top": {"location": "zmax", "method": "equilibrium", 
+            "velocity": 0.0, "density": 1.0,},
+    "xmin": {"location": "xmin", "method": "equilibrium",
+             "velocity": 0.0,"density": 1.0,},
+    "xmax": {"location": "xmax","method": "equilibrium",
+             "velocity": 0.0,"density": 1.0,},
+    "ymin": {"location": "ymin","method": "equilibrium",
+             "velocity": 0.0,"density": 1.0,},
+    "ymax": {"location": "ymax","method": "equilibrium",
+             "velocity": 0.0,"density": 1.0,},
 }
 
 # =============================================================================
@@ -121,15 +144,32 @@ actuator_line = {
     "enabled": True,
     
     "rotor": {
-        "preset": "ntnu_bt1",
-        "tsr": TSR,
-        "u_inf": U_INF,
-        # Hub center in PHYSICAL UNITS [m]
-        # Will be converted to lattice units by Rotor.to_lattice_units()
-        "hub_center": [HUB_X_PHYS, HUB_Y_PHYS, HUB_Z_PHYS],
-        "resolution": RESOLUTION,
-        "theta_0": 0.0,
-        "rotation_axis": "hawt_x",
+        "n_blades": N_BLADES,
+        "hub_center": [HUB_X_PHYS, HUB_Y_PHYS, HUB_Z_PHYS],  # [m]
+        "omega": OMEGA,               # [rad/s] NEGATIVE for CW from +Z
+        "theta_0": 0.0,                # [rad]
+        "rotation_axis": "hawt_z",     # Z-axis rotation
+        
+        # Blade geometry
+        "blade": {
+            "sections": [
+                # Root region (inactive) - 0% to 20%
+                {"r": 0.0,              "chord": CHORD, "twist": -PITCH, 
+                 "airfoil": "NACA0012", "active": False},
+                {"r": R_ROOT,           "chord": CHORD, "twist": -PITCH, 
+                 "airfoil": "NACA0012", "active": False},
+                # Active region - 20% to 100%
+                {"r": R_ROOT + 1e-6,    "chord": CHORD, "twist": -PITCH, 
+                 "airfoil": "NACA0012", "active": True},
+                {"r": R_PHYS,           "chord": CHORD, "twist": -PITCH, 
+                 "airfoil": "NACA0012", "active": True},
+            ],
+        },
+        
+        "grid": {
+            "resolution": RESOLUTION,
+            "dx": DX_PHYS,
+        },
     },
     
     "units": {
@@ -141,6 +181,30 @@ actuator_line = {
     "gaussian_cutoff": 3.0,
     "rho_ref": 1.0,
 }
+# actuator_line = {
+#     "enabled": True,
+    
+#     "rotor": {
+#         "preset": "ntnu_bt1",
+#         "tsr": TSR,
+#         "u_inf": U_INF,
+#         # Hub center in PHYSICAL UNITS [m]
+#         # Will be converted to lattice units by Rotor.to_lattice_units()
+#         "hub_center": [HUB_X_PHYS, HUB_Y_PHYS, HUB_Z_PHYS],
+#         "resolution": RESOLUTION,
+#         "theta_0": 0.0,
+#         "rotation_axis": "hawt_x",
+#     },
+    
+#     "units": {
+#         "dx_phys": DX_PHYS,
+#         "dt_phys": DT_PHYS,
+#         "nu_phys": NU_AIR,
+#     },
+    
+#     "gaussian_cutoff": 3.0,
+#     "rho_ref": 1.0,
+# }
 
 # =============================================================================
 # §9. Conservation & Convergence
