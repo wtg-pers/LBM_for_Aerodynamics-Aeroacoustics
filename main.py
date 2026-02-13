@@ -509,6 +509,7 @@ def main():
     last_Cl = 0.0
     last_ct = 0.0
     last_cp = 0.0
+    last_rev = 0.0
 
     for step in pbar:
         # ─── Step 1: Macroscopic Variables ───────────────────────────
@@ -572,6 +573,7 @@ def main():
         if step % 10 == 0:
             if al_model is not None:
                 pbar.set_postfix({
+                    'rev': f"{last_rev:.2f}",
                     'C_T': f"{last_ct:.3f}",
                     'C_P': f"{last_cp:.3f}",
                     'drift': f"{last_drift:+.3f}%"
@@ -617,6 +619,7 @@ def main():
                 perf = al_model.get_rotor_performance()
                 last_ct = perf.get('C_T', 0)
                 last_cp = perf.get('C_P', 0)
+                last_rev = perf.get('revolutions', 0)
                 with open(perf_csv_path, 'a') as fh:
                     fh.write(f"{step},{step},"
                              f"{step * dt_phys:.6e},"

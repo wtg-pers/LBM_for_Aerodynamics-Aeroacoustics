@@ -604,6 +604,59 @@ class Rotor:
         C_P = power / (q_A * u_inf) if q_A > 0 else 0.0  # [dimensionless]
 
         return C_T, C_P
+    
+    def compute_power(
+        self,
+        F_theta_all: np.ndarray
+    ) -> float:
+        """Compute total rotor power from tangential forces
+
+        Physical Definition:
+            P = ω · Q = ω · Σ F_θ,j · r_j   [W or lu_power]
+
+        Only active markers contribute to the power calculation.
+
+        Args:
+            F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
+
+        Returns:
+            power: Total rotor power  [W or lu_power]
+        """
+        active = self.get_all_marker_active()  # [bool]
+        radii = self.get_all_marker_radii()    # [m or lu]
+
+        torque = np.sum(F_theta_all[active] * radii[active])  # [N·m or lu_torque]
+        power = self.omega * torque                            # [W or lu_power]
+
+        return power
+
+    def compute_ct_cp(
+        self,
+        F_n_all: np.ndarray,
+        F_theta_all: np.ndarray,
+        rho: float,
+        u_inf: float
+    ) -> Tuple[float, float]:
+        """Compute thrust and power coefficients (alias for compute_coefficients)
+
+        This is an alias for compute_coefficients() to match the interface
+        expected by ActuatorLineModel.get_rotor_performance().
+
+        Definitions:
+            C_T = T / (0.5 · ρ · U_∞² · A)       [dimensionless]
+            C_P = P / (0.5 · ρ · U_∞³ · A)       [dimensionless]
+
+        Args:
+            F_n_all:     Normal forces, shape (N_b * n_markers,) [N or lu_force]
+            F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
+            rho:   Fluid density       [kg/m³ or lu_density]
+            u_inf: Freestream velocity [m/s or lu/lt]
+
+        Returns:
+            (C_T, C_P): Thrust and power coefficients [dimensionless]
+        """
+        return self.compute_coefficients(F_n_all, F_theta_all, rho, u_inf)
+
 
     # -----------------------------------------------------------------
     # §1.7 Information & Diagnostics
