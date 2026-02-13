@@ -489,6 +489,22 @@ def main():
             dt_phys=dt_phys,
         )
         print(f"  {al_model}")
+
+        # === DEBUG: AL 진단 ===
+        print("\n  [DEBUG] AL Diagnostics:")
+        rotor = al_model.rotor
+        positions = rotor.get_all_marker_positions()
+        print(f"    Marker positions shape: {positions.shape}")
+        print(f"    Marker positions range:")
+        print(f"      X: [{positions[:,0].min():.2f}, {positions[:,0].max():.2f}]")
+        print(f"      Y: [{positions[:,1].min():.2f}, {positions[:,1].max():.2f}]")
+        print(f"      Z: [{positions[:,2].min():.2f}, {positions[:,2].max():.2f}]")
+        print(f"    Domain shape: {domain_shape}")
+        print(f"    Hub center (lu): {rotor.hub_center}")
+        print(f"    Radius (lu): {rotor.radius}")
+        print(f"    Omega (lu): {rotor.omega}")
+        print(f"    Coord system preset: {rotor.coord_system.preset}")
+        # === END DEBUG ===
     else:
         print(f"\n[5.4] Actuator Line: disabled")
         
@@ -515,6 +531,12 @@ def main():
         # ─── Step 1: Macroscopic Variables ───────────────────────────
         rho, u = macro.compute(f_old)
 
+         # === DEBUG: AL step 진단 (처음 몇 step만) ===
+        if al_model is not None and step < 5:
+            print(f"\n[DEBUG step={step}]")
+            print(f"  Before step: rev={al_model.rotor.n_revolutions:.4f}, "
+                f"theta[0]={al_model.rotor.theta[0]:.4f}")
+
         # ─── Step 1.5: Actuator Line → body force + Guo correction ──
         #
         #   Physical Process (Guo et al. 2002, Eq.4):
@@ -523,14 +545,21 @@ def main():
         #
         #   AL Pipeline: rotor rotation → BEM → Gaussian spreading → F(x)
         # ─────────────────────────────────────────────────────────────
+        body_force = None
         if al_model is not None:
             if xp != np:
                 u_np = xp.asnumpy(u)
             else:
                 u_np = np.asarray(u)
+
+            if step < 3:
+                print(f"  Before: rev={al_model.rotor.n_revolutions:.4f}")
             
             F_np = al_model.step(u_np, dt=1.0)       # F(x)  [lattice force]
             body_force = xp.asarray(F_np)
+
+            if step < 3:
+                print(f"  After: rev={al_model.rotor.n_revolutions:.4f}")
             
             # Guo velocity correction: u = u_raw + F/(2ρ)  [Δx/Δt]
             u = u + body_force / (2.0 * rho[None, ...])
@@ -572,8 +601,9 @@ def main():
         # ─── Progress bar ────────────────────────────────────────────
         if step % 10 == 0:
             if al_model is not None:
+                current_rev = al_model.rotor.n_revolutions
                 pbar.set_postfix({
-                    'rev': f"{last_rev:.2f}",
+                    'rev': f"{current_rev:.2f}",
                     'C_T': f"{last_ct:.3f}",
                     'C_P': f"{last_cp:.3f}",
                     'drift': f"{last_drift:+.3f}%"
