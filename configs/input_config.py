@@ -176,8 +176,6 @@ internal_geometry = {}
 # =============================================================================
 actuator_line = {
     "enabled": True,
-
-    # --- Rotor ---
     "rotor": {
         "preset": "ntnu_bt1",
         "tsr": TSR,                     # [dimensionless]
@@ -185,6 +183,7 @@ actuator_line = {
         "hub_center": [HUB_X, HUB_Y, HUB_Z],  # [m] physical coordinates
         "resolution": 40,       # [dimensionless] D/Δx
         "theta_0": 0.0,                # [rad] initial azimuth
+        "rotation_axis": "hawt_x",
     },
 
     # --- Physical → Lattice unit conversion ---
