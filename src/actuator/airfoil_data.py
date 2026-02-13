@@ -1324,3 +1324,570 @@ def create_nrel_s826_database() -> AirfoilDatabase:
     ]), Re=2e5)
 
     return db
+
+def create_polar_from_config(config: dict) -> Callable:
+    """Create polar query function from configuration
+    
+    Args:
+        config: airfoil_polar configuration dictionary
+        
+    Returns:
+        polar_query: Callable(alpha_deg, Re) → (CL, CD)
+    """
+    method = config.get("method", "neuralfoil")
+    
+    if method == "neuralfoil":
+        airfoil_name = config.get("airfoil_name", "naca0012")
+        Re_target = config.get("Re_target", 1e5)
+        mode = config.get("mode", "asb")
+        ncrit = config.get("ncrit", 9.0)
+        dat_path = config.get("dat_path", None)
+        coordinates = config.get("coordinates", None)
+        
+        packs = gen_airfoil_polar(
+            airfoil_name=airfoil_name,
+            Re_target=Re_target,
+            mode=mode,
+            ncrit=ncrit,
+            dat_path=dat_path,
+            coordinates=coordinates,
+        )
+        return make_polar_query(*packs[0])
+    
+    elif method == "flat_plate":
+        Re_target = config.get("Re_target", 1e5)
+        polar = create_flat_plate_polar(Re=Re_target)
+        return polar.get_coefficients
+    
+    elif method == "database":
+        preset = config.get("preset", "nrel_s826")
+        if preset == "nrel_s826":
+            db = create_nrel_s826_database()
+        elif preset == "naca0012_approx":
+            db = AirfoilDatabase("NACA0012")
+            db.add_polar(create_naca0012_polar(Re=1e5))
+        else:
+            raise ValueError(f"Unknown preset: {preset}")
+        return db.to_query()
+    
+    elif method == "csv":
+        csv_path = config["csv_path"]
+        packs = load_airfoil_from_csv(
+            csv_path,
+            alpha_col=config.get("alpha_col", "AoA(deg)"),
+            Re_col=config.get("Re_col", "Re"),
+            CL_col=config.get("CL_col", "cl"),
+            CD_col=config.get("CD_col", "cd"),
+        )
+        return make_polar_query(*packs[0])
+    
+    else:
+        raise ValueError(f"Unknown polar method: {method}")
+    
+def gen_airfoil_polar_extended(
+    airfoil_name: str = "naca0012",
+    Re_target: float = 1e5,
+    Re_min: Optional[float] = None,
+    Re_max: Optional[float] = None,
+    Re_steps: Optional[int] = None,
+    alphas: Optional['npt.NDArray'] = None,
+    mode: str = "asb",
+    ncrit: float = 9.0,
+    coordinates: Optional['npt.NDArray'] = None,
+    dat_path: Optional[str] = None,
+) -> List[Tuple['npt.NDArray', 'npt.NDArray', 'npt.NDArray', 'npt.NDArray']]:
+    """Extended polar generation with configurable Re range
+
+    Enhanced version of gen_airfoil_polar() with explicit Re range control.
+
+    Re Range Determination (priority order):
+        1. If Re_min & Re_max given: use [Re_min, Re_max]
+        2. Else: use [Re_target/2, Re_target*2] (default behavior)
+
+    Args:
+        airfoil_name: Airfoil name for aerosandbox  [string]
+        Re_target:    Target Reynolds number        [dimensionless]
+        Re_min:       Minimum Re (optional)         [dimensionless]
+        Re_max:       Maximum Re (optional)         [dimensionless]
+        Re_steps:     Number of Re points (optional, auto if None)
+        alphas:       Angle of attack array         [degrees]
+        mode:         "asb" | "user" | "dat"
+        ncrit:        Critical N-factor             [dimensionless]
+        coordinates:  Airfoil coords for mode="user"
+        dat_path:     .dat file path for mode="dat"
+
+    Returns:
+        [(Alpha_grid, Re_grid, CL_grid, CD_grid)]
+
+    Example:
+        >>> # Custom Re range: 100 to 1000
+        >>> packs = gen_airfoil_polar_extended(
+        ...     "naca0012", Re_target=300,
+        ...     Re_min=100, Re_max=1000, Re_steps=10
+        ... )
+    """
+    if alphas is None:
+        alphas = np.linspace(-180, 180, 361)  # [degrees]
+
+    # ── Determine Re range ──
+    if Re_min is not None and Re_max is not None:
+        # User-specified range
+        Re_low = Re_min
+        Re_high = Re_max
+        if Re_steps is not None:
+            Res = np.linspace(Re_low, Re_high, Re_steps)
+        else:
+            # Auto step based on order of magnitude
+            order = int(np.floor(np.log10(Re_target)))
+            step = max(10 ** (order - 1), 10)  # minimum step = 10
+            Res = np.arange(Re_low, Re_high + step, step)
+    else:
+        # Default: half-decade around target
+        Re_low = Re_target / 2
+        Re_high = Re_target * 2
+        order = int(np.floor(np.log10(max(Re_target, 10))))
+        step = max(10 ** (order - 1), 10)
+        Res = np.arange(Re_low, Re_high + step, step)
+
+    # Ensure at least 2 Re values
+    if len(Res) < 2:
+        Res = np.array([Re_low, Re_high])
+
+    Alpha, Re = np.meshgrid(alphas, Res)  # [degrees], [dimensionless]
+
+    # ── Generate polars ──
+    if mode == "asb":
+        try:
+            import aerosandbox as asb
+        except ImportError:
+            raise ImportError(
+                "aerosandbox required for mode='asb'. "
+                "Install: pip install aerosandbox"
+            )
+        af = asb.Airfoil(airfoil_name)
+        aero = af.get_aero_from_neuralfoil(
+            alpha=Alpha.ravel(),
+            Re=Re.ravel(),
+            mach=0,
+            model_size="xxlarge"
+        )
+
+    elif mode == "user":
+        try:
+            import neuralfoil as nf
+        except ImportError:
+            raise ImportError(
+                "neuralfoil required for mode='user'. "
+                "Install: pip install neuralfoil"
+            )
+        if coordinates is None:
+            raise ValueError("coordinates required for mode='user'")
+        aero = nf.get_aero_from_coordinates(
+            coordinates=coordinates,
+            alpha=Alpha.ravel(),
+            Re=Re.ravel(),
+            model_size="xxlarge",
+            n_crit=ncrit
+        )
+
+    elif mode == "dat":
+        try:
+            import neuralfoil as nf
+        except ImportError:
+            raise ImportError(
+                "neuralfoil required for mode='dat'. "
+                "Install: pip install neuralfoil"
+            )
+        if dat_path is None:
+            raise ValueError("dat_path required for mode='dat'")
+        aero = nf.get_aero_from_dat_file(
+            filename=dat_path,
+            alpha=Alpha.ravel(),
+            Re=Re.ravel(),
+            model_size="xlarge",
+            n_crit=ncrit
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Use 'asb', 'user', or 'dat'.")
+
+    CL_grid = aero["CL"].reshape(Alpha.shape)  # [dimensionless]
+    CD_grid = aero["CD"].reshape(Alpha.shape)  # [dimensionless]
+
+    return [(Alpha, Re, CL_grid, CD_grid)]
+
+
+class MultiAirfoilPolarManager:
+    """Manager for multiple airfoil polar datasets
+
+    Enables blade sections to use different airfoils by maintaining
+    a dictionary of airfoil_name → polar_query mappings.
+
+    Data Flow:
+        Config → MultiAirfoilPolarManager → polar_query(alpha, Re, airfoil)
+                                          or queries[airfoil](alpha, Re)
+
+    Example:
+        >>> manager = MultiAirfoilPolarManager()
+        >>> manager.add_airfoil_from_neuralfoil("naca0012", Re_target=300)
+        >>> manager.add_airfoil_from_neuralfoil("nrel_s826", Re_target=1e5)
+        >>>
+        >>> # Query with airfoil name
+        >>> cl, cd = manager.query("naca0012", alpha=5.0, Re=200)
+        >>>
+        >>> # Or get individual query function
+        >>> query = manager.get_query("naca0012")
+        >>> cl, cd = query(5.0, 200)
+    """
+
+    def __init__(self) -> None:
+        """Initialize empty manager"""
+        self._databases: Dict[str, AirfoilDatabase] = {}
+        self._queries: Dict[str, Callable] = {}
+        self._default_airfoil: Optional[str] = None
+
+    def add_airfoil(
+        self,
+        name: str,
+        database: AirfoilDatabase,
+        set_default: bool = False
+    ) -> None:
+        """Add an airfoil database
+
+        Args:
+            name: Airfoil identifier (used in blade sections)
+            database: AirfoilDatabase instance
+            set_default: If True, use as fallback for unknown airfoils
+        """
+        self._databases[name] = database
+        self._queries[name] = database.to_query()
+        if set_default or self._default_airfoil is None:
+            self._default_airfoil = name
+
+    def add_airfoil_from_neuralfoil(
+        self,
+        name: str,
+        Re_target: float = 1e5,
+        Re_min: Optional[float] = None,
+        Re_max: Optional[float] = None,
+        Re_steps: Optional[int] = None,
+        mode: str = "asb",
+        ncrit: float = 9.0,
+        dat_path: Optional[str] = None,
+        set_default: bool = False,
+    ) -> None:
+        """Generate and add airfoil polar using neuralfoil/aerosandbox
+
+        Args:
+            name: Airfoil identifier (e.g., "naca0012", "nrel_s826")
+            Re_target: Target Reynolds number  [dimensionless]
+            Re_min: Minimum Re (optional)      [dimensionless]
+            Re_max: Maximum Re (optional)      [dimensionless]
+            Re_steps: Number of Re points
+            mode: "asb" | "user" | "dat"
+            ncrit: Critical N-factor
+            dat_path: Path to .dat file (for mode="dat")
+            set_default: Use as fallback for unknown airfoils
+        """
+        packs = gen_airfoil_polar_extended(
+            airfoil_name=name,
+            Re_target=Re_target,
+            Re_min=Re_min,
+            Re_max=Re_max,
+            Re_steps=Re_steps,
+            mode=mode,
+            ncrit=ncrit,
+            dat_path=dat_path,
+        )
+        db = AirfoilDatabase.from_bemt_pack(packs[0], name=name)
+        self.add_airfoil(name, db, set_default=set_default)
+
+    def add_airfoil_from_flat_plate(
+        self,
+        name: str = "flat_plate",
+        Re_target: float = 1e5,
+        set_default: bool = False,
+    ) -> None:
+        """Add flat plate theory polar
+
+        Args:
+            name: Airfoil identifier
+            Re_target: Reference Re for drag scaling
+            set_default: Use as fallback
+        """
+        polar = create_flat_plate_polar(Re=Re_target)
+        db = AirfoilDatabase(name)
+        db.add_polar(polar)
+        self.add_airfoil(name, db, set_default=set_default)
+
+    def add_airfoil_from_csv(
+        self,
+        name: str,
+        csv_path: str,
+        alpha_col: str = "AoA(deg)",
+        Re_col: str = "Re",
+        CL_col: str = "cl",
+        CD_col: str = "cd",
+        set_default: bool = False,
+    ) -> None:
+        """Add airfoil from CSV file
+
+        Args:
+            name: Airfoil identifier
+            csv_path: Path to CSV file
+            alpha_col, Re_col, CL_col, CD_col: Column names
+            set_default: Use as fallback
+        """
+        db = AirfoilDatabase(name)
+        db.load_csv(
+            csv_path,
+            alpha_col=alpha_col,
+            Re_col=Re_col,
+            CL_col=CL_col,
+            CD_col=CD_col,
+        )
+        self.add_airfoil(name, db, set_default=set_default)
+
+    def get_query(self, airfoil_name: str) -> Callable:
+        """Get polar query function for specific airfoil
+
+        Args:
+            airfoil_name: Airfoil identifier
+
+        Returns:
+            query(alpha_deg, Re) → (CL, CD)
+        """
+        # Normalize name (case-insensitive)
+        name_lower = airfoil_name.lower()
+        for key in self._queries:
+            if key.lower() == name_lower:
+                return self._queries[key]
+
+        # Fallback to default
+        if self._default_airfoil is not None:
+            warnings.warn(
+                f"Unknown airfoil '{airfoil_name}', using default "
+                f"'{self._default_airfoil}'"
+            )
+            return self._queries[self._default_airfoil]
+
+        raise KeyError(f"Airfoil '{airfoil_name}' not found and no default set")
+
+    def query(
+        self,
+        airfoil_name: str,
+        alpha: float,
+        Re: float
+    ) -> Tuple[float, float]:
+        """Query CL, CD for specific airfoil
+
+        Args:
+            airfoil_name: Airfoil identifier
+            alpha: Angle of attack  [degrees]
+            Re: Reynolds number     [dimensionless]
+
+        Returns:
+            (CL, CD)  [dimensionless, dimensionless]
+        """
+        query_func = self.get_query(airfoil_name)
+        return query_func(alpha, Re)
+
+    def to_unified_query(self) -> Callable:
+        """Create unified query function accepting airfoil name
+
+        Returns:
+            query(alpha_deg, Re, airfoil_name) → (CL, CD)
+
+        Note:
+            If airfoil_name is None or empty, uses default airfoil.
+        """
+        def unified_query(
+            alpha_deg: float,
+            Re: float,
+            airfoil_name: Optional[str] = None
+        ) -> Tuple[float, float]:
+            if airfoil_name is None or airfoil_name == "":
+                airfoil_name = self._default_airfoil
+            return self.query(airfoil_name, alpha_deg, Re)
+        return unified_query
+
+    @property
+    def airfoil_names(self) -> List[str]:
+        """List of registered airfoil names"""
+        return list(self._databases.keys())
+
+    @property
+    def default_airfoil(self) -> Optional[str]:
+        """Name of default airfoil"""
+        return self._default_airfoil
+
+    def get_info(self) -> str:
+        """Human-readable summary"""
+        lines = [
+            "MultiAirfoilPolarManager",
+            "=" * 60,
+            f"  Registered airfoils: {len(self._databases)}",
+            f"  Default: {self._default_airfoil}",
+            "",
+        ]
+        for name, db in self._databases.items():
+            Re_lo, Re_hi = db.Re_range
+            marker = " (default)" if name == self._default_airfoil else ""
+            lines.append(f"  [{name}]{marker}")
+            lines.append(f"      Re range: {Re_lo:.0f} ~ {Re_hi:.0f}")
+            lines.append(f"      Polars: {db.num_polars}")
+        return '\n'.join(lines)
+
+    def __repr__(self) -> str:
+        return f"MultiAirfoilPolarManager({self.airfoil_names})"
+
+
+def create_polar_from_config(
+    config: Dict
+) -> Tuple[Callable, Optional[MultiAirfoilPolarManager]]:
+    """Create polar query function(s) from configuration
+
+    Supports both single-airfoil and multi-airfoil configurations.
+
+    Config Formats:
+        1. Single airfoil (legacy compatible):
+            {
+                "method": "neuralfoil",
+                "airfoil_name": "naca0012",
+                "Re_target": 300,
+                ...
+            }
+
+        2. Multiple airfoils:
+            {
+                "method": "multi",
+                "default": "naca0012",
+                "airfoils": {
+                    "naca0012": {"Re_target": 300, "mode": "asb"},
+                    "nrel_s826": {"Re_target": 1e5, "mode": "asb"},
+                    "custom": {"csv_path": "data/custom.csv"}
+                }
+            }
+
+    Args:
+        config: airfoil_polar configuration dictionary
+
+    Returns:
+        (polar_query, manager)
+        - polar_query: Callable for single airfoil query
+        - manager: MultiAirfoilPolarManager (None if single airfoil)
+
+    Raises:
+        ValueError: Invalid configuration
+        ImportError: Missing required packages
+    """
+    method = config.get("method", "neuralfoil")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Multi-airfoil mode
+    # ═══════════════════════════════════════════════════════════════════
+    if method == "multi":
+        manager = MultiAirfoilPolarManager()
+        airfoils_cfg = config.get("airfoils", {})
+        default_name = config.get("default", None)
+
+        if not airfoils_cfg:
+            raise ValueError("'airfoils' dict required for method='multi'")
+
+        for name, af_cfg in airfoils_cfg.items():
+            af_method = af_cfg.get("method", "neuralfoil")
+            is_default = (name == default_name) or (default_name is None)
+
+            if af_method == "neuralfoil":
+                manager.add_airfoil_from_neuralfoil(
+                    name=af_cfg.get("airfoil_name", name),
+                    Re_target=af_cfg.get("Re_target", 1e5),
+                    Re_min=af_cfg.get("Re_min"),
+                    Re_max=af_cfg.get("Re_max"),
+                    Re_steps=af_cfg.get("Re_steps"),
+                    mode=af_cfg.get("mode", "asb"),
+                    ncrit=af_cfg.get("ncrit", 9.0),
+                    dat_path=af_cfg.get("dat_path"),
+                    set_default=is_default,
+                )
+            elif af_method == "flat_plate":
+                manager.add_airfoil_from_flat_plate(
+                    name=name,
+                    Re_target=af_cfg.get("Re_target", 1e5),
+                    set_default=is_default,
+                )
+            elif af_method == "csv":
+                manager.add_airfoil_from_csv(
+                    name=name,
+                    csv_path=af_cfg["csv_path"],
+                    alpha_col=af_cfg.get("alpha_col", "AoA(deg)"),
+                    Re_col=af_cfg.get("Re_col", "Re"),
+                    CL_col=af_cfg.get("CL_col", "cl"),
+                    CD_col=af_cfg.get("CD_col", "cd"),
+                    set_default=is_default,
+                )
+            else:
+                raise ValueError(f"Unknown method '{af_method}' for airfoil '{name}'")
+
+        # Return unified query (3-arg) and manager
+        return manager.to_unified_query(), manager
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Single airfoil modes
+    # ═══════════════════════════════════════════════════════════════════
+    if method == "neuralfoil":
+        airfoil_name = config.get("airfoil_name", "naca0012")
+        Re_target = config.get("Re_target", 1e5)
+        Re_min = config.get("Re_min")
+        Re_max = config.get("Re_max")
+        Re_steps = config.get("Re_steps")
+        mode = config.get("mode", "asb")
+        ncrit = config.get("ncrit", 9.0)
+        dat_path = config.get("dat_path")
+        coordinates = config.get("coordinates")
+
+        packs = gen_airfoil_polar_extended(
+            airfoil_name=airfoil_name,
+            Re_target=Re_target,
+            Re_min=Re_min,
+            Re_max=Re_max,
+            Re_steps=Re_steps,
+            mode=mode,
+            ncrit=ncrit,
+            coordinates=coordinates,
+            dat_path=dat_path,
+        )
+        query = make_polar_query(*packs[0])
+        return query, None
+
+    elif method == "flat_plate":
+        Re_target = config.get("Re_target", 1e5)
+        polar = create_flat_plate_polar(Re=Re_target)
+        return polar.get_coefficients, None
+
+    elif method == "database":
+        preset = config.get("preset", "nrel_s826")
+        if preset == "nrel_s826":
+            db = create_nrel_s826_database()
+        elif preset == "naca0012_approx":
+            db = AirfoilDatabase("NACA0012")
+            db.add_polar(create_naca0012_polar(Re=1e5))
+        else:
+            raise ValueError(f"Unknown preset: {preset}")
+        return db.to_query(), None
+
+    elif method == "csv":
+        csv_path = config["csv_path"]
+        packs = load_airfoil_from_csv(
+            csv_path,
+            alpha_col=config.get("alpha_col", "AoA(deg)"),
+            Re_col=config.get("Re_col", "Re"),
+            CL_col=config.get("CL_col", "cl"),
+            CD_col=config.get("CD_col", "cd"),
+        )
+        return make_polar_query(*packs[0]), None
+
+    else:
+        raise ValueError(
+            f"Unknown polar method: '{method}'. "
+            f"Available: 'neuralfoil', 'flat_plate', 'database', 'csv', 'multi'"
+        )

@@ -52,6 +52,10 @@ from .airfoil_data import (
     load_airfoil_from_csv, load_airfoil_sections_from_csv,
     create_flat_plate_polar, create_naca0012_polar,
     create_nrel_s826_database,
+    # NEW: Config-based polar factory
+    gen_airfoil_polar_extended,
+    MultiAirfoilPolarManager,
+    create_polar_from_config,
 )
 
 # =============================================================================
@@ -94,7 +98,7 @@ from .actuator_line import (
 # Public API
 # =============================================================================
 __all__ = [
-    # Coordinate system (NEW)
+    # Coordinate system
     'RotorCoordinateSystem',
     'RotorAxisPreset',
     'create_coordinate_system',
@@ -104,6 +108,10 @@ __all__ = [
     'load_airfoil_from_csv', 'load_airfoil_sections_from_csv',
     'create_flat_plate_polar', 'create_naca0012_polar',
     'create_nrel_s826_database',
+    # NEW: Config-based polar factory
+    'gen_airfoil_polar_extended',
+    'MultiAirfoilPolarManager',
+    'create_polar_from_config',
     # Blade and rotor
     'Blade', 'BladeSection',
     'Rotor',

@@ -470,15 +470,54 @@ def main():
     # [5.4] Actuator Line Model (conditional)
     # =========================================================================
     al_model = None
+    polar_manager = None  # For multi-airfoil support
+    
     if al_enabled:
         from src.actuator.actuator_line import create_actuator_line_from_config
-        from src.actuator.airfoil_data import create_nrel_s826_database
+        from src.actuator.airfoil_data import create_polar_from_config  # NEW
 
         print(f"\n[5.4] Actuator Line Model")
-        print("  Creating rotor & loading airfoil database...")
         
-        db = create_nrel_s826_database()
-        polar_query = db.to_query()
+        # ─────────────────────────────────────────────────────────────────
+        # Load airfoil polar from config
+        # ─────────────────────────────────────────────────────────────────
+        polar_config = config_loader.config.get('airfoil_polar', {})
+        
+        if not polar_config:
+            # Fallback: default neuralfoil configuration
+            print("  [WARNING] No 'airfoil_polar' in config, using default")
+            polar_config = {
+                "method": "neuralfoil",
+                "airfoil_name": "naca0012",
+                "Re_target": 1e5,
+                "mode": "asb",
+            }
+        
+        method = polar_config.get('method', 'neuralfoil')
+        print(f"  Airfoil polar method: '{method}'")
+        
+        if method == 'multi':
+            print(f"    Airfoils: {list(polar_config.get('airfoils', {}).keys())}")
+            print(f"    Default: {polar_config.get('default', 'auto')}")
+        else:
+            print(f"    Airfoil: {polar_config.get('airfoil_name', 'N/A')}")
+            print(f"    Re_target: {polar_config.get('Re_target', 'N/A')}")
+            if polar_config.get('Re_min') is not None:
+                print(f"    Re range: [{polar_config['Re_min']}, {polar_config.get('Re_max')}]")
+        
+        print("  Generating polar data...")
+        polar_query, polar_manager = create_polar_from_config(polar_config)
+        
+        if polar_manager is not None:
+            print(f"  Loaded {len(polar_manager.airfoil_names)} airfoil(s): "
+                  f"{polar_manager.airfoil_names}")
+        else:
+            print("  Single airfoil mode")
+        
+        # ─────────────────────────────────────────────────────────────────
+        # Create Actuator Line Model
+        # ─────────────────────────────────────────────────────────────────
+        print("  Creating rotor...")
         
         al_model = create_actuator_line_from_config(
             config=al_cfg,

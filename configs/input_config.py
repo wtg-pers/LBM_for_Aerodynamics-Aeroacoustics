@@ -140,6 +140,37 @@ internal_geometry = {}
 # =============================================================================
 # §8. Actuator Line Model
 # =============================================================================
+airfoil_polar = {
+    # ─────────────────────────────────────────────────────────────────────
+    # Method: "neuralfoil" | "flat_plate" | "database" | "csv"
+    # ─────────────────────────────────────────────────────────────────────
+    "method": "neuralfoil",
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # For method="neuralfoil" or "flat_plate"
+    # ─────────────────────────────────────────────────────────────────────
+    "airfoil_name": "naca0012",      # aerosandbox 내장 이름 또는 사용자 정의
+    "Re_target": 300,                 # [dimensionless] 타겟 Re
+    "mode": "asb",                    # "asb" | "user" | "dat"
+    "ncrit": 9.0,                     # 천이 N-factor
+    # "dat_path": "data/my_airfoil.dat",  # mode="dat"일 때
+    # "coordinates": None,                 # mode="user"일 때 (N,2) array
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # For method="database" (built-in presets)
+    # ─────────────────────────────────────────────────────────────────────
+    # "preset": "nrel_s826",          # "nrel_s826" | "naca0012_approx"
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # For method="csv"
+    # ─────────────────────────────────────────────────────────────────────
+    # "csv_path": "data/airfoil_polar.csv",
+    # "alpha_col": "AoA(deg)",
+    # "Re_col": "Re",
+    # "CL_col": "cl",
+    # "CD_col": "cd",
+}
+
 actuator_line = {
     "enabled": True,
     
@@ -283,6 +314,7 @@ config = {
     "simulation": simulation,
     "boundaries": boundaries,
     "internal_geometry": internal_geometry,
+    "airfoil_polar": airfoil_polar,
     "actuator_line": actuator_line,
     "conservation": conservation,
     "convergence": convergence,

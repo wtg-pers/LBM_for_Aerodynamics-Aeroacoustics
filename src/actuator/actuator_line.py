@@ -153,25 +153,26 @@ class ActuatorLineModel:
         rotor: 'Rotor',
         nu: float,
         domain_shape: Tuple[int, int, int],
-        polar_query: Callable[[float, float], Tuple[float, float]],
+        polar_query: Callable[..., Tuple[float, float]],  # 변경: ... 으로 유연하게
         rho_ref: float = 1.0,
         n_cut: float = 3.0,
         dx_phys: float = 1.0,
         dt_phys: float = 1.0,
     ) -> None:
-        """Initialize the Actuator Line model
+        '''Initialize the Actuator Line model
 
         Args:
             rotor: Rotor object in LATTICE UNITS
             nu: Kinematic viscosity  [lu²/lt]
             domain_shape: (Nx, Ny, Nz)  [lu]
-            polar_query: Callable(alpha_deg, Re) → (CL, CD)
-                         Must handle per-marker calls.
-            rho_ref: Reference density (default 1.0)  [dimensionless]
-            n_cut: Gaussian cutoff  [dimensionless]
-            dx_phys: Physical grid spacing  [m/lu] (for diagnostics)
-            dt_phys: Physical timestep  [s/lt] (for diagnostics)
-        """
+            polar_query: Airfoil polar query function
+                         - Single airfoil: query(alpha_deg, Re) → (CL, CD)
+                         - Multi airfoil:  query(alpha_deg, Re, airfoil_name) → (CL, CD)
+            rho_ref: Reference density [dimensionless]
+            n_cut: Gaussian cutoff in units of ε
+            dx_phys: Physical grid spacing [m/lu]
+            dt_phys: Physical timestep [s/lt]
+        '''
         self.rotor = rotor
         self.nu = nu                    # [lu²/lt]
         self.rho_ref = rho_ref          # [dimensionless]
@@ -190,6 +191,20 @@ class ActuatorLineModel:
         self._last_positions: Optional[np.ndarray] = None
         self._last_forces_global: Optional[np.ndarray] = None
         self._step_count: int = 0
+
+        # Detect multi-airfoil support
+        # Test if polar_query accepts 3 arguments (alpha, Re, airfoil_name)
+        self._multi_airfoil = False
+        try:
+            import inspect
+            sig = inspect.signature(polar_query)
+            n_params = len([p for p in sig.parameters.values() 
+                           if p.default == inspect.Parameter.empty])
+            # If 3 required params or has 'airfoil' param, it's multi-airfoil
+            self._multi_airfoil = n_params >= 3 or 'airfoil_name' in sig.parameters
+        except (ValueError, TypeError):
+            # If signature inspection fails, assume single airfoil
+            self._multi_airfoil = False
 
     # -----------------------------------------------------------------
     # §2.1 Main Time Step
@@ -268,133 +283,110 @@ class ActuatorLineModel:
     # §2.2 BEM Force Computation
     # -----------------------------------------------------------------
 
-    def _compute_bem_forces(
-        self,
-        u_markers: 'npt.NDArray'
-    ) -> BEMResult:
-        """Compute BEM aerodynamic forces at all markers
+    def _compute_bem_forces_modified(self, u_markers: 'npt.NDArray') -> 'BEMResult':
+        """Compute BEM aerodynamic forces at all markers (MODIFIED for multi-airfoil)
 
         Physical Process (Watanabe et al. Eq. 5-12):
             1. Decompose velocity: u_n (normal), u_θ (tangential)  [Eq. 5]
-            2. Relative velocity:  u_rel = √(u_n² + (ωr - u_θ)²) [Eq. 6]
-            3. Flow angle:         φ = atan2(u_n, ωr - u_θ)       [Eq. 7]
-            4. Angle of attack:    α = φ - γ                       [Eq. 8]
+            2. Relative velocity:  u_rel = √(u_n² + (ωr - u_θ)²)   [Eq. 6]
+            3. Flow angle:         φ = atan2(u_n, ωr - u_θ)        [Eq. 7]
+            4. Angle of attack:    α = φ - γ                        [Eq. 8]
             5. Reynolds number:    Re = u_rel · c_a / ν
-            6. Airfoil lookup:     CL(Re, α), CD(Re, α)
-            7. Lift/drag forces:   F_L = ½·ρ·u_rel²·c·Δr·CL      [Eq. 9]
-                                   F_D = ½·ρ·u_rel²·c·Δr·CD      [Eq. 10]
-            8. Normal/tangential:  F_n = FL·cosφ + FD·sinφ         [Eq. 11]
-                                   F_θ = FL·sinφ - FD·cosφ         [Eq. 12]
+            6. Airfoil lookup:     CL(Re, α, [airfoil]), CD(Re, α, [airfoil])
+            7. Lift/drag forces:   F_L = ½·ρ·u_rel²·c·Δr·CL        [Eq. 9]
+                                F_D = ½·ρ·u_rel²·c·Δr·CD        [Eq. 10]
+            8. Project to blade:   F_n, F_θ                        [Eq. 11-12]
 
         Args:
-            u_markers: Velocity at markers, shape (N_total, 3)  [Δx/Δt]
+            u_markers: Interpolated velocity at markers, shape (N_total, 3) [Δx/Δt]
 
         Returns:
-            BEMResult with all intermediate and final quantities
+            BEMResult with all computed quantities
         """
-        rotor = self.rotor
-        n_total = rotor.total_markers
-        n_per_blade = rotor.markers_per_blade
+        # --- Setup ---
+        n_total = u_markers.shape[0]  # [dimensionless]
+        chord_all = self.rotor.get_all_marker_chords()     # [lu]
+        active_all = self.rotor.get_all_marker_active()    # [bool]
+        dr = self.rotor.get_all_marker_dr()                # [lu]
 
-        # Pre-allocate output arrays
-        u_rel_all = np.zeros(n_total, dtype=np.float64)     # [Δx/Δt]
-        phi_all = np.zeros(n_total, dtype=np.float64)       # [degrees]
-        alpha_all = np.zeros(n_total, dtype=np.float64)     # [degrees]
-        Re_all = np.zeros(n_total, dtype=np.float64)        # [dimensionless]
-        CL_all = np.zeros(n_total, dtype=np.float64)        # [dimensionless]
-        CD_all = np.zeros(n_total, dtype=np.float64)        # [dimensionless]
-        F_L_all = np.zeros(n_total, dtype=np.float64)       # [lattice force]
-        F_D_all = np.zeros(n_total, dtype=np.float64)       # [lattice force]
-        F_n_all = np.zeros(n_total, dtype=np.float64)       # [lattice force]
-        F_theta_all = np.zeros(n_total, dtype=np.float64)   # [lattice force]
+        # Get airfoil names for multi-airfoil mode
+        if self._multi_airfoil:
+            airfoil_all = self.rotor.get_all_marker_airfoils()  # [str list]
 
-        # Process each blade
-        for k in range(rotor.n_blades):
-            idx_start = k * n_per_blade
-            idx_end = idx_start + n_per_blade
+        # Arrays to fill
+        u_rel = np.zeros(n_total)       # [Δx/Δt]
+        phi = np.zeros(n_total)         # [degrees]
+        alpha = np.zeros(n_total)       # [degrees]
+        Re = np.zeros(n_total)          # [dimensionless]
+        CL = np.zeros(n_total)          # [dimensionless]
+        CD = np.zeros(n_total)          # [dimensionless]
 
-            # Blade-specific velocity extraction
-            u_blade = u_markers[idx_start:idx_end]          # (n_markers, 3)
+        # --- Per-blade processing ---
+        n_per = self.rotor.markers_per_blade  # [dimensionless]
+        
+        for b_idx, blade in enumerate(self.rotor.blades):
+            start = b_idx * n_per
+            end = start + n_per
+            theta_b = self.rotor.theta[b_idx]  # [rad]
 
-            # --- Velocity decomposition (Eq. 5-8) ---
-            u_rel, phi_deg, alpha_deg = rotor.compute_relative_velocity(
-                blade_idx=k, u_global=u_blade
-            )
-            # u_rel: [Δx/Δt], phi_deg: [degrees], alpha_deg: [degrees]
+            # Velocity at this blade's markers
+            u_blade = u_markers[start:end]  # (n_per, 3) [Δx/Δt]
 
-            u_rel_all[idx_start:idx_end] = u_rel
-            phi_all[idx_start:idx_end] = phi_deg
-            alpha_all[idx_start:idx_end] = alpha_deg
+            # Compute relative velocity and angles
+            u_rel_b, phi_b, alpha_b = self.rotor.compute_relative_velocity(
+                blade, u_blade, theta_b
+            )  # [Δx/Δt], [degrees], [degrees]
 
-            # --- Blade geometry ---
-            blade = rotor.blades[k]
-            chord = blade.marker_chord       # [lu]
-            dr = blade.marker_dr             # [lu]
-            active = blade.marker_active     # bool
+            u_rel[start:end] = u_rel_b
+            phi[start:end] = phi_b
+            alpha[start:end] = alpha_b
 
-            # --- Reynolds number ---
-            # Re = u_rel · c_a / ν   [dimensionless]
-            Re = u_rel * chord / (self.nu + 1e-30)
-            Re_all[idx_start:idx_end] = Re
+            # Reynolds number: Re = u_rel · chord / ν
+            Re[start:end] = u_rel_b * chord_all[start:end] / self.nu  # [dimensionless]
 
-            # --- Airfoil polar lookup ---
-            CL = np.zeros(n_per_blade, dtype=np.float64)
-            CD = np.zeros(n_per_blade, dtype=np.float64)
+        # ═══════════════════════════════════════════════════════════════════
+        # Airfoil lookup (MODIFIED for multi-airfoil support)
+        # ═══════════════════════════════════════════════════════════════════
+        for i in range(n_total):
+            if active_all[i]:
+                if self._multi_airfoil:
+                    # Multi-airfoil mode: pass airfoil name
+                    CL[i], CD[i] = self.polar_query(alpha[i], Re[i], airfoil_all[i])
+                else:
+                    # Single airfoil mode: original 2-argument call
+                    CL[i], CD[i] = self.polar_query(alpha[i], Re[i])
 
-            for j in range(n_per_blade):
-                if not active[j]:
-                    continue
-                if u_rel[j] < 1e-10:        # No flow → no force
-                    continue
+        # ═══════════════════════════════════════════════════════════════════
+        # Force computation (unchanged from original)
+        # ═══════════════════════════════════════════════════════════════════
+        # Lift and drag (Watanabe Eq. 9-10)
+        # F = 0.5 · ρ · u_rel² · c · Δr · C
+        q_dyn = 0.5 * self.rho_ref * u_rel**2   # [dimensionless] dynamic pressure
+        F_L = q_dyn * chord_all * dr * CL       # [lattice force]
+        F_D = q_dyn * chord_all * dr * CD       # [lattice force]
 
-                cl_j, cd_j = self.polar_query(
-                    float(alpha_deg[j]),      # [degrees]
-                    float(Re[j])              # [dimensionless]
-                )
-                CL[j] = cl_j
-                CD[j] = cd_j
+        # Project to normal/tangential (Watanabe Eq. 11-12)
+        phi_rad = np.radians(phi)                # [radians]
+        F_n = F_L * np.cos(phi_rad) + F_D * np.sin(phi_rad)      # [lattice force]
+        F_theta = F_L * np.sin(phi_rad) - F_D * np.cos(phi_rad)  # [lattice force]
 
-            CL_all[idx_start:idx_end] = CL
-            CD_all[idx_start:idx_end] = CD
-
-            # --- Lift and drag forces (Eq. 9-10) ---
-            # F_L = 0.5 · ρ · u_rel² · c_a · Δr · CL   [lattice force]
-            # F_D = 0.5 · ρ · u_rel² · c_a · Δr · CD   [lattice force]
-            q = 0.5 * self.rho_ref * u_rel ** 2          # [lattice pressure]
-            F_L = q * chord * dr * CL                     # [lattice force]
-            F_D = q * chord * dr * CD                     # [lattice force]
-
-            # Inactive markers produce zero force
-            F_L[~active] = 0.0
-            F_D[~active] = 0.0
-
-            F_L_all[idx_start:idx_end] = F_L
-            F_D_all[idx_start:idx_end] = F_D
-
-            # --- Project to normal/tangential (Eq. 11-12) ---
-            # F_n = F_L·cos(φ) + F_D·sin(φ)     [lattice force]
-            # F_θ = F_L·sin(φ) - F_D·cos(φ)     [lattice force]
-            phi_rad = np.radians(phi_deg)                # [radians]
-            cos_phi = np.cos(phi_rad)                    # [dimensionless]
-            sin_phi = np.sin(phi_rad)                    # [dimensionless]
-
-            F_n = F_L * cos_phi + F_D * sin_phi          # [lattice force]
-            F_theta = F_L * sin_phi - F_D * cos_phi      # [lattice force]
-
-            F_n_all[idx_start:idx_end] = F_n
-            F_theta_all[idx_start:idx_end] = F_theta
+        # Zero out inactive markers
+        F_L[~active_all] = 0.0
+        F_D[~active_all] = 0.0
+        F_n[~active_all] = 0.0
+        F_theta[~active_all] = 0.0
 
         return BEMResult(
-            u_rel=u_rel_all,
-            phi=phi_all,
-            alpha=alpha_all,
-            Re=Re_all,
-            CL=CL_all,
-            CD=CD_all,
-            F_L=F_L_all,
-            F_D=F_D_all,
-            F_n=F_n_all,
-            F_theta=F_theta_all,
+            u_rel=u_rel,
+            phi=phi,
+            alpha=alpha,
+            Re=Re,
+            CL=CL,
+            CD=CD,
+            F_L=F_L,
+            F_D=F_D,
+            F_n=F_n,
+            F_theta=F_theta,
         )
 
     # -----------------------------------------------------------------
