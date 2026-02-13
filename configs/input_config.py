@@ -45,7 +45,7 @@ else:
 # =============================================================================
 
 RESOLUTION = 40              # [-]  Grid cells per L_REF (N = L_REF / Δx)
-LATTICE_VELOCITY = 0.05      # [-]  u_lu (controls accuracy, recommend 0.02~0.1)
+LATTICE_VELOCITY = 0.1      # [-]  u_lu (controls accuracy, recommend 0.02~0.1)
 
 # =============================================================================
 # §3. AUTO-CALCULATED LATTICE PARAMETERS
@@ -257,6 +257,11 @@ if ALM_ENABLED:
             "dt_phys": DT_PHYS,        # [s/lt]
             "nu_phys": NU_PHYS,        # [m²/s]
         },
+
+        "grid": {
+                "resolution": RESOLUTION,   # [-] D/Δx = 40
+                "dx": DX_PHYS,              # [m/lu]
+            },
         
         "rho_ref": RHO_REF,            # [kg/m³]
         "gaussian_cutoff": 3.0,

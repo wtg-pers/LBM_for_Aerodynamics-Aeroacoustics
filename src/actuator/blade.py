@@ -167,6 +167,15 @@ class Blade:
             raise ValueError(
                 f"Blade span must be positive: r_hub={self.r_hub}, r_tip={self.r_tip}"
             )
+        
+        # Root-cut radius: first active section's radial position  [m]
+        # Determines where marker particles actually begin.
+        # Physical meaning: hub/nacelle region produces no aero forces
+        active_sections = [s for s in self.sections if s.is_active]
+        if active_sections:
+            self.r_root_cut: float = active_sections[0].r   # [m]
+        else:
+            self.r_root_cut: float = self.r_hub             # [m] fallback
 
         # Build interpolation functions from section data
         self._build_interpolators()
@@ -232,35 +241,64 @@ class Blade:
     # §2.2 Marker Generation
     # -----------------------------------------------------------------
 
-    def generate_markers(self, dr: float) -> None:
+    def generate_markers(self, dr: float, skip_inactive_root: bool = True) -> None:
         """Generate evenly-spaced marker particles along the blade span
 
         Markers are placed at:
-            r_j = r_hub + (j + 0.5) · Δr    for j = 0, 1, ..., N-1
+            r_j = r_start + (j + 0.5) · Δr    for j = 0, 1, ..., N-1
 
-        where N = floor(span / Δr). The half-cell offset ensures markers
-        are centered within their influence region.
+        where r_start depends on skip_inactive_root:
+            - True  (default): r_start = r_root_cut  (first active section)
+            - False (legacy):  r_start = r_hub        (includes inactive root)
+
+        Physical Rationale:
+            In the AL model, markers represent blade elements that interact
+            with the flow. The root region (r < r_root_cut) belongs to the
+            hub/nacelle and produces no aerodynamic forces. Placing markers
+            there wastes computation and creates visual artifacts where
+            markers pass through the hub center, making separate blades
+            appear as one continuous line.
 
         Args:
             dr: Marker spacing  [m]
                 Typically dr = Δx/2 for good force resolution
+            skip_inactive_root: If True, start markers from first active
+                                section. If False, start from r_hub.
+                                [default: True]
         """
         self.marker_dr = dr  # [m]
 
-        # Number of markers that fit in the span
-        n = int(np.floor(self.span / dr))
+        # --- Determine starting radius ---
+        if skip_inactive_root and hasattr(self, 'r_root_cut'):
+            r_start = self.r_root_cut     # [m] first active section
+        else:
+            r_start = self.r_hub          # [m] legacy: from absolute hub
+
+        # Effective span for marker placement  [m]
+        effective_span = self.r_tip - r_start  # [m]
+
+        if effective_span <= 0:
+            raise ValueError(
+                f"No active blade span: r_start={r_start:.6f}, "
+                f"r_tip={self.r_tip:.6f}. Check blade section definitions."
+            )
+
+        # Number of markers that fit in the active span
+        n = int(np.floor(effective_span / dr))
         if n < 1:
             raise ValueError(
-                f"Marker spacing dr={dr} is too large for span={self.span}"
+                f"Marker spacing dr={dr} too large for "
+                f"effective span={effective_span:.6f}"
             )
         self.n_markers = n
 
-        # Radial positions (cell-centered)
-        self.marker_r = self.r_hub + (np.arange(n) + 0.5) * dr  # [m]
+        # Radial positions (cell-centered), starting from r_start  [m]
+        #   r_j = r_start + (j + 0.5) · Δr
+        self.marker_r = r_start + (np.arange(n) + 0.5) * dr  # [m]
 
         # Interpolate properties at each marker
-        self.marker_chord = self._chord_interp(self.marker_r)  # [m]
-        self.marker_twist = self._twist_interp(self.marker_r)  # [degrees]
+        self.marker_chord = self._chord_interp(self.marker_r)    # [m]
+        self.marker_twist = self._twist_interp(self.marker_r)    # [degrees]
 
         # Airfoil and active flag (nearest-neighbor lookup)
         self.marker_airfoil = [self._get_airfoil_at_r(r) for r in self.marker_r]

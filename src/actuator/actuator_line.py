@@ -631,6 +631,11 @@ def create_actuator_line_from_config(
     """
     rotor_cfg = config.get('rotor', {})
 
+    if 'grid' not in rotor_cfg:
+        rotor_cfg['grid'] = {}
+    if 'dx' not in rotor_cfg['grid']:
+        rotor_cfg['grid']['dx'] = dx_phys          # [m/lu]
+
     # Create rotor (in physical units first)
     rotor_phys = Rotor.from_config(rotor_cfg)
 
