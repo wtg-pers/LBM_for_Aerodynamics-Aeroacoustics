@@ -24,10 +24,18 @@ OMEGA_ROTOR = RPM * 2.0 * np.pi / 60.0   # [rad/s]  Angular velocity
 U_REF      = OMEGA_ROTOR * (R_ROTOR * 0.75)  # [m/s]    Reference velocity
 U_INF      = 0.0             # [m/s]    Freestream/inlet velocity (0 for hover)
 
+# ─── u_inf_lu 계산 ──────────────────────────────────────────────
+# U_inf = 0.1 m/s  (≈ 1% of U_tip = 9.8175 m/s)
+# u_inf_lu = U_inf × dt / dx
+#          = 0.1 × (u_lu × dx / U_ref) / dx
+#          = 0.1 × u_lu / U_ref
+#          = 0.1 × 0.1 / 9.8175 ≈ 0.00102 [Δx/Δt]
+
+
 # -----------------------------------------------------------------------------
 # Reynolds number OR viscosity (choose ONE, Re takes priority)
 # -----------------------------------------------------------------------------
-RE         = 100             # [-]      Reynolds number (PRIORITY)
+RE         = 1000             # [-]      Reynolds number (PRIORITY)
 NU_PHYS    = None            # [m²/s]   Kinematic viscosity (set if RE=None)
 
 # --- Auto-calculate: Re ↔ ν_phys ---
@@ -50,7 +58,7 @@ else:
 # §2. NUMERICAL PARAMETERS (User Input - Discretization)
 # =============================================================================
 
-RESOLUTION = 20              # [-]  Grid cells per rotor diameter (D/Δx)
+RESOLUTION = 40              # [-]  Grid cells per rotor diameter (D/Δx)
                              #      ALM standard: 20~40 for test, 60+ for production
 LATTICE_VELOCITY = 0.1      # [-]  u_lu (controls accuracy, recommend 0.02~0.1)
 
@@ -100,9 +108,9 @@ for _w in _stability_warnings:
 # §4. DOMAIN CONFIGURATION
 # =============================================================================
 # Domain size in lattice units, as multiples of rotor diameter D
-DOMAIN_MULT_X = 6            # [-]  Domain = 5D in x
-DOMAIN_MULT_Y = 6            # [-]  Domain = 5D in y
-DOMAIN_MULT_Z = 8            # [-]  Domain = 8D in z (rotation axis)
+DOMAIN_MULT_X = 4            # [-]  Domain = 5D in x
+DOMAIN_MULT_Y = 4            # [-]  Domain = 5D in y
+DOMAIN_MULT_Z = 6            # [-]  Domain = 8D in z (rotation axis)
 
 Nx = DOMAIN_MULT_X * RESOLUTION    # [lu]
 Ny = DOMAIN_MULT_Y * RESOLUTION    # [lu]
@@ -135,7 +143,7 @@ simulation = {
         "L_ref_lu": L_REF_LU,
 
         # Initial flow field
-        "initial_flow_velocity": U_INF_LU,
+        "initial_flow_velocity": [0.0, 0.0, -0.001],
         
         # Conversion factors
         "dx": DX_PHYS,             # [m/lu]
@@ -172,8 +180,10 @@ boundaries = {
     # "ground": {"location": "zmin", "method": "regularized_wall",},
     "ground": {"location": "zmin", "method": "regularized_outlet", 
             "velocity": 0.0, "density": 1.0, "k": 0.1},
-    "top": {"location": "zmax", "method": "regularized_outlet", 
-            "velocity": 0.0, "density": 1.0, "k": 0.1},
+    "top": {"location": "zmax", "method": "regularized_inlet", 
+            'velocity': [0.0, 0.0, -0.001],
+            "density": 1.0, "k": 0.1},
+
     "xmin": {"location": "xmin", "method": "regularized_outlet",
              "velocity": 0.0,"density": 1.0, "k": 0.1},
     "xmax": {"location": "xmax","method": "regularized_outlet",
@@ -274,18 +284,17 @@ if ALM_ENABLED:
                      "twist": -PITCH, "airfoil": "naca0012", "active": True},
                 ],
             },
+
+            "grid": {"n_radial": 20,            # [-]  markers per blade (radial direction)
+            },
         },
-        
+
+
         "units": {
             "dx_phys": DX_PHYS,        # [m/lu]
             "dt_phys": DT_PHYS,        # [s/lt]
             "nu_phys": NU_PHYS,        # [m²/s]
         },
-
-        "grid": {
-                "resolution": RESOLUTION,   # [-] D/Δx = 40
-                "dx": DX_PHYS,              # [m/lu]
-            },
         
         "rho_ref": RHO_REF,            # [kg/m³]
         "gaussian_cutoff": 3.0,
@@ -296,19 +305,26 @@ if ALM_ENABLED:
 # =============================================================================
 # §9. AIRFOIL POLAR (Only if ALM enabled)
 # =============================================================================
+# if ALM_ENABLED:
+#     airfoil_polar = {
+#         "method": "neuralfoil",
+#         "airfoil_name": "naca0012",
+#         "Re_target": RE_POLAR_TARGET,
+#         "Re_min": RE_POLAR_MIN,
+#         "Re_max": RE_POLAR_MAX,
+#         "mode": "asb",
+#         "ncrit": 9.0,
+#     }
+# else:
+#     airfoil_polar = {}
 if ALM_ENABLED:
     airfoil_polar = {
-        "method": "neuralfoil",
-        "airfoil_name": "naca0012",
-        "Re_target": RE_POLAR_TARGET,
-        "Re_min": RE_POLAR_MIN,
-        "Re_max": RE_POLAR_MAX,
-        "mode": "asb",
-        "ncrit": 9.0,
+        "method": "prescribed",
+        "CL_fixed": 1.0,
+        "CD_fixed": 0.02,
     }
 else:
     airfoil_polar = {}
-
 # =============================================================================
 # §9. FORCE CALCULATION (Optional Module)
 # =============================================================================

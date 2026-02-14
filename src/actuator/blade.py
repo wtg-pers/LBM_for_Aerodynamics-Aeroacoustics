@@ -241,32 +241,43 @@ class Blade:
     # §2.2 Marker Generation
     # -----------------------------------------------------------------
 
-    def generate_markers(self, dr: float, skip_inactive_root: bool = True) -> None:
+    def generate_markers(
+            self,
+            n_radial: int,
+            skip_inactive_root: bool = True,
+        ) -> None:
         """Generate evenly-spaced marker particles along the blade span
 
         Markers are placed at:
             r_j = r_start + (j + 0.5) · Δr    for j = 0, 1, ..., N-1
+            where Δr = effective_span / n_radial
 
-        where r_start depends on skip_inactive_root:
-            - True  (default): r_start = r_root_cut  (first active section)
-            - False (legacy):  r_start = r_hub        (includes inactive root)
+        The user explicitly specifies how many radial elements to use.
+        This decouples blade element resolution from LBM grid resolution
+        (RESOLUTION = D/Δx), which controls a completely different aspect
+        of the simulation.
 
-        Physical Rationale:
-            In the AL model, markers represent blade elements that interact
-            with the flow. The root region (r < r_root_cut) belongs to the
-            hub/nacelle and produces no aerodynamic forces. Placing markers
-            there wastes computation and creates visual artifacts where
-            markers pass through the hub center, making separate blades
-            appear as one continuous line.
+        Guideline:
+            Watanabe et al. recommend Δr ≈ Δx/2 as a starting point.
+            With RESOLUTION=40 (R=20 cells) and active span ≈ 0.8R,
+            that gives n_radial ≈ 0.8×20×2 = 32. But the user is free
+            to choose any value based on their accuracy/cost trade-off.
+
+        The root region (r < r_root_cut) belongs to the hub/nacelle and
+        produces no aerodynamic forces. Placing markers there wastes
+        computation and creates visual artifacts.
 
         Args:
-            dr: Marker spacing  [m]
-                Typically dr = Δx/2 for good force resolution
+            n_radial: Number of markers along active blade span  [-]
             skip_inactive_root: If True, start markers from first active
                                 section. If False, start from r_hub.
                                 [default: True]
+
+        Raises:
+            ValueError: If n_radial < 1 or no active span
         """
-        self.marker_dr = dr  # [m]
+        if n_radial < 1:
+            raise ValueError(f"n_radial must be >= 1, got {n_radial}")
 
         # --- Determine starting radius ---
         if skip_inactive_root and hasattr(self, 'r_root_cut'):
@@ -283,13 +294,10 @@ class Blade:
                 f"r_tip={self.r_tip:.6f}. Check blade section definitions."
             )
 
-        # Number of markers that fit in the active span
-        n = int(np.floor(effective_span / dr))
-        if n < 1:
-            raise ValueError(
-                f"Marker spacing dr={dr} too large for "
-                f"effective span={effective_span:.6f}"
-            )
+        n = n_radial
+        dr = effective_span / n           # [m]
+
+        self.marker_dr = dr  # [m]
         self.n_markers = n
 
         # Radial positions (cell-centered), starting from r_start  [m]
@@ -819,7 +827,7 @@ class Blade:
         
         # Copy marker generation state if markers were generated
         if self.n_markers > 0:
-            new_blade.generate_markers(dr=self.marker_dr / length_scale)
+            new_blade.generate_markers(n_radial=self.n_markers)
             if self.marker_epsilon.any():
                 # Recalculate epsilon in new units
                 new_blade.marker_epsilon = self.marker_epsilon / length_scale

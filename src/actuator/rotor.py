@@ -859,6 +859,7 @@ class Rotor:
         hub_center: Tuple[float, float, float] = (3.66, 1.341, 0.817),
         dx: Optional[float] = None,
         resolution: int = 160,
+        n_radial: int = 20,
         theta_0: float = 0.0,
         rotation_axis: str = "hawt_x"
     ) -> 'Rotor':
@@ -879,6 +880,7 @@ class Rotor:
             hub_center: Hub position in global coords    [m]
             dx: Lattice spacing (if None, computed from resolution)  [m]
             resolution: D/Δx grid cells per diameter     [dimensionless]
+            n_radial: Number of markers per blade        [-]
             theta_0: Initial azimuth of blade 0          [rad]
             rotation_axis: Rotation axis preset          [default: "hawt_x"]
 
@@ -896,11 +898,10 @@ class Rotor:
         # Grid spacing
         if dx is None:
             dx = D / resolution  # [m]
-        dr = dx / 2.0            # [m] marker spacing (Sec. 3.2)
 
         # Create prototype blade
         blade = Blade.from_ntnu_bt1()
-        blade.generate_markers(dr=dr)
+        blade.generate_markers(n_radial=n_radial)
         blade.set_lattice_spacing(dx=dx)
 
         return cls(
@@ -923,7 +924,7 @@ class Rotor:
         twist_tip: float = 0.0,
         omega: float = 100.0,
         hub_center: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-        dr: float = 0.005,
+        n_radial: int = 10,
         dx: Optional[float] = None,
         theta_0: float = 0.0,
         rotation_axis: str = "hawt_x"
@@ -955,7 +956,7 @@ class Rotor:
             twist_tip=twist_tip,
             airfoil='flat_plate'
         )
-        blade.generate_markers(dr=dr)
+        blade.generate_markers(n_radial=n_radial)
         if dx is not None:
             blade.set_lattice_spacing(dx=dx)
 
@@ -1015,16 +1016,24 @@ class Rotor:
 
         # Grid
         grid_cfg = config.get('grid', {})
-        dx = grid_cfg.get('dx', None)
-        resolution = grid_cfg.get('resolution', 160)
 
+        dx = grid_cfg.get('dx')
         if dx is None:
-            # Estimate dx from blade radius and resolution
-            D = 2.0 * blade.r_tip
-            dx = D / resolution
+            raise ValueError(
+                "'grid.dx' is required in rotor config. "
+                "It should be injected from the top-level RESOLUTION "
+                "via create_actuator_line_from_config()."
+            )
 
-        dr = dx / 2.0  # Δr = Δx/2
-        blade.generate_markers(dr=dr)
+        n_radial = grid_cfg.get('n_radial')
+        if n_radial is None:
+            raise ValueError(
+                "'grid.n_radial' is required in rotor config. "
+                "Specify the number of marker particles per blade "
+                "along the radial direction."
+            )
+
+        blade.generate_markers(n_radial=int(n_radial))
         blade.set_lattice_spacing(dx=dx)
 
         # Hub center
@@ -1080,8 +1089,6 @@ class Rotor:
         blade_lu = self.blades[0].to_lattice_units(length_scale)
 
         # Regenerate markers in lattice units
-        dr_lu = self.blades[0].marker_dr / length_scale  # [lu]
-        blade_lu.generate_markers(dr=dr_lu)
         blade_lu.set_lattice_spacing(dx=1.0)  # Δx = 1 in lattice units
 
         # Convert coordinate system to lattice units

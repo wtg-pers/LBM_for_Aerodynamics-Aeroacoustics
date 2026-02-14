@@ -1325,64 +1325,6 @@ def create_nrel_s826_database() -> AirfoilDatabase:
 
     return db
 
-def create_polar_from_config(config: dict) -> Callable:
-    """Create polar query function from configuration
-    
-    Args:
-        config: airfoil_polar configuration dictionary
-        
-    Returns:
-        polar_query: Callable(alpha_deg, Re) → (CL, CD)
-    """
-    method = config.get("method", "neuralfoil")
-    
-    if method == "neuralfoil":
-        airfoil_name = config.get("airfoil_name", "naca0012")
-        Re_target = config.get("Re_target", 1e5)
-        mode = config.get("mode", "asb")
-        ncrit = config.get("ncrit", 9.0)
-        dat_path = config.get("dat_path", None)
-        coordinates = config.get("coordinates", None)
-        
-        packs = gen_airfoil_polar(
-            airfoil_name=airfoil_name,
-            Re_target=Re_target,
-            mode=mode,
-            ncrit=ncrit,
-            dat_path=dat_path,
-            coordinates=coordinates,
-        )
-        return make_polar_query(*packs[0])
-    
-    elif method == "flat_plate":
-        Re_target = config.get("Re_target", 1e5)
-        polar = create_flat_plate_polar(Re=Re_target)
-        return polar.get_coefficients
-    
-    elif method == "database":
-        preset = config.get("preset", "nrel_s826")
-        if preset == "nrel_s826":
-            db = create_nrel_s826_database()
-        elif preset == "naca0012_approx":
-            db = AirfoilDatabase("NACA0012")
-            db.add_polar(create_naca0012_polar(Re=1e5))
-        else:
-            raise ValueError(f"Unknown preset: {preset}")
-        return db.to_query()
-    
-    elif method == "csv":
-        csv_path = config["csv_path"]
-        packs = load_airfoil_from_csv(
-            csv_path,
-            alpha_col=config.get("alpha_col", "AoA(deg)"),
-            Re_col=config.get("Re_col", "Re"),
-            CL_col=config.get("CL_col", "cl"),
-            CD_col=config.get("CD_col", "cd"),
-        )
-        return make_polar_query(*packs[0])
-    
-    else:
-        raise ValueError(f"Unknown polar method: {method}")
     
 def gen_airfoil_polar_extended(
     airfoil_name: str = "naca0012",
@@ -1825,8 +1767,12 @@ def create_polar_from_config(
                     CD_col=af_cfg.get("CD_col", "cd"),
                     set_default=is_default,
                 )
+            
             else:
-                raise ValueError(f"Unknown method '{af_method}' for airfoil '{name}'")
+                raise ValueError(
+                    f"Unknown airfoil method '{af_method}' for '{name}'. "
+                    f"Available: 'neuralfoil', 'flat_plate', 'csv'"
+                )
 
         # Return unified query (3-arg) and manager
         return manager.to_unified_query(), manager
@@ -1886,8 +1832,68 @@ def create_polar_from_config(
         )
         return make_polar_query(*packs[0]), None
 
+    # ─────────────────────────────────────────────────────────────────
+    # [TEMPORARY / TEST-ONLY] Prescribed fixed CL/CD
+    # ─────────────────────────────────────────────────────────────────
+    # Purpose:
+    #   Bypass airfoil polar lookup entirely by returning user-specified
+    #   constant CL and CD values, regardless of α and Re.
+    #
+    # Use Case:
+    #   - Isolate and verify the ALM-LBM coupling pipeline
+    #     (Gaussian spreading → Guo forcing → wake formation)
+    #     independently from airfoil aerodynamic accuracy.
+    #   - Useful when BGK collision limits Re to very low values
+    #     where real polar data yields CL/CD ≈ 1 (non-physical wake).
+    #
+    # WARNING:
+    #   This is NOT physically meaningful — it ignores α and Re
+    #   dependence entirely. Remove or replace with a proper polar
+    #   method (neuralfoil, csv, database) once the collision model
+    #   supports production-level Re (e.g., Cumulant or MRT).
+    #
+    # Config Example:
+    #   airfoil_polar = {
+    #       "method": "prescribed",
+    #       "CL": 1.0,         # [-] constant lift coefficient
+    #       "CD": 0.02,        # [-] constant drag coefficient
+    #   }
+    # ─────────────────────────────────────────────────────────────────
+    elif method == "prescribed":
+        CL_fixed = float(config.get("CL", 0.5))    # [-]
+        CD_fixed = float(config.get("CD", 0.01))    # [-]
+
+        warnings.warn(
+            f"[TEST-ONLY] Using prescribed polar: CL={CL_fixed}, CD={CD_fixed}. "
+            f"This ignores α/Re dependence and is intended for ALM-LBM "
+            f"coupling verification only. Replace with a physical polar "
+            f"method for production runs.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+        def _prescribed_query(
+            alpha_deg: float,
+            Re: float,
+            airfoil_name: Optional[str] = None,
+        ) -> Tuple[float, float]:
+            """[TEST-ONLY] Return fixed CL/CD regardless of α and Re.
+
+            Args:
+                alpha_deg: Angle of attack  [degrees]  (IGNORED)
+                Re: Reynolds number  [dimensionless]    (IGNORED)
+                airfoil_name: Airfoil identifier        (IGNORED)
+
+            Returns:
+                (CL, CD): Fixed coefficients  [dimensionless]
+            """
+            return CL_fixed, CD_fixed
+
+        return _prescribed_query, None
+
     else:
         raise ValueError(
             f"Unknown polar method: '{method}'. "
-            f"Available: 'neuralfoil', 'flat_plate', 'database', 'csv', 'multi'"
+            f"Available: 'neuralfoil', 'flat_plate', 'database', "
+            f"'csv', 'multi', 'prescribed'"
         )

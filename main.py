@@ -338,13 +338,19 @@ def main():
         if lattice.dim == 2:
             rho0 = xp.ones((Nx, Ny), dtype=xp.float64)
             u0 = xp.zeros((2, Nx, Ny), dtype=xp.float64)
-            u0[0] = flow_vel  # x-velocity  [Δx/Δt]
+
         else:
             rho0 = xp.ones((Nx, Ny, Nz), dtype=xp.float64)
             u0 = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64)
-            u0[0] = flow_vel  # x-velocity  [Δx/Δt]
-        
-        print(f"  Initial velocity: {flow_vel} [Δx/Δt]")
+
+       # Initial velocity: scalar → x-direction (legacy), list → per-component
+        if isinstance(flow_vel, (list, tuple)):
+            for d in range(min(len(flow_vel), lattice.dim)):
+                u0[d] = flow_vel[d]    # [Δx/Δt]
+            print(f"  Initial velocity: {flow_vel} [Δx/Δt]")
+        else:
+            u0[0] = flow_vel           # [Δx/Δt] x-direction (legacy)
+            print(f"  Initial velocity: {flow_vel} [Δx/Δt] (x-dir)")
         
         f_old = eq.compute(rho0, u0)
         print(f"  Initial total mass: {float(xp.sum(f_old)):.6f}")
