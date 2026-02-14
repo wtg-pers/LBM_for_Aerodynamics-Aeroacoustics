@@ -99,9 +99,9 @@ for _w in _stability_warnings:
 # Nx = DOMAIN_MULTIPLE_X * RESOLUTION    # [lu]
 # Ny = DOMAIN_MULTIPLE_Y * RESOLUTION    # [lu]
 # Nz = DOMAIN_MULTIPLE_Z * RESOLUTION    # [lu]
-Nx = 160
-Ny = 160
-Nz = 400
+Nx = 80
+Ny = 80
+Nz = 100
 
 # =============================================================================
 # §4. SIMULATION SETTINGS
@@ -162,18 +162,18 @@ simulation = {
 
 boundaries = {
     # "ground": {"location": "zmin", "method": "regularized_wall",},
-    "ground": {"location": "zmin", "method": "neumann", 
-            "velocity": 0.0, "density": 1.0,},
-    "top": {"location": "zmax", "method": "equilibrium", 
-            "velocity": 0.0, "density": 1.0,},
-    "xmin": {"location": "xmin", "method": "equilibrium",
-             "velocity": 0.0,"density": 1.0,},
-    "xmax": {"location": "xmax","method": "equilibrium",
-             "velocity": 0.0,"density": 1.0,},
-    "ymin": {"location": "ymin","method": "equilibrium",
-             "velocity": 0.0,"density": 1.0,},
-    "ymax": {"location": "ymax","method": "equilibrium",
-             "velocity": 0.0,"density": 1.0,},
+    "ground": {"location": "zmin", "method": "regularized_outlet", 
+            "velocity": 0.0, "density": 1.0, "k": 0.1},
+    "top": {"location": "zmax", "method": "regularized_inlet", 
+            "velocity": 0.0, "density": 1.0, "k": 0.1},
+    "xmin": {"location": "xmin", "method": "regularized_outlet",
+             "velocity": 0.0,"density": 1.0, "k": 0.1},
+    "xmax": {"location": "xmax","method": "regularized_outlet",
+             "velocity": 0.0,"density": 1.0, "k": 0.1},
+    "ymin": {"location": "ymin","method": "regularized_outlet",
+             "velocity": 0.0,"density": 1.0, "k": 0.1},
+    "ymax": {"location": "ymax","method": "regularized_outlet",
+             "velocity": 0.0,"density": 1.0, "k": 0.1},
 }
 
 # =============================================================================
