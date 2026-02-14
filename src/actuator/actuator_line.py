@@ -83,27 +83,31 @@ class BEMResult:
     All arrays have shape (N_total_markers,) where N_total = N_blades × N_markers.
 
     Physical quantities at each marker:
-        u_rel:  Relative wind speed          [Δx/Δt]
-        phi:    Local flow angle             [degrees]
-        alpha:  Angle of attack              [degrees]
-        Re:     Chord Reynolds number        [dimensionless]
-        CL:     Lift coefficient             [dimensionless]
-        CD:     Drag coefficient             [dimensionless]
-        F_L:    Lift force per marker        [lattice force]
-        F_D:    Drag force per marker        [lattice force]
-        F_n:    Normal (streamwise) force    [lattice force]
-        F_theta: Tangential (rotational)     [lattice force]
+        u_n:    Axial (normal) velocity         [Δx/Δt]   (Phase 0: C_T/C_P 보정용)
+        u_theta: Tangential velocity            [Δx/Δt]   (Phase 0: 진단용)
+        u_rel:  Relative wind speed             [Δx/Δt]
+        phi:    Local flow angle                [degrees]
+        alpha:  Angle of attack                 [degrees]
+        Re:     Chord Reynolds number           [dimensionless]
+        CL:     Lift coefficient                [dimensionless]
+        CD:     Drag coefficient                [dimensionless]
+        F_L:    Lift force per marker           [lattice force]
+        F_D:    Drag force per marker           [lattice force]
+        F_n:    Normal (streamwise) force       [lattice force]
+        F_theta: Tangential (rotational)        [lattice force]
     """
-    u_rel: np.ndarray       # [Δx/Δt]
-    phi: np.ndarray         # [degrees]
-    alpha: np.ndarray       # [degrees]
-    Re: np.ndarray          # [dimensionless]
-    CL: np.ndarray          # [dimensionless]
-    CD: np.ndarray          # [dimensionless]
-    F_L: np.ndarray         # [lattice force]
-    F_D: np.ndarray         # [lattice force]
-    F_n: np.ndarray         # [lattice force]
-    F_theta: np.ndarray     # [lattice force]
+    u_n: np.ndarray             # [Δx/Δt]  — axial velocity (Watanabe Eq. 5)
+    u_theta: np.ndarray         # [Δx/Δt]  — tangential velocity (Watanabe Eq. 5)
+    u_rel: np.ndarray           # [Δx/Δt]
+    phi: np.ndarray             # [degrees]
+    alpha: np.ndarray           # [degrees]
+    Re: np.ndarray              # [dimensionless]
+    CL: np.ndarray              # [dimensionless]
+    CD: np.ndarray              # [dimensionless]
+    F_L: np.ndarray             # [lattice force]
+    F_D: np.ndarray             # [lattice force]
+    F_n: np.ndarray             # [lattice force]
+    F_theta: np.ndarray         # [lattice force]
 
 
 # =============================================================================
@@ -160,6 +164,8 @@ class ActuatorLineModel:
         n_cut: float = 3.0,
         dx_phys: float = 1.0,
         dt_phys: float = 1.0,
+        u_inf_lu: Optional[float] = None,
+        coeff_mode: str = 'auto',
     ) -> None:
         """Initialize the Actuator Line model
 
@@ -173,6 +179,12 @@ class ActuatorLineModel:
             n_cut: Gaussian cutoff  [dimensionless]
             dx_phys: Physical grid spacing  [m/lu] (for diagnostics)
             dt_phys: Physical timestep  [s/lt] (for diagnostics)
+            u_inf_lu: Freestream velocity in lattice units  [Δx/Δt] or None
+                      If provided, used directly for C_T/C_P calculation.
+                      If None, fallback to mean(|u_n|) from BEM
+                      (note: u_n ≈ u_∞(1-a), underestimates u_∞ by ~30% at Betz limit)
+            coeff_mode: Performance coefficient convention
+                        'wind_turbine' | 'rotorcraft' | 'auto'
         """
         self.rotor = rotor
         self.nu = nu                    # [lu²/lt]
@@ -182,6 +194,8 @@ class ActuatorLineModel:
         self.n_cut = n_cut
         self.dx_phys = dx_phys          # [m/lu]
         self.dt_phys = dt_phys          # [s/lt]
+        self.u_inf_lu = u_inf_lu        # [Δx/Δt] or None
+        self.coeff_mode = coeff_mode    # 'wind_turbine' | 'rotorcraft' | 'auto'
 
         # Pre-allocate body force array
         Nx, Ny, Nz = domain_shape
@@ -312,9 +326,11 @@ class ActuatorLineModel:
         n_per_blade = rotor.markers_per_blade
 
         # Pre-allocate output arrays
-        u_rel_all = np.zeros(n_total, dtype=np.float64)     # [Δx/Δt]
-        phi_all = np.zeros(n_total, dtype=np.float64)       # [degrees]
-        alpha_all = np.zeros(n_total, dtype=np.float64)     # [degrees]
+        u_n_all = np.zeros(n_total, dtype=np.float64)         # [Δx/Δt]  axial
+        u_theta_all = np.zeros(n_total, dtype=np.float64)     # [Δx/Δt]  tangential
+        u_rel_all = np.zeros(n_total, dtype=np.float64)       # [Δx/Δt]
+        phi_all = np.zeros(n_total, dtype=np.float64)         # [degrees]
+        alpha_all = np.zeros(n_total, dtype=np.float64)       # [degrees]
         Re_all = np.zeros(n_total, dtype=np.float64)        # [dimensionless]
         CL_all = np.zeros(n_total, dtype=np.float64)        # [dimensionless]
         CD_all = np.zeros(n_total, dtype=np.float64)        # [dimensionless]
@@ -332,11 +348,14 @@ class ActuatorLineModel:
             u_blade = u_markers[idx_start:idx_end]          # (n_markers, 3)
 
             # --- Velocity decomposition (Eq. 5-8) ---
-            u_rel, phi_deg, alpha_deg = rotor.compute_relative_velocity(
+            u_rel, phi_deg, alpha_deg, u_n, u_theta = rotor.compute_relative_velocity(
                 blade_idx=k, u_global=u_blade
             )
             # u_rel: [Δx/Δt], phi_deg: [degrees], alpha_deg: [degrees]
+            # u_n: [Δx/Δt] axial, u_theta: [Δx/Δt] tangential
 
+            u_n_all[idx_start:idx_end] = u_n
+            u_theta_all[idx_start:idx_end] = u_theta
             u_rel_all[idx_start:idx_end] = u_rel
             phi_all[idx_start:idx_end] = phi_deg
             alpha_all[idx_start:idx_end] = alpha_deg
@@ -413,6 +432,8 @@ class ActuatorLineModel:
             F_theta_all[idx_start:idx_end] = F_theta
 
         return BEMResult(
+            u_n=u_n_all,
+            u_theta=u_theta_all,
             u_rel=u_rel_all,
             phi=phi_all,
             alpha=alpha_all,
@@ -432,15 +453,23 @@ class ActuatorLineModel:
     def get_rotor_performance(self) -> dict:
         """Get latest rotor performance coefficients
 
+        u_inf estimation strategy (priority order):
+            1. self.u_inf_lu from config (most accurate)
+            2. mean(|u_n|) from BEM axial velocity (fallback)
+               Note: u_n ≈ u_∞(1-a), underestimates u_∞ by ~30% at Betz limit
+
         Returns:
             dict with:
-                - thrust [lattice force]
-                - torque [lattice force · lu]
-                - power  [lattice power]
-                - C_T    [dimensionless]
-                - C_P    [dimensionless]
-                - theta  [degrees] per blade
-                - time   [lt]
+                - thrust      [lattice force]
+                - torque      [lattice force · lu]
+                - power       [lattice power]
+                - C_T         [dimensionless]
+                - C_P         [dimensionless]
+                - coeff_mode  'wind_turbine' or 'rotorcraft' (actually used)
+                - u_inf_used  [Δx/Δt] u_inf value used for coefficients
+                - FM          [dimensionless] Figure of Merit (hover)
+                - theta_deg   [degrees] per blade
+                - time        [lt]
                 - revolutions [dimensionless]
         """
         if self._last_bem_result is None:
@@ -454,16 +483,27 @@ class ActuatorLineModel:
         )
         power = rotor.compute_power(bem.F_theta)
 
-        # For C_T, C_P we need u_inf in lattice units
-        # Estimate from mean normal velocity at markers
-        active = rotor.get_all_marker_active()
-        u_n_active = bem.u_rel[active]
-        u_inf_est = np.mean(u_n_active) if len(u_n_active) > 0 else 1.0
+        # --- u_inf estimation (BUG FIX: was using u_rel, now u_n) ---
+        # Priority: config value > BEM axial velocity fallback
+        if self.u_inf_lu is not None:
+            u_inf_used = self.u_inf_lu                              # [Δx/Δt] config
+        else:
+            active = rotor.get_all_marker_active()
+            u_n_active = bem.u_n[active]                            # [Δx/Δt] axial only
+            u_inf_used = float(np.mean(np.abs(u_n_active))) \
+                if len(u_n_active) > 0 else 0.0                    # [Δx/Δt]
 
-        C_T, C_P = rotor.compute_ct_cp(
+        # --- C_T, C_P (dual mode) ---
+        C_T, C_P, actual_mode = rotor.compute_ct_cp(
             bem.F_n, bem.F_theta,
             rho=self.rho_ref,
-            u_inf=u_inf_est
+            u_inf=u_inf_used,
+            mode=self.coeff_mode
+        )
+
+        # --- Figure of Merit (always rotorcraft convention) ---
+        FM = rotor.compute_figure_of_merit(
+            bem.F_n, bem.F_theta, rho=self.rho_ref
         )
 
         return {
@@ -472,6 +512,9 @@ class ActuatorLineModel:
             'power': power,
             'C_T': C_T,
             'C_P': C_P,
+            'coeff_mode': actual_mode,
+            'u_inf_used': u_inf_used,
+            'FM': FM,
             'theta_deg': np.degrees(rotor.theta).tolist(),
             'time': rotor.time,
             'revolutions': rotor.n_revolutions,
@@ -531,35 +574,38 @@ class ActuatorLineModel:
         self,
         performance: dict,
         rho_phys: float = 1.225,
-        u_ref: float = 10.0,
     ) -> dict:
         """Convert performance dict to physical units
 
         Uses the stored dx_phys and dt_phys to convert forces,
         torques, and power from lattice to SI units.
 
+        Dimensional derivation (ρ₀ = 1 in lattice):
+            F_phys = F_lu × ρ_phys × dx⁴ / dt²     [N]
+            Q_phys = Q_lu × ρ_phys × dx⁵ / dt²     [N·m]
+            P_phys = P_lu × ρ_phys × dx⁵ / dt³     [W]
+
+        P = F·v → P_phys = F_lu·(ρ·dx⁴/dt²) × (dx/dt) = ρ·dx⁵/dt³ × P_lu
+
         Args:
             performance: Output from get_rotor_performance()
-            rho_phys: Physical air density [kg/m³]
-            u_ref: Reference velocity [m/s]
+            rho_phys: Physical air density  [kg/m³]
 
         Returns:
             dict with added '_phys' keys for thrust, torque, power
         """
-        dx = self.dx_phys
-        dt = self.dt_phys
+        dx = self.dx_phys   # [m/lu]
+        dt = self.dt_phys   # [s/lt]
 
-        # F_phys = F_lu · (ρ_phys · dx⁴ / dt²)
-        # With ρ₀=1 in lattice units
-        force_scale = rho_phys * dx ** 4 / dt ** 2   # [N]
-        torque_scale = force_scale * dx                  # [N·m]
-        power_scale = rho_phys * u_ref ** 3 * dx ** 2   # [W]
+        force_scale  = rho_phys * dx**4 / dt**2     # [N / lu_force]
+        torque_scale = rho_phys * dx**5 / dt**2     # [N·m / lu_torque]
+        power_scale  = rho_phys * dx**5 / dt**3     # [W / lu_power]
 
         result = dict(performance)
         if 'thrust' in performance:
-            result['thrust_phys'] = performance['thrust'] * force_scale
-            result['torque_phys'] = performance['torque'] * torque_scale
-            result['power_phys'] = performance['power'] * power_scale
+            result['thrust_phys'] = performance['thrust'] * force_scale   # [N]
+            result['torque_phys'] = performance['torque'] * torque_scale  # [N·m]
+            result['power_phys'] = performance['power'] * power_scale     # [W]
         return result
 
     # -----------------------------------------------------------------
@@ -602,20 +648,17 @@ def create_actuator_line_from_config(
     polar_query: Callable,
     dx_phys: float = 1.0,
     dt_phys: float = 1.0,
+    u_inf_lu: Optional[float] = None,
+    coeff_mode: str = 'auto',
 ) -> ActuatorLineModel:
     """Create an ActuatorLineModel from a configuration dictionary
 
     Expected Config Format:
         {
-            "rotor": {
-                "preset": "ntnu_bt1",
-                "tsr": 6.0,
-                "u_inf": 10.0,
-                "hub_center": [3.66, 1.341, 0.817],
-                "resolution": 160
-            },
+            "rotor": { ... },
             "gaussian_cutoff": 3.0,
-            "rho_ref": 1.0
+            "rho_ref": 1.0,
+            "coeff_mode": "auto"        # 'wind_turbine' | 'rotorcraft' | 'auto'
         }
 
     Args:
@@ -625,6 +668,9 @@ def create_actuator_line_from_config(
         polar_query: Airfoil data query function
         dx_phys: Physical grid spacing [m/lu]
         dt_phys: Physical timestep [s/lt]
+        u_inf_lu: Freestream velocity [Δx/Δt] or None (BEM fallback)
+        coeff_mode: Override for coefficient mode.
+                    If not provided, reads from config['coeff_mode'].
 
     Returns:
         Configured ActuatorLineModel instance
@@ -645,6 +691,10 @@ def create_actuator_line_from_config(
         time_scale=dt_phys
     )
 
+    # Resolve coeff_mode: explicit argument > config key > default
+    resolved_mode = coeff_mode if coeff_mode != 'auto' \
+        else config.get('coeff_mode', 'auto')
+
     return ActuatorLineModel(
         rotor=rotor_lu,
         nu=nu_lattice,
@@ -654,4 +704,6 @@ def create_actuator_line_from_config(
         n_cut=config.get('gaussian_cutoff', 3.0),
         dx_phys=dx_phys,
         dt_phys=dt_phys,
+        u_inf_lu=u_inf_lu,
+        coeff_mode=resolved_mode,
     )

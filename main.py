@@ -285,7 +285,8 @@ def main():
         perf_csv_path = os.path.join(csv_dir, 'rotor_performance.csv')
         with open(perf_csv_path, 'w') as fh:
             fh.write('step,time_lt,time_phys,revolutions,'
-                     'thrust_lu,torque_lu,power_lu,C_T,C_P\n')
+                     'thrust_lu,torque_lu,power_lu,'
+                     'C_T,C_P,coeff_mode,u_inf_used,FM\n')
         print(f"  Rotor CSV: {perf_csv_path}")
 
     # =========================================================================
@@ -519,7 +520,12 @@ def main():
         # Create Actuator Line Model
         # ─────────────────────────────────────────────────────────────────
         print("  Creating rotor...")
-        
+
+        # --- u_inf_lu 도출 ---
+        U_inf_phys = physics_config.get('U_inf', 0.0)        # [m/s]
+        u_inf_lu = U_inf_phys * dt_phys / dx_phys             # [Δx/Δt]
+        u_inf_lu_arg = u_inf_lu if u_inf_lu > 0 else None
+
         al_model = create_actuator_line_from_config(
             config=al_cfg,
             domain_shape=domain_shape,
@@ -527,7 +533,16 @@ def main():
             polar_query=polar_query,
             dx_phys=dx_phys,
             dt_phys=dt_phys,
+            u_inf_lu=u_inf_lu_arg,
+            coeff_mode=al_cfg.get('coeff_mode', 'auto'),
         )
+
+        if al_model.u_inf_lu is not None:
+            print(f"  u_inf_lu = {al_model.u_inf_lu:.6f} [Δx/Δt]  (from U_inf={U_inf_phys} m/s)")
+        else:
+            print(f"  u_inf_lu = None (hover mode, BEM fallback)")
+        print(f"  coeff_mode = '{al_model.coeff_mode}'")
+
         print(f"  {al_model}")
 
         # === DEBUG: AL 진단 ===
@@ -682,7 +697,10 @@ def main():
                              f"{perf.get('thrust', 0):.6e},"
                              f"{perf.get('torque', 0):.6e},"
                              f"{perf.get('power', 0):.6e},"
-                             f"{last_ct:.6f},{last_cp:.6f}\n")
+                             f"{last_ct:.6f},{last_cp:.6f},"
+                             f"{perf.get('coeff_mode', 'N/A')},"
+                             f"{perf.get('u_inf_used', 0):.6e},"
+                             f"{perf.get('FM', 0):.6f}\n")
 
             # Convergence check
             if conv_monitor.enabled:
@@ -805,8 +823,10 @@ def main():
         perf = al_model.get_rotor_performance()
         print(f"\n[9] Rotor Performance")
         print(f"  Revolutions: {perf.get('revolutions', 0):.2f}")
-        print(f"  C_T = {perf.get('C_T', 0):.4f}")
+        print(f"  C_T = {perf.get('C_T', 0):.4f}  (mode: {perf.get('coeff_mode', 'N/A')})")
         print(f"  C_P = {perf.get('C_P', 0):.4f}")
+        print(f"  FM  = {perf.get('FM', 0):.4f}")
+        print(f"  u_inf_used = {perf.get('u_inf_used', 0):.6e} [Δx/Δt]")
     
     # =========================================================================
     # Convergence Summary

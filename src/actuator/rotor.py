@@ -431,23 +431,26 @@ class Rotor:
         self,
         blade_idx: int,
         u_global: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Compute relative velocity components for BEM calculation
 
         From Watanabe et al. Eq. 5-8:
+            u_n, u_θ = decompose(u_global)         [Eq. 5]
             u_rel = √(u_n² + (ω·r - u_θ)²)       [Eq. 6]
-            φ = atan2(u_n, ω·r - u_θ)            [Eq. 7]
-            α = φ - γ                             [Eq. 8]
+            φ = atan2(u_n, ω·r - u_θ)             [Eq. 7]
+            α = φ - γ                              [Eq. 8]
 
         Args:
             blade_idx: Blade index
             u_global: Global velocity at markers, shape (n_markers, 3)  [m/s or lu/lt]
 
         Returns:
-            (u_rel, phi_deg, alpha_deg):
+            (u_rel, phi_deg, alpha_deg, u_n, u_theta):
                 u_rel:     Relative velocity magnitude, shape (n_markers,)  [m/s or lu/lt]
                 phi_deg:   Flow angle, shape (n_markers,)                   [degrees]
                 alpha_deg: Angle of attack, shape (n_markers,)              [degrees]
+                u_n:       Axial (normal) velocity, shape (n_markers,)      [m/s or lu/lt]
+                u_theta:   Tangential velocity, shape (n_markers,)          [m/s or lu/lt]
         """
         blade = self.blades[blade_idx]
 
@@ -473,7 +476,7 @@ class Rotor:
         # Angle of attack (Eq. 8)  [degrees]
         alpha_deg = phi_deg - blade.marker_twist         # [degrees]
 
-        return u_rel, phi_deg, alpha_deg
+        return u_rel, phi_deg, alpha_deg, u_n, u_theta
 
     # -----------------------------------------------------------------
     # §1.5 Marker Property Access (Aggregated)
@@ -572,38 +575,70 @@ class Rotor:
         F_n_all: np.ndarray,
         F_theta_all: np.ndarray,
         rho: float,
-        u_inf: float
-    ) -> Tuple[float, float]:
-        """Compute thrust and power coefficients
+        u_inf: float,
+        mode: str = 'auto'
+    ) -> Tuple[float, float, str]:
+        """Compute thrust and power coefficients (wind turbine or rotorcraft)
 
-        Definitions:
-            C_T = T / (0.5 · ρ · U_∞² · A)       [dimensionless]
-            C_P = P / (0.5 · ρ · U_∞³ · A)       [dimensionless]
-                = ω · Q / (0.5 · ρ · U_∞³ · A)
+        Two conventions are supported:
+
+        Wind turbine (standard):
+            C_T = T / (0.5 · ρ · U_∞² · A)           [dimensionless]
+            C_P = P / (0.5 · ρ · U_∞³ · A)           [dimensionless]
+
+        Rotorcraft (Leishman convention):
+            C_T = T / (ρ · A · (ωR)²)                [dimensionless]
+            C_P = P / (ρ · A · (ωR)³)                [dimensionless]
+
+        Mode selection:
+            'wind_turbine': Always use wind turbine convention
+            'rotorcraft':   Always use rotorcraft convention
+            'auto':         u_inf < 0.01·ωR → rotorcraft, else wind_turbine
 
         Args:
             F_n_all:     Normal forces, shape (N_b * n_markers,) [N or lu_force]
             F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
             rho:   Fluid density       [kg/m³ or lu_density]
             u_inf: Freestream velocity [m/s or lu/lt]
+            mode:  'wind_turbine' | 'rotorcraft' | 'auto'
 
         Returns:
-            (C_T, C_P): Thrust and power coefficients [dimensionless]
+            (C_T, C_P, actual_mode):
+                C_T: Thrust coefficient  [dimensionless]
+                C_P: Power coefficient   [dimensionless]
+                actual_mode: Mode actually used ('wind_turbine' or 'rotorcraft')
         """
         thrust, torque = self.compute_torque_thrust(F_n_all, F_theta_all)
         power = self.omega * torque  # [W or lu_power]
 
-        # Rotor swept area
-        A = np.pi * self.radius**2   # [m² or lu²]
+        # Rotor swept area  [m² or lu²]
+        A = np.pi * self.radius**2
 
-        # Dynamic pressure × area
-        q_A = 0.5 * rho * u_inf**2 * A  # [N or lu_force]
+        # --- Mode selection ---
+        omega_R = self.omega * self.radius          # [m/s or lu/lt] tip speed
+        if mode == 'auto':
+            actual_mode = 'rotorcraft' if u_inf < 0.01 * omega_R else 'wind_turbine'
+        else:
+            actual_mode = mode
 
-        # Coefficients
-        C_T = thrust / q_A if q_A > 0 else 0.0  # [dimensionless]
-        C_P = power / (q_A * u_inf) if q_A > 0 else 0.0  # [dimensionless]
+        # --- Coefficient calculation ---
+        if actual_mode == 'rotorcraft':
+            # Leishman convention: normalize by tip speed
+            # C_T = T / (ρ · A · (ωR)²)   [dimensionless]
+            # C_P = P / (ρ · A · (ωR)³)   [dimensionless]
+            denom_T = rho * A * omega_R**2              # [N or lu_force]
+            denom_P = rho * A * omega_R**3              # [W or lu_power]
+            C_T = thrust / denom_T if denom_T > 0 else 0.0
+            C_P = power / denom_P if denom_P > 0 else 0.0
+        else:
+            # Wind turbine convention: normalize by freestream
+            # C_T = T / (0.5 · ρ · U_∞² · A)   [dimensionless]
+            # C_P = P / (0.5 · ρ · U_∞³ · A)   [dimensionless]
+            q_A = 0.5 * rho * u_inf**2 * A              # [N or lu_force]
+            C_T = thrust / q_A if q_A > 0 else 0.0
+            C_P = power / (q_A * u_inf) if q_A > 0 else 0.0
 
-        return C_T, C_P
+        return C_T, C_P, actual_mode
     
     def compute_power(
         self,
@@ -635,27 +670,70 @@ class Rotor:
         F_n_all: np.ndarray,
         F_theta_all: np.ndarray,
         rho: float,
-        u_inf: float
-    ) -> Tuple[float, float]:
+        u_inf: float,
+        mode: str = 'auto'
+    ) -> Tuple[float, float, str]:
         """Compute thrust and power coefficients (alias for compute_coefficients)
 
         This is an alias for compute_coefficients() to match the interface
         expected by ActuatorLineModel.get_rotor_performance().
 
-        Definitions:
-            C_T = T / (0.5 · ρ · U_∞² · A)       [dimensionless]
-            C_P = P / (0.5 · ρ · U_∞³ · A)       [dimensionless]
+        Supports dual mode: 'wind_turbine' / 'rotorcraft' / 'auto'.
+        See compute_coefficients() for full documentation.
 
         Args:
             F_n_all:     Normal forces, shape (N_b * n_markers,) [N or lu_force]
             F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
             rho:   Fluid density       [kg/m³ or lu_density]
             u_inf: Freestream velocity [m/s or lu/lt]
+            mode:  'wind_turbine' | 'rotorcraft' | 'auto'
 
         Returns:
-            (C_T, C_P): Thrust and power coefficients [dimensionless]
+            (C_T, C_P, actual_mode): Coefficients + mode used [dimensionless]
         """
-        return self.compute_coefficients(F_n_all, F_theta_all, rho, u_inf)
+        return self.compute_coefficients(F_n_all, F_theta_all, rho, u_inf, mode)
+
+    def compute_figure_of_merit(
+        self,
+        F_n_all: np.ndarray,
+        F_theta_all: np.ndarray,
+        rho: float
+    ) -> float:
+        """Compute Figure of Merit for hover performance (Leishman convention)
+
+        Definition:
+            FM = C_T^{3/2} / (√2 · C_P)     [dimensionless]
+
+        Physical meaning:
+            FM = 1.0 → ideal hover (momentum theory limit)
+            FM ≈ 0.7-0.8 → typical well-designed rotor
+            FM only meaningful in hover/near-hover conditions.
+
+        Uses rotorcraft convention internally:
+            C_T = T / (ρ · A · (ωR)²)
+            C_P = P / (ρ · A · (ωR)³)
+
+        Args:
+            F_n_all:     Normal forces, shape (N_b * n_markers,) [N or lu_force]
+            F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
+            rho:   Fluid density  [kg/m³ or lu_density]
+
+        Returns:
+            FM: Figure of Merit  [dimensionless], 0.0 if C_P ≈ 0
+        """
+        # Always use rotorcraft convention for FM
+        C_T, C_P, _ = self.compute_coefficients(
+            F_n_all, F_theta_all, rho,
+            u_inf=0.0, mode='rotorcraft'
+        )
+
+        # FM = C_T^{3/2} / (√2 · C_P)   [dimensionless]
+        if C_P > 1e-30 and C_T > 0.0:
+            FM = C_T**1.5 / (np.sqrt(2.0) * C_P)
+        else:
+            FM = 0.0
+
+        return FM
 
 
     # -----------------------------------------------------------------

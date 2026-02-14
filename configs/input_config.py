@@ -2,14 +2,20 @@ import numpy as np
 import warnings
 
 
-L_REF      = 0.025           # [m]      Characteristic length (= rotor diameter D)
+L_REF      = 0.025           # [m]      Characteristic length (= blade chord c)
+                             #          Used for Re definition: Re = U_ref·L_ref/ν
 RHO_REF    = 1.205           # [kg/m³]  Reference density (air at 20°C)
+
+# -----------------------------------------------------------------------------
+# Rotor geometry (for ALM)
+# -----------------------------------------------------------------------------
+R_ROTOR    = 0.125           # [m]      Rotor radius (USER INPUT, independent of L_REF)
+D_ROTOR    = 2.0 * R_ROTOR  # [m]      Rotor diameter
 
 # -----------------------------------------------------------------------------
 # Rotor operating condition (for ALM)
 # -----------------------------------------------------------------------------
 RPM        = 1000            # [rpm]    Rotor rotational speed (USER INPUT)
-R_ROTOR    = L_REF / 2       # [m]      Rotor radius = D/2
 OMEGA_ROTOR = RPM * 2.0 * np.pi / 60.0   # [rad/s]  Angular velocity
 
 # -----------------------------------------------------------------------------
@@ -44,7 +50,8 @@ else:
 # §2. NUMERICAL PARAMETERS (User Input - Discretization)
 # =============================================================================
 
-RESOLUTION = 40              # [-]  Grid cells per L_REF (N = L_REF / Δx)
+RESOLUTION = 20              # [-]  Grid cells per rotor diameter (D/Δx)
+                             #      ALM standard: 20~40 for test, 60+ for production
 LATTICE_VELOCITY = 0.1      # [-]  u_lu (controls accuracy, recommend 0.02~0.1)
 
 # =============================================================================
@@ -53,14 +60,16 @@ LATTICE_VELOCITY = 0.1      # [-]  u_lu (controls accuracy, recommend 0.02~0.1)
 # DO NOT MODIFY - These are derived from user inputs above.
 
 # --- Conversion factors ---
-DX_PHYS    = L_REF / RESOLUTION                      # [m/lu]
-DT_PHYS    = LATTICE_VELOCITY * DX_PHYS / U_REF      # [s/lt]
+DX_PHYS    = D_ROTOR / RESOLUTION                    # [m/lu]  grid spacing
+DT_PHYS    = LATTICE_VELOCITY * DX_PHYS / U_REF      # [s/lt]  timestep
 
 OMEGA_LU = OMEGA_ROTOR * DT_PHYS
 STEPS_PER_REV = int(2 * np.pi / OMEGA_LU)
 
 # --- Lattice parameters ---
-L_REF_LU   = RESOLUTION                              # [lu]
+L_REF_LU   = L_REF / DX_PHYS                         # [lu]  chord in lattice units
+D_LU        = RESOLUTION                              # [lu]  rotor diameter = D/Δx
+R_LU        = D_LU / 2.0                              # [lu]  rotor radius
 U_REF_LU   = LATTICE_VELOCITY                        # [lu/lt]
 U_INF_LU   = U_INF / U_REF * LATTICE_VELOCITY        # [lu/lt] inlet velocity in LU
 NU_LU      = NU_PHYS * DT_PHYS / (DX_PHYS ** 2)      # [lu²/lt]
@@ -90,18 +99,14 @@ for _w in _stability_warnings:
 # =============================================================================
 # §4. DOMAIN CONFIGURATION
 # =============================================================================
-# Domain size in lattice units, or as multiples of L_REF
+# Domain size in lattice units, as multiples of rotor diameter D
+DOMAIN_MULT_X = 5            # [-]  Domain = 5D in x
+DOMAIN_MULT_Y = 5            # [-]  Domain = 5D in y
+DOMAIN_MULT_Z = 8            # [-]  Domain = 8D in z (rotation axis)
 
-# DOMAIN_MULTIPLE_X = 10       # [-]  Domain = 10 × L_REF in x
-# DOMAIN_MULTIPLE_Y = 5        # [-]  Domain = 5 × L_REF in y
-# DOMAIN_MULTIPLE_Z = 5        # [-]  Domain = 5 × L_REF in z
-
-# Nx = DOMAIN_MULTIPLE_X * RESOLUTION    # [lu]
-# Ny = DOMAIN_MULTIPLE_Y * RESOLUTION    # [lu]
-# Nz = DOMAIN_MULTIPLE_Z * RESOLUTION    # [lu]
-Nx = 80
-Ny = 80
-Nz = 100
+Nx = DOMAIN_MULT_X * RESOLUTION    # [lu]
+Ny = DOMAIN_MULT_Y * RESOLUTION    # [lu]
+Nz = DOMAIN_MULT_Z * RESOLUTION    # [lu]
 
 # =============================================================================
 # §4. SIMULATION SETTINGS
@@ -136,7 +141,7 @@ simulation = {
     
     "time": {
         "max_steps": STEPS_PER_REV * 20,
-        "output_interval": STEPS_PER_REV // 18,
+        "output_interval": STEPS_PER_REV // 12,
         "checkpoint_interval": STEPS_PER_REV * 2,
         "probe_interval": 10,
     },
@@ -175,6 +180,21 @@ boundaries = {
     "ymax": {"location": "ymax","method": "regularized_outlet",
              "velocity": 0.0,"density": 1.0, "k": 0.1},
 }
+
+# boundaries = {
+#     "ground": {"location": "zmin", "method": "regularized_wall",},
+
+#     "top": {"location": "zmax", "method": "equilibrium", 
+#             "velocity": 0.0, "density": 1.0,},
+#     "xmin": {"location": "xmin", "method": "equilibrium",
+#              "velocity": 0.0,"density": 1.0,},
+#     "xmax": {"location": "xmax","method": "equilibrium",
+#              "velocity": 0.0,"density": 1.0,},
+#     "ymin": {"location": "ymin","method": "equilibrium",
+#              "velocity": 0.0,"density": 1.0,},
+#     "ymax": {"location": "ymax","method": "equilibrium",
+#              "velocity": 0.0,"density": 1.0,},
+# }
 
 # =============================================================================
 # §6. INTERNAL GEOMETRY (Optional Module)
@@ -266,6 +286,8 @@ if ALM_ENABLED:
         
         "rho_ref": RHO_REF,            # [kg/m³]
         "gaussian_cutoff": 3.0,
+        "coeff_mode": "auto",          # 'wind_turbine' | 'rotorcraft' | 'auto'
+                                       # auto: u_inf < 1% tip speed → rotorcraft
     })
 
 # =============================================================================
@@ -361,33 +383,40 @@ def print_summary():
     print("=" * 70)
     print()
     print(" §1. Physical Parameters (User Input):")
-    print(f"      L_ref   = {L_REF} m")
-    print(f"      U_ref   = {U_REF} m/s")
+    print(f"      L_ref   = {L_REF} m  (= chord, for Re definition)")
+    print(f"      R_rotor = {R_ROTOR} m,  D = {D_ROTOR} m")
+    print(f"      c/R     = {L_REF/R_ROTOR:.2f}")
+    print(f"      σ       = {2*L_REF/(np.pi*R_ROTOR):.4f}  (N_b·c/πR, 2 blades)")
+    print(f"      U_ref   = {U_REF:.4f} m/s  (ωR×0.75)")
     print(f"      ρ_ref   = {RHO_REF} kg/m³")
     print(f"      Re      = {RE}")
     print(f"      ν_phys  = {NU_PHYS:.6e} m²/s")
     print()
     print(" §2. Discretization (User Input):")
-    print(f"      Resolution       = {RESOLUTION} (N = L_ref/Δx)")
+    print(f"      Resolution       = {RESOLUTION} (D/Δx, rotor diameter basis)")
     print(f"      Lattice velocity = {LATTICE_VELOCITY} (u_lu)")
     print()
     print(" §3. Lattice Parameters (Auto-calculated):")
-    print(f"      Δx      = {DX_PHYS:.6e} m")
+    print(f"      Δx      = {DX_PHYS:.6e} m  ({DX_PHYS*1000:.3f} mm)")
     print(f"      Δt      = {DT_PHYS:.6e} s")
+    print(f"      chord   = {L_REF_LU:.1f} cells")
+    print(f"      D       = {D_LU:.0f} cells,  R = {R_LU:.0f} cells")
     print(f"      ν_lu    = {NU_LU:.6f}")
     print(f"      τ       = {TAU:.6f}")
-    print(f"      ω       = {OMEGA_LBM:.6f}")
+    print(f"      ω_LBM   = {OMEGA_LBM:.6f}")
     print(f"      Ma_lu   = {MA_LATTICE:.4f}")
     print()
     print(" §4. Domain:")
     print(f"      Grid    = {Nx} × {Ny} × {Nz} = {Nx*Ny*Nz:,} cells")
     print(f"      Size    = {Nx*DX_PHYS:.4f} × {Ny*DX_PHYS:.4f} × {Nz*DX_PHYS:.4f} m")
+    print(f"      Domain  = {DOMAIN_MULT_X}D × {DOMAIN_MULT_Y}D × {DOMAIN_MULT_Z}D")
     print()
     print(" §5. Time:")
     max_steps = simulation['time']['max_steps']
     print(f"      Max steps      = {max_steps:,}")
+    print(f"      Steps/rev      = {STEPS_PER_REV:,}")
     print(f"      Physical time  = {max_steps * DT_PHYS:.4f} s")
-    print(f"      Convective t*  = {max_steps * DT_PHYS * U_REF / L_REF:.1f}")
+    print(f"      Revolutions    = {max_steps / STEPS_PER_REV:.1f}")
     print()
     print(" §6. Modules:")
     print(f"      ALM             = {ALM_ENABLED}")
