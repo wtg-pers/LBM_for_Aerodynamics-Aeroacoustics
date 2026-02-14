@@ -100,8 +100,8 @@ for _w in _stability_warnings:
 # §4. DOMAIN CONFIGURATION
 # =============================================================================
 # Domain size in lattice units, as multiples of rotor diameter D
-DOMAIN_MULT_X = 5            # [-]  Domain = 5D in x
-DOMAIN_MULT_Y = 5            # [-]  Domain = 5D in y
+DOMAIN_MULT_X = 6            # [-]  Domain = 5D in x
+DOMAIN_MULT_Y = 6            # [-]  Domain = 5D in y
 DOMAIN_MULT_Z = 8            # [-]  Domain = 8D in z (rotation axis)
 
 Nx = DOMAIN_MULT_X * RESOLUTION    # [lu]
@@ -133,6 +133,9 @@ simulation = {
         "nu_lu": NU_LU,
         "u_ref_lu": U_REF_LU,
         "L_ref_lu": L_REF_LU,
+
+        # Initial flow field
+        "initial_flow_velocity": U_INF_LU,
         
         # Conversion factors
         "dx": DX_PHYS,             # [m/lu]
@@ -140,9 +143,9 @@ simulation = {
     },
     
     "time": {
-        "max_steps": STEPS_PER_REV * 20,
+        "max_steps": STEPS_PER_REV * 40,
         "output_interval": STEPS_PER_REV // 12,
-        "checkpoint_interval": STEPS_PER_REV * 2,
+        "checkpoint_interval": STEPS_PER_REV * 10,
         "probe_interval": 10,
     },
 }
@@ -169,7 +172,7 @@ boundaries = {
     # "ground": {"location": "zmin", "method": "regularized_wall",},
     "ground": {"location": "zmin", "method": "regularized_outlet", 
             "velocity": 0.0, "density": 1.0, "k": 0.1},
-    "top": {"location": "zmax", "method": "regularized_inlet", 
+    "top": {"location": "zmax", "method": "regularized_outlet", 
             "velocity": 0.0, "density": 1.0, "k": 0.1},
     "xmin": {"location": "xmin", "method": "regularized_outlet",
              "velocity": 0.0,"density": 1.0, "k": 0.1},
@@ -182,17 +185,17 @@ boundaries = {
 }
 
 # boundaries = {
-#     "ground": {"location": "zmin", "method": "regularized_wall",},
+#     "ground": {"location": "zmin", "method": "neumann",},
 
 #     "top": {"location": "zmax", "method": "equilibrium", 
-#             "velocity": 0.0, "density": 1.0,},
-#     "xmin": {"location": "xmin", "method": "equilibrium",
+#             "velocity": 0.015, "density": 1.0,},
+#     "xmin": {"location": "xmin", "method": "regularized_wall",
 #              "velocity": 0.0,"density": 1.0,},
-#     "xmax": {"location": "xmax","method": "equilibrium",
+#     "xmax": {"location": "xmax","method": "regularized_wall",
 #              "velocity": 0.0,"density": 1.0,},
-#     "ymin": {"location": "ymin","method": "equilibrium",
+#     "ymin": {"location": "ymin","method": "regularized_wall",
 #              "velocity": 0.0,"density": 1.0,},
-#     "ymax": {"location": "ymax","method": "equilibrium",
+#     "ymax": {"location": "ymax","method": "regularized_wall",
 #              "velocity": 0.0,"density": 1.0,},
 # }
 
@@ -286,7 +289,7 @@ if ALM_ENABLED:
         
         "rho_ref": RHO_REF,            # [kg/m³]
         "gaussian_cutoff": 3.0,
-        "coeff_mode": "auto",          # 'wind_turbine' | 'rotorcraft' | 'auto'
+        "coeff_mode": "rotorcraft",          # 'wind_turbine' | 'rotorcraft' | 'auto'
                                        # auto: u_inf < 1% tip speed → rotorcraft
     })
 
@@ -322,7 +325,7 @@ force_calculation = {
 # =============================================================================
 conservation = {
     "enabled": True,
-    "check_interval": 100,
+    "check_interval": 10,
     "verbose": 0,
     "log_to_csv": True,
 }

@@ -147,12 +147,11 @@ def main():
     # [2] Physics Parameters
     # =========================================================================
     Re = physics_config.get('Re')
-    u_init = physics_config.get('u_ref_lu')
-    char_length = physics_config.get('L_ref_lu')
+    u_ref_lu = physics_config.get('u_ref_lu')       # [Δx/Δt] reference velocity (lattice)
+    L_ref_lu = physics_config.get('L_ref_lu')
 
-    u_ref = physics_config.get('u_ref', u_init)
+    u_ref_phys = physics_config.get('U_ref')        # [m/s] reference velocity (physical)
     nu_lu = physics_config.get('nu_lu')
-    nu = nu_lu 
     tau = physics_config.get('tau')
 
     config_max_steps = time_config.get('max_steps', 10000)
@@ -162,9 +161,9 @@ def main():
 
     print(f"\n[2] Physics Parameters")
     print(f"  Re = {Re}")
-    print(f"  u_init = {u_init} [Δx/Δt], u_ref = {u_ref} [Δx/Δt]")
-    print(f"  L_char = {char_length} [Δx]")
-    print(f"  ν = {nu:.6f} [Δx²/Δt], τ = {tau:.6f}")
+    print(f"  u_ref_lu = {u_ref_lu} [Δx/Δt], U_ref = {u_ref_phys} [m/s]")
+    print(f"  L_ref_lu = {L_ref_lu} [Δx]")
+    print(f"  ν = {nu_lu:.6f} [Δx²/Δt], τ = {tau:.6f}")
 
     # Physical unit conversion (needed for Actuator Line)
     dx_phys = None  # [m/lu]
@@ -199,7 +198,7 @@ def main():
     mask, geom_info = create_geometry_mask(
         xp, lattice, domain_shape, 
         internal_geom, 
-        characteristic_length=char_length,
+        characteristic_length=L_ref_lu,
         verbose=True
     )
 
@@ -332,9 +331,9 @@ def main():
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")
         
         # Initial flow velocity:
-        #   - Default: u_init (used as reference velocity for ν calculation)
-        #   - Override: initial_flow_velocity (e.g., 0.0 for hover/quiescent)
-        flow_vel = physics_config.get('initial_flow_velocity', u_init)
+        #   - Default: 0.0 (quiescent, e.g. hover)
+        #   - Override: initial_flow_velocity in config (e.g. U_inf_lu for forward flight)
+        flow_vel = physics_config.get('initial_flow_velocity', 0.0)
         
         if lattice.dim == 2:
             rho0 = xp.ones((Nx, Ny), dtype=xp.float64)
@@ -345,10 +344,7 @@ def main():
             u0 = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64)
             u0[0] = flow_vel  # x-velocity  [Δx/Δt]
         
-        if flow_vel != u_init:
-            print(f"  Initial velocity: {flow_vel} [Δx/Δt] (u_init={u_init} used for ν only)")
-        else:
-            print(f"  Initial velocity: {flow_vel} [Δx/Δt]")
+        print(f"  Initial velocity: {flow_vel} [Δx/Δt]")
         
         f_old = eq.compute(rho0, u0)
         print(f"  Initial total mass: {float(xp.sum(f_old)):.6f}")
@@ -420,8 +416,8 @@ def main():
             'start_step': force_config.get('start_step', 0),
             'reference': {
                 'rho': ref_config.get('rho', 1.0),
-                'velocity': ref_config.get('velocity', u_init),
-                'char_length': ref_config.get('char_length', char_length),
+                'velocity': ref_config.get('velocity', u_ref_lu),
+                'char_length': ref_config.get('char_length', L_ref_lu),
                 'span_length': ref_config.get('span_length', default_span),
             },
             'log': {
@@ -462,8 +458,8 @@ def main():
 
     if conv_monitor.enabled:
         conv_monitor.initialize(
-            char_length=char_length,
-            u_ref=u_init,
+            char_length=L_ref_lu,
+            u_ref=u_ref_lu,
         )
     else:
         print("  Convergence monitor: disabled")
@@ -529,7 +525,7 @@ def main():
         al_model = create_actuator_line_from_config(
             config=al_cfg,
             domain_shape=domain_shape,
-            nu_lattice=nu,
+            nu_lattice=nu_lu,
             polar_query=polar_query,
             dx_phys=dx_phys,
             dt_phys=dt_phys,
@@ -803,8 +799,8 @@ def main():
         
         St = compute_strouhal_number(
             force_history=force_mgr.history,
-            char_length=char_length,
-            u_ref=u_init,
+            char_length=L_ref_lu,
+            u_ref=u_ref_lu,
             component='Cl',
             min_periods=3
         )
