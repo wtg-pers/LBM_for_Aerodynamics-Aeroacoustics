@@ -99,9 +99,9 @@ for _w in _stability_warnings:
 # Nx = DOMAIN_MULTIPLE_X * RESOLUTION    # [lu]
 # Ny = DOMAIN_MULTIPLE_Y * RESOLUTION    # [lu]
 # Nz = DOMAIN_MULTIPLE_Z * RESOLUTION    # [lu]
-Nx = 200
-Ny = 200
-Nz = 100
+Nx = 160
+Ny = 160
+Nz = 400
 
 # =============================================================================
 # §4. SIMULATION SETTINGS
@@ -135,8 +135,8 @@ simulation = {
     },
     
     "time": {
-        "max_steps": STEPS_PER_REV * 50,
-        "output_interval": STEPS_PER_REV // 180,
+        "max_steps": STEPS_PER_REV * 20,
+        "output_interval": STEPS_PER_REV // 18,
         "checkpoint_interval": STEPS_PER_REV * 2,
         "probe_interval": 10,
     },
@@ -161,8 +161,9 @@ simulation = {
 # }
 
 boundaries = {
-    "ground": {"location": "zmin", "method": "regularized_wall",},
-
+    # "ground": {"location": "zmin", "method": "regularized_wall",},
+    "ground": {"location": "zmin", "method": "neumann", 
+            "velocity": 0.0, "density": 1.0,},
     "top": {"location": "zmax", "method": "equilibrium", 
             "velocity": 0.0, "density": 1.0,},
     "xmin": {"location": "xmin", "method": "equilibrium",
@@ -214,7 +215,7 @@ if ALM_ENABLED:
     # Hub position
     HUB_X_LU    = Nx // 2
     HUB_Y_LU    = Ny // 2
-    HUB_Z_LU    = Nz // 3
+    HUB_Z_LU    = Nz * 0.75
     
     HUB_X_PHYS  = HUB_X_LU * DX_PHYS   # [m]
     HUB_Y_PHYS  = HUB_Y_LU * DX_PHYS   # [m]
