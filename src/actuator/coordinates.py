@@ -584,7 +584,7 @@ class RotorCoordinateSystem:
                             Shape matches input (scalar or (N,))
         """
         # Rotational direction vector (Watanabe Eq. 5 convention)
-        e_rot = self.radial_vector(theta)
+        e_rot = self.math_tangent_vector(theta)
         
         u_global = np.asarray(u_global)
         
@@ -635,7 +635,7 @@ class RotorCoordinateSystem:
             F_global: Force ON BLADE in global frame
                       Shape (3,) if inputs are scalar, (N, 3) if arrays
         """
-        e_tan = self.tangent_vector(theta)
+        e_tan = self.math_tangent_vector(theta)
         
         F_n = np.asarray(F_n)
         F_theta = np.asarray(F_theta)
