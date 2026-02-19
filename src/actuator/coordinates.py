@@ -60,20 +60,28 @@ For a marker at radial distance r and azimuth angle θ:
     x_marker = hub + r·cos(θ)·ê_ref + r·sin(θ)·ê_perp     [m or lu]
              = hub + R @ [r·cos(θ), r·sin(θ), 0]ᵀ
 
-Velocity Decomposition (Watanabe Eq. 5):
-========================================
+Velocity Decomposition:
+=======================
     u_n = u · n̂                                           [m/s]
-    u_θ = u · ê_rot(θ)                                    [m/s]
+    u_θ = u · ê_θ(θ)                                      [m/s]
     
-    where ê_rot(θ) = cos(θ)·ê_ref + sin(θ)·ê_perp
-    (This is the RADIAL direction, matching Watanabe's convention)
+    where ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp
+    (tangent to rotation, perpendicular to radial direction)
+    
+    Note: Watanabe Eq. 5 uses u·ê_r (radial direction) which coincides
+    with the mathematical tangent only for HAWT_X. The tangent vector
+    used here generalizes correctly to arbitrary rotation axes.
 
-Force Projection (Watanabe convention):
-=======================================
-    F^AL = F_n·n̂ + F_θ·ê_tan(θ)                          [N or lu_force]
+Force Projection:
+=================
+    F^AL = F_n·n̂ + F_θ·ê_θ(θ)                            [N or lu_force]
     
-    where ê_tan(θ) = cos(θ)·ê_ref - sin(θ)·ê_perp
-    (Watanabe's tangent convention, 90° from mathematical tangent)
+    where ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp
+    (standard tangent vector ∂x/∂θ, perpendicular to radial direction)
+    
+    This choice ensures azimuth-independent torque:
+        Q = Σ (r_j × F^AL_j) · n̂ = Σ F_θ,j · r_j
+    which is physically required for uniform inflow.
 
 References:
     - Watanabe et al., Comp. & Fluids 305, 106901, 2026 (Sec. 2.2)
@@ -491,33 +499,6 @@ class RotorCoordinateSystem:
         else:
             return (self.rotation_matrix.T @ x_rel.T).T
     
-    def tangent_vector(self, theta: float) -> np.ndarray:
-        """Compute tangential unit vector at azimuth θ (Watanabe convention)
-        
-        Physical Definition (Watanabe et al.):
-            The tangent vector used in force projection follows the convention
-            from the AL force projection formula:
-            
-                F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))
-            
-            This implies the tangent vector is:
-                ê_tan(θ) = cos(θ)·ê_ref - sin(θ)·ê_perp
-            
-            (This is 90° ahead of the mathematical tangent ∂x/∂θ)
-        
-        Convention at specific angles (HAWT_X_AXIS):
-            θ = 0:    ê_tan = (0, 1, 0) = +ŷ  (blade chord direction)
-            θ = π/2:  ê_tan = (0, 0, -1) = -ẑ
-            θ = π:    ê_tan = (0, -1, 0) = -ŷ
-        
-        Args:
-            theta: Azimuth angle  [radians]
-        
-        Returns:
-            e_tan: Tangential unit vector (Watanabe convention), shape (3,)
-        """
-        return np.cos(theta) * self.e_ref - np.sin(theta) * self.e_perp
-    
     def radial_vector(self, theta: float) -> np.ndarray:
         """Compute radial unit vector at azimuth θ
         
@@ -535,7 +516,7 @@ class RotorCoordinateSystem:
         """
         return np.cos(theta) * self.e_ref + np.sin(theta) * self.e_perp
     
-    def math_tangent_vector(self, theta: float) -> np.ndarray:
+    def tangent_vector(self, theta: float) -> np.ndarray:
         """Compute mathematical tangent vector (direction of increasing θ)
         
         This is the standard ∂x/∂θ direction:
@@ -559,11 +540,20 @@ class RotorCoordinateSystem:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Decompose global velocity into normal and tangential components
         
-        Watanabe et al. Eq. 5 Convention:
-            u_n = u · n̂                           (axial / streamwise)
-            u_θ = u · ê_rot(θ)                    (rotational direction)
+        Velocity Decomposition:
+            u_n = u · n̂                           (axial / normal to rotor plane)
+            u_θ = u · ê_θ(θ)                      (tangential / rotational direction)
         
-        where ê_rot(θ) = cos(θ)·ê_ref + sin(θ)·ê_perp (radial direction)
+        where ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp (tangent to rotation)
+        
+        For HAWT_X_AXIS, this gives:
+            u_n = u_x
+            u_θ = -u_y·sin(θ) + u_z·cos(θ)
+        
+        Note: Watanabe Eq. 5 uses u·ê_r (radial), which is equivalent to
+        u·ê_θ only for their specific HAWT_X convention. The tangent vector
+        used here generalizes to arbitrary rotation axes while preserving
+        torque conservation.
         
         For HAWT_X_AXIS, this reduces to:
             u_n = u_x
@@ -584,7 +574,7 @@ class RotorCoordinateSystem:
                             Shape matches input (scalar or (N,))
         """
         # Rotational direction vector (Watanabe Eq. 5 convention)
-        e_rot = self.math_tangent_vector(theta)
+        e_rot = self.tangent_vector(theta)
         
         u_global = np.asarray(u_global)
         
@@ -599,30 +589,86 @@ class RotorCoordinateSystem:
         
         return u_n, u_theta
     
+    # def project_force_to_global(
+    #     self,
+    #     F_n: Union[float, np.ndarray],
+    #     F_theta: Union[float, np.ndarray],
+    #     theta: float
+    # ) -> np.ndarray:
+    #     """Project local forces to global coordinate frame
+        
+    #     Force Projection:
+    #         F^AL = F_n·n̂ + F_θ·ê_θ(θ)
+    #             = F_n·n̂ + F_θ·(-sin(θ)·ê_ref + cos(θ)·ê_perp)
+        
+    #     For HAWT_X_AXIS (ê_ref=ŷ, ê_perp=ẑ), this gives:
+    #         F^AL = (F_n, -F_θ·sin(θ), F_θ·cos(θ))
+        
+    #     Torque consistency proof:
+    #         Q = (r × F^AL)·n̂ = F_θ·r   (azimuth-independent)
+        
+    #     Sign Convention (IMPORTANT):
+    #         F_n > 0:  Force on blade in +n̂ direction
+    #         F_θ > 0:  Force on blade in +ê_tan(θ) direction
+            
+    #         The BODY FORCE on fluid (Eq. 13) is -F^AL:
+    #             F_body = -F^AL = -F_n·n̂ - F_θ·ê_tan(θ)
+            
+    #         This means positive thrust (F_n > 0) decelerates the flow,
+    #         creating the wake deficit.
+        
+    #     Args:
+    #         F_n: Normal (axial) force(s)  [N or lattice force]
+    #              Scalar or shape (N,)
+    #         F_theta: Tangential force(s)  [N or lattice force]
+    #                  Scalar or shape (N,)
+    #         theta: Azimuth angle  [radians]
+        
+    #     Returns:
+    #         F_global: Force ON BLADE in global frame
+    #                   Shape (3,) if inputs are scalar, (N, 3) if arrays
+    #     """
+    #     e_tan = self.tangent_vector(theta)
+        
+    #     F_n = np.asarray(F_n)
+    #     F_theta = np.asarray(F_theta)
+        
+    #     is_scalar = (F_n.ndim == 0)
+        
+    #     if is_scalar:
+    #         # Single force: return shape (3,)
+    #         return float(F_n) * self.n_axis + float(F_theta) * e_tan
+    #     else:
+    #         # Multiple forces: return shape (N, 3)
+    #         return (F_n[:, None] * self.n_axis[None, :] +
+    #                 F_theta[:, None] * e_tan[None, :])
     def project_force_to_global(
         self,
         F_n: Union[float, np.ndarray],
         F_theta: Union[float, np.ndarray],
-        theta: float
+        theta: float,
+        rotation_sign: float = 1.0
     ) -> np.ndarray:
         """Project local forces to global coordinate frame
         
-        Watanabe Convention:
-            F^AL = F_n·n̂ + F_θ·ê_tan(θ)
-                 = F_n·n̂ + F_θ·(cos(θ)·ê_ref - sin(θ)·ê_perp)
+        Watanabe Convention (extended for counter-rotation):
+            F^AL = F_n·n̂ + rotation_sign · F_θ·ê_tan(θ)
         
-        For HAWT_X_AXIS, this gives:
+        The rotation_sign accounts for the fact that F_theta from BEM
+        is computed in the blade-local frame (where blade always moves
+        in the "positive" direction). When projected to the global frame:
+            ω > 0: rotation_sign = +1 → F_theta acts in +ê_tan direction
+            ω < 0: rotation_sign = -1 → F_theta acts in -ê_tan direction
+        
+        For HAWT_X_AXIS with ω > 0 (backward compatible):
             F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))   [Watanabe convention]
         
         Sign Convention (IMPORTANT):
             F_n > 0:  Force on blade in +n̂ direction
-            F_θ > 0:  Force on blade in +ê_tan(θ) direction
+            F_θ > 0:  Force on blade opposing its local motion (drag-like)
             
             The BODY FORCE on fluid (Eq. 13) is -F^AL:
-                F_body = -F^AL = -F_n·n̂ - F_θ·ê_tan(θ)
-            
-            This means positive thrust (F_n > 0) decelerates the flow,
-            creating the wake deficit.
+                F_body = -F^AL = -F_n·n̂ - rotation_sign·F_θ·ê_tan(θ)
         
         Args:
             F_n: Normal (axial) force(s)  [N or lattice force]
@@ -630,85 +676,68 @@ class RotorCoordinateSystem:
             F_theta: Tangential force(s)  [N or lattice force]
                      Scalar or shape (N,)
             theta: Azimuth angle  [radians]
+            rotation_sign: sign(ω), +1.0 or -1.0  [-]
+                           Controls global direction of tangential force.
+                           Default +1.0 preserves backward compatibility.
         
         Returns:
             F_global: Force ON BLADE in global frame
                       Shape (3,) if inputs are scalar, (N, 3) if arrays
         """
-        e_tan = self.math_tangent_vector(theta)
+        e_tan = self.tangent_vector(theta)
         
         F_n = np.asarray(F_n)
         F_theta = np.asarray(F_theta)
         
+        # ★ rotation_sign: 블레이드 로컬 F_theta → 글로벌 방향 반영 ★
+        F_theta_global = rotation_sign * F_theta   # [N or lattice force]
+        
         is_scalar = (F_n.ndim == 0)
         
         if is_scalar:
-            # Single force: return shape (3,)
-            return float(F_n) * self.n_axis + float(F_theta) * e_tan
+            return float(F_n) * self.n_axis + float(F_theta_global) * e_tan
         else:
-            # Multiple forces: return shape (N, 3)
             return (F_n[:, None] * self.n_axis[None, :] +
-                    F_theta[:, None] * e_tan[None, :])
+                    F_theta_global[:, None] * e_tan[None, :])
     
     # -----------------------------------------------------------------
-    # §2.4 Batch Operations (for vectorized marker handling)
+    # §2.4 Unit Conversion
     # -----------------------------------------------------------------
-    
-    def all_marker_positions(
-        self,
-        r_array: np.ndarray,
-        theta: float
-    ) -> np.ndarray:
-        """Compute positions for all markers at once
+    @classmethod
+    def _from_validated_axes(
+        cls,
+        hub_center: np.ndarray,
+        n_axis: np.ndarray,
+        e_ref: np.ndarray,
+        e_perp: np.ndarray,
+        inflow_direction: np.ndarray,
+        rotation_matrix: np.ndarray,
+        preset: 'RotorAxisPreset'
+    ) -> 'RotorCoordinateSystem':
+        """Internal constructor bypassing Gram-Schmidt for already-validated axes
         
-        Optimized batch version of marker_position() for array inputs.
+        Used by to_lattice_units() where only hub_center changes and
+        all axis vectors are already orthonormalized.
         
         Args:
-            r_array: Radial positions, shape (N,)  [m or lu]
-            theta: Azimuth angle  [radians]
+            hub_center: Rotor center position  [m or lu]
+            n_axis, e_ref, e_perp: Orthonormal axis vectors  [dimensionless]
+            inflow_direction: Wind approach direction  [dimensionless]
+            rotation_matrix: Pre-built 3×3 rotation matrix
+            preset: Configuration preset
         
         Returns:
-            positions: Shape (N, 3) global coordinates
+            RotorCoordinateSystem with pre-validated axes
         """
-        return self.marker_position(r_array, theta)
-    
-    def decompose_velocity_batch(
-        self,
-        u_global: np.ndarray,
-        theta: float
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Decompose velocities for all markers at once
-        
-        Args:
-            u_global: Velocities at markers, shape (N, 3)  [m/s or lu/lt]
-            theta: Azimuth angle  [radians]
-        
-        Returns:
-            (u_n, u_theta): Each shape (N,)
-        """
-        return self.decompose_velocity(u_global, theta)
-    
-    def project_forces_batch(
-        self,
-        F_n: np.ndarray,
-        F_theta: np.ndarray,
-        theta: float
-    ) -> np.ndarray:
-        """Project forces for all markers at once
-        
-        Args:
-            F_n: Normal forces, shape (N,)  [N or lattice force]
-            F_theta: Tangential forces, shape (N,)
-            theta: Azimuth angle  [radians]
-        
-        Returns:
-            F_global: Shape (N, 3) global forces ON BLADE
-        """
-        return self.project_force_to_global(F_n, F_theta, theta)
-    
-    # -----------------------------------------------------------------
-    # §2.5 Unit Conversion
-    # -----------------------------------------------------------------
+        obj = object.__new__(cls)
+        obj.hub_center = np.asarray(hub_center, dtype=np.float64)
+        obj.n_axis = n_axis
+        obj.e_ref = e_ref
+        obj.e_perp = e_perp
+        obj.inflow_direction = inflow_direction
+        obj.rotation_matrix = rotation_matrix
+        obj.preset = preset
+        return obj
     
     def to_lattice_units(self, length_scale: float) -> 'RotorCoordinateSystem':
         """Create a new coordinate system with hub center in lattice units
@@ -717,6 +746,7 @@ class RotorCoordinateSystem:
         
         Note: Only the hub_center has units; the axis vectors and
         rotation matrix are dimensionless and remain unchanged.
+        Bypasses Gram-Schmidt since axes are already validated.
         
         Args:
             length_scale: Physical size of one lattice cell  [m/lu]
@@ -724,11 +754,13 @@ class RotorCoordinateSystem:
         Returns:
             New RotorCoordinateSystem in lattice units
         """
-        return RotorCoordinateSystem(
+        return RotorCoordinateSystem._from_validated_axes(
             hub_center=self.hub_center / length_scale,
-            rotation_axis=self.n_axis,
-            reference_axis=self.e_ref,
+            n_axis=self.n_axis,
+            e_ref=self.e_ref,
+            e_perp=self.e_perp,
             inflow_direction=self.inflow_direction,
+            rotation_matrix=self.rotation_matrix,
             preset=self.preset
         )
     

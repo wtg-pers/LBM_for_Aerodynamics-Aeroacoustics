@@ -638,7 +638,237 @@ class ActuatorLineModel:
 
 
 # =============================================================================
-# §3. Factory Function
+# §2.5  Multi-Rotor Manager
+# =============================================================================
+
+class MultiRotorManager:
+    """Manages multiple ActuatorLineModel instances on a shared domain
+
+    Each rotor operates independently (BEM, Gaussian spreading),
+    and their body forces are linearly superposed onto the shared grid.
+
+    Wake interaction is captured IMPLICITLY: rotor k's wake modifies
+    the velocity field u(x), which rotor k+1 samples at its markers.
+
+    Attributes:
+        models: List of ActuatorLineModel, one per rotor
+        names: Human-readable labels (e.g., 'rotor_0', 'upwind')
+        domain_shape: (Nx, Ny, Nz)  [lu]
+        n_rotors: Number of rotors  [dimensionless]
+
+    Example:
+        >>> mgr = MultiRotorManager(domain_shape=(200, 100, 100))
+        >>> mgr.add_model(al_model_0, name='upwind')
+        >>> mgr.add_model(al_model_1, name='downwind')
+        >>>
+        >>> # In time loop:
+        >>> F_total = mgr.step(u_field, dt=1.0)
+    """
+
+    def __init__(
+        self,
+        domain_shape: Tuple[int, int, int],
+    ) -> None:
+        """Initialize MultiRotorManager
+
+        Args:
+            domain_shape: (Nx, Ny, Nz) shared grid  [lu]
+        """
+        self.domain_shape = domain_shape    # [lu]
+        self.models: List['ActuatorLineModel'] = []
+        self.names: List[str] = []
+
+        # Pre-allocate accumulated body force array
+        Nx, Ny, Nz = domain_shape
+        self._F_total = np.zeros((3, Nx, Ny, Nz), dtype=np.float64)
+        # [lattice force / lu³]
+
+    # -----------------------------------------------------------------
+    # Construction
+    # -----------------------------------------------------------------
+
+    def add_model(
+        self,
+        model: 'ActuatorLineModel',
+        name: Optional[str] = None,
+    ) -> None:
+        """Register an ActuatorLineModel
+
+        Args:
+            model: Configured AL model (already in lattice units)
+            name: Human-readable label (auto-generated if None)
+        """
+        if model.domain_shape != self.domain_shape:
+            raise ValueError(
+                f"Domain shape mismatch: manager has {self.domain_shape}, "
+                f"but model '{name}' has {model.domain_shape}"
+            )
+        if name is None:
+            name = f"rotor_{len(self.models)}"
+        self.models.append(model)
+        self.names.append(name)
+
+    @property
+    def n_rotors(self) -> int:
+        """Number of registered rotors  [dimensionless]"""
+        return len(self.models)
+
+    # -----------------------------------------------------------------
+    # §2.5.1  Main Time Step (matches ActuatorLineModel.step interface)
+    # -----------------------------------------------------------------
+
+    def step(
+        self,
+        u_field: 'npt.NDArray',
+        dt: float = 1.0,
+        external_F: Optional['npt.NDArray'] = None,
+    ) -> 'npt.NDArray':
+        """Execute one AL timestep for ALL rotors
+
+        Physical Process:
+            F_total(x) = Σ_k F_k(x)
+
+        Each ALM_k independently:
+            1. Advances its rotor azimuth
+            2. Samples u(x) at its markers
+            3. Computes BEM forces
+            4. Spreads forces via Gaussian kernel
+
+        All F_k are accumulated into a single body force field.
+
+        Args:
+            u_field: Velocity field, shape (3, Nx, Ny, Nz)  [Δx/Δt]
+            dt: Timestep  [lt]
+            external_F: Additional body force (e.g., from sponge layer)
+                        shape (3, Nx, Ny, Nz)  [lattice force / lu³]
+
+        Returns:
+            F_total: Combined body force field
+                     shape (3, Nx, Ny, Nz)  [lattice force / lu³]
+        """
+        # Reset accumulator
+        self._F_total[:] = 0.0
+
+        if external_F is not None:
+            self._F_total[:] = external_F   # [lattice force / lu³]
+
+        # Each rotor spreads its own forces; first rotor writes into
+        # fresh _F_grid, subsequent rotors accumulate additively.
+        for i, model in enumerate(self.models):
+            # Each model.step() returns its own F_grid (internal array)
+            F_k = model.step(u_field, dt=dt, external_F=None)
+            # [lattice force / lu³]
+            self._F_total += F_k    # Linear superposition
+
+        return self._F_total
+
+    # -----------------------------------------------------------------
+    # §2.5.2  Performance Queries
+    # -----------------------------------------------------------------
+
+    def get_rotor_performance(self, rotor_idx: Optional[int] = None) -> dict:
+        """Get performance coefficients for one or all rotors
+
+        Args:
+            rotor_idx: If None, returns dict of all rotors.
+                       If int, returns single rotor's performance.
+
+        Returns:
+            Single rotor: same dict as ActuatorLineModel.get_rotor_performance()
+            All rotors: {'rotor_0': {...}, 'rotor_1': {...}, ...}
+        """
+        if rotor_idx is not None:
+            return self.models[rotor_idx].get_rotor_performance()
+
+        results = {}
+        for i, (model, name) in enumerate(zip(self.models, self.names)):
+            results[name] = model.get_rotor_performance()
+        return results
+
+    def get_all_marker_positions(self) -> Dict[str, np.ndarray]:
+        """Get marker positions for all rotors (for VTK output)
+
+        Returns:
+            {name: positions_array} for each rotor
+        """
+        return {
+            name: model._last_positions
+            for name, model in zip(self.names, self.models)
+            if model._last_positions is not None
+        }
+
+    # -----------------------------------------------------------------
+    # §2.5.3  Proxy Properties (backward compatibility)
+    # -----------------------------------------------------------------
+
+    @property
+    def rotor(self) -> 'Rotor':
+        """Primary rotor (first registered) — for backward compatibility"""
+        if not self.models:
+            raise RuntimeError("No rotors registered")
+        return self.models[0].rotor
+
+    @property
+    def coeff_mode(self) -> str:
+        """Primary rotor's coefficient mode"""
+        return self.models[0].coeff_mode if self.models else 'auto'
+
+    @property
+    def u_inf_lu(self) -> Optional[float]:
+        """Primary rotor's u_inf_lu  [Δx/Δt]"""
+        return self.models[0].u_inf_lu if self.models else None
+
+    @property
+    def _last_positions(self) -> Optional[np.ndarray]:
+        """Concatenated positions from all rotors (for VTK)"""
+        positions = []
+        for model in self.models:
+            if model._last_positions is not None:
+                positions.append(model._last_positions)
+        return np.vstack(positions) if positions else None
+
+    @property
+    def _last_bem_result(self):
+        """Primary rotor's BEM result (for backward compatibility)"""
+        return self.models[0]._last_bem_result if self.models else None
+
+    @property
+    def _last_forces_global(self) -> Optional[np.ndarray]:
+        """Concatenated forces from all rotors (for VTK)"""
+        forces = []
+        for model in self.models:
+            if model._last_forces_global is not None:
+                forces.append(model._last_forces_global)
+        return np.vstack(forces) if forces else None
+
+    # -----------------------------------------------------------------
+    # §2.5.4  Info
+    # -----------------------------------------------------------------
+
+    def get_info(self) -> str:
+        """Human-readable summary"""
+        lines = [
+            f"MultiRotorManager: {self.n_rotors} rotor(s)",
+            "=" * 60,
+        ]
+        for i, (model, name) in enumerate(zip(self.models, self.names)):
+            lines.append(f"\n  [{i}] {name}:")
+            lines.append(f"      Hub: {model.rotor.hub_center}")
+            lines.append(f"      R={model.rotor.radius:.1f} lu, "
+                         f"ω={model.rotor.omega:.6f} rad/lt")
+            lines.append(f"      Blades: {model.rotor.n_blades}, "
+                         f"Markers: {model.rotor.total_markers}")
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return (
+            f"MultiRotorManager(n_rotors={self.n_rotors}, "
+            f"domain={self.domain_shape})"
+        )
+
+
+# =============================================================================
+# §3. Factory Functions (UPDATED)
 # =============================================================================
 
 def create_actuator_line_from_config(
@@ -650,48 +880,31 @@ def create_actuator_line_from_config(
     dt_phys: float = 1.0,
     u_inf_lu: Optional[float] = None,
     coeff_mode: str = 'auto',
-) -> ActuatorLineModel:
-    """Create an ActuatorLineModel from a configuration dictionary
+) -> 'ActuatorLineModel':
+    """Create a SINGLE ActuatorLineModel from config  (unchanged API)
 
     Expected Config Format:
         {
             "rotor": { ... },
             "gaussian_cutoff": 3.0,
             "rho_ref": 1.0,
-            "coeff_mode": "auto"        # 'wind_turbine' | 'rotorcraft' | 'auto'
+            "coeff_mode": "auto"
         }
-
-    Args:
-        config: AL model configuration
-        domain_shape: (Nx, Ny, Nz)
-        nu_lattice: Kinematic viscosity [lu²/lt]
-        polar_query: Airfoil data query function
-        dx_phys: Physical grid spacing [m/lu]
-        dt_phys: Physical timestep [s/lt]
-        u_inf_lu: Freestream velocity [Δx/Δt] or None (BEM fallback)
-        coeff_mode: Override for coefficient mode.
-                    If not provided, reads from config['coeff_mode'].
-
-    Returns:
-        Configured ActuatorLineModel instance
     """
+    from src.actuator.rotor import Rotor  # local import to avoid circular
+
     rotor_cfg = config.get('rotor', {})
 
     if 'grid' not in rotor_cfg:
         rotor_cfg['grid'] = {}
     if 'dx' not in rotor_cfg['grid']:
-        rotor_cfg['grid']['dx'] = dx_phys          # [m/lu]
+        rotor_cfg['grid']['dx'] = dx_phys   # [m/lu]
 
-    # Create rotor (in physical units first)
     rotor_phys = Rotor.from_config(rotor_cfg)
-
-    # Convert to lattice units
     rotor_lu = rotor_phys.to_lattice_units(
-        length_scale=dx_phys,
-        time_scale=dt_phys
+        length_scale=dx_phys, time_scale=dt_phys
     )
 
-    # Resolve coeff_mode: explicit argument > config key > default
     resolved_mode = coeff_mode if coeff_mode != 'auto' \
         else config.get('coeff_mode', 'auto')
 
@@ -707,3 +920,189 @@ def create_actuator_line_from_config(
         u_inf_lu=u_inf_lu,
         coeff_mode=resolved_mode,
     )
+
+
+def create_multi_rotor_from_config(
+    config: dict,
+    domain_shape: Tuple[int, int, int],
+    nu_lattice: float,
+    polar_query: Callable,
+    dx_phys: float = 1.0,
+    dt_phys: float = 1.0,
+    u_inf_lu: Optional[float] = None,
+    coeff_mode: str = 'auto',
+) -> MultiRotorManager:
+    """Create a MultiRotorManager from config containing 'rotors' list
+
+    Supports two config formats:
+    
+    Format A (single rotor — backward compatible):
+        {
+            "rotor": { ... },
+            "gaussian_cutoff": 3.0,
+            ...
+        }
+    
+    Format B (multi rotor):
+        {
+            "rotors": [
+                {"name": "upwind",   "rotor": { ... }},
+                {"name": "downwind", "rotor": { ... }},
+            ],
+            "gaussian_cutoff": 3.0,  # shared defaults
+            "rho_ref": 1.0,
+            "coeff_mode": "auto",
+        }
+
+    Each rotor entry can override shared defaults:
+        {
+            "name": "rotor_0",
+            "rotor": { ... },                # Rotor geometry config
+            "gaussian_cutoff": 4.0,          # override shared default
+            "rho_ref": 1.0,
+            "coeff_mode": "wind_turbine",    # override
+            "u_inf_lu": 0.05,               # per-rotor u_inf override
+        }
+
+    Args:
+        config: AL config dict (with 'rotors' list or single 'rotor')
+        domain_shape: (Nx, Ny, Nz)  [lu]
+        nu_lattice: Kinematic viscosity  [lu²/lt]
+        polar_query: Airfoil data query function
+        dx_phys: Physical grid spacing  [m/lu]
+        dt_phys: Physical timestep  [s/lt]
+        u_inf_lu: Freestream velocity  [Δx/Δt] (default for all rotors)
+        coeff_mode: Default coefficient mode
+
+    Returns:
+        MultiRotorManager with all rotors registered
+    """
+    manager = MultiRotorManager(domain_shape=domain_shape)
+
+    # ── Detect format ──
+    if 'rotors' in config:
+        # Format B: multi-rotor list
+        rotors_list = config['rotors']
+    elif 'rotor' in config:
+        # Format A: single rotor → wrap in list for uniform handling
+        rotors_list = [{"rotor": config['rotor']}]
+    else:
+        raise ValueError(
+            "actuator_line config must contain either 'rotor' (single) "
+            "or 'rotors' (list) key"
+        )
+
+    # ── Shared defaults ──
+    shared_defaults = {
+        'gaussian_cutoff': config.get('gaussian_cutoff', 3.0),
+        'rho_ref': config.get('rho_ref', 1.0),
+        'coeff_mode': config.get('coeff_mode', coeff_mode),
+    }
+
+    # ── Create each rotor ──
+    for i, rotor_entry in enumerate(rotors_list):
+        name = rotor_entry.get('name', f'rotor_{i}')
+
+        # Build per-rotor config by merging shared defaults + overrides
+        single_config = {
+            'rotor': rotor_entry.get('rotor', rotor_entry),
+            'gaussian_cutoff': rotor_entry.get(
+                'gaussian_cutoff', shared_defaults['gaussian_cutoff']
+            ),
+            'rho_ref': rotor_entry.get(
+                'rho_ref', shared_defaults['rho_ref']
+            ),
+            'coeff_mode': rotor_entry.get(
+                'coeff_mode', shared_defaults['coeff_mode']
+            ),
+        }
+
+        # Per-rotor u_inf override
+        rotor_u_inf = rotor_entry.get('u_inf_lu', u_inf_lu)
+
+        al_model = create_actuator_line_from_config(
+            config=single_config,
+            domain_shape=domain_shape,
+            nu_lattice=nu_lattice,
+            polar_query=polar_query,
+            dx_phys=dx_phys,
+            dt_phys=dt_phys,
+            u_inf_lu=rotor_u_inf,
+            coeff_mode=single_config['coeff_mode'],
+        )
+
+        manager.add_model(al_model, name=name)
+
+    return manager
+
+
+# =============================================================================
+# §3. Factory Function [single factory old version]
+# =============================================================================
+
+# def create_actuator_line_from_config(
+#     config: dict,
+#     domain_shape: Tuple[int, int, int],
+#     nu_lattice: float,
+#     polar_query: Callable,
+#     dx_phys: float = 1.0,
+#     dt_phys: float = 1.0,
+#     u_inf_lu: Optional[float] = None,
+#     coeff_mode: str = 'auto',
+# ) -> ActuatorLineModel:
+#     """Create an ActuatorLineModel from a configuration dictionary
+
+#     Expected Config Format:
+#         {
+#             "rotor": { ... },
+#             "gaussian_cutoff": 3.0,
+#             "rho_ref": 1.0,
+#             "coeff_mode": "auto"        # 'wind_turbine' | 'rotorcraft' | 'auto'
+#         }
+
+#     Args:
+#         config: AL model configuration
+#         domain_shape: (Nx, Ny, Nz)
+#         nu_lattice: Kinematic viscosity [lu²/lt]
+#         polar_query: Airfoil data query function
+#         dx_phys: Physical grid spacing [m/lu]
+#         dt_phys: Physical timestep [s/lt]
+#         u_inf_lu: Freestream velocity [Δx/Δt] or None (BEM fallback)
+#         coeff_mode: Override for coefficient mode.
+#                     If not provided, reads from config['coeff_mode'].
+
+#     Returns:
+#         Configured ActuatorLineModel instance
+#     """
+#     rotor_cfg = config.get('rotor', {})
+
+#     if 'grid' not in rotor_cfg:
+#         rotor_cfg['grid'] = {}
+#     if 'dx' not in rotor_cfg['grid']:
+#         rotor_cfg['grid']['dx'] = dx_phys          # [m/lu]
+
+#     # Create rotor (in physical units first)
+#     rotor_phys = Rotor.from_config(rotor_cfg)
+
+#     # Convert to lattice units
+#     rotor_lu = rotor_phys.to_lattice_units(
+#         length_scale=dx_phys,
+#         time_scale=dt_phys
+#     )
+
+#     # Resolve coeff_mode: explicit argument > config key > default
+#     resolved_mode = coeff_mode if coeff_mode != 'auto' \
+#         else config.get('coeff_mode', 'auto')
+
+#     return ActuatorLineModel(
+#         rotor=rotor_lu,
+#         nu=nu_lattice,
+#         domain_shape=domain_shape,
+#         polar_query=polar_query,
+#         rho_ref=config.get('rho_ref', 1.0),
+#         n_cut=config.get('gaussian_cutoff', 3.0),
+#         dx_phys=dx_phys,
+#         dt_phys=dt_phys,
+#         u_inf_lu=u_inf_lu,
+#         coeff_mode=resolved_mode,
+#     )

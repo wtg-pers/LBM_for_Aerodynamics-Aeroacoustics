@@ -473,23 +473,22 @@ def main():
     # =========================================================================
     # [5.4] Actuator Line Model (conditional)
     # =========================================================================
-    al_model = None
-    polar_manager = None  # For multi-airfoil support
+    al_model = None           # ActuatorLineModel 또는 MultiRotorManager
+    polar_manager = None
     
     if al_enabled:
-        from src.actuator.actuator_line import create_actuator_line_from_config
-        from src.actuator.airfoil_data import create_polar_from_config  # NEW
+        from src.actuator.actuator_line import (
+            create_actuator_line_from_config,
+            create_multi_rotor_from_config,   # ← NEW
+            MultiRotorManager,                 # ← NEW
+        )
+        from src.actuator.airfoil_data import create_polar_from_config
 
-        print(f"\n[5.4] Actuator Line Model")
+        print(f"\\n[5.4] Actuator Line Model")
         
-        # ─────────────────────────────────────────────────────────────────
-        # Load airfoil polar from config
-        # ─────────────────────────────────────────────────────────────────
+        # ── Load airfoil polar ──
         polar_config = config_loader.config.get('airfoil_polar', {})
-        
         if not polar_config:
-            # Fallback: default neuralfoil configuration
-            print("  [WARNING] No 'airfoil_polar' in config, using default")
             polar_config = {
                 "method": "neuralfoil",
                 "airfoil_name": "naca0012",
@@ -500,52 +499,134 @@ def main():
         method = polar_config.get('method', 'neuralfoil')
         print(f"  Airfoil polar method: '{method}'")
         
-        if method == 'multi':
-            print(f"    Airfoils: {list(polar_config.get('airfoils', {}).keys())}")
-            print(f"    Default: {polar_config.get('default', 'auto')}")
-        else:
-            print(f"    Airfoil: {polar_config.get('airfoil_name', 'N/A')}")
-            print(f"    Re_target: {polar_config.get('Re_target', 'N/A')}")
-            if polar_config.get('Re_min') is not None:
-                print(f"    Re range: [{polar_config['Re_min']}, {polar_config.get('Re_max')}]")
-        
-        print("  Generating polar data...")
         polar_query, polar_manager = create_polar_from_config(polar_config)
         
-        if polar_manager is not None:
-            print(f"  Loaded {len(polar_manager.airfoil_names)} airfoil(s): "
-                  f"{polar_manager.airfoil_names}")
-        else:
-            print("  Single airfoil mode")
-        
-        # ─────────────────────────────────────────────────────────────────
-        # Create Actuator Line Model
-        # ─────────────────────────────────────────────────────────────────
-        print("  Creating rotor...")
-
-        # --- u_inf_lu 도출 ---
+        # ── u_inf_lu ──
         U_inf_phys = physics_config.get('U_inf', 0.0)        # [m/s]
         u_inf_lu = U_inf_phys * dt_phys / dx_phys             # [Δx/Δt]
         u_inf_lu_arg = u_inf_lu if u_inf_lu > 0 else None
 
-        al_model = create_actuator_line_from_config(
-            config=al_cfg,
-            domain_shape=domain_shape,
-            nu_lattice=nu_lu,
-            polar_query=polar_query,
-            dx_phys=dx_phys,
-            dt_phys=dt_phys,
-            u_inf_lu=u_inf_lu_arg,
-            coeff_mode=al_cfg.get('coeff_mode', 'auto'),
-        )
+        # ── Detect single vs multi rotor ──
+        if 'rotors' in al_cfg:
+            # ═══ Multi-Rotor Mode ═══
+            print(f"  Mode: MULTI-ROTOR ({len(al_cfg['rotors'])} rotors)")
+            
+            al_model = create_multi_rotor_from_config(
+                config=al_cfg,
+                domain_shape=domain_shape,
+                nu_lattice=nu_lu,
+                polar_query=polar_query,
+                dx_phys=dx_phys,
+                dt_phys=dt_phys,
+                u_inf_lu=u_inf_lu_arg,
+                coeff_mode=al_cfg.get('coeff_mode', 'auto'),
+            )
+            
+            # Print each rotor info
+            for i, (model, name) in enumerate(
+                zip(al_model.models, al_model.names)
+            ):
+                print(f"    [{i}] {name}: "
+                      f"hub={model.rotor.hub_center}, "
+                      f"R={model.rotor.radius:.1f} lu, "
+                      f"ω={model.rotor.omega:.6f} rad/lt, "
+                      f"blades={model.rotor.n_blades}")
+        else:
+            # ═══ Single-Rotor Mode (backward compatible) ═══
+            print(f"  Mode: SINGLE-ROTOR")
+            
+            al_model = create_actuator_line_from_config(
+                config=al_cfg,
+                domain_shape=domain_shape,
+                nu_lattice=nu_lu,
+                polar_query=polar_query,
+                dx_phys=dx_phys,
+                dt_phys=dt_phys,
+                u_inf_lu=u_inf_lu_arg,
+                coeff_mode=al_cfg.get('coeff_mode', 'auto'),
+            )
 
-        if al_model.u_inf_lu is not None:
-            print(f"  u_inf_lu = {al_model.u_inf_lu:.6f} [Δx/Δt]  (from U_inf={U_inf_phys} m/s)")
+        # ── Print summary (works for both single & multi) ──
+        if hasattr(al_model, 'u_inf_lu') and al_model.u_inf_lu is not None:
+            print(f"  u_inf_lu = {al_model.u_inf_lu:.6f} [Δx/Δt]")
         else:
             print(f"  u_inf_lu = None (hover mode, BEM fallback)")
-        print(f"  coeff_mode = '{al_model.coeff_mode}'")
+        
+        if hasattr(al_model, 'coeff_mode'):
+            print(f"  coeff_mode = '{al_model.coeff_mode}'")
+    # al_model = None
+    # polar_manager = None  # For multi-airfoil support
+    
+    # if al_enabled:
+    #     from src.actuator.actuator_line import create_actuator_line_from_config
+    #     from src.actuator.airfoil_data import create_polar_from_config  # NEW
 
-        print(f"  {al_model}")
+    #     print(f"\n[5.4] Actuator Line Model")
+        
+    #     # ─────────────────────────────────────────────────────────────────
+    #     # Load airfoil polar from config
+    #     # ─────────────────────────────────────────────────────────────────
+    #     polar_config = config_loader.config.get('airfoil_polar', {})
+        
+    #     if not polar_config:
+    #         # Fallback: default neuralfoil configuration
+    #         print("  [WARNING] No 'airfoil_polar' in config, using default")
+    #         polar_config = {
+    #             "method": "neuralfoil",
+    #             "airfoil_name": "naca0012",
+    #             "Re_target": 1e5,
+    #             "mode": "asb",
+    #         }
+        
+    #     method = polar_config.get('method', 'neuralfoil')
+    #     print(f"  Airfoil polar method: '{method}'")
+        
+    #     if method == 'multi':
+    #         print(f"    Airfoils: {list(polar_config.get('airfoils', {}).keys())}")
+    #         print(f"    Default: {polar_config.get('default', 'auto')}")
+    #     else:
+    #         print(f"    Airfoil: {polar_config.get('airfoil_name', 'N/A')}")
+    #         print(f"    Re_target: {polar_config.get('Re_target', 'N/A')}")
+    #         if polar_config.get('Re_min') is not None:
+    #             print(f"    Re range: [{polar_config['Re_min']}, {polar_config.get('Re_max')}]")
+        
+    #     print("  Generating polar data...")
+    #     polar_query, polar_manager = create_polar_from_config(polar_config)
+        
+    #     if polar_manager is not None:
+    #         print(f"  Loaded {len(polar_manager.airfoil_names)} airfoil(s): "
+    #               f"{polar_manager.airfoil_names}")
+    #     else:
+    #         print("  Single airfoil mode")
+        
+    #     # ─────────────────────────────────────────────────────────────────
+    #     # Create Actuator Line Model
+    #     # ─────────────────────────────────────────────────────────────────
+    #     print("  Creating rotor...")
+
+    #     # --- u_inf_lu 도출 ---
+    #     U_inf_phys = physics_config.get('U_inf', 0.0)        # [m/s]
+    #     u_inf_lu = U_inf_phys * dt_phys / dx_phys             # [Δx/Δt]
+    #     u_inf_lu_arg = u_inf_lu if u_inf_lu > 0 else None
+
+    #     al_model = create_actuator_line_from_config(
+    #         config=al_cfg,
+    #         domain_shape=domain_shape,
+    #         nu_lattice=nu_lu,
+    #         polar_query=polar_query,
+    #         dx_phys=dx_phys,
+    #         dt_phys=dt_phys,
+    #         u_inf_lu=u_inf_lu_arg,
+    #         coeff_mode=al_cfg.get('coeff_mode', 'auto'),
+    #     )
+
+    #     if al_model.u_inf_lu is not None:
+    #         print(f"  u_inf_lu = {al_model.u_inf_lu:.6f} [Δx/Δt]  (from U_inf={U_inf_phys} m/s)")
+    #     else:
+    #         print(f"  u_inf_lu = None (hover mode, BEM fallback)")
+    #     print(f"  coeff_mode = '{al_model.coeff_mode}'")
+
+    #     print(f"  {al_model}")
 
         # === DEBUG: AL 진단 ===
         # print("\n  [DEBUG] AL Diagnostics:")
@@ -643,13 +724,24 @@ def main():
         # ─── Progress bar ────────────────────────────────────────────
         if step % 10 == 0:
             if al_model is not None:
-                current_rev = al_model.rotor.n_revolutions
-                pbar.set_postfix({
-                    'rev': f"{current_rev:.2f}",
-                    'C_T': f"{last_ct:.3f}",
-                    'C_P': f"{last_cp:.3f}",
-                    'drift': f"{last_drift:+.3f}%"
-                })
+                if isinstance(al_model, MultiRotorManager):
+                    # Show primary rotor's performance
+                    perf = al_model.get_rotor_performance(rotor_idx=0)
+                    current_rev = perf.get('revolutions', 0)
+                    pbar.set_postfix({
+                        'rev': f"{current_rev:.2f}",
+                        'C_T': f"{perf.get('C_T', 0):.3f}",
+                        'rotors': f"{al_model.n_rotors}",
+                        'drift': f"{last_drift:+.3f}%"
+                    })
+                else:
+                    current_rev = al_model.rotor.n_revolutions
+                    pbar.set_postfix({
+                        'rev': f"{current_rev:.2f}",
+                        'C_T': f"{last_ct:.3f}",
+                        'C_P': f"{last_cp:.3f}",
+                        'drift': f"{last_drift:+.3f}%"
+                    })
             elif force_mgr is not None:
                 pbar.set_postfix({
                     'Cd': f"{last_Cd:.3f}",
@@ -688,21 +780,25 @@ def main():
 
             # Rotor performance logging (Actuator Line)
             if al_model is not None and perf_csv_path is not None:
-                perf = al_model.get_rotor_performance()
-                last_ct = perf.get('C_T', 0)
-                last_cp = perf.get('C_P', 0)
-                last_rev = perf.get('revolutions', 0)
-                with open(perf_csv_path, 'a') as fh:
-                    fh.write(f"{step},{step},"
-                             f"{step * dt_phys:.6e},"
-                             f"{perf.get('revolutions', 0):.4f},"
-                             f"{perf.get('thrust', 0):.6e},"
-                             f"{perf.get('torque', 0):.6e},"
-                             f"{perf.get('power', 0):.6e},"
-                             f"{last_ct:.6f},{last_cp:.6f},"
-                             f"{perf.get('coeff_mode', 'N/A')},"
-                             f"{perf.get('u_inf_used', 0):.6e},"
-                             f"{perf.get('FM', 0):.6f}\n")
+                if isinstance(al_model, MultiRotorManager):
+                    # Log each rotor separately
+                    for ri, rname in enumerate(al_model.names):
+                        perf = al_model.get_rotor_performance(rotor_idx=ri)
+                        # CSV header에 rotor name 접두사 추가 필요
+                        last_ct = perf.get('C_T', 0)
+                        last_cp = perf.get('C_P', 0)
+                        last_rev = perf.get('revolutions', 0)
+                        with open(perf_csv_path, 'a') as fh:
+                            fh.write(f"{step},{rname},{last_rev:.6f},"
+                                     f"{last_ct:.6f},{last_cp:.6f}\\n")
+                else:
+                    perf = al_model.get_rotor_performance()
+                    last_ct = perf.get('C_T', 0)
+                    last_cp = perf.get('C_P', 0)
+                    last_rev = perf.get('revolutions', 0)
+                    with open(perf_csv_path, 'a') as fh:
+                        fh.write(f"{step},{last_rev:.6f},"
+                                 f"{last_ct:.6f},{last_cp:.6f}\\n")
 
             # Convergence check
             if conv_monitor.enabled:
@@ -822,13 +918,20 @@ def main():
     # Rotor Performance Summary (Actuator Line)
     # =========================================================================
     if al_model is not None:
-        perf = al_model.get_rotor_performance()
-        print(f"\n[9] Rotor Performance")
-        print(f"  Revolutions: {perf.get('revolutions', 0):.2f}")
-        print(f"  C_T = {perf.get('C_T', 0):.4f}  (mode: {perf.get('coeff_mode', 'N/A')})")
-        print(f"  C_P = {perf.get('C_P', 0):.4f}")
-        print(f"  FM  = {perf.get('FM', 0):.4f}")
-        print(f"  u_inf_used = {perf.get('u_inf_used', 0):.6e} [Δx/Δt]")
+        if isinstance(al_model, MultiRotorManager):
+            print(f"\\n[9] Multi-Rotor Performance ({al_model.n_rotors} rotors)")
+            for i, name in enumerate(al_model.names):
+                perf = al_model.get_rotor_performance(rotor_idx=i)
+                print(f"  [{i}] {name}:")
+                print(f"      Rev={perf.get('revolutions',0):.2f}, "
+                      f"C_T={perf.get('C_T',0):.4f}, "
+                      f"C_P={perf.get('C_P',0):.4f}")
+        else:
+            perf = al_model.get_rotor_performance()
+            print(f"\\n[9] Rotor Performance")
+            print(f"  Revolutions: {perf.get('revolutions', 0):.2f}")
+            print(f"  C_T = {perf.get('C_T', 0):.4f}")
+            print(f"  C_P = {perf.get('C_P', 0):.4f}")
     
     # =========================================================================
     # Convergence Summary

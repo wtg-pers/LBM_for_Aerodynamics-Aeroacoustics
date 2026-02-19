@@ -329,6 +329,30 @@ class Rotor:
     # §1.3 Force Projection
     # -----------------------------------------------------------------
 
+    # def project_blade_forces(
+    #     self,
+    #     blade_idx: int,
+    #     F_n: np.ndarray,
+    #     F_theta: np.ndarray
+    # ) -> np.ndarray:
+    #     """Project forces on a single blade to global frame
+
+    #     Uses the blade's coordinate system for projection.
+
+    #     Args:
+    #         blade_idx: Blade index
+    #         F_n:     Normal (axial) forces, shape (n_markers,)  [N or lu_force]
+    #         F_theta: Tangential (rotational) forces, shape (n_markers,) [N or lu_force]
+
+    #     Returns:
+    #         F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
+    #                   [N or lu_force]
+    #     """
+    #     return self.blades[blade_idx].project_forces_to_global(
+    #         F_n=F_n,
+    #         F_theta=F_theta,
+    #         theta=self.theta[blade_idx]
+    #     )  # [N or lu_force]
     def project_blade_forces(
         self,
         blade_idx: int,
@@ -338,6 +362,8 @@ class Rotor:
         """Project forces on a single blade to global frame
 
         Uses the blade's coordinate system for projection.
+        Automatically applies rotation_sign = sign(ω) for
+        correct global force direction with counter-rotating rotors.
 
         Args:
             blade_idx: Blade index
@@ -348,18 +374,54 @@ class Rotor:
             F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
                       [N or lu_force]
         """
+        rotation_sign = float(np.sign(self.omega))  # [-]
+
         return self.blades[blade_idx].project_forces_to_global(
             F_n=F_n,
             F_theta=F_theta,
-            theta=self.theta[blade_idx]
+            theta=self.theta[blade_idx],
+            rotation_sign=rotation_sign
         )  # [N or lu_force]
 
+    # def project_all_forces(
+    #     self,
+    #     F_n_all: np.ndarray,
+    #     F_theta_all: np.ndarray
+    # ) -> np.ndarray:
+    #     """Project forces on ALL blades to global frame
+
+    #     Args:
+    #         F_n_all:     Normal forces, shape (N_b * n_markers,)  [N or lu_force]
+    #         F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
+    #                      Ordered as [blade_0_markers, blade_1_markers, ...]
+
+    #     Returns:
+    #         F_global: shape (N_b * n_markers, 3) — (F_x, F_y, F_z)
+    #                   [N or lu_force]
+    #     """
+    #     F_global = np.zeros((self.total_markers, 3), dtype=np.float64)
+
+    #     for k in range(self.n_blades):
+    #         i_start = k * self.markers_per_blade
+    #         i_end = i_start + self.markers_per_blade
+
+    #         F_global[i_start:i_end, :] = self.blades[k].project_forces_to_global(
+    #             F_n=F_n_all[i_start:i_end],
+    #             F_theta=F_theta_all[i_start:i_end],
+    #             theta=self.theta[k]
+    #         )  # [N or lu_force]
+
+    #     return F_global  # [N or lu_force]
     def project_all_forces(
         self,
         F_n_all: np.ndarray,
         F_theta_all: np.ndarray
     ) -> np.ndarray:
         """Project forces on ALL blades to global frame
+
+        Automatically applies rotation_sign = sign(ω) so that
+        counter-rotating rotors (ω < 0) project tangential forces
+        in the correct global direction.
 
         Args:
             F_n_all:     Normal forces, shape (N_b * n_markers,)  [N or lu_force]
@@ -370,6 +432,8 @@ class Rotor:
             F_global: shape (N_b * n_markers, 3) — (F_x, F_y, F_z)
                       [N or lu_force]
         """
+        rotation_sign = float(np.sign(self.omega))  # [-]
+
         F_global = np.zeros((self.total_markers, 3), dtype=np.float64)
 
         for k in range(self.n_blades):
@@ -379,7 +443,8 @@ class Rotor:
             F_global[i_start:i_end, :] = self.blades[k].project_forces_to_global(
                 F_n=F_n_all[i_start:i_end],
                 F_theta=F_theta_all[i_start:i_end],
-                theta=self.theta[k]
+                theta=self.theta[k],
+                rotation_sign=rotation_sign       # ← 역회전 지원
             )  # [N or lu_force]
 
         return F_global  # [N or lu_force]
@@ -460,21 +525,45 @@ class Rotor:
             theta=self.theta[blade_idx]
         )
 
-        # Blade rotation velocity (Eq. 6 setup)
-        omega_r = self.omega * blade.marker_r  # [m/s or lu/lt]
+        # # Blade rotation velocity (Eq. 6 setup)
+        # omega_r = self.omega * blade.marker_r  # [m/s or lu/lt]
 
-        # Tangential velocity relative to blade (Eq. 6)
-        u_tangential_rel = omega_r - u_theta   # [m/s or lu/lt]
+        # # Tangential velocity relative to blade (Eq. 6)
+        # u_tangential_rel = omega_r - u_theta   # [m/s or lu/lt]
+
+        # # Relative velocity magnitude (Eq. 6)
+        # u_rel = np.sqrt(u_n**2 + u_tangential_rel**2)  # [m/s or lu/lt]
+
+        # # Flow angle (Eq. 7)  [rad]
+        # phi_rad = np.arctan2(u_n, u_tangential_rel)     # [rad]
+        # phi_deg = np.degrees(phi_rad)                    # [degrees]
+
+        # # Angle of attack (Eq. 8)  [degrees]
+        # alpha_deg = phi_deg - blade.marker_twist         # [degrees]
+
+        # return u_rel, phi_deg, alpha_deg, u_n, u_theta
+
+        # ω 부호 분리: BEM 삼각형은 블레이드 로컬 프레임 (Eq. 6-7)
+        # blade_speed = |ω|·r  (항상 양수: 블레이드 이동 속력)
+        # u_theta_blade: 블레이드 이동 방향에서 본 유동의 접선 성분
+        #   ω > 0 → 블레이드가 +ê_θ 방향 → +u_theta가 순풍
+        #   ω < 0 → 블레이드가 -ê_θ 방향 → -u_theta가 순풍
+        rotation_sign = np.sign(self.omega)                    # +1 or -1  [-]
+        blade_speed = np.abs(self.omega) * blade.marker_r      # |ω|·r  [m/s or lu/lt]
+        u_theta_blade = rotation_sign * u_theta                # [m/s or lu/lt]
+
+        # Blade-frame relative tangential velocity (Eq. 6, always positive expected)
+        u_tangential_rel = blade_speed - u_theta_blade         # [m/s or lu/lt]
 
         # Relative velocity magnitude (Eq. 6)
-        u_rel = np.sqrt(u_n**2 + u_tangential_rel**2)  # [m/s or lu/lt]
+        u_rel = np.sqrt(u_n**2 + u_tangential_rel**2)         # [m/s or lu/lt]
 
-        # Flow angle (Eq. 7)  [rad]
-        phi_rad = np.arctan2(u_n, u_tangential_rel)     # [rad]
-        phi_deg = np.degrees(phi_rad)                    # [degrees]
+        # Flow angle (Eq. 7) — always 1st quadrant for normal operation
+        phi_rad = np.arctan2(u_n, u_tangential_rel)            # [rad]
+        phi_deg = np.degrees(phi_rad)                          # [degrees]
 
-        # Angle of attack (Eq. 8)  [degrees]
-        alpha_deg = phi_deg - blade.marker_twist         # [degrees]
+        # Angle of attack (Eq. 8)
+        alpha_deg = phi_deg - blade.marker_twist               # [degrees]
 
         return u_rel, phi_deg, alpha_deg, u_n, u_theta
 
@@ -566,7 +655,11 @@ class Rotor:
         radii = self.get_all_marker_radii()    # [m or lu]
 
         thrust = np.sum(F_n_all[active])                    # [N or lu_force]
-        torque = np.sum(F_theta_all[active] * radii[active])  # [N·m or lu_torque]
+        torque_local = np.sum(F_theta_all[active] * radii[active])  # [N·m or lu_torque]
+
+        # Global-frame torque: sign(ω) maps blade-local → rotation axis direction
+        rotation_sign = float(np.sign(self.omega))  # [-]
+        torque = rotation_sign * torque_local        # [N·m or lu_torque]
 
         return thrust, torque
 
@@ -615,7 +708,7 @@ class Rotor:
         A = np.pi * self.radius**2
 
         # --- Mode selection ---
-        omega_R = self.omega * self.radius          # [m/s or lu/lt] tip speed
+        omega_R = np.abs(self.omega) * self.radius          # [m/s or lu/lt] tip speed
         if mode == 'auto':
             actual_mode = 'rotorcraft' if u_inf < 0.01 * omega_R else 'wind_turbine'
         else:
@@ -660,8 +753,11 @@ class Rotor:
         active = self.get_all_marker_active()  # [bool]
         radii = self.get_all_marker_radii()    # [m or lu]
 
-        torque = np.sum(F_theta_all[active] * radii[active])  # [N·m or lu_torque]
-        power = self.omega * torque                            # [W or lu_power]
+        torque_local = np.sum(F_theta_all[active] * radii[active])  # [N·m or lu_torque]
+        rotation_sign = float(np.sign(self.omega))  # [-]
+        torque = rotation_sign * torque_local        # [N·m or lu_torque] (global frame)
+
+        power = self.omega * torque                  # [W or lu_power]
 
         return power
 

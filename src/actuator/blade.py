@@ -455,7 +455,7 @@ class Blade:
         Local Coordinate System:
             If coord_system is set (recommended):
                 ê_n = coord_system.n_axis              (rotation axis / normal)
-                ê_θ = coord_system.tangent_vector(θ)   (Watanabe tangent)
+                ê_θ = coord_system.tangent_vector(θ)   (standard tangent, ∂x/∂θ direction)
                 ê_r = coord_system.radial_vector(θ)    (radial / outward)
             
             If coord_system is None (legacy, X-axis only):
@@ -498,20 +498,68 @@ class Blade:
     # §2.5 Force Projection to Global Frame
     # -----------------------------------------------------------------
 
+    # def project_forces_to_global(
+    #     self,
+    #     F_n: np.ndarray,
+    #     F_theta: np.ndarray,
+    #     theta: float
+    # ) -> np.ndarray:
+    #     """Project normal/tangential forces to global (x, y, z) frame
+
+    #     Watanabe et al. Convention:
+    #         If coord_system is set (recommended):
+    #             F^AL = coord_system.project_force_to_global(F_n, F_theta, theta)
+            
+    #         If coord_system is None (legacy, X-axis only):
+    #             F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))
+
+    #     Sign Convention:
+    #         F^AL is the aerodynamic force ON THE BLADE from the fluid.
+    #         The body force applied to the fluid (Eq. 13) is -F^AL.
+
+    #     Args:
+    #         F_n:     Normal forces, shape (n_markers,)     [N or lattice force]
+    #         F_theta: Tangential forces, shape (n_markers,) [N or lattice force]
+    #         theta:   Azimuth angle  [radians]
+
+    #     Returns:
+    #         F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
+    #                   [N or lattice force units]
+    #     """
+    #     # --- New: Use coordinate system if available ---
+    #     if self._coord_system is not None:
+    #         return self._coord_system.project_force_to_global(F_n, F_theta, theta)
+        
+    #     # --- Legacy: Hardcoded X-axis rotation ---
+    #     cos_t = np.cos(theta)   # [dimensionless]
+    #     sin_t = np.sin(theta)   # [dimensionless]
+
+    #     F_global = np.zeros((self.n_markers, 3), dtype=np.float64)
+    #     F_global[:, 0] = F_n                    # F_x = F_n
+    #     F_global[:, 1] = F_theta * cos_t        # F_y = F_θ · cos(θ)
+    #     F_global[:, 2] = -F_theta * sin_t       # F_z = -F_θ · sin(θ)
+
+    #     return F_global  # [N or lattice force units]
     def project_forces_to_global(
         self,
         F_n: np.ndarray,
         F_theta: np.ndarray,
-        theta: float
+        theta: float,
+        rotation_sign: float = 1.0
     ) -> np.ndarray:
         """Project normal/tangential forces to global (x, y, z) frame
 
-        Watanabe et al. Convention:
+        Extended Watanabe Convention (counter-rotation support):
             If coord_system is set (recommended):
-                F^AL = coord_system.project_force_to_global(F_n, F_theta, theta)
+                F^AL = coord_system.project_force_to_global(
+                    F_n, F_theta, theta, rotation_sign)
             
             If coord_system is None (legacy, X-axis only):
-                F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))
+                F^AL = (F_n, sign·F_θ·cos(θ), -sign·F_θ·sin(θ))
+
+        rotation_sign accounts for the blade's rotation direction:
+            ω > 0 → rotation_sign = +1 (default, backward compatible)
+            ω < 0 → rotation_sign = -1 (counter-rotating rotor)
 
         Sign Convention:
             F^AL is the aerodynamic force ON THE BLADE from the fluid.
@@ -521,6 +569,8 @@ class Blade:
             F_n:     Normal forces, shape (n_markers,)     [N or lattice force]
             F_theta: Tangential forces, shape (n_markers,) [N or lattice force]
             theta:   Azimuth angle  [radians]
+            rotation_sign: sign(ω), +1.0 or -1.0  [-]
+                           Default +1.0 preserves backward compatibility.
 
         Returns:
             F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
@@ -528,16 +578,21 @@ class Blade:
         """
         # --- New: Use coordinate system if available ---
         if self._coord_system is not None:
-            return self._coord_system.project_force_to_global(F_n, F_theta, theta)
+            return self._coord_system.project_force_to_global(
+                F_n, F_theta, theta, rotation_sign=rotation_sign
+            )
         
         # --- Legacy: Hardcoded X-axis rotation ---
         cos_t = np.cos(theta)   # [dimensionless]
         sin_t = np.sin(theta)   # [dimensionless]
 
+        # ★ rotation_sign 적용 (legacy path) ★
+        F_theta_global = rotation_sign * F_theta   # [N or lattice force]
+
         F_global = np.zeros((self.n_markers, 3), dtype=np.float64)
-        F_global[:, 0] = F_n                    # F_x = F_n
-        F_global[:, 1] = F_theta * cos_t        # F_y = F_θ · cos(θ)
-        F_global[:, 2] = -F_theta * sin_t       # F_z = -F_θ · sin(θ)
+        F_global[:, 0] = F_n                          # F_x = F_n
+        F_global[:, 1] = F_theta_global * cos_t       # F_y = sign·F_θ · cos(θ)
+        F_global[:, 2] = -F_theta_global * sin_t      # F_z = -sign·F_θ · sin(θ)
 
         return F_global  # [N or lattice force units]
 

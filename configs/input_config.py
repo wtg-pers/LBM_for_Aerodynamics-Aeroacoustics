@@ -244,15 +244,45 @@ if ALM_ENABLED:
     PITCH       = 10.0              # [deg] Collective pitch
     N_BLADES    = 2                 # [-]
     ROOT_CUT    = 0.20              # [-]
+
+    # ── Blade section template (재사용) ──
+    def _make_blade_sections(R, chord, pitch):
+        """공통 blade section 생성기"""
+        return [
+            {"r": 0.0,                       "chord": chord, 
+             "twist": -pitch, "airfoil": "naca0012", "active": False},
+            {"r": R * ROOT_CUT,              "chord": chord, 
+             "twist": -pitch, "airfoil": "naca0012", "active": False},
+            {"r": R * ROOT_CUT + 1e-6,       "chord": chord, 
+             "twist": -pitch, "airfoil": "naca0012", "active": True},
+            {"r": R,                         "chord": chord, 
+             "twist": -pitch, "airfoil": "naca0012", "active": True},
+        ]
     
-    # Hub position
-    HUB_X_LU    = Nx // 2
-    HUB_Y_LU    = Ny // 2
-    HUB_Z_LU    = Nz * 0.75
+    # ── Rotor 0: Upwind turbine ──
+    HUB_0_X_LU = Nx * 0.3
+    HUB_0_Y_LU = Ny * 0.3
+    HUB_0_Z_LU = Nz * 0.75
+
+    # ── Rotor 1: Downwind turbine ──
+    HUB_1_X_LU = Nx * 0.7
+    HUB_1_Y_LU = Ny * 0.3
+    HUB_1_Z_LU = Nz * 0.75
+
+    # ── Rotor 2: Upwind turbine ──
+    HUB_2_X_LU = Nx * 0.3
+    HUB_2_Y_LU = Ny * 0.7
+    HUB_2_Z_LU = Nz * 0.75
+
+    # ── Rotor 3: Downwind turbine ──
+    HUB_3_X_LU = Nx * 0.7
+    HUB_3_Y_LU = Ny * 0.7
+    HUB_3_Z_LU = Nz * 0.75
+
     
-    HUB_X_PHYS  = HUB_X_LU * DX_PHYS   # [m]
-    HUB_Y_PHYS  = HUB_Y_LU * DX_PHYS   # [m]
-    HUB_Z_PHYS  = HUB_Z_LU * DX_PHYS   # [m]
+    # HUB_X_PHYS  = HUB_X_LU * DX_PHYS   # [m]
+    # HUB_Y_PHYS  = HUB_Y_LU * DX_PHYS   # [m]
+    # HUB_Z_PHYS  = HUB_Z_LU * DX_PHYS   # [m]
     
     # Polar Re range
     RE_POLAR_MIN    = max(1.0, RE * 0.15)
@@ -265,41 +295,109 @@ actuator_line = {
 
 if ALM_ENABLED:
     actuator_line.update({
-        "rotor": {
-            "n_blades": N_BLADES,
-            "hub_center": [HUB_X_PHYS, HUB_Y_PHYS, HUB_Z_PHYS],  # [m]
-            "omega": OMEGA_ROTOR,      # [rad/s] rotor angular velocity
-            "theta_0": 0.0,            # [rad]
-            "rotation_axis": "hawt_z",
-            
-            "blade": {
-                "sections": [
-                    {"r": 0.0,                       "chord": CHORD_BLADE, 
-                     "twist": -PITCH, "airfoil": "naca0012", "active": False},
-                    {"r": R_ROTOR * ROOT_CUT,        "chord": CHORD_BLADE, 
-                     "twist": -PITCH, "airfoil": "naca0012", "active": False},
-                    {"r": R_ROTOR * ROOT_CUT + 1e-6, "chord": CHORD_BLADE, 
-                     "twist": -PITCH, "airfoil": "naca0012", "active": True},
-                    {"r": R_ROTOR,                   "chord": CHORD_BLADE, 
-                     "twist": -PITCH, "airfoil": "naca0012", "active": True},
-                ],
-            },
+        # ─── 공유 파라미터 (shared defaults) ───
+        "rho_ref": RHO_REF,                # [kg/m³]
+        "gaussian_cutoff": 3.0,            # [-]
+        "coeff_mode": "rotorcraft",        # 'wind_turbine' | 'rotorcraft' | 'auto'
 
-            "grid": {"n_radial": 20,            # [-]  markers per blade (radial direction)
-            },
-        },
-
-
+        # ─── 단위 변환 (shared) ───
         "units": {
-            "dx_phys": DX_PHYS,        # [m/lu]
-            "dt_phys": DT_PHYS,        # [s/lt]
-            "nu_phys": NU_PHYS,        # [m²/s]
+            "dx_phys": DX_PHYS,            # [m/lu]
+            "dt_phys": DT_PHYS,            # [s/lt]
+            "nu_phys": NU_PHYS,            # [m²/s]
         },
-        
-        "rho_ref": RHO_REF,            # [kg/m³]
-        "gaussian_cutoff": 3.0,
-        "coeff_mode": "rotorcraft",          # 'wind_turbine' | 'rotorcraft' | 'auto'
-                                       # auto: u_inf < 1% tip speed → rotorcraft
+
+        # ─── Multi-rotor 리스트 ───
+        "rotors": [
+            {
+                "name": "rotor_0",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_0_X_LU * DX_PHYS,
+                                   HUB_0_Y_LU * DX_PHYS,
+                                   HUB_0_Z_LU * DX_PHYS],  # [m]
+                    "omega": OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": "hawt_z",
+
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+                # Per-rotor override (optional):
+                # "coeff_mode": "wind_turbine",
+                # "gaussian_cutoff": 4.0,
+            },
+            # ────────────── Rotor 1: Downwind ──────────────
+            {
+                "name": "rotor_1",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_1_X_LU * DX_PHYS,
+                                   HUB_1_Y_LU * DX_PHYS,
+                                   HUB_1_Z_LU * DX_PHYS],  # [m]
+                    "omega": -OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": "hawt_z",
+
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+            },
+
+            {
+                "name": "rotor_2",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_2_X_LU * DX_PHYS,
+                                   HUB_2_Y_LU * DX_PHYS,
+                                   HUB_2_Z_LU * DX_PHYS],  # [m]
+                    "omega": -OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": "hawt_z",
+
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+                # Per-rotor override (optional):
+                # "coeff_mode": "wind_turbine",
+                # "gaussian_cutoff": 4.0,
+            },
+
+            {
+                "name": "rotor_3",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_3_X_LU * DX_PHYS,
+                                   HUB_3_Y_LU * DX_PHYS,
+                                   HUB_3_Z_LU * DX_PHYS],  # [m]
+                    "omega": OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": "hawt_z",
+
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+                # Per-rotor override (optional):
+                # "coeff_mode": "wind_turbine",
+                # "gaussian_cutoff": 4.0,
+            },
+        ]
     })
 
 # =============================================================================

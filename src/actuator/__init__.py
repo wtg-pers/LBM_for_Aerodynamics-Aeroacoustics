@@ -90,8 +90,10 @@ from .spreading import (
 # =============================================================================
 from .actuator_line import (
     ActuatorLineModel,
+    MultiRotorManager,
     BEMResult,
     create_actuator_line_from_config,
+    create_multi_rotor_from_config,
 )
 
 # =============================================================================

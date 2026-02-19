@@ -244,80 +244,163 @@ class MarkerVTPWriter:
     def write_from_al_model(
         self,
         step: int,
+        al_model,  # ActuatorLineModel 또는 MultiRotorManager
+        time: Optional[float] = None,
+        prefix: str = 'markers',
+    ) -> Optional[str]:
+        """Convenience method: extract all data from AL model(s)"""
+        
+        # ── Import here to avoid circular dependency ──
+        from src.actuator.actuator_line import MultiRotorManager
+        
+        if isinstance(al_model, MultiRotorManager):
+            return self._write_multi_rotor(step, al_model, time, prefix)
+        else:
+            return self._write_single_rotor(step, al_model, time, prefix)
+
+
+    def _write_single_rotor(
+        self,
+        step: int,
         al_model: 'ActuatorLineModel',
         time: Optional[float] = None,
         prefix: str = 'markers',
     ) -> Optional[str]:
-        """Convenience method: extract all data from ActuatorLineModel
-
-        Extracts positions, forces, and BEM diagnostics from the AL model's
-        last computed step and writes them as a single VTP file.
-
-        Args:
-            step: Time step number
-            al_model: ActuatorLineModel with completed step data
-            time: Physical time
-            prefix: Filename prefix
-
-        Returns:
-            Path to written file, or None if no data available
-        """
+        """기존 로직 그대로 — 단일 로터"""
         if al_model._last_positions is None:
             return None
 
         positions = al_model._last_positions  # (N_total, 3) [lu]
         rotor = al_model.rotor
 
-        # --- Build scalar fields ---
         scalars: Dict[str, np.ndarray] = {}
 
-        # Blade and marker identification
-        n_per = rotor.markers_per_blade  # [dimensionless]
+        n_per = rotor.markers_per_blade
         blade_ids = np.repeat(
             np.arange(rotor.n_blades), n_per
-        ).astype(np.float32)  # [dimensionless]
+        ).astype(np.float32)
         marker_ids = np.tile(
             np.arange(n_per), rotor.n_blades
-        ).astype(np.float32)  # [dimensionless]
+        ).astype(np.float32)
 
         scalars['blade_id'] = blade_ids
         scalars['marker_id'] = marker_ids
+        scalars['radius'] = rotor.get_all_marker_radii()
+        scalars['active'] = rotor.get_all_marker_active().astype(np.float32)
 
-        # Radial position
-        scalars['radius'] = rotor.get_all_marker_radii()  # [lu]
-
-        # Active flag
-        scalars['active'] = rotor.get_all_marker_active().astype(
-            np.float32
-        )  # [0 or 1]
-
-        # BEM results (if available)
         bem = al_model._last_bem_result
         if bem is not None:
-            scalars['alpha'] = bem.alpha        # [degrees]
-            scalars['phi'] = bem.phi            # [degrees]
-            scalars['CL'] = bem.CL              # [dimensionless]
-            scalars['CD'] = bem.CD              # [dimensionless]
-            scalars['u_rel'] = bem.u_rel        # [Δx/Δt]
-            scalars['Re'] = bem.Re              # [dimensionless]
-            scalars['F_L'] = bem.F_L            # [lattice force]
-            scalars['F_D'] = bem.F_D            # [lattice force]
-            scalars['F_n'] = bem.F_n            # [lattice force]
-            scalars['F_theta'] = bem.F_theta    # [lattice force]
+            scalars['alpha'] = bem.alpha
+            scalars['phi'] = bem.phi
+            scalars['CL'] = bem.CL
+            scalars['CD'] = bem.CD
+            scalars['u_rel'] = bem.u_rel
+            scalars['Re'] = bem.Re
+            scalars['F_L'] = bem.F_L
+            scalars['F_D'] = bem.F_D
+            scalars['F_n'] = bem.F_n
+            scalars['F_theta'] = bem.F_theta
 
-        # --- Build vector fields ---
         vectors: Dict[str, np.ndarray] = {}
-
         if al_model._last_forces_global is not None:
-            vectors['force'] = al_model._last_forces_global  # (N, 3) [lattice force]
+            vectors['force'] = al_model._last_forces_global
 
         return self.write(
-            step=step,
-            positions=positions,
-            scalars=scalars,
-            vectors=vectors,
-            time=time,
-            prefix=prefix,
+            step=step, positions=positions,
+            scalars=scalars, vectors=vectors,
+            time=time, prefix=prefix,
+        )
+
+
+    def _write_multi_rotor(
+        self,
+        step: int,
+        manager: 'MultiRotorManager',
+        time: Optional[float] = None,
+        prefix: str = 'markers',
+    ) -> Optional[str]:
+        """Multi-rotor: 각 로터의 데이터를 올바르게 concatenate"""
+        
+        # ── 각 로터에서 개별 데이터 수집 후 concatenate ──
+        all_positions = []
+        all_scalars: Dict[str, list] = {
+            'rotor_id': [],      # ← NEW: 로터 식별자
+            'blade_id': [],
+            'marker_id': [],
+            'radius': [],
+            'active': [],
+            'alpha': [], 'phi': [],
+            'CL': [], 'CD': [],
+            'u_rel': [], 'Re': [],
+            'F_L': [], 'F_D': [],
+            'F_n': [], 'F_theta': [],
+        }
+        all_forces = []
+
+        for ri, model in enumerate(manager.models):
+            if model._last_positions is None:
+                continue
+
+            rotor = model.rotor
+            n_per = rotor.markers_per_blade
+            n_total = rotor.total_markers   # n_blades × n_per
+
+            all_positions.append(model._last_positions)
+
+            # ── rotor_id: 이 로터의 모든 마커에 동일한 ri ──
+            all_scalars['rotor_id'].append(
+                np.full(n_total, ri, dtype=np.float32)
+            )
+
+            # ── blade_id: 로터 내에서의 blade 인덱스 ──
+            all_scalars['blade_id'].append(
+                np.repeat(np.arange(rotor.n_blades), n_per).astype(np.float32)
+            )
+
+            # ── marker_id: blade 내에서의 radial 인덱스 ──
+            all_scalars['marker_id'].append(
+                np.tile(np.arange(n_per), rotor.n_blades).astype(np.float32)
+            )
+
+            all_scalars['radius'].append(rotor.get_all_marker_radii())
+            all_scalars['active'].append(
+                rotor.get_all_marker_active().astype(np.float32)
+            )
+
+            # ── BEM results ──
+            bem = model._last_bem_result
+            if bem is not None:
+                for key in ('alpha','phi','CL','CD','u_rel','Re',
+                            'F_L','F_D','F_n','F_theta'):
+                    all_scalars[key].append(getattr(bem, key))
+            else:
+                # BEM 미실행 시 zero fill
+                for key in ('alpha','phi','CL','CD','u_rel','Re',
+                            'F_L','F_D','F_n','F_theta'):
+                    all_scalars[key].append(np.zeros(n_total, dtype=np.float32))
+
+            if model._last_forces_global is not None:
+                all_forces.append(model._last_forces_global)
+
+        if not all_positions:
+            return None
+
+        # ── Concatenate ──
+        positions = np.vstack(all_positions)        # (N_total_all, 3)
+        
+        scalars: Dict[str, np.ndarray] = {}
+        for key, arrays in all_scalars.items():
+            if arrays:
+                scalars[key] = np.concatenate(arrays)
+
+        vectors: Dict[str, np.ndarray] = {}
+        if all_forces:
+            vectors['force'] = np.vstack(all_forces)
+
+        return self.write(
+            step=step, positions=positions,
+            scalars=scalars, vectors=vectors,
+            time=time, prefix=prefix,
         )
 
     def write_pvd(self, pvd_filename: str = 'markers.pvd') -> str:
