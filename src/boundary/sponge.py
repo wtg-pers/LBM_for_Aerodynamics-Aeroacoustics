@@ -129,19 +129,20 @@ class SpongeLayerBC:
         N = self.domain_shape[axis]          # domain size along normal axis  [lattice units]
         L = min(self.thickness, N // 2)      # cap at half domain  [lattice units]
         
-        # ── 1D damping profile along the normal axis ──
+        # ── 1D damping profile along the normal axis (vectorized) ──
         sigma_1d = xp.zeros(N, dtype=xp.float64)    # [dimensionless]
+        idx = xp.arange(N, dtype=xp.float64)
         
         if is_min:
-            # Sponge at min face: node 0 gets σ_max, node L gets σ = 0
-            for i in range(L):
-                d = L - i                                    # [lattice units]
-                sigma_1d[i] = self.sigma_max * (d / L) ** 2  # [dimensionless]
+            # Sponge at min face: node 0 gets σ_max, node L gets σ ≈ 0
+            mask = idx < L
+            d = L - idx                                         # [lattice units]
+            sigma_1d[mask] = self.sigma_max * (d[mask] / L) ** 2  # [dimensionless]
         else:
-            # Sponge at max face: node N-1 gets σ_max, node N-1-L gets σ = 0
-            for i in range(N - L, N):
-                d = i - (N - L - 1)                          # [lattice units]
-                sigma_1d[i] = self.sigma_max * (d / L) ** 2
+            # Sponge at max face: node N-1 gets σ_max, node N-1-L gets σ ≈ 0
+            mask = idx >= (N - L)
+            d = idx - (N - L - 1)                               # [lattice units]
+            sigma_1d[mask] = self.sigma_max * (d[mask] / L) ** 2
         
         # Reshape for broadcasting: f has shape (Q, Nx, Ny[, Nz])
         # sigma needs shape (1, ..., N, ..., 1) with N at position axis+1

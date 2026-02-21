@@ -39,7 +39,6 @@ References:
 # =============================================================================
 from .coordinates import (
     RotorCoordinateSystem,
-    RotorAxisPreset,
     create_coordinate_system,
 )
 
@@ -102,7 +101,6 @@ from .actuator_line import (
 __all__ = [
     # Coordinate system
     'RotorCoordinateSystem',
-    'RotorAxisPreset',
     'create_coordinate_system',
     # Airfoil data
     'AirfoilPolarData', 'AirfoilDatabase',

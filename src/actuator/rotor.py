@@ -24,13 +24,12 @@ of marker particles (see blade.py). The rotor rotates at angular velocity
 
 Coordinate System Support:
 ==========================
-This module now supports arbitrary rotation axes via RotorCoordinateSystem.
+This module supports arbitrary rotation axes via RotorCoordinateSystem.
 
-    Presets:
-        - "hawt_x":  Standard HAWT, rotation about X-axis (Watanabe et al.)
-        - "hawt_z":  HAWT with vertical tower, rotation about Z-axis
-        - "vawt":    Vertical-axis wind turbine
-        - "custom":  User-defined rotation axis
+    The rotation axis is always specified as a 3D vector:
+        rotation_axis = [1, 0, 0]      # HAWT along X-axis
+        rotation_axis = [0, 0, 1]      # HAWT along Z-axis
+        rotation_axis = [1, 0, 0.1]    # tilted rotor
 
     The coordinate system is automatically propagated to all blades.
 
@@ -69,7 +68,6 @@ if TYPE_CHECKING:
 from .blade import Blade, BladeSection
 from .coordinates import (
     RotorCoordinateSystem, 
-    RotorAxisPreset,
     create_coordinate_system
 )
 
@@ -113,7 +111,7 @@ class Rotor:
 
     Example:
         >>> rotor = Rotor.from_ntnu_bt1(tsr=6.0, u_inf=10.0)
-        >>> print(rotor.coord_system.preset)  # hawt_x
+        >>> print(rotor.coord_system.axis_label)  # +x-axis
         >>> rotor.advance(dt=8.38e-6)
         >>> positions = rotor.get_all_marker_positions()
     """
@@ -125,7 +123,7 @@ class Rotor:
         hub_center: Tuple[float, float, float],
         omega: float,
         theta_0: float = 0.0,
-        rotation_axis: str = "hawt_x",
+        rotation_axis: Union[list, tuple, np.ndarray] = (1, 0, 0),
         inflow_direction: Optional[Tuple[float, float, float]] = None
     ) -> None:
         """Initialize rotor from a prototype blade
@@ -144,10 +142,11 @@ class Rotor:
                    Positive = CCW when viewed from upstream
             theta_0: Initial azimuth of blade 0  [rad]
                      Default 0.0 = blade 0 in reference direction
-            rotation_axis: Rotation axis preset or "custom"
-                           Options: "hawt_x", "hawt_z", "vawt", "custom"
-            inflow_direction: Wind approach direction (required if rotation_axis="custom")
-                              For presets, this is automatically determined.
+            rotation_axis: Rotation axis as 3D vector.
+                           e.g. [1,0,0], [0,0,1], [1,0,0.1]
+            inflow_direction: Wind approach direction (optional).
+                              Defaults to rotation_axis (HAWT assumption).
+                              Specify explicitly for VAWT / oblique inflow.
 
         Raises:
             ValueError: If n_blades < 1 or blade has no markers
@@ -165,22 +164,11 @@ class Rotor:
         self.omega: float = omega                             # [rad/s or rad/lu_time]
         self.radius: float = blade_prototype.r_tip            # [m or lu]
 
-        # --- Create coordinate system ---
-        if rotation_axis == "custom":
-            if inflow_direction is None:
-                raise ValueError(
-                    "inflow_direction is required when rotation_axis='custom'"
-                )
-            # For custom, we need more parameters - use a default reference axis
-            # User should use the explicit constructor for full custom control
-            raise ValueError(
-                "For custom rotation axis, create RotorCoordinateSystem manually "
-                "and use Rotor.from_coordinate_system() factory method."
-            )
-        
+        # --- Create coordinate system from axis vector ---
         self._coord_system = create_coordinate_system(
             hub_center=hub_center,
-            preset=rotation_axis
+            rotation_axis=rotation_axis,
+            inflow_direction=inflow_direction,
         )
 
         # --- Create blade copies with azimuthal offset ---
@@ -848,7 +836,7 @@ class Rotor:
             f"  Blades:           {self.n_blades}",
             f"  Radius:           {self.radius:.4f}",
             f"  Hub center:       ({hub[0]:.3f}, {hub[1]:.3f}, {hub[2]:.3f})",
-            f"  Rotation axis:    {self._coord_system.preset.value}",
+            f"  Rotation axis:    {self._coord_system.axis_label}",
             f"  ω:                {self.omega:.4f} rad/s  ({omega_rpm:.2f} RPM)",
             f"  Period:           {period:.6f} s",
             f"  Markers/blade:    {self.markers_per_blade}",
@@ -882,7 +870,7 @@ class Rotor:
     def __repr__(self) -> str:
         return (
             f"Rotor(n_blades={self.n_blades}, R={self.radius:.3f}, "
-            f"ω={self.omega:.2f} rad/s, axis={self._coord_system.preset.value}, "
+            f"ω={self.omega:.2f} rad/s, axis={self._coord_system.axis_label}, "
             f"markers={self.total_markers})"
         )
 
@@ -957,7 +945,7 @@ class Rotor:
         resolution: int = 160,
         n_radial: int = 20,
         theta_0: float = 0.0,
-        rotation_axis: str = "hawt_x"
+        rotation_axis: Union[list, tuple, np.ndarray] = (1, 0, 0)
     ) -> 'Rotor':
         """Create the NTNU Blind Test 1 rotor (3 × NREL S826 blades)
 
@@ -978,7 +966,7 @@ class Rotor:
             resolution: D/Δx grid cells per diameter     [dimensionless]
             n_radial: Number of markers per blade        [-]
             theta_0: Initial azimuth of blade 0          [rad]
-            rotation_axis: Rotation axis preset          [default: "hawt_x"]
+            rotation_axis: Rotation axis as 3D vector    [dimensionless]
 
         Returns:
             Rotor instance with 3 blades and markers generated
@@ -1023,7 +1011,7 @@ class Rotor:
         n_radial: int = 10,
         dx: Optional[float] = None,
         theta_0: float = 0.0,
-        rotation_axis: str = "hawt_x"
+        rotation_axis: Union[list, tuple, np.ndarray] = (1, 0, 0)
     ) -> 'Rotor':
         """Create a simple constant-chord rotor for testing
 
@@ -1039,7 +1027,7 @@ class Rotor:
             dr: Marker spacing [m or lu]
             dx: Lattice spacing (for ε calculation) [m or lu]
             theta_0: Initial azimuth [rad]
-            rotation_axis: Rotation axis preset [default: "hawt_x"]
+            rotation_axis: Rotation axis as 3D vector  [dimensionless]
 
         Returns:
             Rotor instance
@@ -1077,7 +1065,7 @@ class Rotor:
                 "tsr": 6.0,               # alternative: compute ω
                 "u_inf": 10.0,            # required if tsr is given
                 "theta_0": 0.0,
-                "rotation_axis": "hawt_x",  # NEW: rotation axis preset
+                "rotation_axis": [1, 0, 0],  # 3D vector
                 "blade": {
                     "preset": "ntnu_bt1"  # or explicit sections
                 },
@@ -1102,7 +1090,7 @@ class Rotor:
                 resolution=config.get('grid', {}).get('resolution', 160),
                 dx=config.get('grid', {}).get('dx', None),
                 theta_0=config.get('theta_0', 0.0),
-                rotation_axis=config.get('rotation_axis', 'hawt_x'),
+                rotation_axis=config.get('rotation_axis', [1, 0, 0]),
             )
 
         # --- General construction ---
@@ -1143,8 +1131,9 @@ class Rotor:
             R = blade.r_tip
             omega = tsr * u_inf / R
 
-        # Rotation axis
-        rotation_axis = config.get('rotation_axis', 'hawt_x')
+        # Rotation axis (3D vector, e.g. [1, 0, 0])
+        rotation_axis = config.get('rotation_axis', [1, 0, 0])
+        inflow_direction = config.get('inflow_direction', None)
 
         return cls(
             blade_prototype=blade,
@@ -1153,6 +1142,7 @@ class Rotor:
             omega=omega,
             theta_0=config.get('theta_0', 0.0),
             rotation_axis=rotation_axis,
+            inflow_direction=inflow_direction,
         )
 
     # =================================================================

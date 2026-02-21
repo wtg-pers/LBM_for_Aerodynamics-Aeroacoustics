@@ -93,7 +93,6 @@ Date: 2026-02
 
 from typing import TYPE_CHECKING, Tuple, Optional, Union, Dict
 from dataclasses import dataclass, field
-from enum import Enum
 
 import numpy as np
 
@@ -102,55 +101,32 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
-# §1. Preset Rotation Axis Configurations
+# §1. Axis Label Utility
 # =============================================================================
 
-class RotorAxisPreset(Enum):
-    """Predefined rotor axis configurations
+def _axis_label(n_axis: np.ndarray) -> str:
+    """Generate a human-readable label from the rotation axis vector
     
-    Each preset defines (rotation_axis, reference_axis, inflow_direction).
+    Standard Cartesian axes get short labels; others show the vector.
     
-    Physical Convention:
-        - rotation_axis:    Normal to rotor plane (spin axis)
-        - reference_axis:   Direction of blade at θ=0
-        - inflow_direction: Direction wind approaches FROM
+    Args:
+        n_axis: Normalized rotation axis  [dimensionless]
+    
+    Returns:
+        Label string, e.g. "+x-axis", "-z-axis", "(0.500, 0.000, 0.866)"
     """
-    # Standard HAWT: rotation about X-axis (streamwise)
-    # Wind from +X, θ=0 → blade in +Y, rotation CCW from upstream (+X view)
-    # Wake forms in +X direction (downstream)
-    HAWT_X_AXIS = "hawt_x"
-    
-    # HAWT with Z-axis rotation (e.g., vertical tower, top-down simulation)
-    # Wind from +Z, θ=0 → blade in +X, rotation CCW from above (+Z view)
-    HAWT_Z_AXIS = "hawt_z"
-    
-    # Vertical-axis wind turbine (Darrieus/H-rotor)
-    # Rotation about Z (vertical), wind from +X (horizontal)
-    # Note: For VAWT, inflow is PERPENDICULAR to rotation axis
-    VAWT = "vawt"
-    
-    # Custom: user provides axes directly
-    CUSTOM = "custom"
-
-
-# Preset axis definitions: (rotation_axis, reference_axis, inflow_direction)
-_PRESET_AXES: Dict[RotorAxisPreset, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {
-    RotorAxisPreset.HAWT_X_AXIS: (
-        np.array([1.0, 0.0, 0.0]),  # n̂: rotation about X
-        np.array([0.0, 1.0, 0.0]),  # ê_ref: θ=0 in +Y
-        np.array([1.0, 0.0, 0.0]),  # inflow: wind from +X
-    ),
-    RotorAxisPreset.HAWT_Z_AXIS: (
-        np.array([0.0, 0.0, 1.0]),  # n̂: rotation about Z
-        np.array([1.0, 0.0, 0.0]),  # ê_ref: θ=0 in +X
-        np.array([0.0, 0.0, 1.0]),  # inflow: wind from +Z
-    ),
-    RotorAxisPreset.VAWT: (
-        np.array([0.0, 0.0, 1.0]),  # n̂: rotation about Z (vertical)
-        np.array([1.0, 0.0, 0.0]),  # ê_ref: θ=0 in +X
-        np.array([1.0, 0.0, 0.0]),  # inflow: wind from +X (horizontal)
-    ),
-}
+    _NAMED = {
+        (1, 0, 0): "x-axis",
+        (0, 1, 0): "y-axis",
+        (0, 0, 1): "z-axis",
+    }
+    for key, label in _NAMED.items():
+        ref = np.array(key, dtype=np.float64)
+        if np.allclose(n_axis, ref, atol=1e-10):
+            return f"+{label}"
+        if np.allclose(n_axis, -ref, atol=1e-10):
+            return f"-{label}"
+    return f"({n_axis[0]:.4f}, {n_axis[1]:.4f}, {n_axis[2]:.4f})"
 
 
 # =============================================================================
@@ -179,14 +155,13 @@ class RotorCoordinateSystem:
         e_ref: Reference axis unit vector  [dimensionless]
         e_perp: Perpendicular axis unit vector  [dimensionless]
         inflow_direction: Wind approach direction  [dimensionless]
-        rotation_matrix: 3×3 orthonormal transformation matrix
-        preset: Configuration preset used (for serialization)
+        rotation_matrix: 3x3 orthonormal transformation matrix
+        axis_label: Human-readable label for the rotation axis
     
     Example:
-        >>> # Standard HAWT (X-axis rotation, wind from +X)
-        >>> coord = RotorCoordinateSystem.from_preset(
-        ...     RotorAxisPreset.HAWT_X_AXIS,
-        ...     hub_center=(3.66, 1.341, 0.817)
+        >>> coord = RotorCoordinateSystem.from_axis_vector(
+        ...     hub_center=(3.66, 1.341, 0.817),
+        ...     rotation_axis=[1, 0, 0]
         ... )
         >>> pos = coord.marker_position(r=0.4, theta=np.pi/4)
         >>> print(coord.wake_direction)  # [1, 0, 0] (downstream)
@@ -198,7 +173,6 @@ class RotorCoordinateSystem:
         rotation_axis: Union[Tuple[float, float, float], np.ndarray],
         reference_axis: Union[Tuple[float, float, float], np.ndarray],
         inflow_direction: Union[Tuple[float, float, float], np.ndarray],
-        preset: RotorAxisPreset = RotorAxisPreset.CUSTOM
     ) -> None:
         """Initialize coordinate system from axis vectors
         
@@ -210,7 +184,6 @@ class RotorCoordinateSystem:
             rotation_axis: Rotation axis direction (will be normalized)
             reference_axis: θ=0 blade direction (will be orthogonalized)
             inflow_direction: Wind approach direction (will be normalized)
-            preset: Configuration preset identifier
         
         Raises:
             ValueError: If axes are parallel or zero-length
@@ -267,7 +240,7 @@ class RotorCoordinateSystem:
             self.n_axis    # Column 2: local z → n_axis direction
         ])
         
-        self.preset = preset
+        self.axis_label: str = _axis_label(self.n_axis)  # e.g. "+z-axis"
         
         # Validate orthonormality
         if not self._check_orthonormality():
@@ -280,71 +253,101 @@ class RotorCoordinateSystem:
         return np.allclose(should_be_identity, np.eye(3), atol=tol)
     
     # -----------------------------------------------------------------
-    # §2.1 Factory Methods
+    # §2.1 Factory Method — from_axis_vector (Primary Interface)
     # -----------------------------------------------------------------
     
     @classmethod
-    def from_preset(
+    def from_axis_vector(
         cls,
-        preset: RotorAxisPreset,
-        hub_center: Union[Tuple[float, float, float], np.ndarray]
+        hub_center: Union[Tuple[float, float, float], np.ndarray],
+        rotation_axis: Union[Tuple[float, float, float], np.ndarray],
+        inflow_direction: Optional[Union[Tuple[float, float, float], np.ndarray]] = None,
+        reference_axis: Optional[Union[Tuple[float, float, float], np.ndarray]] = None,
     ) -> 'RotorCoordinateSystem':
-        """Create coordinate system from a preset configuration
+        """Create coordinate system from a rotation axis vector
         
-        Available Presets:
-            HAWT_X_AXIS: Standard horizontal-axis (Watanabe et al.)
-                         Wind from +X, wake in +X, rotation about X
-            HAWT_Z_AXIS: Horizontal-axis with Z rotation
-                         Wind from +Z, wake in +Z, rotation about Z
-            VAWT:        Vertical-axis turbine
-                         Wind from +X, rotation about Z (vertical)
+        This is the primary (and only) factory method.
+        Supply the rotation axis as a 3-component vector; the remaining
+        axes are auto-derived unless explicitly provided.
+        
+        Auto-Derivation Logic:
+            1. inflow_direction:
+               - If provided → use as-is (allows VAWT / oblique inflow)
+               - If omitted  → inflow = rotation_axis (standard HAWT)
+            
+            2. reference_axis (θ=0 blade direction):
+               - If provided → orthogonalized against n̂ via Gram-Schmidt
+               - If omitted  → auto-generated perpendicular to n̂
+                 Algorithm: pick the global axis LEAST aligned with n̂,
+                 then Gram-Schmidt.  This guarantees a well-conditioned
+                 ê_ref for any rotation axis, including tilted ones.
+        
+        Config Usage:
+            "rotation_axis": [1, 0, 0]        # HAWT along X
+            "rotation_axis": [0, 0, 1]        # HAWT along Z
+            "rotation_axis": [1, 0, 0.1]      # tilted rotor
         
         Args:
-            preset: Preset configuration
-            hub_center: Rotor center position  [m or lu]
+            hub_center:       Rotor center position        [m or lu]
+            rotation_axis:    Rotation axis direction       [will be normalized]
+            inflow_direction: Wind approach direction       [optional, default = rotation_axis]
+            reference_axis:   θ=0 blade direction           [optional, auto-derived if omitted]
         
         Returns:
             Configured RotorCoordinateSystem
         
         Raises:
-            ValueError: If preset is CUSTOM (use constructor instead)
+            ValueError: If rotation_axis is zero-length
+        
+        Example:
+            >>> coord = RotorCoordinateSystem.from_axis_vector(
+            ...     hub_center=(5, 3, 3), rotation_axis=[1, 0, 0]
+            ... )
+            >>> print(coord.axis_label)   # +x-axis
+            
+            >>> # Tilted rotor (5 deg pitch)
+            >>> coord = RotorCoordinateSystem.from_axis_vector(
+            ...     hub_center=(5, 3, 3),
+            ...     rotation_axis=[np.cos(np.radians(5)), 0, np.sin(np.radians(5))]
+            ... )
         """
-        if preset == RotorAxisPreset.CUSTOM:
-            raise ValueError(
-                "CUSTOM preset requires explicit axes; "
-                "use the constructor directly"
+        # --- Input validation: must be a numeric sequence, not a string ---
+        if isinstance(rotation_axis, str):
+            raise TypeError(
+                f"rotation_axis must be a 3D vector (list/tuple/ndarray), "
+                f"got string '{rotation_axis}'. "
+                f"Example: rotation_axis=[1, 0, 0]"
             )
         
-        rotation_axis, reference_axis, inflow_dir = _PRESET_AXES[preset]
+        n = np.asarray(rotation_axis, dtype=np.float64)
+        n_norm = np.linalg.norm(n)
+        if n_norm < 1e-12:
+            raise ValueError("rotation_axis cannot be zero vector")
+        n_hat = n / n_norm  # [dimensionless]
+        
+        # --- Inflow direction ---
+        if inflow_direction is not None:
+            inflow = np.asarray(inflow_direction, dtype=np.float64)
+        else:
+            inflow = n_hat.copy()  # HAWT default: inflow parallel to rotation axis
+        
+        # --- Reference axis (auto-derive if not provided) ---
+        if reference_axis is not None:
+            e_ref_candidate = np.asarray(reference_axis, dtype=np.float64)
+        else:
+            # Pick the global axis LEAST aligned with n̂
+            # This avoids the Gram-Schmidt singularity when n̂ is parallel to candidate
+            candidates = np.eye(3)  # [x̂, ŷ, ẑ]
+            dots = np.abs(candidates @ n_hat)  # |cos(angle)| with each axis
+            best_idx = np.argmin(dots)  # axis most perpendicular to n̂
+            e_ref_candidate = candidates[best_idx]
+        
         return cls(
             hub_center=hub_center,
-            rotation_axis=rotation_axis,
-            reference_axis=reference_axis,
-            inflow_direction=inflow_dir,
-            preset=preset
+            rotation_axis=n_hat,
+            reference_axis=e_ref_candidate,
+            inflow_direction=inflow,
         )
-    
-    @classmethod
-    def hawt_standard(
-        cls,
-        hub_center: Union[Tuple[float, float, float], np.ndarray]
-    ) -> 'RotorCoordinateSystem':
-        """Create standard HAWT coordinate system (X-axis rotation)
-        
-        This matches the Watanabe et al. (2026) convention:
-            - Flow in +X direction (wind from +X)
-            - Rotor plane in Y-Z
-            - θ=0: blade in +Y direction
-            - CCW rotation when viewed from upstream (+X)
-            - Wake forms in +X direction (downstream)
-        
-        Args:
-            hub_center: Rotor center position  [m or lu]
-        
-        Returns:
-            HAWT_X_AXIS coordinate system
-        """
-        return cls.from_preset(RotorAxisPreset.HAWT_X_AXIS, hub_center)
     
     # -----------------------------------------------------------------
     # §2.2 Wake and Thrust Direction Properties
@@ -506,7 +509,13 @@ class RotorCoordinateSystem:
             ê_r(θ) = cos(θ)·ê_ref + sin(θ)·ê_perp
         
         This points outward from hub toward blade tip.
-        Same as ê_rot used in velocity decomposition.
+        
+        Note: This is NOT the vector used in velocity decomposition or
+        force projection. Those use tangent_vector() instead, which
+        ensures azimuth-independent torque conservation.
+        
+        The radial vector is perpendicular to the tangent vector:
+            ê_r(θ) ⊥ ê_θ(θ) ⊥ n̂
         
         Args:
             theta: Azimuth angle  [radians]
@@ -520,16 +529,30 @@ class RotorCoordinateSystem:
         """Compute mathematical tangent vector (direction of increasing θ)
         
         This is the standard ∂x/∂θ direction:
-            ê_θ^math = -sin(θ)·ê_ref + cos(θ)·ê_perp
+            ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp
         
-        Note: NOT used in Watanabe's AL model force projection.
-        Provided for reference and debugging.
+        This vector is used in:
+            - decompose_velocity(): u_θ = u · ê_θ(θ)
+            - project_force_to_global(): F^AL = F_n·n̂ + F_θ·ê_θ(θ)
+        
+        The tangent vector ensures azimuth-independent torque:
+            Q = Σ (r_j × F^AL_j) · n̂ = Σ F_θ,j · r_j   (for all θ)
+        
+        Note: Watanabe Eq. 5 uses the radial vector instead, which breaks
+        torque conservation for non-X-axis rotors. Our implementation
+        intentionally uses the mathematical tangent for generality.
+        
+        For HAWT_X_AXIS (ê_ref=ŷ, ê_perp=ẑ):
+            ê_θ(θ) = (0, -sin(θ), cos(θ))
+        
+        For HAWT_Z_AXIS (ê_ref=x̂, ê_perp=ŷ):
+            ê_θ(θ) = (-sin(θ), cos(θ), 0)
         
         Args:
             theta: Azimuth angle  [radians]
         
         Returns:
-            e_theta_math: Mathematical tangent, shape (3,)
+            e_theta: Tangent unit vector, shape (3,)  [dimensionless]
         """
         return -np.sin(theta) * self.e_ref + np.cos(theta) * self.e_perp
     
@@ -542,27 +565,38 @@ class RotorCoordinateSystem:
         
         Velocity Decomposition:
             u_n = u · n̂                           (axial / normal to rotor plane)
-            u_θ = u · ê_θ(θ)                      (tangential / rotational direction)
+            u_θ = u · ê_θ(θ)                      (tangential / rotation direction)
         
-        where ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp (tangent to rotation)
+        where ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp
+        (mathematical tangent, direction of increasing θ)
         
-        For HAWT_X_AXIS, this gives:
+        For HAWT_X_AXIS (n̂=x̂, ê_ref=ŷ, ê_perp=ẑ):
             u_n = u_x
             u_θ = -u_y·sin(θ) + u_z·cos(θ)
         
-        Note: Watanabe Eq. 5 uses u·ê_r (radial), which is equivalent to
-        u·ê_θ only for their specific HAWT_X convention. The tangent vector
-        used here generalizes to arbitrary rotation axes while preserving
-        torque conservation.
+        For HAWT_Z_AXIS (n̂=ẑ, ê_ref=x̂, ê_perp=ŷ):
+            u_n = u_z
+            u_θ = -u_x·sin(θ) + u_y·cos(θ)
         
-        For HAWT_X_AXIS, this reduces to:
-            u_n = u_x
-            u_θ = u_y·cos(θ) + u_z·sin(θ)     [Watanabe Eq. 5]
+        Convention Difference from Watanabe et al.:
+            Watanabe Eq. 5 uses the RADIAL projection:
+                u_θ^W = u · ê_r(θ) = u_y·cos(θ) + u_z·sin(θ)  (HAWT_X)
+            Our code uses the TANGENT projection:
+                u_θ   = u · ê_θ(θ) = -u_y·sin(θ) + u_z·cos(θ) (HAWT_X)
+            
+            The tangent projection is used because it:
+            (1) Correctly represents the velocity in the blade motion direction
+            (2) Ensures azimuth-independent torque (torque conservation)
+            (3) Generalizes to arbitrary rotation axes
+            
+            For pure axial flow (u ∥ n̂), both give u_θ = 0, so the
+            BEM velocity triangle is unaffected. Differences appear only
+            in induced in-plane velocities, which are small.
         
         Physical Interpretation:
-            u_n:  Velocity component through rotor plane (creates thrust)
-            u_θ:  Velocity component in the radial direction of current blade position
-                  (used with ω·r to compute relative velocity for lift/drag)
+            u_n:  Velocity through the rotor plane (creates thrust)  [m/s]
+            u_θ:  Velocity in tangential direction at current blade position
+                  (combined with ω·r to compute relative velocity)  [m/s]
         
         Args:
             u_global: Velocity vector(s) in global frame
@@ -651,24 +685,35 @@ class RotorCoordinateSystem:
     ) -> np.ndarray:
         """Project local forces to global coordinate frame
         
-        Watanabe Convention (extended for counter-rotation):
-            F^AL = F_n·n̂ + rotation_sign · F_θ·ê_tan(θ)
+        Force Projection (extended for counter-rotation):
+            F^AL = F_n·n̂ + rotation_sign · F_θ·ê_θ(θ)
+        
+        where ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp (tangent vector)
         
         The rotation_sign accounts for the fact that F_theta from BEM
         is computed in the blade-local frame (where blade always moves
         in the "positive" direction). When projected to the global frame:
-            ω > 0: rotation_sign = +1 → F_theta acts in +ê_tan direction
-            ω < 0: rotation_sign = -1 → F_theta acts in -ê_tan direction
+            ω > 0: rotation_sign = +1 → F_theta acts in +ê_θ direction
+            ω < 0: rotation_sign = -1 → F_theta acts in -ê_θ direction
         
-        For HAWT_X_AXIS with ω > 0 (backward compatible):
-            F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))   [Watanabe convention]
+        For HAWT_X_AXIS with ω > 0:
+            F^AL = (F_n, -F_θ·sin(θ), F_θ·cos(θ))
+        
+        Convention difference from Watanabe:
+            Watanabe uses radial projection:  (F_n, F_θ·cos(θ), -F_θ·sin(θ))
+            Our code uses tangent projection: (F_n, -F_θ·sin(θ), F_θ·cos(θ))
+            Both yield correct torque for uniform inflow; the tangent form
+            ensures azimuth-independent torque for arbitrary rotation axes.
+        
+        Torque conservation proof:
+            Q = (r × F^AL) · n̂ = F_θ · r   (constant for all θ)
         
         Sign Convention (IMPORTANT):
             F_n > 0:  Force on blade in +n̂ direction
-            F_θ > 0:  Force on blade opposing its local motion (drag-like)
+            F_θ > 0:  Force on blade in +ê_θ direction (drives rotation)
             
             The BODY FORCE on fluid (Eq. 13) is -F^AL:
-                F_body = -F^AL = -F_n·n̂ - rotation_sign·F_θ·ê_tan(θ)
+                F_body = -F^AL = -F_n·n̂ - rotation_sign·F_θ·ê_θ(θ)
         
         Args:
             F_n: Normal (axial) force(s)  [N or lattice force]
@@ -712,7 +757,7 @@ class RotorCoordinateSystem:
         e_perp: np.ndarray,
         inflow_direction: np.ndarray,
         rotation_matrix: np.ndarray,
-        preset: 'RotorAxisPreset'
+        axis_label: str
     ) -> 'RotorCoordinateSystem':
         """Internal constructor bypassing Gram-Schmidt for already-validated axes
         
@@ -723,8 +768,8 @@ class RotorCoordinateSystem:
             hub_center: Rotor center position  [m or lu]
             n_axis, e_ref, e_perp: Orthonormal axis vectors  [dimensionless]
             inflow_direction: Wind approach direction  [dimensionless]
-            rotation_matrix: Pre-built 3×3 rotation matrix
-            preset: Configuration preset
+            rotation_matrix: Pre-built 3x3 rotation matrix
+            axis_label: Human-readable label for the rotation axis
         
         Returns:
             RotorCoordinateSystem with pre-validated axes
@@ -736,7 +781,7 @@ class RotorCoordinateSystem:
         obj.e_perp = e_perp
         obj.inflow_direction = inflow_direction
         obj.rotation_matrix = rotation_matrix
-        obj.preset = preset
+        obj.axis_label = axis_label
         return obj
     
     def to_lattice_units(self, length_scale: float) -> 'RotorCoordinateSystem':
@@ -761,7 +806,7 @@ class RotorCoordinateSystem:
             e_perp=self.e_perp,
             inflow_direction=self.inflow_direction,
             rotation_matrix=self.rotation_matrix,
-            preset=self.preset
+            axis_label=self.axis_label
         )
     
     # -----------------------------------------------------------------
@@ -776,7 +821,7 @@ class RotorCoordinateSystem:
         lines = [
             "RotorCoordinateSystem",
             "=" * 60,
-            f"  Preset:           {self.preset.value}",
+            f"  Rotation axis:    {self.axis_label}",
             f"  Configuration:    {config_type}",
             f"  Hub center:       ({self.hub_center[0]:.4f}, "
             f"{self.hub_center[1]:.4f}, {self.hub_center[2]:.4f})",
@@ -803,7 +848,7 @@ class RotorCoordinateSystem:
         return "\n".join(lines)
     
     def __repr__(self) -> str:
-        return (f"RotorCoordinateSystem(preset={self.preset.value}, "
+        return (f"RotorCoordinateSystem(axis={self.axis_label}, "
                 f"hub={tuple(np.round(self.hub_center, 4))}, "
                 f"inflow={tuple(np.round(self.inflow_direction, 4))})")
     
@@ -824,70 +869,46 @@ class RotorCoordinateSystem:
 
 
 # =============================================================================
-# §3. Convenience Functions
+# §3. Convenience Factory Function
 # =============================================================================
 
 def create_coordinate_system(
     hub_center: Union[Tuple[float, float, float], np.ndarray],
-    preset: str = "hawt_x",
-    rotation_axis: Optional[Tuple[float, float, float]] = None,
+    rotation_axis: Union[Tuple[float, float, float], list, np.ndarray],
     reference_axis: Optional[Tuple[float, float, float]] = None,
     inflow_direction: Optional[Tuple[float, float, float]] = None
 ) -> RotorCoordinateSystem:
-    """Factory function to create a coordinate system
+    """Create a rotor coordinate system from a rotation axis vector
     
-    Provides a simple interface for common use cases.
+    The rotation axis is specified as a 3-component vector (e.g. [1, 0, 0]).
+    Reference axis and inflow direction are auto-derived if not provided.
+    
+    Auto-Derivation:
+        - inflow_direction: defaults to rotation_axis (standard HAWT)
+        - reference_axis:   auto-generated perpendicular to rotation_axis
     
     Args:
-        hub_center: Rotor center position  [m or lu]
-        preset: Preset name ("hawt_x", "hawt_z", "vawt", "custom")
-        rotation_axis: Custom rotation axis (required if preset="custom")
-        reference_axis: Custom reference axis (required if preset="custom")
-        inflow_direction: Custom inflow direction (required if preset="custom")
+        hub_center:       Rotor center position  [m or lu]
+        rotation_axis:    3D direction vector, e.g. [1, 0, 0] or [0, 0, 1]
+        reference_axis:   θ=0 blade direction [optional, auto-derived]
+        inflow_direction: Wind approach direction [optional, default = rotation_axis]
     
     Returns:
         Configured RotorCoordinateSystem
     
     Example:
-        >>> # Standard HAWT (wind from +X)
-        >>> coord = create_coordinate_system(
-        ...     hub_center=(3.66, 1.341, 0.817),
-        ...     preset="hawt_x"
-        ... )
+        >>> coord = create_coordinate_system(hub, rotation_axis=[1, 0, 0])
+        >>> coord = create_coordinate_system(hub, rotation_axis=[0, 0, 1])
+        >>> coord = create_coordinate_system(hub, rotation_axis=[1, 0, 0.1])  # tilted
         
-        >>> # Custom tilted rotor
+        >>> # VAWT: rotation perpendicular to inflow
         >>> coord = create_coordinate_system(
-        ...     hub_center=(0, 0, 0),
-        ...     preset="custom",
-        ...     rotation_axis=(1, 0, 0.1),    # slightly tilted
-        ...     reference_axis=(0, 1, 0),
-        ...     inflow_direction=(1, 0, 0)    # wind still from +X
+        ...     hub, rotation_axis=[0, 0, 1], inflow_direction=[1, 0, 0]
         ... )
     """
-    preset_map = {
-        "hawt_x": RotorAxisPreset.HAWT_X_AXIS,
-        "hawt_z": RotorAxisPreset.HAWT_Z_AXIS,
-        "vawt": RotorAxisPreset.VAWT,
-        "custom": RotorAxisPreset.CUSTOM,
-    }
-    
-    preset_enum = preset_map.get(preset.lower())
-    if preset_enum is None:
-        available = ", ".join(preset_map.keys())
-        raise ValueError(f"Unknown preset '{preset}'. Available: {available}")
-    
-    if preset_enum == RotorAxisPreset.CUSTOM:
-        if rotation_axis is None or reference_axis is None or inflow_direction is None:
-            raise ValueError(
-                "Custom preset requires rotation_axis, reference_axis, "
-                "and inflow_direction"
-            )
-        return RotorCoordinateSystem(
-            hub_center=hub_center,
-            rotation_axis=rotation_axis,
-            reference_axis=reference_axis,
-            inflow_direction=inflow_direction,
-            preset=preset_enum
-        )
-    else:
-        return RotorCoordinateSystem.from_preset(preset_enum, hub_center)
+    return RotorCoordinateSystem.from_axis_vector(
+        hub_center=hub_center,
+        rotation_axis=rotation_axis,
+        inflow_direction=inflow_direction,
+        reference_axis=reference_axis,
+    )

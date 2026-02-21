@@ -604,7 +604,7 @@ class Blade:
         """Human-readable blade summary"""
         coord_info = "Not set (legacy mode)"
         if self._coord_system is not None:
-            coord_info = f"{self._coord_system.preset.value}"
+            coord_info = f"{self._coord_system.axis_label}"
         
         lines = [
             "Blade Geometry Summary",
@@ -653,7 +653,7 @@ class Blade:
     def __repr__(self) -> str:
         coord_str = "None"
         if self._coord_system is not None:
-            coord_str = self._coord_system.preset.value
+            coord_str = self._coord_system.axis_label
         return (
             f"Blade(r=[{self.r_hub:.3f}, {self.r_tip:.3f}] m, "
             f"span={self.span:.3f} m, "

@@ -27,6 +27,7 @@ Target (ρ, u) Resolution Rules:
     | Velocity ∩ Pressure  | ρ_target        | u_inlet          |
     | Velocity ∩ Freestream| ρ_freestream    | u_inlet          |
     | Pressure ∩ Pressure  | avg(ρ_target)   | extrapolate      |
+    | Sponge ∩ any         | ρ∞              | U∞               |
     | Freestream ∩ any     | ρ∞              | U∞               |
 
 References:
@@ -219,8 +220,9 @@ class CornerBC:
         Priority rules (physical basis):
             1. WALL present → u = 0 (no-slip dominates velocity)
             2. VELOCITY provides u; PRESSURE provides ρ
-            3. NEUMANN prescribes nothing → pure extrapolation
-            4. Fallback: extrapolate from diagonal interior
+            3. SPONGE provides (ρ∞, U∞) from its freestream target
+            4. NEUMANN prescribes nothing → pure extrapolation
+            5. Fallback: extrapolate from diagonal interior
         
         Args:
             faces: List of FaceConfig objects meeting at this node
@@ -308,6 +310,34 @@ class CornerBC:
                 rho_t = xp.full_like(rho_ext, avg_rho)
             
             return rho_t, u_ext
+        
+        # --- Sponge present → use freestream target (ρ∞, U∞) ---
+        # Sponge faces have well-defined freestream targets stored in
+        # FaceConfig.density and FaceConfig.velocity.  At edge/corner nodes
+        # where sponge meets sponge (or sponge meets neumann), using the
+        # sponge target is consistent with the volume damping in the buffer
+        # zone. This prevents corner nodes from extrapolating interior
+        # values that may contain strong wake structures.
+        if BCType.SPONGE in types:
+            sf = next(fc for fc in faces if fc.bc_type == BCType.SPONGE)
+            
+            rho_t = xp.asarray(sf.density, dtype=xp.float64)
+            if isinstance(rho_ext, np.ndarray) or (hasattr(rho_ext, 'ndim') and rho_ext.ndim > 0):
+                rho_t = xp.full_like(rho_ext, float(sf.density))
+            
+            if isinstance(rho_ext, (int, float)) or rho_ext.ndim == 0:
+                u_t = xp.zeros(self.dim, dtype=xp.float64)
+            else:
+                u_t = xp.zeros((self.dim,) + rho_ext.shape, dtype=xp.float64)
+            
+            vel = sf.velocity
+            if isinstance(vel, (int, float)):
+                u_t[0] = float(vel)
+            elif isinstance(vel, (list, tuple)):
+                for d in range(min(len(vel), self.dim)):
+                    u_t[d] = float(vel[d])
+            
+            return rho_t, u_t
         
         # --- Neumann / Fallback: pure extrapolation ---
         # NEUMANN faces prescribe nothing (∂f/∂n = 0 is handled by face BC).
