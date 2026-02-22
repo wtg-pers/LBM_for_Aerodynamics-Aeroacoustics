@@ -117,14 +117,14 @@ for _w in _stability_warnings:
 # Nz = DOMAIN_MULT_Z * RESOLUTION    # [lu]
 
 # Edge flight test quadcopter
-# Nx = 250
-# Ny = 200
-# Nz = 100
-
-# L+C test
 Nx = 250
-Ny = 100  # 230
+Ny = 200
 Nz = 100
+
+# # L+C test
+# Nx = 250
+# Ny = 100  # 230
+# Nz = 100
 
 # =============================================================================
 # §4. SIMULATION SETTINGS
@@ -287,70 +287,70 @@ if ALM_ENABLED:
              "twist": -pitch, "airfoil": "naca0012", "active": True},
         ]
     
-    # # ── Rotor 0: Upwind turbine ──
-    # HUB_0_X_LU = Nx * 0.2406
-    # HUB_0_Y_LU = Ny * 0.3737
-    # HUB_0_Z_LU = Nz * 0.5
+    # ── Rotor 0: Upwind turbine ──
+    HUB_0_X_LU = Nx * 0.2406
+    HUB_0_Y_LU = Ny * 0.3737
+    HUB_0_Z_LU = Nz * 0.5
 
-    # # ── Rotor 1: Downwind turbine ──
-    # HUB_1_X_LU = Nx * 0.4456
-    # HUB_1_Y_LU = Ny * 0.3737
-    # HUB_1_Z_LU = Nz * 0.5
+    # ── Rotor 1: Downwind turbine ──
+    HUB_1_X_LU = Nx * 0.4456
+    HUB_1_Y_LU = Ny * 0.3737
+    HUB_1_Z_LU = Nz * 0.5
 
-    # # ── Rotor 2: Upwind turbine ──
-    # HUB_2_X_LU = Nx * 0.2406
-    # HUB_2_Y_LU = Ny * 0.6263
-    # HUB_2_Z_LU = Nz * 0.5
+    # ── Rotor 2: Upwind turbine ──
+    HUB_2_X_LU = Nx * 0.2406
+    HUB_2_Y_LU = Ny * 0.6263
+    HUB_2_Z_LU = Nz * 0.5
 
-    # # ── Rotor 3: Downwind turbine ──
-    # HUB_3_X_LU = Nx * 0.4456
-    # HUB_3_Y_LU = Ny * 0.6263
-    # HUB_3_Z_LU = Nz * 0.5
+    # ── Rotor 3: Downwind turbine ──
+    HUB_3_X_LU = Nx * 0.4456
+    HUB_3_Y_LU = Ny * 0.6263
+    HUB_3_Z_LU = Nz * 0.5
 
-    # ── Rotor 0  ──
-    HUB_0_X_LU = 30
-    HUB_0_Y_LU = 185
-    HUB_0_Z_LU = 50
+    # # ── Rotor 0  ──
+    # HUB_0_X_LU = 30
+    # HUB_0_Y_LU = 185
+    # HUB_0_Z_LU = 50
 
-    # ── Rotor 1  ──
-    HUB_1_X_LU = 30
-    HUB_1_Y_LU = 145
-    HUB_1_Z_LU = 50
+    # # ── Rotor 1  ──
+    # HUB_1_X_LU = 30
+    # HUB_1_Y_LU = 145
+    # HUB_1_Z_LU = 50
 
-    # ── Rotor 2  ──
-    HUB_2_X_LU = 30
-    HUB_2_Y_LU = 85
-    HUB_2_Z_LU = 50
+    # # ── Rotor 2  ──
+    # HUB_2_X_LU = 30
+    # HUB_2_Y_LU = 85
+    # HUB_2_Z_LU = 50
 
-    # ── Rotor 3  ──
-    HUB_3_X_LU = 30
-    HUB_3_Y_LU = 45
-    HUB_3_Z_LU = 50
+    # # ── Rotor 3  ──
+    # HUB_3_X_LU = 30
+    # HUB_3_Y_LU = 45
+    # HUB_3_Z_LU = 50
 
-    # ── Rotor 4  ──
-    HUB_4_X_LU = 80
-    HUB_4_Y_LU = 185
-    HUB_4_Z_LU = 50
+    # # ── Rotor 4  ──
+    # HUB_4_X_LU = 80
+    # HUB_4_Y_LU = 185
+    # HUB_4_Z_LU = 50
 
-    # ── Rotor 5  ──
-    HUB_5_X_LU = 80
-    HUB_5_Y_LU = 145
-    HUB_5_Z_LU = 50
+    # # ── Rotor 5  ──
+    # HUB_5_X_LU = 80
+    # HUB_5_Y_LU = 145
+    # HUB_5_Z_LU = 50
 
-    # ── Rotor 6  ──
-    HUB_6_X_LU = 80
-    HUB_6_Y_LU = 85
-    HUB_6_Z_LU = 50
+    # # ── Rotor 6  ──
+    # HUB_6_X_LU = 80
+    # HUB_6_Y_LU = 85
+    # HUB_6_Z_LU = 50
 
-    # ── Rotor 7  ──
-    HUB_7_X_LU = 80
-    HUB_7_Y_LU = 45
-    HUB_7_Z_LU = 50
+    # # ── Rotor 7  ──
+    # HUB_7_X_LU = 80
+    # HUB_7_Y_LU = 45
+    # HUB_7_Z_LU = 50
 
-    # ── Rotor 8 ──
-    HUB_8_X_LU = 30
-    HUB_8_Y_LU = 50
-    HUB_8_Z_LU = 50
+    # # ── Rotor 8 ──
+    # HUB_8_X_LU = 30
+    # HUB_8_Y_LU = 50
+    # HUB_8_Z_LU = 50
 
     
     # HUB_X_PHYS  = HUB_X_LU * DX_PHYS   # [m]
@@ -382,94 +382,94 @@ if ALM_ENABLED:
 
         # ─── Multi-rotor 리스트 ───
         "rotors": [
-            # {
-            #     "name": "rotor_0",
-            #     "rotor": {
-            #         "n_blades": N_BLADES,
-            #         "hub_center": [HUB_0_X_LU * DX_PHYS,
-            #                        HUB_0_Y_LU * DX_PHYS,
-            #                        HUB_0_Z_LU * DX_PHYS],  # [m]
-            #         "omega": -OMEGA_ROTOR,           # [rad/s]
-            #         "theta_0": 0.0,                 # [rad]
-            #         "rotation_axis": "hawt_z",
+            {
+                "name": "rotor_0",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_0_X_LU * DX_PHYS,
+                                   HUB_0_Y_LU * DX_PHYS,
+                                   HUB_0_Z_LU * DX_PHYS],  # [m]
+                    "omega": -OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": [0, 0, 1],
 
-            #         "blade": {
-            #             "sections": _make_blade_sections(
-            #                 R_ROTOR, CHORD_BLADE, PITCH
-            #             ),
-            #         },
-            #         "grid": {"n_radial": 20},
-            #     },
-            #     # Per-rotor override (optional):
-            #     # "coeff_mode": "wind_turbine",
-            #     # "gaussian_cutoff": 4.0,
-            # },
-            # # ────────────── Rotor 1: Downwind ──────────────
-            # {
-            #     "name": "rotor_1",
-            #     "rotor": {
-            #         "n_blades": N_BLADES,
-            #         "hub_center": [HUB_1_X_LU * DX_PHYS,
-            #                        HUB_1_Y_LU * DX_PHYS,
-            #                        HUB_1_Z_LU * DX_PHYS],  # [m]
-            #         "omega": OMEGA_ROTOR,           # [rad/s]
-            #         "theta_0": 0.0,                 # [rad]
-            #         "rotation_axis": "hawt_z",
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+                # Per-rotor override (optional):
+                # "coeff_mode": "wind_turbine",
+                # "gaussian_cutoff": 4.0,
+            },
+            # ────────────── Rotor 1: Downwind ──────────────
+            {
+                "name": "rotor_1",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_1_X_LU * DX_PHYS,
+                                   HUB_1_Y_LU * DX_PHYS,
+                                   HUB_1_Z_LU * DX_PHYS],  # [m]
+                    "omega": OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": [0, 0, 1],
 
-            #         "blade": {
-            #             "sections": _make_blade_sections(
-            #                 R_ROTOR, CHORD_BLADE, PITCH
-            #             ),
-            #         },
-            #         "grid": {"n_radial": 20},
-            #     },
-            # },
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+            },
 
-            # {
-            #     "name": "rotor_2",
-            #     "rotor": {
-            #         "n_blades": N_BLADES,
-            #         "hub_center": [HUB_2_X_LU * DX_PHYS,
-            #                        HUB_2_Y_LU * DX_PHYS,
-            #                        HUB_2_Z_LU * DX_PHYS],  # [m]
-            #         "omega": -OMEGA_ROTOR,           # [rad/s]
-            #         "theta_0": 0.0,                 # [rad]
-            #         "rotation_axis": "hawt_z",
+            {
+                "name": "rotor_2",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_2_X_LU * DX_PHYS,
+                                   HUB_2_Y_LU * DX_PHYS,
+                                   HUB_2_Z_LU * DX_PHYS],  # [m]
+                    "omega": OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": [0, 0, 1],
 
-            #         "blade": {
-            #             "sections": _make_blade_sections(
-            #                 R_ROTOR, CHORD_BLADE, PITCH
-            #             ),
-            #         },
-            #         "grid": {"n_radial": 20},
-            #     },
-            #     # Per-rotor override (optional):
-            #     # "coeff_mode": "wind_turbine",
-            #     # "gaussian_cutoff": 4.0,
-            # },
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+                # Per-rotor override (optional):
+                # "coeff_mode": "wind_turbine",
+                # "gaussian_cutoff": 4.0,
+            },
 
-            # {
-            #     "name": "rotor_3",
-            #     "rotor": {
-            #         "n_blades": N_BLADES,
-            #         "hub_center": [HUB_3_X_LU * DX_PHYS,
-            #                        HUB_3_Y_LU * DX_PHYS,
-            #                        HUB_3_Z_LU * DX_PHYS],  # [m]
-            #         "omega": OMEGA_ROTOR,           # [rad/s]
-            #         "theta_0": 0.0,                 # [rad]
-            #         "rotation_axis": "hawt_z",
+            {
+                "name": "rotor_3",
+                "rotor": {
+                    "n_blades": N_BLADES,
+                    "hub_center": [HUB_3_X_LU * DX_PHYS,
+                                   HUB_3_Y_LU * DX_PHYS,
+                                   HUB_3_Z_LU * DX_PHYS],  # [m]
+                    "omega": -OMEGA_ROTOR,           # [rad/s]
+                    "theta_0": 0.0,                 # [rad]
+                    "rotation_axis": [0, 0, 1],
 
-            #         "blade": {
-            #             "sections": _make_blade_sections(
-            #                 R_ROTOR, CHORD_BLADE, PITCH
-            #             ),
-            #         },
-            #         "grid": {"n_radial": 20},
-            #     },
-            #     # Per-rotor override (optional):
-            #     # "coeff_mode": "wind_turbine",
-            #     # "gaussian_cutoff": 4.0,
-            # },
+                    "blade": {
+                        "sections": _make_blade_sections(
+                            R_ROTOR, CHORD_BLADE, PITCH
+                        ),
+                    },
+                    "grid": {"n_radial": 20},
+                },
+                # Per-rotor override (optional):
+                # "coeff_mode": "wind_turbine",
+                # "gaussian_cutoff": 4.0,
+            },
 
             # {
             #     "name": "rotor_4",
@@ -560,28 +560,28 @@ if ALM_ENABLED:
             #     # "gaussian_cutoff": 4.0,
             # },
 
-            {
-                "name": "rotor_8",
-                "rotor": {
-                    "n_blades": 3,
-                    "hub_center": [HUB_8_X_LU * DX_PHYS,
-                                   HUB_8_Y_LU * DX_PHYS,
-                                   HUB_8_Z_LU * DX_PHYS],  # [m]
-                    "omega": -OMEGA_ROTOR,           # [rad/s]
-                    "theta_0": 0.0,                 # [rad]
-                    "rotation_axis": [1, 0, 0],
+            # {
+            #     "name": "rotor_8",
+            #     "rotor": {
+            #         "n_blades": 3,
+            #         "hub_center": [HUB_8_X_LU * DX_PHYS,
+            #                        HUB_8_Y_LU * DX_PHYS,
+            #                        HUB_8_Z_LU * DX_PHYS],  # [m]
+            #         "omega": -OMEGA_ROTOR,           # [rad/s]
+            #         "theta_0": 0.0,                 # [rad]
+            #         "rotation_axis": [1, 0, 0],
 
-                    "blade": {
-                        "sections": _make_blade_sections(
-                            R_ROTOR, CHORD_BLADE, PITCH
-                        ),
-                    },
-                    "grid": {"n_radial": 20},
-                },
-                # Per-rotor override (optional):
-                # "coeff_mode": "wind_turbine",
-                # "gaussian_cutoff": 4.0,
-            },
+            #         "blade": {
+            #             "sections": _make_blade_sections(
+            #                 R_ROTOR, CHORD_BLADE, PITCH
+            #             ),
+            #         },
+            #         "grid": {"n_radial": 20},
+            #     },
+            #     # Per-rotor override (optional):
+            #     # "coeff_mode": "wind_turbine",
+            #     # "gaussian_cutoff": 4.0,
+            # },
         ]
     })
 
