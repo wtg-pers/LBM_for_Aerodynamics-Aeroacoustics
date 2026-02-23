@@ -64,10 +64,12 @@ from .rotor import Rotor
 from .interpolation import (
     interpolate_velocity_batch,
     interpolate_velocity_batch_fast,
+    interpolate_velocity_batch_gpu,
 )
 from .spreading import (
     spread_forces_to_grid,
     spread_forces_uniform_epsilon,
+    spread_forces_to_grid_gpu,
     check_force_conservation,
 )
 
@@ -166,6 +168,7 @@ class ActuatorLineModel:
         dt_phys: float = 1.0,
         u_inf_lu: Optional[float] = None,
         coeff_mode: str = 'auto',
+        xp=None,
     ) -> None:
         """Initialize the Actuator Line model
 
@@ -185,6 +188,9 @@ class ActuatorLineModel:
                       (note: u_n ≈ u_∞(1-a), underestimates u_∞ by ~30% at Betz limit)
             coeff_mode: Performance coefficient convention
                         'wind_turbine' | 'rotorcraft' | 'auto'
+            xp: Array module — numpy or cupy (default: numpy).
+                When cupy, interpolation and spreading run on GPU.
+                u_field passed to step() should be an xp array.
         """
         self.rotor = rotor
         self.nu = nu                    # [lu²/lt]
@@ -196,10 +202,12 @@ class ActuatorLineModel:
         self.dt_phys = dt_phys          # [s/lt]
         self.u_inf_lu = u_inf_lu        # [Δx/Δt] or None
         self.coeff_mode = coeff_mode    # 'wind_turbine' | 'rotorcraft' | 'auto'
+        self.xp = xp if xp is not None else np   # array backend
 
-        # Pre-allocate body force array
+        # Pre-allocate body force array (on GPU if xp is cupy)
         Nx, Ny, Nz = domain_shape
-        self._F_grid = np.zeros((3, Nx, Ny, Nz), dtype=np.float64)
+        self._F_grid = self.xp.zeros((3, Nx, Ny, Nz), dtype=self.xp.float64)
+        # [lattice force / lu³]
 
         # Diagnostics storage (updated each step)
         self._last_bem_result: Optional[BEMResult] = None
@@ -233,6 +241,15 @@ class ActuatorLineModel:
         """Execute one complete AL timestep
 
         This is the PRIMARY interface called from the LBM time loop.
+        u_field can be a GPU (cupy) or CPU (numpy) array — the method
+        dispatches interpolation and spreading to the appropriate backend
+        via self.xp.
+
+        Data flow (GPU path):
+            GPU(u) → interpolate(GPU) → CPU(u_markers, ~KB)
+            → BEM(CPU) → CPU(F_markers, ~KB)
+            → spread(GPU) → GPU(F_grid)
+            No full-domain GPU↔CPU transfer needed.
 
         Physical Steps (see module docstring for data flow):
             1. Advance rotor azimuth
@@ -242,49 +259,58 @@ class ActuatorLineModel:
 
         Args:
             u_field: Velocity field, shape (3, Nx, Ny, Nz)  [Δx/Δt]
+                     Can be xp array (GPU or CPU).
             dt: Timestep (default 1.0 in lattice units)  [lt]
             external_F: Additional body force to combine with AL force
                         shape (3, Nx, Ny, Nz)  [lattice force / lu³]
+                        Must be same backend as self.xp.
 
         Returns:
             F_grid: Total body force field, shape (3, Nx, Ny, Nz)
                     [lattice force / lu³]
+                    Same backend as self.xp (GPU if cupy).
         """
-        # --- Step 1: Advance rotor ---
+        xp = self.xp
+
+        # --- Step 1: Advance rotor (CPU, trivial) ---
         self.rotor.advance(dt)
 
-        # --- Step 2: Get marker positions ---
+        # --- Step 2: Get marker positions (CPU, ~200 markers) ---
         positions = self.rotor.get_all_marker_positions()   # (N_total, 3) [lu]
         self._last_positions = positions
 
         # --- Step 3: Interpolate velocity at markers ---
+        # GPU path: u_field stays on GPU, only u_markers (~KB) returns to CPU
         epsilon_all = self.rotor.get_all_marker_epsilon()    # (N_total,) [lu]
         active_all = self.rotor.get_all_marker_active()      # (N_total,) bool
 
-        u_markers = interpolate_velocity_batch(
-            u_field, positions, epsilon_all, n_cut=self.n_cut
-        )  # (N_total, 3) [Δx/Δt]
+        u_markers = interpolate_velocity_batch_gpu(
+            u_field, positions, epsilon_all,
+            xp=xp, n_cut=self.n_cut
+        )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
 
-        # --- Step 4-7: BEM force calculation ---
+        # --- Step 4-7: BEM force calculation (CPU, small arrays) ---
         bem_result = self._compute_bem_forces(u_markers)
         self._last_bem_result = bem_result
 
-        # --- Step 8: Project to global frame ---
+        # --- Step 8: Project to global frame (CPU, small arrays) ---
         F_global = self.rotor.project_all_forces(
             bem_result.F_n, bem_result.F_theta
-        )  # (N_total, 3) [lattice force]
+        )  # (N_total, 3) [lattice force] — numpy (CPU)
         self._last_forces_global = F_global
 
         # --- Step 9: Gaussian spreading ---
-        self._F_grid[:] = 0.0  # Reset
+        # GPU path: F_grid allocated and filled on GPU, no CPU transfer
+        self._F_grid[:] = 0.0  # Reset (works for both numpy and cupy)
         if external_F is not None:
             self._F_grid[:] = external_F  # Start from external force
 
-        spread_forces_to_grid(
+        spread_forces_to_grid_gpu(
             self.domain_shape,
             positions,
             F_global,
             epsilon_all,
+            xp=xp,
             marker_active=active_all,
             n_cut=self.n_cut,
             F_grid=self._F_grid
@@ -668,19 +694,23 @@ class MultiRotorManager:
     def __init__(
         self,
         domain_shape: Tuple[int, int, int],
+        xp=None,
     ) -> None:
         """Initialize MultiRotorManager
 
         Args:
             domain_shape: (Nx, Ny, Nz) shared grid  [lu]
+            xp: Array module — numpy or cupy (default: numpy).
+                Controls allocation backend for _F_total accumulator.
         """
         self.domain_shape = domain_shape    # [lu]
+        self.xp = xp if xp is not None else np   # array backend
         self.models: List['ActuatorLineModel'] = []
         self.names: List[str] = []
 
-        # Pre-allocate accumulated body force array
+        # Pre-allocate accumulated body force array (on GPU if xp is cupy)
         Nx, Ny, Nz = domain_shape
-        self._F_total = np.zeros((3, Nx, Ny, Nz), dtype=np.float64)
+        self._F_total = self.xp.zeros((3, Nx, Ny, Nz), dtype=self.xp.float64)
         # [lattice force / lu³]
 
     # -----------------------------------------------------------------
@@ -730,21 +760,25 @@ class MultiRotorManager:
 
         Each ALM_k independently:
             1. Advances its rotor azimuth
-            2. Samples u(x) at its markers
-            3. Computes BEM forces
-            4. Spreads forces via Gaussian kernel
+            2. Samples u(x) at its markers (GPU if xp is cupy)
+            3. Computes BEM forces (always CPU)
+            4. Spreads forces via Gaussian kernel (GPU if xp is cupy)
 
         All F_k are accumulated into a single body force field.
+        When xp is cupy, all arrays remain on GPU throughout.
 
         Args:
             u_field: Velocity field, shape (3, Nx, Ny, Nz)  [Δx/Δt]
+                     Can be xp array (GPU or CPU).
             dt: Timestep  [lt]
             external_F: Additional body force (e.g., from sponge layer)
                         shape (3, Nx, Ny, Nz)  [lattice force / lu³]
+                        Must be same backend as self.xp.
 
         Returns:
             F_total: Combined body force field
                      shape (3, Nx, Ny, Nz)  [lattice force / lu³]
+                     Same backend as self.xp (GPU if cupy).
         """
         # Reset accumulator
         self._F_total[:] = 0.0
@@ -880,6 +914,7 @@ def create_actuator_line_from_config(
     dt_phys: float = 1.0,
     u_inf_lu: Optional[float] = None,
     coeff_mode: str = 'auto',
+    xp=None,
 ) -> 'ActuatorLineModel':
     """Create a SINGLE ActuatorLineModel from config  (unchanged API)
 
@@ -890,6 +925,11 @@ def create_actuator_line_from_config(
             "rho_ref": 1.0,
             "coeff_mode": "auto"
         }
+
+    Args:
+        ...
+        xp: Array module — numpy or cupy (default: numpy).
+            Passed to ActuatorLineModel for GPU dispatch.
     """
     from src.actuator.rotor import Rotor  # local import to avoid circular
 
@@ -919,6 +959,7 @@ def create_actuator_line_from_config(
         dt_phys=dt_phys,
         u_inf_lu=u_inf_lu,
         coeff_mode=resolved_mode,
+        xp=xp,
     )
 
 
@@ -931,6 +972,7 @@ def create_multi_rotor_from_config(
     dt_phys: float = 1.0,
     u_inf_lu: Optional[float] = None,
     coeff_mode: str = 'auto',
+    xp=None,
 ) -> MultiRotorManager:
     """Create a MultiRotorManager from config containing 'rotors' list
 
@@ -977,7 +1019,7 @@ def create_multi_rotor_from_config(
     Returns:
         MultiRotorManager with all rotors registered
     """
-    manager = MultiRotorManager(domain_shape=domain_shape)
+    manager = MultiRotorManager(domain_shape=domain_shape, xp=xp)
 
     # ── Detect format ──
     if 'rotors' in config:
@@ -1029,6 +1071,7 @@ def create_multi_rotor_from_config(
             dt_phys=dt_phys,
             u_inf_lu=rotor_u_inf,
             coeff_mode=single_config['coeff_mode'],
+            xp=xp,
         )
 
         manager.add_model(al_model, name=name)

@@ -520,6 +520,7 @@ def main():
                 dt_phys=dt_phys,
                 u_inf_lu=u_inf_lu_arg,
                 coeff_mode=al_cfg.get('coeff_mode', 'auto'),
+                xp=xp,
             )
             
             # Print each rotor info
@@ -544,6 +545,7 @@ def main():
                 dt_phys=dt_phys,
                 u_inf_lu=u_inf_lu_arg,
                 coeff_mode=al_cfg.get('coeff_mode', 'auto'),
+                xp=xp,
             )
 
         # ── Print summary (works for both single & multi) ──
@@ -676,13 +678,9 @@ def main():
         #   AL Pipeline: rotor rotation → BEM → Gaussian spreading → F(x)
         # ─────────────────────────────────────────────────────────────
         if al_model is not None:
-            if xp != np:
-                u_np = xp.asnumpy(u)
-            else:
-                u_np = np.asarray(u)
-            
-            F_np = al_model.step(u_np, dt=1.0)       # F(x)  [lattice force]
-            body_force = xp.asarray(F_np)
+            # GPU patch (P1-P3): u stays on GPU, F_grid returns on GPU
+            # No full-domain GPU↔CPU transfer needed
+            body_force = al_model.step(u, dt=1.0)    # F(x)  [lattice force / lu³]
             
             # Guo velocity correction: u = u_raw + F/(2ρ)  [Δx/Δt]
             u += (body_force / (2.0 * rho[None, ...]))
