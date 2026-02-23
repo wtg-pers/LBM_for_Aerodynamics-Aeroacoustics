@@ -72,6 +72,9 @@ from .interpolation import (
     interpolate_velocity_batch,
     interpolate_velocity_batch_fast,
     compute_interpolation_stencil_info,
+    # GPU-capable (P1)
+    interpolate_velocity_batch_gpu,
+    verify_gpu_interpolation,
 )
 
 # =============================================================================
@@ -121,6 +124,9 @@ __all__ = [
     'interpolate_velocity_batch',
     'interpolate_velocity_batch_fast',
     'compute_interpolation_stencil_info',
+    # GPU-capable (P1)
+    'interpolate_velocity_batch_gpu',
+    'verify_gpu_interpolation',
     # Spreading
     'spread_force_single_marker',
     'spread_forces_to_grid',

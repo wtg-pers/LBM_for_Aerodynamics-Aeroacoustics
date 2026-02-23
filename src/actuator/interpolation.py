@@ -353,3 +353,370 @@ def compute_interpolation_stencil_info(
         'n_nodes_sphere': n_sphere,
         'kernel_at_cutoff': kernel_ratio,
     }
+
+
+# =============================================================================
+# §6. GPU-Capable Batch Interpolation (xp-agnostic)
+# =============================================================================
+#
+# Design:
+#   - u_field lives on GPU (cupy) → interpolation runs on GPU
+#   - u_field lives on CPU (numpy) → falls back to existing §3/§4 functions
+#   - Return value is ALWAYS numpy (CPU) → feeds into BEM (CPU-only)
+#
+# Data Transfer:
+#   GPU path: only marker data crosses PCIe (~KB, not ~MB)
+#     GPU→CPU: u_markers  (N_markers × 3 × 8 bytes ≈ 4.8 KB for 200 markers)
+#     CPU→GPU: marker_positions, marker_epsilon (same order)
+#
+# Memory:
+#   N=200, ε=2Δx, n_cut=3 → S=13 → (200,13,13,13)×8B ≈ 34 MB per array
+#   Total ~120 MB — well within typical GPU memory
+#
+# =============================================================================
+
+def interpolate_velocity_batch_gpu(
+    u_field: 'npt.NDArray',
+    marker_positions: 'npt.NDArray',
+    marker_epsilon: 'npt.NDArray',
+    xp,
+    n_cut: float = 3.0
+) -> 'npt.NDArray':
+    """GPU-capable batch velocity interpolation at all marker positions
+
+    When xp is cupy, performs interpolation entirely on GPU using the
+    u_field already resident in GPU memory. Only marker-sized arrays
+    (~KB) cross the PCIe bus, eliminating the ~228 MB round-trip
+    that previously bottlenecked every timestep.
+
+    When xp is numpy, delegates to existing CPU functions (§3 or §4).
+
+    Physical formula (same as §2):
+        u(x_j) = Σ_x u(x)·η_ε(|x - x_j|) / Σ_x η_ε(|x - x_j|)
+
+    where η_ε(d) = (1/π^{3/2}ε³)·exp(-d²/ε²) truncated at d = n_cut·ε.
+    The normalization prefactor cancels in the ratio, so only exp(-d²/ε²)
+    is computed.
+
+    Args:
+        u_field: Velocity field, shape (3, Nx, Ny, Nz)  [Δx/Δt]
+                 Can be cupy array (GPU) or numpy array (CPU).
+        marker_positions: All marker positions, shape (N_markers, 3)  [lu]
+                          Always numpy (CPU) — from rotor kinematics.
+        marker_epsilon: Gaussian width per marker, shape (N_markers,)  [lu]
+                        Always numpy (CPU).
+        xp: Array module — numpy or cupy.
+        n_cut: Cutoff in units of ε  [dimensionless]
+
+    Returns:
+        u_markers: Velocity at each marker, shape (N_markers, 3)  [Δx/Δt]
+                   Always numpy (CPU) — feeds into BEM pipeline.
+    """
+    # ── CPU fallback: delegate to existing functions ──
+    if xp.__name__ == 'numpy':
+        # Always use §3 (per-marker loop) as the reference implementation.
+        # §4 (batch_fast) uses round-based stencils that can miss edge nodes
+        # vs §2's floor/ceil stencils, causing ~1e-5 discrepancies.
+        return interpolate_velocity_batch(
+            u_field, marker_positions,
+            marker_epsilon, n_cut=n_cut
+        )
+
+    # ── GPU path ──
+    eps_unique = np.unique(marker_epsilon)
+    if len(eps_unique) == 1:
+        u_markers_gpu = _interpolate_uniform_eps_gpu(
+            u_field, marker_positions,
+            float(eps_unique[0]), xp, n_cut
+        )
+    else:
+        u_markers_gpu = _interpolate_varying_eps_gpu(
+            u_field, marker_positions,
+            marker_epsilon, xp, n_cut
+        )
+
+    # GPU → CPU: only marker velocities (~KB)
+    return xp.asnumpy(u_markers_gpu)   # (N_markers, 3)  [Δx/Δt]
+
+
+# -----------------------------------------------------------------------------
+# §6.1 Uniform ε — Fully Vectorized GPU Interpolation
+# -----------------------------------------------------------------------------
+
+def _interpolate_uniform_eps_gpu(
+    u_field: 'npt.NDArray',
+    marker_positions: 'npt.NDArray',
+    epsilon: float,
+    xp,
+    n_cut: float
+) -> 'npt.NDArray':
+    """Fully vectorized GPU interpolation for uniform Gaussian width
+
+    All markers share the same ε, so the stencil shape (S, S, S) is
+    identical. This enables a single batched tensor operation:
+
+        shape: (N_markers, S, S, S)
+
+    for grid indices, distances, weights, and velocities — processed
+    in one GPU kernel launch per operation.
+
+    Memory layout:
+        gx, gy, gz:  (N_markers, S, S, S) int32   — grid indices
+        d_sq:        (N_markers, S, S, S) float64  — squared distances  [lu²]
+        weights:     (N_markers, S, S, S) float64  — Gaussian weights   [dimless]
+        u_local:     (N_markers, S, S, S) float64  — per-component vel  [Δx/Δt]
+
+    Args:
+        u_field: (3, Nx, Ny, Nz) GPU array  [Δx/Δt]
+        marker_positions: (N_markers, 3) numpy  [lu]
+        epsilon: Uniform Gaussian width  [lu]
+        xp: cupy module
+        n_cut: Cutoff multiplier  [dimensionless]
+
+    Returns:
+        u_markers: (N_markers, 3) GPU array  [Δx/Δt]
+    """
+    _, Nx, Ny, Nz = u_field.shape
+    n_markers = marker_positions.shape[0]
+
+    r_cut = n_cut * epsilon              # [lu]
+    eps_sq = epsilon * epsilon            # [lu²]
+    r_cut_sq = r_cut * r_cut             # [lu²]
+    # +1 ensures we capture all nodes that §2's floor/ceil bounding box
+    # would include, regardless of fractional marker position.
+    # Extra nodes beyond r_cut get zero weight from spherical cutoff.
+    half = int(np.ceil(r_cut)) + 1       # [lu, integer]
+
+    # ── CPU → GPU: marker positions only (~KB) ──
+    pos_gpu = xp.asarray(marker_positions, dtype=xp.float64)   # (N_markers, 3) [lu]
+
+    # ── Stencil offsets (shared for all markers) ──
+    offsets = xp.arange(-half, half + 1, dtype=xp.float64)     # (S,) [lu]
+    S = len(offsets)    # stencil width = 2*half + 1
+
+    # 3D stencil offset grid: (S, S, S) each
+    ox, oy, oz = xp.meshgrid(offsets, offsets, offsets, indexing='ij')
+
+    # ── Nearest grid node for each marker ──
+    ix0 = xp.round(pos_gpu[:, 0]).astype(xp.int32)   # (N_markers,)
+    iy0 = xp.round(pos_gpu[:, 1]).astype(xp.int32)
+    iz0 = xp.round(pos_gpu[:, 2]).astype(xp.int32)
+
+    # ── Absolute grid indices: (N_markers, S, S, S) ──
+    # Broadcasting: (N,1,1,1) + (1,S,S,S) → (N,S,S,S)
+    gx = ix0[:, None, None, None] + ox[None, :, :, :].astype(xp.int32)
+    gy = iy0[:, None, None, None] + oy[None, :, :, :].astype(xp.int32)
+    gz = iz0[:, None, None, None] + oz[None, :, :, :].astype(xp.int32)
+
+    # ── Domain bounds check ──
+    valid = (
+        (gx >= 0) & (gx < Nx) &
+        (gy >= 0) & (gy < Ny) &
+        (gz >= 0) & (gz < Nz)
+    )   # (N_markers, S, S, S) bool
+
+    # Clamp for safe indexing (invalid nodes masked to zero weight)
+    gx_c = xp.clip(gx, 0, Nx - 1)
+    gy_c = xp.clip(gy, 0, Ny - 1)
+    gz_c = xp.clip(gz, 0, Nz - 1)
+
+    # ── Squared distances from each marker to its stencil nodes ──
+    # pos_gpu[:, d] shape (N,) → (N,1,1,1) for broadcasting
+    dx = gx.astype(xp.float64) - pos_gpu[:, 0, None, None, None]   # [lu]
+    dy = gy.astype(xp.float64) - pos_gpu[:, 1, None, None, None]   # [lu]
+    dz = gz.astype(xp.float64) - pos_gpu[:, 2, None, None, None]   # [lu]
+    d_sq = dx * dx + dy * dy + dz * dz                              # [lu²]
+
+    # ── Gaussian weights with cutoff ──
+    # η ∝ exp(-d²/ε²), masked by domain bounds and cutoff radius
+    weights = xp.where(
+        valid & (d_sq <= r_cut_sq),
+        xp.exp(-d_sq / eps_sq),    # [dimensionless] (prefactor cancels)
+        0.0
+    )   # (N_markers, S, S, S)
+
+    # Normalization per marker
+    W_sum = xp.sum(weights, axis=(1, 2, 3))        # (N_markers,) [dimless]
+    W_sum = xp.maximum(W_sum, 1e-30)               # avoid division by zero
+
+    # ── Weighted velocity for each component ──
+    u_markers = xp.zeros((n_markers, 3), dtype=xp.float64)   # [Δx/Δt]
+
+    for d in range(3):
+        # Gather grid velocity at stencil nodes: u_field[d, gx, gy, gz]
+        u_local = u_field[d, gx_c, gy_c, gz_c]     # (N_markers, S, S, S) [Δx/Δt]
+        u_local = u_local * weights                  # weighted [Δx/Δt × dimless]
+        u_markers[:, d] = xp.sum(u_local, axis=(1, 2, 3)) / W_sum   # [Δx/Δt]
+
+    return u_markers   # (N_markers, 3) GPU array [Δx/Δt]
+
+
+# -----------------------------------------------------------------------------
+# §6.2 Varying ε — Padded GPU Interpolation
+# -----------------------------------------------------------------------------
+
+def _interpolate_varying_eps_gpu(
+    u_field: 'npt.NDArray',
+    marker_positions: 'npt.NDArray',
+    marker_epsilon: 'npt.NDArray',
+    xp,
+    n_cut: float
+) -> 'npt.NDArray':
+    """GPU interpolation when markers have different Gaussian widths
+
+    Strategy: Use the MAXIMUM ε to define the stencil size, then apply
+    per-marker cutoff via masking. Markers with smaller ε simply have
+    more zero-weight nodes in their stencil — computationally wasteful
+    but fully vectorized.
+
+    This is acceptable when the ε variation is modest (e.g., ε(r) based
+    on local chord vs. 2Δx clamping). For extreme variation, chunk-based
+    processing would be more memory-efficient.
+
+    Args:
+        u_field: (3, Nx, Ny, Nz) GPU array  [Δx/Δt]
+        marker_positions: (N_markers, 3) numpy  [lu]
+        marker_epsilon: (N_markers,) numpy  [lu]
+        xp: cupy module
+        n_cut: Cutoff multiplier  [dimensionless]
+
+    Returns:
+        u_markers: (N_markers, 3) GPU array  [Δx/Δt]
+    """
+    _, Nx, Ny, Nz = u_field.shape
+    n_markers = marker_positions.shape[0]
+
+    # Use max ε for stencil sizing
+    eps_max = float(np.max(marker_epsilon))          # [lu]
+    r_cut_max = n_cut * eps_max                      # [lu]
+    # +1 to capture all nodes §2's floor/ceil bounding box would include
+    half = int(np.ceil(r_cut_max)) + 1               # [lu, integer]
+
+    # ── CPU → GPU: marker data ──
+    pos_gpu = xp.asarray(marker_positions, dtype=xp.float64)   # (N,3) [lu]
+    eps_gpu = xp.asarray(marker_epsilon, dtype=xp.float64)     # (N,)  [lu]
+    eps_sq_gpu = eps_gpu * eps_gpu                              # (N,)  [lu²]
+    r_cut_gpu = n_cut * eps_gpu                                 # (N,)  [lu]
+    r_cut_sq_gpu = r_cut_gpu * r_cut_gpu                        # (N,)  [lu²]
+
+    # ── Stencil offsets (sized by max ε) ──
+    offsets = xp.arange(-half, half + 1, dtype=xp.float64)
+    S = len(offsets)
+    ox, oy, oz = xp.meshgrid(offsets, offsets, offsets, indexing='ij')
+
+    # ── Grid indices: (N_markers, S, S, S) ──
+    ix0 = xp.round(pos_gpu[:, 0]).astype(xp.int32)
+    iy0 = xp.round(pos_gpu[:, 1]).astype(xp.int32)
+    iz0 = xp.round(pos_gpu[:, 2]).astype(xp.int32)
+
+    gx = ix0[:, None, None, None] + ox[None, :, :, :].astype(xp.int32)
+    gy = iy0[:, None, None, None] + oy[None, :, :, :].astype(xp.int32)
+    gz = iz0[:, None, None, None] + oz[None, :, :, :].astype(xp.int32)
+
+    valid = (
+        (gx >= 0) & (gx < Nx) &
+        (gy >= 0) & (gy < Ny) &
+        (gz >= 0) & (gz < Nz)
+    )
+
+    gx_c = xp.clip(gx, 0, Nx - 1)
+    gy_c = xp.clip(gy, 0, Ny - 1)
+    gz_c = xp.clip(gz, 0, Nz - 1)
+
+    # ── Distances ──
+    dx = gx.astype(xp.float64) - pos_gpu[:, 0, None, None, None]
+    dy = gy.astype(xp.float64) - pos_gpu[:, 1, None, None, None]
+    dz = gz.astype(xp.float64) - pos_gpu[:, 2, None, None, None]
+    d_sq = dx * dx + dy * dy + dz * dz   # (N, S, S, S) [lu²]
+
+    # ── Per-marker Gaussian weights with per-marker cutoff ──
+    # eps_sq_gpu, r_cut_sq_gpu: (N,) → (N,1,1,1) for broadcasting
+    weights = xp.where(
+        valid & (d_sq <= r_cut_sq_gpu[:, None, None, None]),
+        xp.exp(-d_sq / eps_sq_gpu[:, None, None, None]),
+        0.0
+    )
+
+    W_sum = xp.sum(weights, axis=(1, 2, 3))
+    W_sum = xp.maximum(W_sum, 1e-30)
+
+    # ── Weighted velocity ──
+    u_markers = xp.zeros((n_markers, 3), dtype=xp.float64)
+
+    for d in range(3):
+        u_local = u_field[d, gx_c, gy_c, gz_c]
+        u_local = u_local * weights
+        u_markers[:, d] = xp.sum(u_local, axis=(1, 2, 3)) / W_sum
+
+    return u_markers   # (N_markers, 3) GPU array [Δx/Δt]
+
+
+# =============================================================================
+# §7. GPU vs CPU Verification Utility
+# =============================================================================
+
+def verify_gpu_interpolation(
+    u_field_np: 'npt.NDArray',
+    marker_positions: 'npt.NDArray',
+    marker_epsilon: 'npt.NDArray',
+    n_cut: float = 3.0,
+    rtol: float = 1e-12,
+    atol: float = 1e-14,
+) -> dict:
+    """Verify GPU interpolation against CPU reference
+
+    Runs both CPU (§3) and GPU (§6) paths, comparing results element-wise.
+    This function requires cupy to be importable.
+
+    Args:
+        u_field_np: Velocity field (numpy), shape (3, Nx, Ny, Nz)  [Δx/Δt]
+        marker_positions: (N_markers, 3) numpy  [lu]
+        marker_epsilon: (N_markers,) numpy  [lu]
+        n_cut: Cutoff multiplier  [dimensionless]
+        rtol: Relative tolerance for comparison
+        atol: Absolute tolerance for comparison
+
+    Returns:
+        dict with:
+            - match: bool — True if all within tolerance
+            - max_abs_error: Maximum absolute difference  [Δx/Δt]
+            - max_rel_error: Maximum relative difference  [dimensionless]
+            - u_cpu: CPU result (N_markers, 3)
+            - u_gpu: GPU result (N_markers, 3)
+    """
+    try:
+        import cupy as cp
+    except ImportError:
+        return {'match': None, 'error': 'cupy not available'}
+
+    # CPU reference
+    u_cpu = interpolate_velocity_batch(
+        u_field_np, marker_positions, marker_epsilon, n_cut=n_cut
+    )
+
+    # GPU path
+    u_field_gpu = cp.asarray(u_field_np)
+    u_gpu = interpolate_velocity_batch_gpu(
+        u_field_gpu, marker_positions, marker_epsilon,
+        xp=cp, n_cut=n_cut
+    )
+
+    # Compare
+    abs_err = np.abs(u_cpu - u_gpu)
+    max_abs = float(np.max(abs_err))
+
+    # Relative error (avoid division by zero)
+    denom = np.maximum(np.abs(u_cpu), 1e-30)
+    rel_err = abs_err / denom
+    max_rel = float(np.max(rel_err[np.abs(u_cpu) > atol]))  \
+        if np.any(np.abs(u_cpu) > atol) else 0.0
+
+    match = np.allclose(u_cpu, u_gpu, rtol=rtol, atol=atol)
+
+    return {
+        'match': match,
+        'max_abs_error': max_abs,
+        'max_rel_error': max_rel,
+        'u_cpu': u_cpu,
+        'u_gpu': u_gpu,
+    }

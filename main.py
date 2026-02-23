@@ -685,7 +685,7 @@ def main():
             body_force = xp.asarray(F_np)
             
             # Guo velocity correction: u = u_raw + F/(2ρ)  [Δx/Δt]
-            u = u + body_force / (2.0 * rho[None, ...])
+            u += (body_force / (2.0 * rho[None, ...]))
 
         # ─── Step 2: Equilibrium Distribution ────────────────────────
         f_eq = eq.compute(rho, u)
