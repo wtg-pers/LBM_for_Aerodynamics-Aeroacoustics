@@ -380,7 +380,8 @@ def interpolate_velocity_batch_gpu(
     marker_positions: 'npt.NDArray',
     marker_epsilon: 'npt.NDArray',
     xp,
-    n_cut: float = 3.0
+    n_cut: float = 3.0,
+    gpu_mem_limit_mb: float = 512.0
 ) -> 'npt.NDArray':
     """GPU-capable batch velocity interpolation at all marker positions
 
@@ -388,6 +389,10 @@ def interpolate_velocity_batch_gpu(
     u_field already resident in GPU memory. Only marker-sized arrays
     (~KB) cross the PCIe bus, eliminating the ~228 MB round-trip
     that previously bottlenecked every timestep.
+
+    P4 Enhancement: Automatic chunking when estimated GPU memory
+    exceeds gpu_mem_limit_mb. Splits markers into chunks that fit
+    within the budget, processes each on GPU, and concatenates results.
 
     When xp is numpy, delegates to existing CPU functions (§3 or §4).
 
@@ -407,6 +412,8 @@ def interpolate_velocity_batch_gpu(
                         Always numpy (CPU).
         xp: Array module — numpy or cupy.
         n_cut: Cutoff in units of ε  [dimensionless]
+        gpu_mem_limit_mb: Maximum GPU memory for interpolation work arrays
+                          [MB]. Triggers chunking if exceeded. Default 512.
 
     Returns:
         u_markers: Velocity at each marker, shape (N_markers, 3)  [Δx/Δt]
@@ -422,21 +429,96 @@ def interpolate_velocity_batch_gpu(
             marker_epsilon, n_cut=n_cut
         )
 
-    # ── GPU path ──
+    # ── GPU path with auto-chunking (P4) ──
+    n_markers = marker_positions.shape[0]
     eps_unique = np.unique(marker_epsilon)
-    if len(eps_unique) == 1:
-        u_markers_gpu = _interpolate_uniform_eps_gpu(
-            u_field, marker_positions,
-            float(eps_unique[0]), xp, n_cut
-        )
-    else:
-        u_markers_gpu = _interpolate_varying_eps_gpu(
-            u_field, marker_positions,
-            marker_epsilon, xp, n_cut
-        )
+    is_uniform = (len(eps_unique) == 1)
+    epsilon_for_stencil = float(eps_unique[0]) if is_uniform \
+        else float(np.max(marker_epsilon))
 
-    # GPU → CPU: only marker velocities (~KB)
-    return xp.asnumpy(u_markers_gpu)   # (N_markers, 3)  [Δx/Δt]
+    # Estimate memory and determine chunk size
+    chunk_size = _compute_chunk_size(
+        n_markers, epsilon_for_stencil, n_cut, gpu_mem_limit_mb
+    )
+
+    if chunk_size >= n_markers:
+        # ── Single batch (no chunking needed) ──
+        if is_uniform:
+            u_gpu = _interpolate_uniform_eps_gpu(
+                u_field, marker_positions,
+                float(eps_unique[0]), xp, n_cut
+            )
+        else:
+            u_gpu = _interpolate_varying_eps_gpu(
+                u_field, marker_positions,
+                marker_epsilon, xp, n_cut
+            )
+        return xp.asnumpy(u_gpu)
+
+    # ── Chunked processing ──
+    u_all = np.zeros((n_markers, 3), dtype=np.float64)   # [Δx/Δt]
+
+    for c_start in range(0, n_markers, chunk_size):
+        c_end = min(c_start + chunk_size, n_markers)
+        pos_chunk = marker_positions[c_start:c_end]
+        eps_chunk = marker_epsilon[c_start:c_end]
+
+        if is_uniform:
+            u_chunk_gpu = _interpolate_uniform_eps_gpu(
+                u_field, pos_chunk,
+                float(eps_unique[0]), xp, n_cut
+            )
+        else:
+            u_chunk_gpu = _interpolate_varying_eps_gpu(
+                u_field, pos_chunk, eps_chunk, xp, n_cut
+            )
+
+        u_all[c_start:c_end] = xp.asnumpy(u_chunk_gpu)
+
+    return u_all   # (N_markers, 3)  [Δx/Δt]
+
+
+def _compute_chunk_size(
+    n_markers: int,
+    epsilon: float,
+    n_cut: float,
+    mem_limit_mb: float
+) -> int:
+    """Compute optimal chunk size to fit within GPU memory budget
+
+    Memory estimation for (N_chunk, S, S, S) tensors:
+        - gx, gy, gz: 3 × N × S³ × 4 bytes (int32)
+        - gx_c, gy_c, gz_c: 3 × N × S³ × 4 bytes (int32)
+        - valid: N × S³ × 1 byte (bool)
+        - dx, dy, dz, d_sq: 4 × N × S³ × 8 bytes (float64)
+        - weights: N × S³ × 8 bytes (float64)
+        - u_local: N × S³ × 8 bytes (float64) × 3 components (sequential)
+        Total ≈ N × S³ × (24 + 24 + 1 + 32 + 8 + 8) = N × S³ × 97 bytes
+        With overhead: ~N × S³ × 120 bytes
+
+    Args:
+        n_markers: Total number of markers
+        epsilon: Gaussian width (or max ε for varying)  [lu]
+        n_cut: Cutoff multiplier  [dimensionless]
+        mem_limit_mb: GPU memory budget  [MB]
+
+    Returns:
+        chunk_size: Number of markers per chunk (≥1, ≤n_markers)
+    """
+    r_cut = n_cut * epsilon
+    half = int(np.ceil(r_cut)) + 1
+    S = 2 * half + 1                                        # stencil width
+    S_cubed = S * S * S                                     # stencil volume
+
+    bytes_per_marker = S_cubed * 120                        # [bytes]
+    mem_limit_bytes = mem_limit_mb * 1024 * 1024            # [bytes]
+
+    if bytes_per_marker <= 0:
+        return n_markers
+
+    chunk = int(mem_limit_bytes / bytes_per_marker)
+    chunk = max(1, min(chunk, n_markers))
+    return chunk
 
 
 # -----------------------------------------------------------------------------

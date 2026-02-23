@@ -389,19 +389,128 @@ def check_force_conservation(
 # Design:
 #   - F_grid lives entirely on GPU — never transferred to CPU
 #   - Marker data (positions, forces, epsilon) sent to GPU (~KB)
-#   - Each marker's stencil computation runs on GPU (vectorized)
-#   - Marker loop in Python (50~200 iterations) — avoids race conditions
 #
-# Data Transfer:
-#   CPU→GPU: marker_positions, marker_forces, marker_epsilon (~15 KB for 200 markers)
-#   GPU→CPU: nothing — F_grid stays on GPU for Guo forcing
+# Evolution:
+#   P2 (Method A): Python marker loop, each stencil GPU-vectorized
+#   P5 (Method B): CuPy RawKernel — ALL markers × ALL stencil nodes
+#                  processed in a single CUDA kernel launch using atomicAdd.
+#                  Eliminates Python loop entirely.
 #
-# Race Condition Strategy:
-#   Method A (sequential markers): each marker's stencil accumulates into F_grid
-#   one at a time. No overlapping writes. Safe and sufficient for N_markers ≤ 200.
-#   Method B (atomicAdd via RawKernel) deferred to P5 if performance demands.
+# RawKernel Strategy (P5):
+#   Thread grid: (n_active_markers × S³) total threads
+#   Each thread:
+#     1. Decode (marker_idx, local_x, local_y, local_z) from linear index
+#     2. Compute absolute grid position → bounds check
+#     3. Compute distance, Gaussian weight, cutoff check
+#     4. atomicAdd(-force * eta) to F_grid[d, ix, iy, iz]
+#
+#   atomicAdd on double is supported on compute capability ≥ 6.0 (Pascal+).
+#   For 200 markers × S=13 → 439,400 threads — well within GPU capacity.
 #
 # =============================================================================
+
+# --- CUDA kernel source (P5) ---
+_SPREAD_KERNEL_SRC = r"""
+extern "C" __global__
+void spread_forces_kernel(
+    double* F_grid,             // (3, Nx, Ny, Nz) — output, atomicAdd target
+    const double* positions,    // (N_active, 3) — marker positions [lu]
+    const double* forces,       // (N_active, 3) — marker forces [lattice force]
+    const double* epsilons,     // (N_active,) — per-marker epsilon [lu]
+    const int N_active,         // number of active markers
+    const int Nx, const int Ny, const int Nz,
+    const int S,                // stencil width (2*half+1)
+    const int half,             // stencil half-width
+    const double n_cut,         // cutoff multiplier [dimensionless]
+    const double inv_pi32       // 1 / pi^{3/2} [dimensionless]
+)
+{
+    // Global thread index → (marker_idx, stencil linear index)
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    int S3 = S * S * S;
+    int total = N_active * S3;
+    if (tid >= total) return;
+
+    int m = tid / S3;           // marker index
+    int s = tid % S3;           // stencil linear index
+
+    // Decode stencil (sx, sy, sz) from linear index s
+    int sz = s % S;
+    int sy = (s / S) % S;
+    int sx = s / (S * S);
+
+    // Stencil offsets: [-half, ..., +half]
+    int ox = sx - half;
+    int oy = sy - half;
+    int oz = sz - half;
+
+    // Marker position
+    double xj = positions[m * 3 + 0];
+    double yj = positions[m * 3 + 1];
+    double zj = positions[m * 3 + 2];
+
+    // Nearest grid node
+    int ix0 = (int)round(xj);
+    int iy0 = (int)round(yj);
+    int iz0 = (int)round(zj);
+
+    // Absolute grid position
+    int ix = ix0 + ox;
+    int iy = iy0 + oy;
+    int iz = iz0 + oz;
+
+    // Domain bounds check
+    if (ix < 0 || ix >= Nx || iy < 0 || iy >= Ny || iz < 0 || iz >= Nz)
+        return;
+
+    // Per-marker epsilon and cutoff
+    double eps = epsilons[m];
+    double eps_sq = eps * eps;
+    double r_cut = n_cut * eps;
+    double r_cut_sq = r_cut * r_cut;
+
+    // Distance from marker to grid node
+    double dx = (double)ix - xj;
+    double dy = (double)iy - yj;
+    double dz = (double)iz - zj;
+    double d_sq = dx*dx + dy*dy + dz*dz;
+
+    // Cutoff check (spherical)
+    if (d_sq > r_cut_sq) return;
+
+    // Gaussian kernel: eta = (1 / (pi^{3/2} * eps^3)) * exp(-d_sq / eps_sq)
+    double norm = inv_pi32 / (eps * eps * eps);     // [1/lu^3]
+    double eta = norm * exp(-d_sq / eps_sq);         // [1/lu^3]
+
+    // Force components (Newton's third law: negative sign)
+    double fx = -forces[m * 3 + 0] * eta;  // [lattice force / lu^3]
+    double fy = -forces[m * 3 + 1] * eta;
+    double fz = -forces[m * 3 + 2] * eta;
+
+    // Flat index into F_grid: F_grid[d, ix, iy, iz]
+    // F_grid layout: (3, Nx, Ny, Nz) row-major → index = d*Nx*Ny*Nz + ix*Ny*Nz + iy*Nz + iz
+    int grid_size = Nx * Ny * Nz;
+    int flat_idx = ix * Ny * Nz + iy * Nz + iz;
+
+    atomicAdd(&F_grid[0 * grid_size + flat_idx], fx);
+    atomicAdd(&F_grid[1 * grid_size + flat_idx], fy);
+    atomicAdd(&F_grid[2 * grid_size + flat_idx], fz);
+}
+"""
+
+# Compiled kernel cache (lazy init)
+_spread_kernel_cache = {}
+
+
+def _get_spread_kernel(xp):
+    """Get or compile the spreading CUDA kernel (cached)"""
+    if 'kernel' not in _spread_kernel_cache:
+        _spread_kernel_cache['kernel'] = xp.RawKernel(
+            _SPREAD_KERNEL_SRC,
+            'spread_forces_kernel'
+        )
+    return _spread_kernel_cache['kernel']
+
 
 def spread_forces_to_grid_gpu(
     domain_shape: Tuple[int, int, int],
@@ -415,8 +524,12 @@ def spread_forces_to_grid_gpu(
 ) -> 'npt.NDArray':
     """GPU-capable batch force spreading (Eq. 13) — xp dispatch
 
-    When xp is cupy, F_grid lives on GPU and marker stencil operations
-    run on GPU. Only marker-sized arrays (~KB) cross PCIe.
+    When xp is cupy:
+      - P5 path (default): CuPy RawKernel with atomicAdd.
+        ALL markers processed in a single CUDA kernel launch.
+        No Python loop. Maximum GPU parallelism.
+      - Fallback: Method A (marker loop) if RawKernel compilation fails.
+
     When xp is numpy, delegates to existing CPU function (§2).
 
     The returned F_grid is an xp array (cupy if GPU, numpy if CPU),
@@ -463,28 +576,133 @@ def spread_forces_to_grid_gpu(
     if marker_active is None:
         marker_active = np.ones(n_markers, dtype=bool)
 
-    # Marker loop (Method A: sequential to avoid race conditions)
-    # Python overhead: ~200 iterations × ~0.01ms = ~2ms — negligible
-    # Each iteration's stencil computation (~2000 nodes) is GPU-vectorized
-    for j in range(n_markers):
-        if not marker_active[j]:
-            continue
+    # Filter to active, nonzero-force markers (on CPU, cheap)
+    force_mag_sq = np.sum(marker_forces ** 2, axis=1)   # (N_markers,)
+    active_mask = marker_active & (force_mag_sq > 1e-60)
+    n_active = int(np.sum(active_mask))
 
-        # Skip zero-force markers (check on CPU, cheap)
-        force_mag_sq = float(np.sum(marker_forces[j] ** 2))
-        if force_mag_sq < 1e-60:
-            continue
+    if n_active == 0:
+        return F_grid
 
-        _spread_single_marker_gpu(
-            F_grid,
-            marker_positions[j],     # (3,) numpy  [lu]
-            marker_forces[j],        # (3,) numpy  [lattice force]
-            float(marker_epsilon[j]),  # scalar     [lu]
-            xp,
-            n_cut
+    active_pos = marker_positions[active_mask]        # (N_active, 3)
+    active_forces = marker_forces[active_mask]        # (N_active, 3)
+    active_eps = marker_epsilon[active_mask]           # (N_active,)
+
+    # ── Try RawKernel (P5) ──
+    try:
+        _spread_rawkernel_gpu(
+            F_grid, active_pos, active_forces, active_eps,
+            domain_shape, xp, n_cut
+        )
+    except Exception:
+        # Fallback to Method A (marker loop) if kernel fails
+        _spread_method_a_gpu(
+            F_grid, active_pos, active_forces, active_eps,
+            xp, n_cut
         )
 
     return F_grid   # (3, Nx, Ny, Nz) GPU array [lattice force / lu³]
+
+
+# -----------------------------------------------------------------------------
+# §5.1 RawKernel Spreading (P5 — Full Parallelism)
+# -----------------------------------------------------------------------------
+
+def _spread_rawkernel_gpu(
+    F_grid: 'npt.NDArray',
+    positions: 'npt.NDArray',
+    forces: 'npt.NDArray',
+    epsilons: 'npt.NDArray',
+    domain_shape: Tuple[int, int, int],
+    xp,
+    n_cut: float
+) -> None:
+    """Spread all marker forces using CUDA RawKernel with atomicAdd
+
+    Single kernel launch processes ALL markers × ALL stencil nodes.
+    No Python loop. Race conditions resolved by atomicAdd on double.
+
+    Thread layout:
+        total_threads = N_active × S³
+        thread i → marker (i // S³), stencil node (i % S³)
+
+    Memory: only marker arrays transferred CPU→GPU (~KB).
+    F_grid modified in-place on GPU.
+
+    Args:
+        F_grid: (3, Nx, Ny, Nz) GPU array, modified IN-PLACE
+        positions: (N_active, 3) numpy  [lu]
+        forces: (N_active, 3) numpy  [lattice force]
+        epsilons: (N_active,) numpy  [lu]
+        domain_shape: (Nx, Ny, Nz)  [lu]
+        xp: cupy module
+        n_cut: Cutoff multiplier  [dimensionless]
+    """
+    Nx, Ny, Nz = domain_shape
+    n_active = positions.shape[0]
+
+    # Stencil size from max epsilon
+    eps_max = float(np.max(epsilons))
+    r_cut_max = n_cut * eps_max
+    half = int(np.ceil(r_cut_max)) + 1       # +1 for floor/ceil matching
+    S = 2 * half + 1
+
+    # Transfer marker data to GPU (~KB)
+    pos_gpu = xp.asarray(positions.astype(np.float64).ravel(),
+                         dtype=xp.float64)         # (N_active*3,)
+    force_gpu = xp.asarray(forces.astype(np.float64).ravel(),
+                           dtype=xp.float64)       # (N_active*3,)
+    eps_gpu = xp.asarray(epsilons.astype(np.float64),
+                         dtype=xp.float64)         # (N_active,)
+
+    inv_pi32 = 1.0 / (np.pi ** 1.5)                # [dimensionless]
+
+    # Launch kernel
+    total_threads = n_active * S * S * S
+    block_size = 256
+    grid_size = (total_threads + block_size - 1) // block_size
+
+    kernel = _get_spread_kernel(xp)
+    kernel(
+        (grid_size,), (block_size,),
+        (
+            F_grid, pos_gpu, force_gpu, eps_gpu,
+            np.int32(n_active),
+            np.int32(Nx), np.int32(Ny), np.int32(Nz),
+            np.int32(S), np.int32(half),
+            np.float64(n_cut), np.float64(inv_pi32)
+        )
+    )
+    # F_grid modified in-place via atomicAdd
+
+
+# -----------------------------------------------------------------------------
+# §5.2 Method A Fallback (marker loop, P2 legacy)
+# -----------------------------------------------------------------------------
+
+def _spread_method_a_gpu(
+    F_grid: 'npt.NDArray',
+    positions: 'npt.NDArray',
+    forces: 'npt.NDArray',
+    epsilons: 'npt.NDArray',
+    xp,
+    n_cut: float
+) -> None:
+    """Fallback: spread via Python marker loop (Method A from P2)
+
+    Each marker's stencil is computed as a GPU-vectorized operation.
+    Safe (no race conditions), sufficient for N_markers ≤ 200.
+    Used only when RawKernel compilation fails.
+    """
+    for j in range(positions.shape[0]):
+        _spread_single_marker_gpu(
+            F_grid,
+            positions[j],
+            forces[j],
+            float(epsilons[j]),
+            xp,
+            n_cut
+        )
 
 
 # -----------------------------------------------------------------------------
