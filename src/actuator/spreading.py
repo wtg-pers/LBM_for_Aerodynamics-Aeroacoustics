@@ -380,3 +380,273 @@ def check_force_conservation(
         'relative_error': rel_error,
         'is_conserved': bool(np.all(rel_error < 1e-3)),
     }
+
+
+# =============================================================================
+# §5. GPU-Capable Force Spreading (xp-agnostic)
+# =============================================================================
+#
+# Design:
+#   - F_grid lives entirely on GPU — never transferred to CPU
+#   - Marker data (positions, forces, epsilon) sent to GPU (~KB)
+#   - Each marker's stencil computation runs on GPU (vectorized)
+#   - Marker loop in Python (50~200 iterations) — avoids race conditions
+#
+# Data Transfer:
+#   CPU→GPU: marker_positions, marker_forces, marker_epsilon (~15 KB for 200 markers)
+#   GPU→CPU: nothing — F_grid stays on GPU for Guo forcing
+#
+# Race Condition Strategy:
+#   Method A (sequential markers): each marker's stencil accumulates into F_grid
+#   one at a time. No overlapping writes. Safe and sufficient for N_markers ≤ 200.
+#   Method B (atomicAdd via RawKernel) deferred to P5 if performance demands.
+#
+# =============================================================================
+
+def spread_forces_to_grid_gpu(
+    domain_shape: Tuple[int, int, int],
+    marker_positions: 'npt.NDArray',
+    marker_forces: 'npt.NDArray',
+    marker_epsilon: 'npt.NDArray',
+    xp,
+    marker_active: Optional['npt.NDArray'] = None,
+    n_cut: float = 3.0,
+    F_grid: Optional['npt.NDArray'] = None
+) -> 'npt.NDArray':
+    """GPU-capable batch force spreading (Eq. 13) — xp dispatch
+
+    When xp is cupy, F_grid lives on GPU and marker stencil operations
+    run on GPU. Only marker-sized arrays (~KB) cross PCIe.
+    When xp is numpy, delegates to existing CPU function (§2).
+
+    The returned F_grid is an xp array (cupy if GPU, numpy if CPU),
+    ready for direct use in Guo forcing without any host↔device transfer.
+
+    Physical formula (Watanabe et al. Eq. 13):
+        F(x) = Σ_j  -F_j^AL · η_ε(|x - x_j|)
+        η_ε(d) = 1/(π^{3/2}·ε³) · exp(-d²/ε²)    [1/lu³]
+
+    Args:
+        domain_shape: (Nx, Ny, Nz)  [lu]
+        marker_positions: (N_markers, 3) numpy  [lu]
+        marker_forces: (N_markers, 3) numpy  [lattice force]
+        marker_epsilon: (N_markers,) numpy  [lu]
+        xp: Array module — numpy or cupy.
+        marker_active: (N_markers,) bool numpy (default: all True)
+        n_cut: Cutoff in units of ε  [dimensionless]
+        F_grid: Optional pre-allocated xp array, shape (3, Nx, Ny, Nz).
+                If provided, forces are ACCUMULATED (not zeroed).
+                Must be an xp array matching the backend.
+
+    Returns:
+        F_grid: Body force field, shape (3, Nx, Ny, Nz)  [lattice force / lu³]
+                Same backend as xp (GPU array if cupy, CPU if numpy).
+    """
+    # ── CPU fallback: delegate to existing §2 ──
+    if xp.__name__ == 'numpy':
+        return spread_forces_to_grid(
+            domain_shape, marker_positions, marker_forces,
+            marker_epsilon, marker_active=marker_active,
+            n_cut=n_cut, F_grid=F_grid
+        )
+
+    # ── GPU path ──
+    Nx, Ny, Nz = domain_shape
+    n_markers = marker_positions.shape[0]
+
+    # Allocate F_grid on GPU if not provided
+    if F_grid is None:
+        F_grid = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64)
+        # [lattice force / lu³]
+
+    # Default: all markers active
+    if marker_active is None:
+        marker_active = np.ones(n_markers, dtype=bool)
+
+    # Marker loop (Method A: sequential to avoid race conditions)
+    # Python overhead: ~200 iterations × ~0.01ms = ~2ms — negligible
+    # Each iteration's stencil computation (~2000 nodes) is GPU-vectorized
+    for j in range(n_markers):
+        if not marker_active[j]:
+            continue
+
+        # Skip zero-force markers (check on CPU, cheap)
+        force_mag_sq = float(np.sum(marker_forces[j] ** 2))
+        if force_mag_sq < 1e-60:
+            continue
+
+        _spread_single_marker_gpu(
+            F_grid,
+            marker_positions[j],     # (3,) numpy  [lu]
+            marker_forces[j],        # (3,) numpy  [lattice force]
+            float(marker_epsilon[j]),  # scalar     [lu]
+            xp,
+            n_cut
+        )
+
+    return F_grid   # (3, Nx, Ny, Nz) GPU array [lattice force / lu³]
+
+
+# -----------------------------------------------------------------------------
+# §5.1 Single Marker GPU Spreading (stencil vectorized)
+# -----------------------------------------------------------------------------
+
+def _spread_single_marker_gpu(
+    F_grid: 'npt.NDArray',
+    marker_pos: 'npt.NDArray',
+    marker_force: 'npt.NDArray',
+    epsilon: float,
+    xp,
+    n_cut: float
+) -> None:
+    """Spread one marker's force onto GPU-resident F_grid
+
+    The stencil is a small box [x_j ± r_cut] typically ~13³ = 2197 nodes.
+    All operations within this box (meshgrid, distance, Gaussian, accumulation)
+    run as vectorized GPU kernels.
+
+    Memory per call: ~17 KB for ε=2, n_cut=3 — negligible.
+
+    Args:
+        F_grid: (3, Nx, Ny, Nz) GPU array, modified IN-PLACE  [lattice force / lu³]
+        marker_pos: (3,) numpy  [lu]
+        marker_force: (3,) numpy  [lattice force]
+        epsilon: Gaussian width  [lu]
+        xp: cupy module
+        n_cut: Cutoff multiplier  [dimensionless]
+    """
+    _, Nx, Ny, Nz = F_grid.shape
+    eps_sq = epsilon * epsilon                            # [lu²]
+    r_cut = n_cut * epsilon                               # [lu]
+    r_cut_sq = r_cut * r_cut                              # [lu²]
+
+    # Gaussian normalization: 1 / (π^{3/2} · ε³)  [1/lu³]
+    norm = 1.0 / (np.pi ** 1.5 * epsilon ** 3)
+
+    # ── Bounding box (matches §1 floor/ceil convention) ──
+    xj, yj, zj = float(marker_pos[0]), float(marker_pos[1]), float(marker_pos[2])
+
+    x_min = max(int(np.floor(xj - r_cut)), 0)
+    x_max = min(int(np.ceil(xj + r_cut)), Nx - 1)
+    y_min = max(int(np.floor(yj - r_cut)), 0)
+    y_max = min(int(np.ceil(yj + r_cut)), Ny - 1)
+    z_min = max(int(np.floor(zj - r_cut)), 0)
+    z_max = min(int(np.ceil(zj + r_cut)), Nz - 1)
+
+    if x_max < x_min or y_max < y_min or z_max < z_min:
+        return
+
+    # ── GPU stencil coordinate arrays ──
+    ix = xp.arange(x_min, x_max + 1, dtype=xp.float64)   # [lu]
+    iy = xp.arange(y_min, y_max + 1, dtype=xp.float64)   # [lu]
+    iz = xp.arange(z_min, z_max + 1, dtype=xp.float64)   # [lu]
+
+    gx, gy, gz = xp.meshgrid(ix, iy, iz, indexing='ij')   # each (sx, sy, sz)
+
+    # ── Squared distances ──
+    dx = gx - xj                                           # [lu]
+    dy = gy - yj                                           # [lu]
+    dz = gz - zj                                           # [lu]
+    d_sq = dx * dx + dy * dy + dz * dz                     # [lu²]
+
+    # ── Gaussian kernel with spherical cutoff ──
+    mask = d_sq <= r_cut_sq
+    eta = xp.where(mask, norm * xp.exp(-d_sq / eps_sq), 0.0)   # [1/lu³]
+
+    # ── Accumulate: F_grid(x) += -F^AL · η_ε ──
+    # Negative sign = Newton's third law (reaction on fluid)
+    for d in range(3):
+        F_grid[d, x_min:x_max+1, y_min:y_max+1, z_min:z_max+1] += (
+            -float(marker_force[d]) * eta                  # [lattice force / lu³]
+        )
+
+
+# =============================================================================
+# §6. GPU vs CPU Spreading Verification Utility
+# =============================================================================
+
+def verify_gpu_spreading(
+    domain_shape: Tuple[int, int, int],
+    marker_positions: 'npt.NDArray',
+    marker_forces: 'npt.NDArray',
+    marker_epsilon: 'npt.NDArray',
+    marker_active: Optional['npt.NDArray'] = None,
+    n_cut: float = 3.0,
+    rtol: float = 1e-12,
+    atol: float = 1e-14,
+) -> dict:
+    """Verify GPU spreading against CPU reference
+
+    Runs both CPU (§2) and GPU (§5) paths, comparing F_grid element-wise.
+    Also checks force conservation for both paths.
+
+    Args:
+        domain_shape: (Nx, Ny, Nz)  [lu]
+        marker_positions: (N_markers, 3) numpy  [lu]
+        marker_forces: (N_markers, 3) numpy  [lattice force]
+        marker_epsilon: (N_markers,) numpy  [lu]
+        marker_active: (N_markers,) bool or None
+        n_cut: Cutoff multiplier  [dimensionless]
+        rtol: Relative tolerance
+        atol: Absolute tolerance
+
+    Returns:
+        dict with:
+            - match: bool — True if grids match within tolerance
+            - max_abs_error: Maximum absolute difference  [lattice force / lu³]
+            - max_rel_error: Maximum relative difference  [dimensionless]
+            - cpu_conserved: Force conservation on CPU path
+            - gpu_conserved: Force conservation on GPU path
+            - F_cpu: CPU result (3, Nx, Ny, Nz) numpy
+            - F_gpu: GPU result (3, Nx, Ny, Nz) numpy
+    """
+    try:
+        import cupy as cp
+    except ImportError:
+        return {'match': None, 'error': 'cupy not available'}
+
+    # CPU reference
+    F_cpu = spread_forces_to_grid(
+        domain_shape, marker_positions, marker_forces,
+        marker_epsilon, marker_active=marker_active,
+        n_cut=n_cut
+    )
+
+    # GPU path
+    F_gpu_dev = spread_forces_to_grid_gpu(
+        domain_shape, marker_positions, marker_forces,
+        marker_epsilon, xp=cp, marker_active=marker_active,
+        n_cut=n_cut
+    )
+    F_gpu = cp.asnumpy(F_gpu_dev)
+
+    # Element-wise comparison
+    abs_err = np.abs(F_cpu - F_gpu)
+    max_abs = float(np.max(abs_err))
+
+    nonzero_mask = np.abs(F_cpu) > atol
+    denom = np.maximum(np.abs(F_cpu), 1e-30)
+    max_rel = float(np.max(abs_err[nonzero_mask] / denom[nonzero_mask])) \
+        if np.any(nonzero_mask) else 0.0
+
+    match = np.allclose(F_cpu, F_gpu, rtol=rtol, atol=atol)
+
+    # Force conservation
+    cons_cpu = check_force_conservation(
+        F_cpu, marker_forces, marker_active
+    )
+    cons_gpu = check_force_conservation(
+        F_gpu, marker_forces, marker_active
+    )
+
+    return {
+        'match': match,
+        'max_abs_error': max_abs,
+        'max_rel_error': max_rel,
+        'cpu_conserved': cons_cpu['is_conserved'],
+        'gpu_conserved': cons_gpu['is_conserved'],
+        'cpu_conservation_error': cons_cpu['relative_error'],
+        'gpu_conservation_error': cons_gpu['relative_error'],
+        'F_cpu': F_cpu,
+        'F_gpu': F_gpu,
+    }

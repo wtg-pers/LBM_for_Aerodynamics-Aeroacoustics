@@ -85,6 +85,9 @@ from .spreading import (
     spread_forces_to_grid,
     spread_forces_uniform_epsilon,
     check_force_conservation,
+    # GPU-capable (P2)
+    spread_forces_to_grid_gpu,
+    verify_gpu_spreading,
 )
 
 # =============================================================================
@@ -132,6 +135,9 @@ __all__ = [
     'spread_forces_to_grid',
     'spread_forces_uniform_epsilon',
     'check_force_conservation',
+    # GPU-capable (P2)
+    'spread_forces_to_grid_gpu',
+    'verify_gpu_spreading',
     # Main controller
     'ActuatorLineModel',
     'BEMResult',
