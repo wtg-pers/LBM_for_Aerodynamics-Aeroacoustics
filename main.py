@@ -17,9 +17,8 @@ Usage:
     python main.py --restart-latest --extend 10000
 """
 
-import os, sys, time, glob, argparse
+import os, sys, argparse
 import numpy as np
-from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -34,6 +33,7 @@ from src.collision.bgk import BGK
 from src.streaming.stream import StreamingPull
 from src.forcing import GuoForcing, get_forcing_scheme
 from src.solver.simulation import Simulation
+from src.solver.output_manager import OutputManager
 
 # =============================================================================
 # I/O Modules
@@ -58,7 +58,7 @@ from src.utilities.lattice_validation import LatticeValidator
 from src.utilities.directory_utils import setup_output_directories
 from src.utilities.flux_utils import ConservationManager
 from src.utilities.force_calculator import ForceManager
-from src.utilities.convergence import ConvergenceMonitor, ConvergenceStatus
+from src.utilities.convergence import ConvergenceMonitor
 
 
 # =============================================================================
@@ -298,7 +298,6 @@ def main():
     collision = BGK(xp)
 
     forcing_scheme = GuoForcing(xp, lattice)
-    body_force = None  # shape: (dim, Nx, Ny[, Nz]) when active [lattice force units]
 
     # =========================================================================
     # [5] Initial Condition
@@ -667,283 +666,52 @@ def main():
     sim.set_distribution(f_old)
     sim.step_count = start_step
     sim.print_info()
-        
+
+    # =========================================================================
+    # [5.6] Create OutputManager
+    # =========================================================================
+    output = OutputManager(
+        xp=xp,
+        macroscopic=macro,
+        lattice=lattice,
+        sim_params=sim_params,
+        vtk_writer=vtk_writer,
+        marker_vtk_writer=marker_vtk_writer,
+        checkpoint_mgr=checkpoint_mgr,
+        conservation_mgr=conservation_mgr,
+        force_mgr=force_mgr,
+        conv_monitor=conv_monitor,
+        al_model=al_model,
+        output_interval=output_interval,
+        check_interval=check_interval,
+        checkpoint_interval=checkpoint_interval,
+        tau=tau,
+        solid_mask_np=solid_mask_np,
+        perf_csv_path=perf_csv_path,
+        domain_shape=domain_shape,
+        L_ref_lu=L_ref_lu,
+        u_ref_lu=u_ref_lu,
+        config_path=args.config,
+    )
+
     # =========================================================================
     # [6] Time Loop
     # =========================================================================
     print(f"\n[6] Running Simulation")
     print("="*70)
 
-    start_time = time.perf_counter()
-    custom_format = "{l_bar}{bar:10}|{n_fmt}/{total_fmt} {rate_fmt} [{elapsed}{postfix}]"
-    pbar = tqdm(range(start_step, end_step), 
-                unit="step",
-                ncols=99, bar_format=custom_format)
-    
-    last_drift = 0.0
-    last_Cd = 0.0
-    last_Cl = 0.0
-    last_ct = 0.0
-    last_cp = 0.0
-    last_rev = 0.0
+    output.start(start_step, end_step)
 
-    for step in pbar:
-        # ─── Physics: 1 LBM timestep ─────────────────────────────
+    for step in range(start_step, end_step):
         sim.advance()
-
-        # ─── Force Calculation (MEM) ─────────────────────────────
-        if force_mgr is not None and force_mgr.should_compute(step):
-            force_result = force_mgr.compute_and_log(step, sim.f_post, verbose=False)
-            if force_result:
-                last_Cd = force_result['Cd']
-                last_Cl = force_result['Cl']
-                conv_monitor.feed_force(step, last_Cd, last_Cl)
-
-        # ─── Progress bar ────────────────────────────────────────────
-        if step % 10 == 0:
-            if al_model is not None:
-                if isinstance(al_model, MultiRotorManager):
-                    # Show primary rotor's performance
-                    perf = al_model.get_rotor_performance(rotor_idx=0)
-                    current_rev = perf.get('revolutions', 0)
-                    pbar.set_postfix({
-                        'rev': f"{current_rev:.2f}",
-                        'C_T': f"{perf.get('C_T', 0):.3f}",
-                        'rotors': f"{al_model.n_rotors}",
-                        'drift': f"{last_drift:+.3f}%"
-                    })
-                else:
-                    current_rev = al_model.rotor.n_revolutions
-                    pbar.set_postfix({
-                        'rev': f"{current_rev:.2f}",
-                        'C_T': f"{last_ct:.3f}",
-                        'C_P': f"{last_cp:.3f}",
-                        'drift': f"{last_drift:+.3f}%"
-                    })
-            elif force_mgr is not None:
-                pbar.set_postfix({
-                    'Cd': f"{last_Cd:.3f}",
-                    'Cl': f"{last_Cl:.3f}",
-                })
-            else:
-                pbar.set_postfix({
-                    'ρ': f"{float(sim.rho.mean()):.4f}",
-                    'drift': f"{last_drift:+.4f}%"
-                })
-        
-        # ─── VTK output ─────────────────────────────────────────────
-        if vtk_writer is not None and step % output_interval == 0:
-            extra_vectors_vtk = {}
-            if sim.body_force is not None:
-                extra_vectors_vtk['body_force'] = sim.body_force
-
-            vtk_writer.write(
-                step=step, rho=sim.rho, u=sim.u,
-                solid_mask=solid_mask_np,
-                extra_vectors=extra_vectors_vtk if extra_vectors_vtk else None,
-                time=float(step),
-            )
-
-            if marker_vtk_writer is not None and al_model is not None:
-                marker_vtk_writer.write_from_al_model(
-                    step=step, al_model=al_model, time=float(step)
-                )
-
-        # ─── Periodic checks ────────────────────────────────────────
-        if step % check_interval == 0 and step > start_step:
-            # Conservation
-            results = conservation_mgr.check(sim.rho, step, verbose=(conservation_mgr.verbose > 0))
-            if results.get('domain'):
-                last_drift = results['domain']['mass_drift_percent']
-
-            # Rotor performance logging (Actuator Line)
-            if al_model is not None and perf_csv_path is not None:
-                if isinstance(al_model, MultiRotorManager):
-                    # Log each rotor separately
-                    for ri, rname in enumerate(al_model.names):
-                        perf = al_model.get_rotor_performance(rotor_idx=ri)
-                        # CSV header에 rotor name 접두사 추가 필요
-                        last_ct = perf.get('C_T', 0)
-                        last_cp = perf.get('C_P', 0)
-                        last_rev = perf.get('revolutions', 0)
-                        with open(perf_csv_path, 'a') as fh:
-                            fh.write(f"{step},{rname},{last_rev:.6f},"
-                                     f"{last_ct:.6f},{last_cp:.6f}\\n")
-                else:
-                    perf = al_model.get_rotor_performance()
-                    last_ct = perf.get('C_T', 0)
-                    last_cp = perf.get('C_P', 0)
-                    last_rev = perf.get('revolutions', 0)
-                    with open(perf_csv_path, 'a') as fh:
-                        fh.write(f"{step},{last_rev:.6f},"
-                                 f"{last_ct:.6f},{last_cp:.6f}\\n")
-
-            # Convergence check
-            if conv_monitor.enabled:
-                conv_monitor.feed_energy(step, sim.rho, sim.u)
-                conv_monitor.feed_divergence_check(sim.rho, sim.u)
-                conv_status = conv_monitor.check(step)
-                
-                if conv_status['diverged']:
-                    print(f"\n  ⚠ DIVERGENCE at step {step}: "
-                            f"{conv_status['diverge_reason']}")
-                    if conv_monitor.on_diverged == 'stop_with_checkpoint':
-                        if checkpoint_mgr is not None:
-                            checkpoint_mgr.save(step=step, f=sim.f,
-                                                rho=sim.rho, u=sim.u,
-                                                tau=tau, config=sim_params)
-                    break
-                
-                if conv_status['converged']:
-                    print(f"\n  ✓ CONVERGED at step {step}")
-                    conv_monitor.print_summary()
-                    if conv_monitor.on_converged == 'checkpoint_and_stop':
-                        if checkpoint_mgr is not None:
-                            checkpoint_mgr.save(step=step, f=sim.f,
-                                                rho=sim.rho, u=sim.u,
-                                                tau=tau, config=sim_params)
-                    if conv_monitor.on_converged != 'continue':
-                        break
-
-        # ─── Checkpoint ──────────────────────────────────────────────
-        if checkpoint_mgr is not None and step > 0 and step % checkpoint_interval == 0:
-            checkpoint_mgr.save(step=step, f=sim.f, rho=sim.rho, u=sim.u, 
-                               tau=tau, config=sim_params)
-
-    elapsed = time.perf_counter() - start_time
-
-    # Max steps 도달 체크
-    if conv_monitor.enabled and not conv_monitor.converged and not conv_monitor.diverged:
-        conv_monitor.mark_max_steps()
-        if conv_monitor.on_max_steps == 'warn':
-            print(f"\n  ⚠ Max steps reached without convergence")
-        elif conv_monitor.on_max_steps == 'error':
-            print(f"\n  ✗ ERROR: Max steps without convergence")
-    
-    # MLUPS (2D/3D compatible)
-    if lattice.dim == 2:
-        total_cells = Nx * Ny
-    else:
-        total_cells = Nx * Ny * Nz
-    mlups = (total_cells * total_steps) / elapsed / 1e6
+        action = output.process(step, sim)
+        if action == 'stop':
+            break
 
     # =========================================================================
-    # [7] Summary & Final Output
+    # [7] Finalize
     # =========================================================================
-    final_step = end_step - 1
-    
-    print("\n" + "="*70)
-    print(f"[7] Summary")
-    print(f"  Completed: step {start_step} → {final_step}")
-    print(f"  Time: {elapsed:.2f}s | MLUPS: {mlups:.2f}")
-    
-    rho_final, u_final = macro.compute(sim.f)
-    
-    if vtk_writer is not None:
-        extra_vectors_vtk = {}
-        if sim.body_force is not None:
-            extra_vectors_vtk['body_force'] = sim.body_force
-
-        vtk_writer.write(
-            step=final_step, rho=rho_final, u=u_final,
-            solid_mask=solid_mask_np,
-            extra_vectors=extra_vectors_vtk if extra_vectors_vtk else None,
-            time=float(final_step),
-        )
-        vtk_writer.write_pvd('simulation.pvd')
-
-        if marker_vtk_writer is not None and al_model is not None:
-            marker_vtk_writer.write_from_al_model(
-                step=final_step, al_model=al_model, time=float(final_step)
-            )
-            marker_vtk_writer.write_pvd()
-    
-    if checkpoint_mgr is not None:
-        checkpoint_mgr.save(step=final_step, f=sim.f, rho=rho_final, 
-                           u=u_final, tau=tau, config=sim_params)
-    
-    # =========================================================================
-    # [8] Final Conservation Analysis
-    # =========================================================================
-    print(f"\n[8] Final Conservation Analysis")
-    final_results = conservation_mgr.check(rho_final, final_step, verbose=True)
-    conservation_mgr.close()
-    
-    # =========================================================================
-    # Force Summary
-    # =========================================================================
-    if force_mgr is not None:
-        force_mgr.print_summary()
-
-        from src.utilities.force_calculator import compute_strouhal_number
-        
-        St = compute_strouhal_number(
-            force_history=force_mgr.history,
-            char_length=L_ref_lu,
-            u_ref=u_ref_lu,
-            component='Cl',
-            min_periods=3
-        )
-        
-        if St is not None:
-            print(f"\n  Strouhal number: St = {St:.4f}")
-        else:
-            print(f"\n  Strouhal number: insufficient data for FFT")
-
-        force_mgr.close()
-    
-    # =========================================================================
-    # Rotor Performance Summary (Actuator Line)
-    # =========================================================================
-    if al_model is not None:
-        if isinstance(al_model, MultiRotorManager):
-            print(f"\\n[9] Multi-Rotor Performance ({al_model.n_rotors} rotors)")
-            for i, name in enumerate(al_model.names):
-                perf = al_model.get_rotor_performance(rotor_idx=i)
-                print(f"  [{i}] {name}:")
-                print(f"      Rev={perf.get('revolutions',0):.2f}, "
-                      f"C_T={perf.get('C_T',0):.4f}, "
-                      f"C_P={perf.get('C_P',0):.4f}")
-        else:
-            perf = al_model.get_rotor_performance()
-            print(f"\\n[9] Rotor Performance")
-            print(f"  Revolutions: {perf.get('revolutions', 0):.2f}")
-            print(f"  C_T = {perf.get('C_T', 0):.4f}")
-            print(f"  C_P = {perf.get('C_P', 0):.4f}")
-    
-    # =========================================================================
-    # Convergence Summary
-    # =========================================================================
-    if conv_monitor.enabled:
-        conv_monitor.print_summary()
-        conv_monitor.close()
-
-    # =========================================================================
-    # Final Status
-    # =========================================================================
-    final_status = conv_monitor.get_status() if conv_monitor else None
-    
-    if final_status == ConvergenceStatus.CONVERGED:
-        print("\n" + "="*70)
-        print(f" ✅ Simulation CONVERGED at step {conv_monitor.converged_step}!")
-        print("="*70)
-    elif final_status == ConvergenceStatus.DIVERGED:
-        print("\n" + "="*70)
-        print(" ❌ Simulation DIVERGED!")
-        print("="*70)
-        return False
-    else:
-        if xp.isnan(rho_final).any() or xp.isinf(rho_final).any():
-            print("\n  ❌ INSTABILITY DETECTED!")
-            return False
-        
-        print("\n" + "="*70)
-        print(" ✓ Simulation completed.")
-        print("="*70)
-        print(f"\nTo continue: python main.py --config {args.config} "
-              f"--restart-latest --extend 10000")
-    
-    return True
+    return output.finalize(sim)
 
 
 if __name__ == "__main__":

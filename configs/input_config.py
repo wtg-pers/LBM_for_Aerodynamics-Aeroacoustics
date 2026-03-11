@@ -321,22 +321,22 @@ if ALM_ENABLED:
     # ── Rotor 0: Upwind turbine ──
     HUB_0_X_LU = 80
     HUB_0_Y_LU = 80
-    HUB_0_Z_LU = Nz * 0.7
+    HUB_0_Z_LU = Nz * 0.5
 
     # ── Rotor 1: Downwind turbine ──
     HUB_1_X_LU = 80
     HUB_1_Y_LU = 120
-    HUB_1_Z_LU = Nz * 0.7
+    HUB_1_Z_LU = Nz * 0.5
 
     # ── Rotor 2: Upwind turbine ──
     HUB_2_X_LU = 120
     HUB_2_Y_LU = 80
-    HUB_2_Z_LU = Nz * 0.7
+    HUB_2_Z_LU = Nz * 0.5
 
     # ── Rotor 3: Downwind turbine ──
     HUB_3_X_LU = 120
     HUB_3_Y_LU = 120
-    HUB_3_Z_LU = Nz * 0.7
+    HUB_3_Z_LU = Nz * 0.5
 
     # # ── Rotor 0  ──
     # HUB_0_X_LU = 30
