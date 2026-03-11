@@ -204,37 +204,68 @@ simulation = {
 #              "velocity": 0.0,"density": 1.0, "k": 0.1},
 # }
 
+# boundaries = {
+#     "inlet":  {"location": "xmin", "method": "neumann",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0},
+#     "outlet": {"location": "xmax", "method": "neumann"},
+
+#     "ymin":   {"location": "ymin", "method": "neumann",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0},
+#     "ymax":   {"location": "ymax", "method": "neumann",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0},
+
+#     "top":    {"location": "zmax", "method": "equilibrium",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0},
+#     "ground": {"location": "zmin", "method": "neumann",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0},
+# }
+
 boundaries = {
     "inlet":  {"location": "xmin", "method": "equilibrium",
                "velocity": [U_INF_LU, 0.0, 0.0], "density": 1.0},
     "outlet": {"location": "xmax", "method": "neumann"},
+
     "ymin":   {"location": "ymin", "method": "equilibrium",
                "velocity": [U_INF_LU, 0.0, 0.0], "density": 1.0},
     "ymax":   {"location": "ymax", "method": "equilibrium",
                "velocity": [U_INF_LU, 0.0, 0.0], "density": 1.0},
+
     "top":    {"location": "zmax", "method": "equilibrium",
                "velocity": [U_INF_LU, 0.0, 0.0], "density": 1.0},
     "ground": {"location": "zmin", "method": "equilibrium",
                "velocity": [U_INF_LU, 0.0, 0.0], "density": 1.0},
 }
 
+# =============================================================================
+# §5. BOUNDARY CONDITIONS — Sponge Layer on lateral + ground
+# =============================================================================
+
+# _SPONGE_THICKNESS = 15        # [lu] buffer zone depth (≈ 0.4D ~ 0.5D)
+# _SPONGE_STRENGTH  = 0.3       # [-] σ_max (quadratic ramp, 0.2~0.5 recommended)
+
 # boundaries = {
-#     # Inlet (top) — quiescent air with micro downwash seed
+#     # ── Inlet (top): equilibrium — clean freestream ──
 #     "top":    {"location": "zmax", "method": "equilibrium",
-#                "velocity": [0.0, 0.0, -0.001], "density": 1.0},
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0},
 
-#     # Outlet (bottom) — zero-gradient, let downwash exit
-#     "ground": {"location": "zmin", "method": "neumann"},
+#     # ── Outlet (ground): sponge — let downwash exit smoothly ──
+#     "ground": {"location": "zmin", "method": "sponge",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0,
+#                "thickness": _SPONGE_THICKNESS, "sigma_max": _SPONGE_STRENGTH},
 
-#     # Sidewalls — quiescent far-field
-#     "xmin":   {"location": "xmin", "method": "equilibrium",
-#                "velocity": 0.0, "density": 1.0},
-#     "xmax":   {"location": "xmax", "method": "equilibrium",
-#                "velocity": 0.0, "density": 1.0},
-#     "ymin":   {"location": "ymin", "method": "equilibrium",
-#                "velocity": 0.0, "density": 1.0},
-#     "ymax":   {"location": "ymax", "method": "equilibrium",
-#                "velocity": 0.0, "density": 1.0},
+#     # ── Lateral faces: sponge — damp induced lateral flow ──
+#     "xmin":   {"location": "xmin", "method": "sponge",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0,
+#                "thickness": _SPONGE_THICKNESS, "sigma_max": _SPONGE_STRENGTH},
+#     "xmax":   {"location": "xmax", "method": "sponge",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0,
+#                "thickness": _SPONGE_THICKNESS, "sigma_max": _SPONGE_STRENGTH},
+#     "ymin":   {"location": "ymin", "method": "sponge",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0,
+#                "thickness": _SPONGE_THICKNESS, "sigma_max": _SPONGE_STRENGTH},
+#     "ymax":   {"location": "ymax", "method": "sponge",
+#                "velocity": [0.0, 0.0, -U_INF_LU], "density": 1.0,
+#                "thickness": _SPONGE_THICKNESS, "sigma_max": _SPONGE_STRENGTH},
 # }
 
 # =============================================================================
@@ -288,24 +319,24 @@ if ALM_ENABLED:
         ]
     
     # ── Rotor 0: Upwind turbine ──
-    HUB_0_X_LU = Nx * 0.2406
-    HUB_0_Y_LU = Ny * 0.3737
-    HUB_0_Z_LU = Nz * 0.5
+    HUB_0_X_LU = 80
+    HUB_0_Y_LU = 80
+    HUB_0_Z_LU = Nz * 0.7
 
     # ── Rotor 1: Downwind turbine ──
-    HUB_1_X_LU = Nx * 0.4456
-    HUB_1_Y_LU = Ny * 0.3737
-    HUB_1_Z_LU = Nz * 0.5
+    HUB_1_X_LU = 80
+    HUB_1_Y_LU = 120
+    HUB_1_Z_LU = Nz * 0.7
 
     # ── Rotor 2: Upwind turbine ──
-    HUB_2_X_LU = Nx * 0.2406
-    HUB_2_Y_LU = Ny * 0.6263
-    HUB_2_Z_LU = Nz * 0.5
+    HUB_2_X_LU = 120
+    HUB_2_Y_LU = 80
+    HUB_2_Z_LU = Nz * 0.7
 
     # ── Rotor 3: Downwind turbine ──
-    HUB_3_X_LU = Nx * 0.4456
-    HUB_3_Y_LU = Ny * 0.6263
-    HUB_3_Z_LU = Nz * 0.5
+    HUB_3_X_LU = 120
+    HUB_3_Y_LU = 120
+    HUB_3_Z_LU = Nz * 0.7
 
     # # ── Rotor 0  ──
     # HUB_0_X_LU = 30

@@ -33,6 +33,7 @@ from src.macroscopic.compute import Macroscopic
 from src.collision.bgk import BGK
 from src.streaming.stream import StreamingPull
 from src.forcing import GuoForcing, get_forcing_scheme
+from src.solver.simulation import Simulation
 
 # =============================================================================
 # I/O Modules
@@ -376,8 +377,7 @@ def main():
     total_steps = end_step - start_step
     print(f"  Steps to run: {total_steps} ({start_step} → {end_step - 1})")
     
-    f_new = xp.empty_like(f_old)
-    f_post = xp.empty_like(f_old)
+    # NOTE: f_new and f_post buffers are managed by Simulation.set_distribution()
 
     # =========================================================================
     # [5.1] Conservation Check Setup
@@ -647,6 +647,26 @@ def main():
         # === END DEBUG ===
     else:
         print(f"\n[5.4] Actuator Line: disabled")
+
+    # =========================================================================
+    # [5.5] Create Simulation Object
+    # =========================================================================
+    sim = Simulation(
+        xp=xp,
+        macroscopic=macro,
+        equilibrium=eq,
+        collision=collision,
+        streaming=streaming,
+        forcing_scheme=forcing_scheme,
+        bc_manager=domain_bc_mgr,
+        tau=tau,
+        domain_shape=domain_shape,
+        obstacle_bc=obstacle_bc,
+        al_model=al_model,
+    )
+    sim.set_distribution(f_old)
+    sim.step_count = start_step
+    sim.print_info()
         
     # =========================================================================
     # [6] Time Loop
@@ -668,56 +688,16 @@ def main():
     last_rev = 0.0
 
     for step in pbar:
-        # ─── Step 1: Macroscopic Variables ───────────────────────────
-        rho, u = macro.compute(f_old)
+        # ─── Physics: 1 LBM timestep ─────────────────────────────
+        sim.advance()
 
-        # ─── Step 1.5: Actuator Line → body force + Guo correction ──
-        #   Physical Process (Guo et al. 2002, Eq.4):
-        #     ρu = Σ ξ_i·f_i + F·Δt/2
-        #     → u_corrected = u_raw + F / (2ρ)
-        #   AL Pipeline: rotor rotation → BEM → Gaussian spreading → F(x)
-        # ─────────────────────────────────────────────────────────────
-        if al_model is not None:
-            # GPU patch (P1-P3): u stays on GPU, F_grid returns on GPU
-            # No full-domain GPU↔CPU transfer needed
-            body_force = al_model.step(u, dt=1.0)    # F(x)  [lattice force / lu³]
-            
-            # Guo velocity correction: u = u_raw + F/(2ρ)  [Δx/Δt]
-            u += (body_force / (2.0 * rho[None, ...]))
-
-        # ─── Step 2: Equilibrium Distribution ────────────────────────
-        f_eq = eq.compute(rho, u)
-
-        # ─── Step 3: Forcing Source Term ─────────────────────────────
-        if body_force is not None:
-            S_i = forcing_scheme.compute_source_term(body_force, rho, u, tau)
-        else:
-            S_i = None
-        
-        # ─── Step 4: Collision (BGK + source term) ───────────────────
-        f_post[:] = collision.collide(f_old, f_eq, tau, source=S_i)
-
-        # ─── Step 5: Streaming (Pull scheme) ─────────────────────────
-        streaming.compute(f_post, f_new)
-
-        # ─── Step 6: Boundary Conditions ─────────────────────────────
-        #   Phase 1: Domain faces (flat) + edge/corner (f = f_eq)
-        domain_bc_mgr.apply_all(f_new, f_post)
-        
-        #   Phase 2: Internal obstacles (HalfwayBounceBack)
-        if obstacle_bc is not None:
-            obstacle_bc.apply_with_reset(f_new, f_post)
-
-        # ─── Force Calculation ───────────────────────────────────────
+        # ─── Force Calculation (MEM) ─────────────────────────────
         if force_mgr is not None and force_mgr.should_compute(step):
-            force_result = force_mgr.compute_and_log(step, f_post, verbose=False)
+            force_result = force_mgr.compute_and_log(step, sim.f_post, verbose=False)
             if force_result:
                 last_Cd = force_result['Cd']
                 last_Cl = force_result['Cl']
                 conv_monitor.feed_force(step, last_Cd, last_Cl)
-        
-        # ─── Swap buffers ────────────────────────────────────────────
-        f_old, f_new = f_new, f_old
 
         # ─── Progress bar ────────────────────────────────────────────
         if step % 10 == 0:
@@ -747,18 +727,18 @@ def main():
                 })
             else:
                 pbar.set_postfix({
-                    'ρ': f"{float(rho.mean()):.4f}",
+                    'ρ': f"{float(sim.rho.mean()):.4f}",
                     'drift': f"{last_drift:+.4f}%"
                 })
         
         # ─── VTK output ─────────────────────────────────────────────
         if vtk_writer is not None and step % output_interval == 0:
             extra_vectors_vtk = {}
-            if body_force is not None:
-                extra_vectors_vtk['body_force'] = body_force
+            if sim.body_force is not None:
+                extra_vectors_vtk['body_force'] = sim.body_force
 
             vtk_writer.write(
-                step=step, rho=rho, u=u,
+                step=step, rho=sim.rho, u=sim.u,
                 solid_mask=solid_mask_np,
                 extra_vectors=extra_vectors_vtk if extra_vectors_vtk else None,
                 time=float(step),
@@ -772,7 +752,7 @@ def main():
         # ─── Periodic checks ────────────────────────────────────────
         if step % check_interval == 0 and step > start_step:
             # Conservation
-            results = conservation_mgr.check(rho, step, verbose=(conservation_mgr.verbose > 0))
+            results = conservation_mgr.check(sim.rho, step, verbose=(conservation_mgr.verbose > 0))
             if results.get('domain'):
                 last_drift = results['domain']['mass_drift_percent']
 
@@ -800,8 +780,8 @@ def main():
 
             # Convergence check
             if conv_monitor.enabled:
-                conv_monitor.feed_energy(step, rho, u)
-                conv_monitor.feed_divergence_check(rho, u)
+                conv_monitor.feed_energy(step, sim.rho, sim.u)
+                conv_monitor.feed_divergence_check(sim.rho, sim.u)
                 conv_status = conv_monitor.check(step)
                 
                 if conv_status['diverged']:
@@ -809,8 +789,8 @@ def main():
                             f"{conv_status['diverge_reason']}")
                     if conv_monitor.on_diverged == 'stop_with_checkpoint':
                         if checkpoint_mgr is not None:
-                            checkpoint_mgr.save(step=step, f=f_old,
-                                                rho=rho, u=u,
+                            checkpoint_mgr.save(step=step, f=sim.f,
+                                                rho=sim.rho, u=sim.u,
                                                 tau=tau, config=sim_params)
                     break
                 
@@ -819,15 +799,15 @@ def main():
                     conv_monitor.print_summary()
                     if conv_monitor.on_converged == 'checkpoint_and_stop':
                         if checkpoint_mgr is not None:
-                            checkpoint_mgr.save(step=step, f=f_old,
-                                                rho=rho, u=u,
+                            checkpoint_mgr.save(step=step, f=sim.f,
+                                                rho=sim.rho, u=sim.u,
                                                 tau=tau, config=sim_params)
                     if conv_monitor.on_converged != 'continue':
                         break
 
         # ─── Checkpoint ──────────────────────────────────────────────
         if checkpoint_mgr is not None and step > 0 and step % checkpoint_interval == 0:
-            checkpoint_mgr.save(step=step, f=f_old, rho=rho, u=u, 
+            checkpoint_mgr.save(step=step, f=sim.f, rho=sim.rho, u=sim.u, 
                                tau=tau, config=sim_params)
 
     elapsed = time.perf_counter() - start_time
@@ -857,12 +837,12 @@ def main():
     print(f"  Completed: step {start_step} → {final_step}")
     print(f"  Time: {elapsed:.2f}s | MLUPS: {mlups:.2f}")
     
-    rho_final, u_final = macro.compute(f_old)
+    rho_final, u_final = macro.compute(sim.f)
     
     if vtk_writer is not None:
         extra_vectors_vtk = {}
-        if body_force is not None:
-            extra_vectors_vtk['body_force'] = body_force
+        if sim.body_force is not None:
+            extra_vectors_vtk['body_force'] = sim.body_force
 
         vtk_writer.write(
             step=final_step, rho=rho_final, u=u_final,
@@ -879,7 +859,7 @@ def main():
             marker_vtk_writer.write_pvd()
     
     if checkpoint_mgr is not None:
-        checkpoint_mgr.save(step=final_step, f=f_old, rho=rho_final, 
+        checkpoint_mgr.save(step=final_step, f=sim.f, rho=rho_final, 
                            u=u_final, tau=tau, config=sim_params)
     
     # =========================================================================

@@ -18,6 +18,11 @@ Physics:
         L = sponge thickness  [lattice units]
         σ_max = maximum damping coefficient  [dimensionless, 0 < σ ≤ 1]
 
+Performance:
+    Only the slab of nodes within the buffer zone is accessed and
+    modified each time step.  Memory footprint and compute cost scale
+    with  Q × L × (transverse area)  instead of  Q × N_total.
+
 Usage in config:
     "farfield_sponge": {
         "location": "xmax",
@@ -56,8 +61,9 @@ class SpongeLayerBC:
     the domain boundary. The damping increases quadratically from
     the inner edge (σ = 0) to the boundary (σ = σ_max).
     
-    This is NOT a FaceBC subclass — it modifies a volume of nodes,
-    not just a single face layer.
+    **Slab-only optimisation**: only the L nodes within the buffer
+    zone are touched each time step, avoiding full-domain temporaries
+    that would otherwise dominate GPU bandwidth.
     
     Attributes:
         location: Which face the sponge is attached to
@@ -113,66 +119,77 @@ class SpongeLayerBC:
                 self.u_inf[d] = float(velocity[d])
     
     def _setup_damping(self) -> None:
-        """Precompute spatial damping profile σ(x) and target equilibrium.
+        """Precompute slab-local damping profile and target equilibrium.
+        
+        Only the L nodes within the buffer zone are stored, not the
+        full domain.  This reduces memory from O(Q·N_total) to
+        O(Q·L·transverse_area).
         
         Damping profile (quadratic ramp):
             σ(x) = σ_max · (d / L)²  [dimensionless]
             
             d = distance from inner edge of sponge  [lattice units]
             L = sponge thickness  [lattice units]
-        
-        The profile is stored as a broadcastable array matching f's shape.
         """
         xp = self.xp
-        axis = self.location.axis
+        axis = self.location.axis          # 0=x, 1=y, 2=z
         is_min = self.location.is_min
-        N = self.domain_shape[axis]          # domain size along normal axis  [lattice units]
-        L = min(self.thickness, N // 2)      # cap at half domain  [lattice units]
+        N = self.domain_shape[axis]        # domain size along normal axis  [lu]
+        L = min(self.thickness, N // 2)    # cap at half domain  [lu]
+        self._L = L                        # store effective thickness
         
-        # ── 1D damping profile along the normal axis (vectorized) ──
-        sigma_1d = xp.zeros(N, dtype=xp.float64)    # [dimensionless]
-        idx = xp.arange(N, dtype=xp.float64)
+        # ── Build slab index (tuple of slices for f[:, ...]) ──
+        # f has shape (Q, Nx, Ny[, Nz])  → axis in f is (axis + 1)
+        slab_slices = [slice(None)] * (self.dim + 1)   # start with [:] everywhere
         
         if is_min:
-            # Sponge at min face: node 0 gets σ_max, node L gets σ ≈ 0
-            mask = idx < L
-            d = L - idx                                         # [lattice units]
-            sigma_1d[mask] = self.sigma_max * (d[mask] / L) ** 2  # [dimensionless]
+            # Sponge at min face: nodes [0, L)
+            slab_slices[axis + 1] = slice(0, L)
+            self._slab_idx = tuple(slab_slices)
+            
+            # 1D damping: node 0 → σ_max, node L-1 → σ ≈ 0
+            d = xp.arange(L, dtype=xp.float64)          # [lu]
+            sigma_1d = self.sigma_max * ((L - d) / L) ** 2  # [dimensionless]
         else:
-            # Sponge at max face: node N-1 gets σ_max, node N-1-L gets σ ≈ 0
-            mask = idx >= (N - L)
-            d = idx - (N - L - 1)                               # [lattice units]
-            sigma_1d[mask] = self.sigma_max * (d[mask] / L) ** 2
+            # Sponge at max face: nodes [N-L, N)
+            slab_slices[axis + 1] = slice(N - L, N)
+            self._slab_idx = tuple(slab_slices)
+            
+            # 1D damping: node 0 (=N-L) → σ ≈ 0, node L-1 (=N-1) → σ_max
+            d = xp.arange(L, dtype=xp.float64)          # [lu]
+            sigma_1d = self.sigma_max * ((d + 1) / L) ** 2  # [dimensionless]
         
-        # Reshape for broadcasting: f has shape (Q, Nx, Ny[, Nz])
-        # sigma needs shape (1, ..., N, ..., 1) with N at position axis+1
-        shape = [1] * (self.dim + 1)    # +1 for Q axis at position 0
-        shape[axis + 1] = N
-        self.sigma = sigma_1d.reshape(shape)
+        # Reshape for broadcasting over slab: (1, ..., L, ..., 1)
+        shape = [1] * (self.dim + 1)
+        shape[axis + 1] = L
+        self.sigma_slab = sigma_1d.reshape(shape)        # [dimensionless]
         
-        # ── Precompute target equilibrium f_eq(ρ∞, U∞) ──
-        rho_target = xp.full(self.domain_shape, self.rho_inf, dtype=xp.float64)
-        u_target = xp.zeros((self.dim,) + self.domain_shape, dtype=xp.float64)
-        for d in range(self.dim):
-            u_target[d] = self.u_inf[d]      # [Δx/Δt]
+        # ── Precompute target f_eq for the slab only ──
+        slab_shape = list(self.domain_shape)
+        slab_shape[axis] = L                              # replace N → L
+        slab_shape = tuple(slab_shape)
         
-        self.f_eq_target = compute_f_eq(
+        rho_target = xp.full(slab_shape, self.rho_inf, dtype=xp.float64)
+        u_target = xp.zeros((self.dim,) + slab_shape, dtype=xp.float64)
+        for d_idx in range(self.dim):
+            u_target[d_idx] = self.u_inf[d_idx]           # [Δx/Δt]
+        
+        self.f_eq_slab = compute_f_eq(
             xp, rho_target, u_target, self.c, self.w, self.cs2
-        )  # shape (Q, Nx, Ny[, Nz])
+        )  # shape (Q, ..., L, ...)
     
     def apply(self, f: 'npt.NDArray') -> None:
-        """Apply sponge damping to the distribution function.
+        """Apply sponge damping to the buffer zone only.
         
-        f ← f + σ(x) · (f_eq∞ - f)
+        f[slab] ← f[slab] + σ · (f_eq∞ − f[slab])
         
-        The damping is strongest at the boundary (σ = σ_max) and
-        zero at the inner edge of the sponge layer.
+        Only L layers are read/written, not the full domain.
         
         Args:
             f: Distribution function, modified in-place (Q, Nx, Ny[, Nz])
         """
-        # Vectorized: σ broadcasts over Q and transverse dimensions
-        f += self.sigma * (self.f_eq_target - f)
+        f_slab = f[self._slab_idx]
+        f_slab += self.sigma_slab * (self.f_eq_slab - f_slab)
     
     def get_info(self) -> str:
         """Return human-readable info string."""
