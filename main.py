@@ -17,48 +17,12 @@ Usage:
     python main.py --restart-latest --extend 10000
 """
 
-import os, sys, argparse
-import numpy as np
+import os, sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# =============================================================================
-# Core LBM Components
-# =============================================================================
-from src.lattice import get_lattice
-from src.domain.domain import Domain
-from src.equilibrium.equilibrium import Maxwellian
-from src.macroscopic.compute import Macroscopic
-from src.collision.bgk import BGK
-from src.streaming.stream import StreamingPull
-from src.forcing import GuoForcing, get_forcing_scheme
-from src.solver.simulation import Simulation
-from src.solver.output_manager import OutputManager
-
-# =============================================================================
-# I/O Modules
-# =============================================================================
-from src.io.config_loader import ConfigLoader
-from src.io.vtk_writer import VTKWriter
-from src.io.checkpoint import CheckpointManager
 from src.io.args_parser import parse_args
-
-# =============================================================================
-# Boundary Conditions
-# =============================================================================
-from src.boundary.domain_bc_manager import DomainBCManager
-from src.boundary.wall import HalfwayBounceBack
-from src.boundary.geometry_manager import create_geometry_mask, validate_geometry_config
-
-# =============================================================================
-# Utilities
-# =============================================================================
-from src.utilities.device import setup_library
-from src.utilities.lattice_validation import LatticeValidator
-from src.utilities.directory_utils import setup_output_directories
-from src.utilities.flux_utils import ConservationManager
-from src.utilities.force_calculator import ForceManager
-from src.utilities.convergence import ConvergenceMonitor
+from src.solver.setup import SimulationSetup
 
 
 # =============================================================================
@@ -78,286 +42,74 @@ def main():
     print("="*70)
 
     # =========================================================================
-    # [0] Configuration Loading
+    # [1] Setup — 시뮬레이션 환경 구성
     # =========================================================================
-    config_loader = ConfigLoader(args.config)
-
-    sim_params = config_loader.get_simulation_params()
-    device_mode = sim_params.get('device_mode')
-    device_id = args.gpu if args.gpu is not None else sim_params.get('device_id', 0)
-
-    domain_config = sim_params.get('domain', {})
-    physics_config = sim_params.get('physics', {})
-    time_config = sim_params.get('time', {})
-
-    # Output configuration
-    output_config = config_loader.config.get('output', {})
-    vtk_config = output_config.get('vtk', {})
-    checkpoint_config = output_config.get('checkpoint', {})
-    
-    # Conservation configuration
-    conservation_config = config_loader.config.get('conservation', {})
-    
-    # Force calculation configuration
-    force_config = config_loader.config.get('force_calculation', {})
-
-    # Convergence configuration
-    conv_config = config_loader.config.get('convergence', {})
-
-    # Actuator Line configuration (optional)
-    al_cfg = config_loader.config.get('actuator_line', {})
-    al_enabled = al_cfg.get('enabled', False)
-
-    xp = setup_library(device_mode, device_id=device_id)
-
-    lattice_model = sim_params.get('lattice_model', 'D3Q27')
-    lattice = get_lattice(lattice_model, xp)
-    dimension = sim_params.get('dimension')
+    setup = SimulationSetup(args)
+    sim    = setup.build_simulation()
+    output = setup.build_output_manager()
 
     # =========================================================================
-    # Lattice Validation
+    # [2] Initialization — 초기 분포 함수 (f)
+    #     TODO(M4): SolverInitializer로 이동 예정
     # =========================================================================
-    print(f"\n[0] Validating Lattice Model ({lattice_model})...")
-    validator = LatticeValidator(xp)
-    is_valid, _ = validator.validate_all(
-        lattice.c, lattice.w, lattice.cs2, verbose=True
-    )
-    if not is_valid:
-        raise RuntimeError("Lattice validation failed!")
-    
-    # =========================================================================
-    # [1] Domain Setup
-    # =========================================================================
-    Nx = domain_config.get('Nx')
-    Ny = domain_config.get('Ny')
-    Nz = domain_config.get('Nz')  # None for 2D
-    if lattice.dim == 2:
-        domain = Domain(lattice, xp, Nx, Ny, None)
-        domain_shape = (Nx, Ny)
-        print(f"\n[1] Domain Setup (2D)")
-        print(f"  Grid: {Nx} x {Ny}")
-        print(f"  Total cells: {Nx*Ny:,}")
-    else:
-        domain = Domain(lattice, xp, Nx, Ny, Nz)
-        domain_shape = (Nx, Ny, Nz)
-        print(f"\n[1] Domain Setup (3D)")
-        print(f"  Grid: {Nx} x {Ny} x {Nz}")
-        print(f"  Total cells: {Nx*Ny*Nz:,}")
-
-    # =========================================================================
-    # [2] Physics Parameters
-    # =========================================================================
-    Re = physics_config.get('Re')
-    u_ref_lu = physics_config.get('u_ref_lu')       # [Δx/Δt] reference velocity (lattice)
-    L_ref_lu = physics_config.get('L_ref_lu')
-
-    u_ref_phys = physics_config.get('U_ref')        # [m/s] reference velocity (physical)
-    nu_lu = physics_config.get('nu_lu')
-    tau = physics_config.get('tau')
-
-    config_max_steps = time_config.get('max_steps', 10000)
-    output_interval = time_config.get('output_interval', 500)
-    checkpoint_interval = time_config.get('checkpoint_interval', 2000)
-    force_interval = time_config.get('probe_interval', force_config.get('interval', 10))
-
-    print(f"\n[2] Physics Parameters")
-    print(f"  Re = {Re}")
-    print(f"  u_ref_lu = {u_ref_lu} [Δx/Δt], U_ref = {u_ref_phys} [m/s]")
-    print(f"  L_ref_lu = {L_ref_lu} [Δx]")
-    print(f"  ν = {nu_lu:.6f} [Δx²/Δt], τ = {tau:.6f}")
-
-    # Physical unit conversion (needed for Actuator Line)
-    dx_phys = None  # [m/lu]
-    dt_phys = None  # [s/lt]
-    if al_enabled:
-        units_cfg = al_cfg['units']
-        dx_phys = units_cfg['dx_phys']
-        dt_phys = units_cfg['dt_phys']
-        print(f"  Δx = {dx_phys*1000:.2f} mm, Δt = {dt_phys*1e6:.2f} μs")
-
-    # =========================================================================
-    # [3] Boundary Conditions — "One Node, One Dynamics" (Palabos architecture)
-    # =========================================================================
-    print(f"\n[3] Domain Boundary Conditions")
-    
-    boundaries_config = config_loader.config.get('boundaries', {})
-    
-    domain_bc_mgr = DomainBCManager(
-        xp=xp,
-        lattice=lattice,
-        boundaries_config=boundaries_config,
-        domain_shape=domain_shape,
-        verbose=True,
-    )
-
-    # Internal obstacle (cylinder, airfoil, etc.)
-    internal_geom = config_loader.config.get('internal_geometry', {})
-    is_valid, msg = validate_geometry_config(internal_geom, domain_shape, lattice.dim)
-    if not is_valid:
-        raise ValueError(f"Invalid geometry configuration: {msg}")
-    
-    mask, geom_info = create_geometry_mask(
-        xp, lattice, domain_shape, 
-        internal_geom, 
-        characteristic_length=L_ref_lu,
-        verbose=True
-    )
-
-    if geom_info['type'] != 'none':
-        obstacle_bc = HalfwayBounceBack(xp, lattice, mask)
-    else:
-        obstacle_bc = None
-
-    solid_mask_np = mask.get() if hasattr(mask, 'get') else mask
-
-    # =========================================================================
-    # [4] I/O Setup
-    # =========================================================================
-    print(f"\n[4] I/O Setup")
-
-    output_dir = args.output_dir or output_config.get('output_dir', './results/vtk')
-    checkpoint_dir = args.checkpoint_dir or output_config.get('checkpoint_dir', './checkpoints')
-    csv_dir = args.csv_dir or output_config.get('csv_dir', './results/csv')
-    
-    is_restart = args.restart_latest or args.restart is not None
-    clear_previous = args.clear or output_config.get('clear_previous', False)
-    
-    print(f"  VTK output dir: {output_dir}")
-    print(f"  Checkpoint dir: {checkpoint_dir}")
-    print(f"  CSV output dir: {csv_dir}")
-
-    setup_output_directories(
-        output_dir=output_dir,
-        checkpoint_dir=checkpoint_dir,
-        csv_dir=csv_dir,
-        clear_previous=clear_previous,
-        is_restart=is_restart
-    )
-    
-    # VTK Writer
-    vtk_enabled = vtk_config.get('enabled', True) and not args.no_vtk
-    if vtk_enabled:
-        vtk_writer = VTKWriter(
-            output_dir=output_dir,
-            domain_shape=domain_shape,
-            precision=vtk_config.get('precision', 'float32'),
-            compression_level=vtk_config.get('compression_level', 0)
-        )
-        size_est = vtk_writer.get_file_size_estimate()
-        print(f"  VTK: enabled ({size_est['estimated_MB']:.2f} MB/file)")
-    else:
-        vtk_writer = None
-        print("  VTK: disabled")
-    
-    # Marker VTP Writer (for Actuator Line diagnostics)
-    marker_vtk_writer = None
-    if vtk_enabled and al_enabled:
-        from src.io.marker_vtk_writer import MarkerVTPWriter
-        marker_dir = os.path.join(output_dir, 'markers')
-        marker_vtk_writer = MarkerVTPWriter(
-            output_dir=marker_dir,
-            precision=vtk_config.get('precision', 'float32')
-        )
-        print(f"  Marker VTP: enabled ({marker_dir})")
-    
-    # Checkpoint Manager
-    checkpoint_enabled = checkpoint_config.get('enabled', True)
-    if checkpoint_enabled:
-        checkpoint_mgr = CheckpointManager(
-            output_dir=checkpoint_dir,
-            prefix='checkpoint',
-            keep_last_n=checkpoint_config.get('keep_last_n', 3),
-            xp=xp
-        )
-
-        if dimension == 2:
-            ckpt_est = checkpoint_mgr.get_size_estimate((lattice.Q, Nx, Ny))
-        else:
-            ckpt_est = checkpoint_mgr.get_size_estimate((lattice.Q, Nx, Ny, Nz))
-        print(f"  Checkpoint: enabled ({ckpt_est['estimated_MB']:.2f} MB/file)")
-    else:
-        checkpoint_mgr = None
-        print("  Checkpoint: disabled")
-
-    # Rotor performance CSV (Actuator Line only)
-    perf_csv_path = None
-    if al_enabled:
-        perf_csv_path = os.path.join(csv_dir, 'rotor_performance.csv')
-        with open(perf_csv_path, 'w') as fh:
-            fh.write('step,time_lt,time_phys,revolutions,'
-                     'thrust_lu,torque_lu,power_lu,'
-                     'C_T,C_P,coeff_mode,u_inf_used,FM\n')
-        print(f"  Rotor CSV: {perf_csv_path}")
-
-    # =========================================================================
-    # Initialize LBM Components
-    # =========================================================================
-    streaming = StreamingPull(xp, lattice, domain_shape)
-    eq = Maxwellian(xp, lattice, domain)
-    macro = Macroscopic(xp, lattice)
-    collision = BGK(xp)
-
-    forcing_scheme = GuoForcing(xp, lattice)
-
-    # =========================================================================
-    # [5] Initial Condition
-    # =========================================================================
+    xp = setup.xp
     start_step = 0
-    
+
     if args.restart_latest:
         print(f"\n[5] Restarting from latest checkpoint...")
-        if checkpoint_mgr is None:
+        if setup.checkpoint_mgr is None:
             raise RuntimeError("Cannot restart: checkpoints are disabled")
-        checkpoint_mgr.print_available()
-        state = checkpoint_mgr.load_latest()
+        setup.checkpoint_mgr.print_available()
+        state = setup.checkpoint_mgr.load_latest()
         f_old = xp.asarray(state['f'])
-        
+
         completed_step = state['step']
         start_step = completed_step + 1
         print(f"  Loaded step {completed_step}, resuming from step {start_step}")
-        
+
     elif args.restart:
         print(f"\n[5] Restarting from: {args.restart}")
-        if checkpoint_mgr is None:
-            checkpoint_mgr = CheckpointManager(output_dir=checkpoint_dir, xp=xp)
-        state = checkpoint_mgr.load(args.restart)
+        if setup.checkpoint_mgr is None:
+            from src.io.checkpoint import CheckpointManager
+            setup.checkpoint_mgr = CheckpointManager(
+                output_dir=setup.checkpoint_dir, xp=xp,
+            )
+        state = setup.checkpoint_mgr.load(args.restart)
         f_old = xp.asarray(state['f'])
-        
+
         completed_step = state['step']
         start_step = completed_step + 1
         print(f"  Loaded step {completed_step}, resuming from step {start_step}")
-        
+
     else:
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")
-        
-        # Initial flow velocity:
-        #   - Default: 0.0 (quiescent, e.g. hover)
-        #   - Override: initial_flow_velocity in config (e.g. U_inf_lu for forward flight)
+        physics_config = setup.sim_params.get('physics', {})
         flow_vel = physics_config.get('initial_flow_velocity', 0.0)
-        
-        if lattice.dim == 2:
-            rho0 = xp.ones((Nx, Ny), dtype=xp.float64)
-            u0 = xp.zeros((2, Nx, Ny), dtype=xp.float64)
 
+        if setup.lattice.dim == 2:
+            rho0 = xp.ones((setup.Nx, setup.Ny), dtype=xp.float64)
+            u0 = xp.zeros((2, setup.Nx, setup.Ny), dtype=xp.float64)
         else:
-            rho0 = xp.ones((Nx, Ny, Nz), dtype=xp.float64)
-            u0 = xp.zeros((3, Nx, Ny, Nz), dtype=xp.float64)
+            rho0 = xp.ones(
+                (setup.Nx, setup.Ny, setup.Nz), dtype=xp.float64,
+            )
+            u0 = xp.zeros(
+                (3, setup.Nx, setup.Ny, setup.Nz), dtype=xp.float64,
+            )
 
-       # Initial velocity: scalar → x-direction (legacy), list → per-component
+        # Initial velocity: scalar → x-direction (legacy), list → per-component
         if isinstance(flow_vel, (list, tuple)):
-            for d in range(min(len(flow_vel), lattice.dim)):
+            for d in range(min(len(flow_vel), setup.lattice.dim)):
                 u0[d] = flow_vel[d]    # [Δx/Δt]
             print(f"  Initial velocity: {flow_vel} [Δx/Δt]")
         else:
             u0[0] = flow_vel           # [Δx/Δt] x-direction (legacy)
             print(f"  Initial velocity: {flow_vel} [Δx/Δt] (x-dir)")
-        
-        f_old = eq.compute(rho0, u0)
+
+        f_old = setup.equilibrium.compute(rho0, u0)
         print(f"  Initial total mass: {float(xp.sum(f_old)):.6f}")
-    
-    # =========================================================================
-    # Determine End Step
-    # =========================================================================
+
+    # ── Determine End Step ──
     if args.max_steps is not None:
         end_step = args.max_steps
         print(f"\n  End step (--max-steps): {end_step}")
@@ -365,337 +117,29 @@ def main():
         end_step = start_step + args.extend
         print(f"\n  Extending by {args.extend} steps: {start_step} → {end_step}")
     else:
-        end_step = config_max_steps
+        end_step = setup.config_max_steps
         print(f"\n  End step (from config): {end_step}")
-    
+
     if start_step >= end_step:
         print(f"\n  ⚠️  start_step ({start_step}) >= end_step ({end_step})")
         print(f"      Use --extend N or --max-steps N to continue")
         return True
-    
+
     total_steps = end_step - start_step
     print(f"  Steps to run: {total_steps} ({start_step} → {end_step - 1})")
-    
-    # NOTE: f_new and f_post buffers are managed by Simulation.set_distribution()
 
-    # =========================================================================
-    # [5.1] Conservation Check Setup
-    # =========================================================================
-    print(f"\n[5.1] Conservation Check Setup")
-    
-    check_interval = conservation_config.get('check_interval', 0)
-    if check_interval == 0:
-        check_interval = output_interval
-    
-    conservation_mgr = ConservationManager(
-        xp=xp,
-        domain_shape=domain_shape,
-        config=conservation_config,
-        solid_mask=mask,
-        csv_dir=csv_dir
-    )
-    
-    print(f"  {conservation_mgr.get_info()}")
-    
-    rho_init, _ = macro.compute(f_old)
-    conservation_mgr.initialize(rho_init, step=start_step)
-    
-    # =========================================================================
-    # [5.2] Force Calculation Setup
-    # =========================================================================
-    print(f"\n[5.2] Force Calculation Setup")
-    
-    force_enabled = force_config.get('enabled', False) and obstacle_bc is not None
-    
-    if force_enabled and not args.no_force:
-        ref_config = force_config.get('reference', {})
-
-        if lattice.dim == 2:
-            default_span = 1  # 2D: unit span  [Δx]
-        else:
-            default_span = Nz  # [Δx]
-
-        force_calc_config = {
-            'enabled': True,
-            'interval': force_interval,
-            'start_step': force_config.get('start_step', 0),
-            'reference': {
-                'rho': ref_config.get('rho', 1.0),
-                'velocity': ref_config.get('velocity', u_ref_lu),
-                'char_length': ref_config.get('char_length', L_ref_lu),
-                'span_length': ref_config.get('span_length', default_span),
-            },
-            'log': {
-                'enabled': True,
-                'filename': 'force_history'
-            }
-        }
-        
-        force_mgr = ForceManager(
-            xp=xp,
-            lattice=lattice,
-            solid_mask=mask,
-            config=force_calc_config,
-            wall_bc=obstacle_bc,
-            csv_dir=csv_dir
-        )
-        force_mgr.initialize()
-    else:
-        force_mgr = None
-        if obstacle_bc is None:
-            print("  Force calculation: disabled (no obstacle)")
-        elif args.no_force:
-            print("  Force calculation: disabled (--no-force)")
-        else:
-            print("  Force calculation: disabled (config)")
-
-    # =========================================================================
-    # [5.3] Convergence Monitor Setup
-    # =========================================================================
-    print(f"\n[5.3] Convergence Monitor Setup")
-
-    has_obstacle = (obstacle_bc is not None) and (force_mgr is not None)
-    conv_monitor = ConvergenceMonitor(
-        config=conv_config,
-        has_obstacle=has_obstacle,
-        csv_dir=csv_dir,
-    )
-
-    if conv_monitor.enabled:
-        conv_monitor.initialize(
-            char_length=L_ref_lu,
-            u_ref=u_ref_lu,
-        )
-    else:
-        print("  Convergence monitor: disabled")
-
-    # =========================================================================
-    # [5.4] Actuator Line Model (conditional)
-    # =========================================================================
-    al_model = None           # ActuatorLineModel 또는 MultiRotorManager
-    polar_manager = None
-    
-    if al_enabled:
-        from src.actuator.actuator_line import (
-            create_actuator_line_from_config,
-            create_multi_rotor_from_config,   # ← NEW
-            MultiRotorManager,                 # ← NEW
-        )
-        from src.actuator.airfoil_data import create_polar_from_config
-
-        print(f"\\n[5.4] Actuator Line Model")
-        
-        # ── Load airfoil polar ──
-        polar_config = config_loader.config.get('airfoil_polar', {})
-        if not polar_config:
-            polar_config = {
-                "method": "neuralfoil",
-                "airfoil_name": "naca0012",
-                "Re_target": 1e5,
-                "mode": "asb",
-            }
-        
-        method = polar_config.get('method', 'neuralfoil')
-        print(f"  Airfoil polar method: '{method}'")
-        
-        polar_query, polar_manager = create_polar_from_config(polar_config)
-        
-        # ── u_inf_lu ──
-        U_inf_phys = physics_config.get('U_inf', 0.0)        # [m/s]
-        u_inf_lu = U_inf_phys * dt_phys / dx_phys             # [Δx/Δt]
-        u_inf_lu_arg = u_inf_lu if u_inf_lu > 0 else None
-
-        # ── Detect single vs multi rotor ──
-        if 'rotors' in al_cfg:
-            # ═══ Multi-Rotor Mode ═══
-            print(f"  Mode: MULTI-ROTOR ({len(al_cfg['rotors'])} rotors)")
-            
-            al_model = create_multi_rotor_from_config(
-                config=al_cfg,
-                domain_shape=domain_shape,
-                nu_lattice=nu_lu,
-                polar_query=polar_query,
-                dx_phys=dx_phys,
-                dt_phys=dt_phys,
-                u_inf_lu=u_inf_lu_arg,
-                coeff_mode=al_cfg.get('coeff_mode', 'auto'),
-                xp=xp,
-            )
-            
-            # Print each rotor info
-            for i, (model, name) in enumerate(
-                zip(al_model.models, al_model.names)
-            ):
-                print(f"    [{i}] {name}: "
-                      f"hub={model.rotor.hub_center}, "
-                      f"R={model.rotor.radius:.1f} lu, "
-                      f"ω={model.rotor.omega:.6f} rad/lt, "
-                      f"blades={model.rotor.n_blades}")
-        else:
-            # ═══ Single-Rotor Mode (backward compatible) ═══
-            print(f"  Mode: SINGLE-ROTOR")
-            
-            al_model = create_actuator_line_from_config(
-                config=al_cfg,
-                domain_shape=domain_shape,
-                nu_lattice=nu_lu,
-                polar_query=polar_query,
-                dx_phys=dx_phys,
-                dt_phys=dt_phys,
-                u_inf_lu=u_inf_lu_arg,
-                coeff_mode=al_cfg.get('coeff_mode', 'auto'),
-                xp=xp,
-            )
-
-        # ── Print summary (works for both single & multi) ──
-        if hasattr(al_model, 'u_inf_lu') and al_model.u_inf_lu is not None:
-            print(f"  u_inf_lu = {al_model.u_inf_lu:.6f} [Δx/Δt]")
-        else:
-            print(f"  u_inf_lu = None (hover mode, BEM fallback)")
-        
-        if hasattr(al_model, 'coeff_mode'):
-            print(f"  coeff_mode = '{al_model.coeff_mode}'")
-    # al_model = None
-    # polar_manager = None  # For multi-airfoil support
-    
-    # if al_enabled:
-    #     from src.actuator.actuator_line import create_actuator_line_from_config
-    #     from src.actuator.airfoil_data import create_polar_from_config  # NEW
-
-    #     print(f"\n[5.4] Actuator Line Model")
-        
-    #     # ─────────────────────────────────────────────────────────────────
-    #     # Load airfoil polar from config
-    #     # ─────────────────────────────────────────────────────────────────
-    #     polar_config = config_loader.config.get('airfoil_polar', {})
-        
-    #     if not polar_config:
-    #         # Fallback: default neuralfoil configuration
-    #         print("  [WARNING] No 'airfoil_polar' in config, using default")
-    #         polar_config = {
-    #             "method": "neuralfoil",
-    #             "airfoil_name": "naca0012",
-    #             "Re_target": 1e5,
-    #             "mode": "asb",
-    #         }
-        
-    #     method = polar_config.get('method', 'neuralfoil')
-    #     print(f"  Airfoil polar method: '{method}'")
-        
-    #     if method == 'multi':
-    #         print(f"    Airfoils: {list(polar_config.get('airfoils', {}).keys())}")
-    #         print(f"    Default: {polar_config.get('default', 'auto')}")
-    #     else:
-    #         print(f"    Airfoil: {polar_config.get('airfoil_name', 'N/A')}")
-    #         print(f"    Re_target: {polar_config.get('Re_target', 'N/A')}")
-    #         if polar_config.get('Re_min') is not None:
-    #             print(f"    Re range: [{polar_config['Re_min']}, {polar_config.get('Re_max')}]")
-        
-    #     print("  Generating polar data...")
-    #     polar_query, polar_manager = create_polar_from_config(polar_config)
-        
-    #     if polar_manager is not None:
-    #         print(f"  Loaded {len(polar_manager.airfoil_names)} airfoil(s): "
-    #               f"{polar_manager.airfoil_names}")
-    #     else:
-    #         print("  Single airfoil mode")
-        
-    #     # ─────────────────────────────────────────────────────────────────
-    #     # Create Actuator Line Model
-    #     # ─────────────────────────────────────────────────────────────────
-    #     print("  Creating rotor...")
-
-    #     # --- u_inf_lu 도출 ---
-    #     U_inf_phys = physics_config.get('U_inf', 0.0)        # [m/s]
-    #     u_inf_lu = U_inf_phys * dt_phys / dx_phys             # [Δx/Δt]
-    #     u_inf_lu_arg = u_inf_lu if u_inf_lu > 0 else None
-
-    #     al_model = create_actuator_line_from_config(
-    #         config=al_cfg,
-    #         domain_shape=domain_shape,
-    #         nu_lattice=nu_lu,
-    #         polar_query=polar_query,
-    #         dx_phys=dx_phys,
-    #         dt_phys=dt_phys,
-    #         u_inf_lu=u_inf_lu_arg,
-    #         coeff_mode=al_cfg.get('coeff_mode', 'auto'),
-    #     )
-
-    #     if al_model.u_inf_lu is not None:
-    #         print(f"  u_inf_lu = {al_model.u_inf_lu:.6f} [Δx/Δt]  (from U_inf={U_inf_phys} m/s)")
-    #     else:
-    #         print(f"  u_inf_lu = None (hover mode, BEM fallback)")
-    #     print(f"  coeff_mode = '{al_model.coeff_mode}'")
-
-    #     print(f"  {al_model}")
-
-        # === DEBUG: AL 진단 ===
-        # print("\n  [DEBUG] AL Diagnostics:")
-        # rotor = al_model.rotor
-        # positions = rotor.get_all_marker_positions()
-        # print(f"    Marker positions shape: {positions.shape}")
-        # print(f"    Marker positions range:")
-        # print(f"      X: [{positions[:,0].min():.2f}, {positions[:,0].max():.2f}]")
-        # print(f"      Y: [{positions[:,1].min():.2f}, {positions[:,1].max():.2f}]")
-        # print(f"      Z: [{positions[:,2].min():.2f}, {positions[:,2].max():.2f}]")
-        # print(f"    Domain shape: {domain_shape}")
-        # print(f"    Hub center (lu): {rotor.hub_center}")
-        # print(f"    Radius (lu): {rotor.radius}")
-        # print(f"    Omega (lu): {rotor.omega}")
-        # print(f"    Coord system preset: {rotor.coord_system.preset}")
-        # === END DEBUG ===
-    else:
-        print(f"\n[5.4] Actuator Line: disabled")
-
-    # =========================================================================
-    # [5.5] Create Simulation Object
-    # =========================================================================
-    sim = Simulation(
-        xp=xp,
-        macroscopic=macro,
-        equilibrium=eq,
-        collision=collision,
-        streaming=streaming,
-        forcing_scheme=forcing_scheme,
-        bc_manager=domain_bc_mgr,
-        tau=tau,
-        domain_shape=domain_shape,
-        obstacle_bc=obstacle_bc,
-        al_model=al_model,
-    )
+    # ── Wire f into Simulation ──
     sim.set_distribution(f_old)
     sim.step_count = start_step
+
+    # ── Conservation initialization (needs f_old) ──
+    rho_init, _ = setup.macro.compute(f_old)
+    setup.conservation_mgr.initialize(rho_init, step=start_step)
+
     sim.print_info()
 
     # =========================================================================
-    # [5.6] Create OutputManager
-    # =========================================================================
-    output = OutputManager(
-        xp=xp,
-        macroscopic=macro,
-        lattice=lattice,
-        sim_params=sim_params,
-        vtk_writer=vtk_writer,
-        marker_vtk_writer=marker_vtk_writer,
-        checkpoint_mgr=checkpoint_mgr,
-        conservation_mgr=conservation_mgr,
-        force_mgr=force_mgr,
-        conv_monitor=conv_monitor,
-        al_model=al_model,
-        output_interval=output_interval,
-        check_interval=check_interval,
-        checkpoint_interval=checkpoint_interval,
-        tau=tau,
-        solid_mask_np=solid_mask_np,
-        perf_csv_path=perf_csv_path,
-        domain_shape=domain_shape,
-        L_ref_lu=L_ref_lu,
-        u_ref_lu=u_ref_lu,
-        config_path=args.config,
-    )
-
-    # =========================================================================
-    # [6] Time Loop
+    # [3] Execution — 시간 루프
     # =========================================================================
     print(f"\n[6] Running Simulation")
     print("="*70)
@@ -709,7 +153,7 @@ def main():
             break
 
     # =========================================================================
-    # [7] Finalize
+    # [4] Finalize
     # =========================================================================
     return output.finalize(sim)
 
