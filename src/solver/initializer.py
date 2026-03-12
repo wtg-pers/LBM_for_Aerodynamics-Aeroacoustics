@@ -20,7 +20,7 @@ Author: LBM Development Team
 Date: 2026-03
 """
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Tuple
 
 if TYPE_CHECKING:
     from types import ModuleType

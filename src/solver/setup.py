@@ -30,11 +30,10 @@ Date: 2026-03
 """
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 if TYPE_CHECKING:
     from types import ModuleType
-    import numpy.typing as npt
 
 from src.lattice import get_lattice
 from src.domain.domain import Domain
