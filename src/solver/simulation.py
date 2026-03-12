@@ -8,12 +8,10 @@ operations in a clear, readable sequence matching the continuous equations:
     1. Macroscopic (ρ, u from f)
     2. Body Force  (ALM pipeline → F(x))
     3. Velocity Correction (Guo: u += F/(2ρ))
-    4. Equilibrium (f_eq from ρ, u)
-    5. Forcing Source Term (S_i from F, ρ, u, τ)
-    6. Collision (BGK: f* = f - ω(f - f_eq) + S_i)
-    7. Streaming (pull: f' = f*(x - c_i))
-    8. Boundary Conditions (domain faces + internal obstacles)
-    9. Buffer Swap (f ← f')
+    4. Collision (equilibrium + forcing + relaxation, all internal)
+    5. Streaming (pull: f' = f*(x - c_i))
+    6. Boundary Conditions (domain faces + internal obstacles)
+    7. Buffer Swap (f ← f')
 
 Design Principle:
     "main은 실행 진입점, Simulation이 물리를 서술한다."
@@ -33,10 +31,8 @@ if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
     from src.macroscopic.compute import Macroscopic
-    from src.equilibrium.equilibrium import Maxwellian
-    from src.collision.bgk import BGK
+    from src.collision.base import CollisionOperator
     from src.streaming.stream import StreamingPull
-    from src.forcing.guo_forcing import GuoForcing
     from src.boundary.domain_bc_manager import DomainBCManager
     from src.boundary.wall import HalfwayBounceBack
 
@@ -74,10 +70,8 @@ class Simulation:
         self,
         xp: 'ModuleType',
         macroscopic: 'Macroscopic',
-        equilibrium: 'Maxwellian',
-        collision: 'BGK',
+        collision: 'CollisionOperator',
         streaming: 'StreamingPull',
-        forcing_scheme: 'GuoForcing',
         bc_manager: 'DomainBCManager',
         tau: float,
         domain_shape: Tuple[int, ...],
@@ -89,10 +83,9 @@ class Simulation:
         Args:
             xp: Array module (numpy or cupy)
             macroscopic: Macroscopic variable calculator (ρ, u from f)
-            equilibrium: Equilibrium distribution calculator (f_eq from ρ, u)
-            collision: Collision operator (BGK)
+            collision: Collision operator (BGK, Cumulant, etc.)
+                       Owns equilibrium and forcing internally.
             streaming: Streaming operator (pull scheme)
-            forcing_scheme: Forcing source term calculator (Guo)
             bc_manager: Domain boundary condition manager
             tau: Relaxation time  [Δt]
                  ν = cs²·(τ - 0.5) in lattice units  [Δx²/Δt]
@@ -106,10 +99,8 @@ class Simulation:
 
         # ── Physical operators ──
         self.macroscopic = macroscopic
-        self.equilibrium = equilibrium
         self.collision = collision
         self.streaming = streaming
-        self.forcing_scheme = forcing_scheme
 
         # ── Boundary conditions ──
         self.bc_manager = bc_manager
@@ -179,12 +170,11 @@ class Simulation:
             1. Macroscopic:     ρ, u = moments(f)
             2. Body Force:      F(x) = ALM pipeline (if active)
             3. Velocity Corr:   u += F/(2ρ)         (Guo, 2002)
-            4. Equilibrium:     f_eq = Maxwellian(ρ, u)
-            5. Forcing:         S_i = Guo source(F, ρ, u, τ)
-            6. Collision:       f* = f - ω(f - f_eq) + S_i
-            7. Streaming:       f' = f*(x - c_i)    (pull scheme)
-            8. Boundary Cond:   domain faces + obstacles
-            9. Buffer Swap:     f ← f'
+            4. Collision:       f* = collide(f, ρ, u, τ, F)
+                                (equilibrium + forcing internally)
+            5. Streaming:       f' = f*(x - c_i)    (pull scheme)
+            6. Boundary Cond:   domain faces + obstacles
+            7. Buffer Swap:     f ← f'
 
         After calling advance():
             - self.rho, self.u, self.body_force are updated
@@ -219,33 +209,19 @@ class Simulation:
             u = u + self.body_force / (2.0 * self.rho[None, ...])
             self.u = u  # Store force-corrected velocity for output
 
-        # ─── Step 4: Equilibrium Distribution ────────────────────────
-        #   f_eq = w_i · ρ · (1 + 3(c_i·u) + 4.5(c_i·u)² - 1.5|u|²)
-        #   [dimensionless]
-        f_eq = self.equilibrium.compute(self.rho, u)
-
-        # ─── Step 5: Forcing Source Term ─────────────────────────────
-        #   S_i = (1 - 1/(2τ)) · w_i · [(c_i - u)/cs² + (c_i·u)·c_i/cs⁴] · F
-        #   [dimensionless]
-        if self.body_force is not None:
-            S_i = self.forcing_scheme.compute_source_term(
-                self.body_force, self.rho, u, self.tau
-            )
-        else:
-            S_i = None
-
-        # ─── Step 6: Collision (BGK + source term) ───────────────────
-        #   f* = f - ω(f - f_eq) + S_i
-        #   where ω = 1/τ  [1/Δt]
-        self._f_post[:] = self.collision.collide(
-            self.f, f_eq, self.tau, source=S_i
+        # ─── Step 4: Collision (equilibrium + forcing + relaxation) ──
+        #   f* = f − ω(f − f_eq) + S_i
+        #   Equilibrium and Guo forcing are computed internally
+        #   by the collision operator.
+        self.collision.collide(
+            self.f, self._f_post, self.rho, u, self.tau, self.body_force
         )
 
-        # ─── Step 7: Streaming (Pull scheme) ─────────────────────────
+        # ─── Step 5: Streaming (Pull scheme) ─────────────────────────
         #   f'(x, t+1) = f*(x - c_i, t)
         self.streaming.compute(self._f_post, self._f_new)
 
-        # ─── Step 8: Boundary Conditions ─────────────────────────────
+        # ─── Step 6: Boundary Conditions ─────────────────────────────
         #   Phase 1: Domain faces (equilibrium, Neumann, etc.)
         self.bc_manager.apply_all(self._f_new, self._f_post)
 
@@ -253,7 +229,7 @@ class Simulation:
         if self.obstacle_bc is not None:
             self.obstacle_bc.apply_with_reset(self._f_new, self._f_post)
 
-        # ─── Step 9: Buffer Swap ─────────────────────────────────────
+        # ─── Step 7: Buffer Swap ─────────────────────────────────────
         #   f ← f'  (new becomes current)
         self.f, self._f_new = self._f_new, self.f
         self.step_count += 1

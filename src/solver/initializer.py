@@ -6,7 +6,7 @@ It answers the question:
     "솔버에 맞는 초기 f를 어떻게 준비할까?"
 
 Two modes:
-    1. Fresh start:  f = f_eq(ρ₀, u₀) from Maxwellian equilibrium
+    1. Fresh start:  f = f_eq(ρ₀, u₀) from collision operator's equilibrium
     2. Restart:       f = checkpoint data + resume step
 
 Future extension:
@@ -174,13 +174,14 @@ class SolverInitializer:
     def _fresh_start(
         self, xp: 'ModuleType', setup: 'SimulationSetup',
     ) -> Tuple[Any, int]:
-        """Create f from Maxwellian equilibrium.
+        """Create f from collision operator's equilibrium.
 
         For BGK solver:
             f = f_eq(ρ₀, u₀)
             where f_eq = w_i · ρ · (1 + 3(c·u) + 4.5(c·u)² - 1.5|u|²)
 
-        Future: Cumulant solver may use a different equilibrium.
+        Each collision model provides its own compute_equilibrium(),
+        so Cumulant solver can use a different equilibrium if needed.
         """
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")
 
@@ -214,7 +215,10 @@ class SolverInitializer:
             print(f"  Initial velocity: {flow_vel} [Δx/Δt] (x-dir)")
 
         # ── Compute f_eq ──
-        f = setup.equilibrium.compute(rho0, u0)              # [dimensionless]
+        # ── Compute f_eq via collision operator ──
+        #   BGK: Maxwellian f_eq = w_i·ρ·(1 + 3(c·u) + 4.5(c·u)² - 1.5|u|²)
+        #   Cumulant: may use different equilibrium (future)
+        f = setup.collision.compute_equilibrium(rho0, u0)    # [dimensionless]
         print(f"  Initial total mass: {float(xp.sum(f)):.6f}")
 
         return f, 0  # start_step = 0

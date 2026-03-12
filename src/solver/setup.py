@@ -37,11 +37,9 @@ if TYPE_CHECKING:
 
 from src.lattice import get_lattice
 from src.domain.domain import Domain
-from src.equilibrium.equilibrium import Maxwellian
 from src.macroscopic.compute import Macroscopic
-from src.collision.bgk import BGK
+from src.collision.bgk import BGKCollision
 from src.streaming.stream import StreamingPull
-from src.forcing import GuoForcing
 
 from src.io.config_loader import ConfigLoader
 from src.io.vtk_writer import VTKWriter
@@ -82,7 +80,7 @@ class SimulationSetup:
         lattice: Lattice model (D2Q9, D3Q27, etc.)
         domain_shape: Grid dimensions (Nx, Ny[, Nz])  [lu]
         tau: Relaxation time  [Δt]
-        equilibrium: Equilibrium calculator (for initializer to use)
+        collision: Collision operator (owns equilibrium + forcing)
         checkpoint_mgr: Checkpoint manager (for initializer to use)
     """
 
@@ -149,10 +147,8 @@ class SimulationSetup:
         return Simulation(
             xp=self.xp,
             macroscopic=self.macro,
-            equilibrium=self.equilibrium,
             collision=self.collision,
             streaming=self.streaming,
-            forcing_scheme=self.forcing_scheme,
             bc_manager=self.domain_bc_mgr,
             tau=self.tau,
             domain_shape=self.domain_shape,
@@ -425,14 +421,17 @@ class SimulationSetup:
             print(f"  Rotor CSV: {self.perf_csv_path}")
 
     def _create_lbm_components(self) -> None:
-        """Create core LBM operator objects."""
+        """Create core LBM operator objects.
+
+        The collision operator (BGKCollision) owns equilibrium and
+        Guo forcing internally. No separate equilibrium or forcing
+        objects are created.
+        """
         self.streaming = StreamingPull(
             self.xp, self.lattice, self.domain_shape,
         )
-        self.equilibrium = Maxwellian(self.xp, self.lattice, self._domain)
         self.macro = Macroscopic(self.xp, self.lattice)
-        self.collision = BGK(self.xp)
-        self.forcing_scheme = GuoForcing(self.xp, self.lattice)
+        self.collision = BGKCollision(self.xp, self.lattice)
 
     def _setup_conservation(self) -> None:
         """[5.1] Conservation check setup.
