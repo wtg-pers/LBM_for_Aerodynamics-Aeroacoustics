@@ -46,7 +46,6 @@ from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING, Optional, List, Tuple, Dict, Union, Callable
 )
-import warnings
 
 import numpy as np
 from scipy import interpolate as sp_interp
@@ -385,66 +384,29 @@ class Blade:
     def get_marker_positions(
         self,
         theta: float,
-        hub_center: Optional[Tuple[float, float, float]] = None
     ) -> np.ndarray:
         """Compute 3D global positions of all markers for a given azimuth
 
         Coordinate Transformation:
-            If coord_system is set (recommended):
-                Uses RotorCoordinateSystem.marker_position() for arbitrary axes.
-                The hub_center parameter is ignored (stored in coord_system).
-            
-            If coord_system is None (legacy mode):
-                Falls back to hardcoded X-axis rotation:
-                    x_j = x_hub
-                    y_j = y_hub + r_j · cos(θ)
-                    z_j = z_hub + r_j · sin(θ)
-                Requires hub_center parameter.
-
-        Convention:
-            - θ = 0: blade points in +y direction (for X-axis rotation)
-            - θ = π/2: blade points in +z direction (vertical up)
-            - Rotation is counterclockwise when viewed from upstream
+            Uses RotorCoordinateSystem.marker_position() for arbitrary axes.
+            Hub center is stored in the coordinate system.
 
         Args:
             theta: Azimuth angle of this blade  [radians]
-            hub_center: Rotor center (x, y, z) in global coords  [m or lu]
-                        Only required if coord_system is not set.
 
         Returns:
             positions: shape (n_markers, 3) — (x, y, z) per marker
                        [m or lattice units]
+
+        Raises:
+            RuntimeError: If coord_system has not been set.
         """
-        # --- New: Use coordinate system if available ---
-        if self._coord_system is not None:
-            return self._coord_system.marker_position(self.marker_r, theta)
-        
-        # --- Legacy: Hardcoded X-axis rotation ---
-        if hub_center is None:
-            raise ValueError(
-                "hub_center is required when coord_system is not set. "
-                "Consider setting a coordinate system via set_coordinate_system()."
+        if self._coord_system is None:
+            raise RuntimeError(
+                "Blade.coord_system is not set. "
+                "Use Rotor to create blades with a coordinate system."
             )
-        
-        # Issue deprecation warning (once per call stack)
-        warnings.warn(
-            "Using legacy hardcoded X-axis rotation in Blade.get_marker_positions(). "
-            "Set a RotorCoordinateSystem for arbitrary rotation axis support.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        
-        x_h, y_h, z_h = hub_center
-
-        cos_theta = np.cos(theta)  # [dimensionless]
-        sin_theta = np.sin(theta)  # [dimensionless]
-
-        positions = np.zeros((self.n_markers, 3), dtype=np.float64)
-        positions[:, 0] = x_h                               # x: rotor plane
-        positions[:, 1] = y_h + self.marker_r * cos_theta   # y: spanwise
-        positions[:, 2] = z_h + self.marker_r * sin_theta   # z: vertical
-
-        return positions  # [m or lattice units]
+        return self._coord_system.marker_position(self.marker_r, theta)
 
     def get_marker_unit_vectors(
         self,
@@ -453,15 +415,9 @@ class Blade:
         """Compute local coordinate unit vectors at each marker
 
         Local Coordinate System:
-            If coord_system is set (recommended):
-                ê_n = coord_system.n_axis              (rotation axis / normal)
-                ê_θ = coord_system.tangent_vector(θ)   (standard tangent, ∂x/∂θ direction)
-                ê_r = coord_system.radial_vector(θ)    (radial / outward)
-            
-            If coord_system is None (legacy, X-axis only):
-                ê_n = (1, 0, 0)                        (streamwise)
-                ê_θ = (0, -sin(θ), cos(θ))            (tangential)
-                ê_r = (0, cos(θ), sin(θ))              (radial)
+            ê_n = coord_system.n_axis              (rotation axis / normal)
+            ê_θ = coord_system.tangent_vector(θ)   (standard tangent, ∂x/∂θ direction)
+            ê_r = coord_system.radial_vector(θ)    (radial / outward)
 
         These are needed for:
             - Velocity decomposition: u_n, u_θ (Eq. 5-6)
@@ -476,70 +432,24 @@ class Blade:
             e_n:     Normal (axial) unit vector
             e_theta: Tangential (Watanabe convention) unit vector
             e_r:     Radial (outward) unit vector
+
+        Raises:
+            RuntimeError: If coord_system has not been set.
         """
-        # --- New: Use coordinate system if available ---
-        if self._coord_system is not None:
-            e_n = self._coord_system.n_axis.copy()
-            e_theta = self._coord_system.tangent_vector(theta)
-            e_r = self._coord_system.radial_vector(theta)
-            return e_n, e_theta, e_r
-        
-        # --- Legacy: Hardcoded X-axis rotation ---
-        cos_t = np.cos(theta)
-        sin_t = np.sin(theta)
-
-        e_n = np.array([1.0, 0.0, 0.0])           # streamwise (x)
-        e_theta = np.array([0.0, -sin_t, cos_t])   # tangential (legacy convention)
-        e_r = np.array([0.0, cos_t, sin_t])        # radial
-
+        if self._coord_system is None:
+            raise RuntimeError(
+                "Blade.coord_system is not set. "
+                "Use Rotor to create blades with a coordinate system."
+            )
+        e_n = self._coord_system.n_axis.copy()
+        e_theta = self._coord_system.tangent_vector(theta)
+        e_r = self._coord_system.radial_vector(theta)
         return e_n, e_theta, e_r
 
     # -----------------------------------------------------------------
     # §2.5 Force Projection to Global Frame
     # -----------------------------------------------------------------
 
-    # def project_forces_to_global(
-    #     self,
-    #     F_n: np.ndarray,
-    #     F_theta: np.ndarray,
-    #     theta: float
-    # ) -> np.ndarray:
-    #     """Project normal/tangential forces to global (x, y, z) frame
-
-    #     Watanabe et al. Convention:
-    #         If coord_system is set (recommended):
-    #             F^AL = coord_system.project_force_to_global(F_n, F_theta, theta)
-            
-    #         If coord_system is None (legacy, X-axis only):
-    #             F^AL = (F_n, F_θ·cos(θ), -F_θ·sin(θ))
-
-    #     Sign Convention:
-    #         F^AL is the aerodynamic force ON THE BLADE from the fluid.
-    #         The body force applied to the fluid (Eq. 13) is -F^AL.
-
-    #     Args:
-    #         F_n:     Normal forces, shape (n_markers,)     [N or lattice force]
-    #         F_theta: Tangential forces, shape (n_markers,) [N or lattice force]
-    #         theta:   Azimuth angle  [radians]
-
-    #     Returns:
-    #         F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
-    #                   [N or lattice force units]
-    #     """
-    #     # --- New: Use coordinate system if available ---
-    #     if self._coord_system is not None:
-    #         return self._coord_system.project_force_to_global(F_n, F_theta, theta)
-        
-    #     # --- Legacy: Hardcoded X-axis rotation ---
-    #     cos_t = np.cos(theta)   # [dimensionless]
-    #     sin_t = np.sin(theta)   # [dimensionless]
-
-    #     F_global = np.zeros((self.n_markers, 3), dtype=np.float64)
-    #     F_global[:, 0] = F_n                    # F_x = F_n
-    #     F_global[:, 1] = F_theta * cos_t        # F_y = F_θ · cos(θ)
-    #     F_global[:, 2] = -F_theta * sin_t       # F_z = -F_θ · sin(θ)
-
-    #     return F_global  # [N or lattice force units]
     def project_forces_to_global(
         self,
         F_n: np.ndarray,
@@ -550,15 +460,11 @@ class Blade:
         """Project normal/tangential forces to global (x, y, z) frame
 
         Extended Watanabe Convention (counter-rotation support):
-            If coord_system is set (recommended):
-                F^AL = coord_system.project_force_to_global(
-                    F_n, F_theta, theta, rotation_sign)
-            
-            If coord_system is None (legacy, X-axis only):
-                F^AL = (F_n, sign·F_θ·cos(θ), -sign·F_θ·sin(θ))
+            F^AL = coord_system.project_force_to_global(
+                F_n, F_theta, theta, rotation_sign)
 
         rotation_sign accounts for the blade's rotation direction:
-            ω > 0 → rotation_sign = +1 (default, backward compatible)
+            ω > 0 → rotation_sign = +1
             ω < 0 → rotation_sign = -1 (counter-rotating rotor)
 
         Sign Convention:
@@ -570,31 +476,22 @@ class Blade:
             F_theta: Tangential forces, shape (n_markers,) [N or lattice force]
             theta:   Azimuth angle  [radians]
             rotation_sign: sign(ω), +1.0 or -1.0  [-]
-                           Default +1.0 preserves backward compatibility.
 
         Returns:
             F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
                       [N or lattice force units]
+
+        Raises:
+            RuntimeError: If coord_system has not been set.
         """
-        # --- New: Use coordinate system if available ---
-        if self._coord_system is not None:
-            return self._coord_system.project_force_to_global(
-                F_n, F_theta, theta, rotation_sign=rotation_sign
+        if self._coord_system is None:
+            raise RuntimeError(
+                "Blade.coord_system is not set. "
+                "Use Rotor to create blades with a coordinate system."
             )
-        
-        # --- Legacy: Hardcoded X-axis rotation ---
-        cos_t = np.cos(theta)   # [dimensionless]
-        sin_t = np.sin(theta)   # [dimensionless]
-
-        # ★ rotation_sign 적용 (legacy path) ★
-        F_theta_global = rotation_sign * F_theta   # [N or lattice force]
-
-        F_global = np.zeros((self.n_markers, 3), dtype=np.float64)
-        F_global[:, 0] = F_n                          # F_x = F_n
-        F_global[:, 1] = F_theta_global * cos_t       # F_y = sign·F_θ · cos(θ)
-        F_global[:, 2] = -F_theta_global * sin_t      # F_z = -sign·F_θ · sin(θ)
-
-        return F_global  # [N or lattice force units]
+        return self._coord_system.project_force_to_global(
+            F_n, F_theta, theta, rotation_sign=rotation_sign
+        )
 
     # -----------------------------------------------------------------
     # §2.6 Utility Methods
@@ -602,9 +499,8 @@ class Blade:
 
     def get_info(self) -> str:
         """Human-readable blade summary"""
-        coord_info = "Not set (legacy mode)"
-        if self._coord_system is not None:
-            coord_info = f"{self._coord_system.axis_label}"
+        coord_info = (f"{self._coord_system.axis_label}"
+                      if self._coord_system is not None else "Not set")
         
         lines = [
             "Blade Geometry Summary",

@@ -501,14 +501,14 @@ def create_boundary_from_config(xp: 'ModuleType',
         - 'pressure_relaxation': PressureRelaxationOutlet (recommended)
         - 'regularized_outlet' / 'reg_outlet': RegularizedOutlet (full reconstruction)
         - 'convective': ConvectiveOutlet (advection-based)
-        - 'neumann' / 'extrapolation': NeumannOutlet (zero-gradient)
+        - 'neumann' / 'zero_gradient': NeumannOutlet (zero-gradient)
     
     Wall BCs:
         - 'bounce_back' / 'hwbb' / 'wall': DomainWallBounceBack
         - 'regularized_wall' / 'reg_wall': RegularizedWall (full reconstruction)
     
     Far-field BCs:
-        - 'freestream' / 'farfield': FreestreamBC (velocity FIXED to U∞)
+        - 'freestream': FreestreamBC (velocity FIXED to U∞)
         - 'sponge': SpongeLayer (buffer zone damping)
     
     Other:
@@ -608,19 +608,11 @@ def create_boundary_from_config(xp: 'ModuleType',
                                    shape=shape)
     
     # =========================================================================
-    # Pressure Relaxation Outlet (formerly CharacteristicOutlet)
+    # Pressure Relaxation Outlet
     # =========================================================================
-    elif method in ['pressure_relaxation', 'characteristic', 'open', 'non_reflecting']:
+    elif method in ['pressure_relaxation', 'open', 'non_reflecting']:
         rho_target = config.get('rho', config.get('rho_target', config.get('pressure', 1.0)))
         relax_coeff = config.get('k', config.get('relax_coeff', 0.1))
-        
-        # Deprecation warning for old name
-        if method == 'characteristic':
-            import warnings
-            warnings.warn(
-                "method='characteristic' is deprecated. Use 'pressure_relaxation' instead.",
-                DeprecationWarning
-            )
         
         return PressureRelaxationOutlet(xp, lattice, location,
                                          rho_target=rho_target,
@@ -628,20 +620,12 @@ def create_boundary_from_config(xp: 'ModuleType',
                                          shape=shape)
     
     # =========================================================================
-    # Freestream BC (formerly CharacteristicFarfield)
+    # Freestream BC
     # =========================================================================
-    elif method in ['freestream', 'farfield', 'far_field']:
+    elif method in ['freestream']:
         rho_inf = config.get('rho', config.get('rho_inf', 1.0))
         u_inf = config.get('u_inf', config.get('velocity', 0.1))
         relax_coeff = config.get('k', config.get('relax_coeff', 0.1))
-        
-        # Deprecation warning for old name
-        if method in ['farfield', 'far_field']:
-            import warnings
-            warnings.warn(
-                "method='farfield' is deprecated. Use 'freestream' instead.",
-                DeprecationWarning
-            )
         
         return FreestreamBC(xp, lattice, location,
                             u_inf=u_inf, rho_inf=rho_inf,
@@ -674,16 +658,7 @@ def create_boundary_from_config(xp: 'ModuleType',
     # =========================================================================
     # Neumann (Zero-gradient) Outlet
     # =========================================================================
-    elif method in ['neumann', 'extrapolation', 'zero_gradient']:
-        # Deprecation warning for old name
-        if method == 'extrapolation':
-            import warnings
-            warnings.warn(
-                "method='extrapolation' is deprecated. "
-                "Use 'neumann' instead.",
-                DeprecationWarning
-            )
-        
+    elif method in ['neumann', 'zero_gradient']:
         return NeumannOutlet(xp, lattice, location, shape=shape)
     
     # =========================================================================

@@ -622,60 +622,7 @@ class RotorCoordinateSystem:
             u_theta = u_global @ e_rot             # (N,)
         
         return u_n, u_theta
-    
-    # def project_force_to_global(
-    #     self,
-    #     F_n: Union[float, np.ndarray],
-    #     F_theta: Union[float, np.ndarray],
-    #     theta: float
-    # ) -> np.ndarray:
-    #     """Project local forces to global coordinate frame
-        
-    #     Force Projection:
-    #         F^AL = F_n·n̂ + F_θ·ê_θ(θ)
-    #             = F_n·n̂ + F_θ·(-sin(θ)·ê_ref + cos(θ)·ê_perp)
-        
-    #     For HAWT_X_AXIS (ê_ref=ŷ, ê_perp=ẑ), this gives:
-    #         F^AL = (F_n, -F_θ·sin(θ), F_θ·cos(θ))
-        
-    #     Torque consistency proof:
-    #         Q = (r × F^AL)·n̂ = F_θ·r   (azimuth-independent)
-        
-    #     Sign Convention (IMPORTANT):
-    #         F_n > 0:  Force on blade in +n̂ direction
-    #         F_θ > 0:  Force on blade in +ê_tan(θ) direction
-            
-    #         The BODY FORCE on fluid (Eq. 13) is -F^AL:
-    #             F_body = -F^AL = -F_n·n̂ - F_θ·ê_tan(θ)
-            
-    #         This means positive thrust (F_n > 0) decelerates the flow,
-    #         creating the wake deficit.
-        
-    #     Args:
-    #         F_n: Normal (axial) force(s)  [N or lattice force]
-    #              Scalar or shape (N,)
-    #         F_theta: Tangential force(s)  [N or lattice force]
-    #                  Scalar or shape (N,)
-    #         theta: Azimuth angle  [radians]
-        
-    #     Returns:
-    #         F_global: Force ON BLADE in global frame
-    #                   Shape (3,) if inputs are scalar, (N, 3) if arrays
-    #     """
-    #     e_tan = self.tangent_vector(theta)
-        
-    #     F_n = np.asarray(F_n)
-    #     F_theta = np.asarray(F_theta)
-        
-    #     is_scalar = (F_n.ndim == 0)
-        
-    #     if is_scalar:
-    #         # Single force: return shape (3,)
-    #         return float(F_n) * self.n_axis + float(F_theta) * e_tan
-    #     else:
-    #         # Multiple forces: return shape (N, 3)
-    #         return (F_n[:, None] * self.n_axis[None, :] +
-    #                 F_theta[:, None] * e_tan[None, :])
+
     def project_force_to_global(
         self,
         F_n: Union[float, np.ndarray],

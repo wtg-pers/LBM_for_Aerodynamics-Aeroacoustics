@@ -203,10 +203,10 @@ class Rotor:
 
     @property
     def hub_center(self) -> Tuple[float, float, float]:
-        """Get hub center position (for backward compatibility)
+        """Get hub center position
         
         Returns:
-            (x, y, z) hub center position
+            (x, y, z) hub center position  [m or lu]
         """
         return tuple(self._coord_system.hub_center)
 
@@ -317,30 +317,6 @@ class Rotor:
     # §1.3 Force Projection
     # -----------------------------------------------------------------
 
-    # def project_blade_forces(
-    #     self,
-    #     blade_idx: int,
-    #     F_n: np.ndarray,
-    #     F_theta: np.ndarray
-    # ) -> np.ndarray:
-    #     """Project forces on a single blade to global frame
-
-    #     Uses the blade's coordinate system for projection.
-
-    #     Args:
-    #         blade_idx: Blade index
-    #         F_n:     Normal (axial) forces, shape (n_markers,)  [N or lu_force]
-    #         F_theta: Tangential (rotational) forces, shape (n_markers,) [N or lu_force]
-
-    #     Returns:
-    #         F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
-    #                   [N or lu_force]
-    #     """
-    #     return self.blades[blade_idx].project_forces_to_global(
-    #         F_n=F_n,
-    #         F_theta=F_theta,
-    #         theta=self.theta[blade_idx]
-    #     )  # [N or lu_force]
     def project_blade_forces(
         self,
         blade_idx: int,
@@ -371,35 +347,6 @@ class Rotor:
             rotation_sign=rotation_sign
         )  # [N or lu_force]
 
-    # def project_all_forces(
-    #     self,
-    #     F_n_all: np.ndarray,
-    #     F_theta_all: np.ndarray
-    # ) -> np.ndarray:
-    #     """Project forces on ALL blades to global frame
-
-    #     Args:
-    #         F_n_all:     Normal forces, shape (N_b * n_markers,)  [N or lu_force]
-    #         F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
-    #                      Ordered as [blade_0_markers, blade_1_markers, ...]
-
-    #     Returns:
-    #         F_global: shape (N_b * n_markers, 3) — (F_x, F_y, F_z)
-    #                   [N or lu_force]
-    #     """
-    #     F_global = np.zeros((self.total_markers, 3), dtype=np.float64)
-
-    #     for k in range(self.n_blades):
-    #         i_start = k * self.markers_per_blade
-    #         i_end = i_start + self.markers_per_blade
-
-    #         F_global[i_start:i_end, :] = self.blades[k].project_forces_to_global(
-    #             F_n=F_n_all[i_start:i_end],
-    #             F_theta=F_theta_all[i_start:i_end],
-    #             theta=self.theta[k]
-    #         )  # [N or lu_force]
-
-    #     return F_global  # [N or lu_force]
     def project_all_forces(
         self,
         F_n_all: np.ndarray,
@@ -748,34 +695,6 @@ class Rotor:
         power = self.omega * torque                  # [W or lu_power]
 
         return power
-
-    def compute_ct_cp(
-        self,
-        F_n_all: np.ndarray,
-        F_theta_all: np.ndarray,
-        rho: float,
-        u_inf: float,
-        mode: str = 'auto'
-    ) -> Tuple[float, float, str]:
-        """Compute thrust and power coefficients (alias for compute_coefficients)
-
-        This is an alias for compute_coefficients() to match the interface
-        expected by ActuatorLineModel.get_rotor_performance().
-
-        Supports dual mode: 'wind_turbine' / 'rotorcraft' / 'auto'.
-        See compute_coefficients() for full documentation.
-
-        Args:
-            F_n_all:     Normal forces, shape (N_b * n_markers,) [N or lu_force]
-            F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
-            rho:   Fluid density       [kg/m³ or lu_density]
-            u_inf: Freestream velocity [m/s or lu/lt]
-            mode:  'wind_turbine' | 'rotorcraft' | 'auto'
-
-        Returns:
-            (C_T, C_P, actual_mode): Coefficients + mode used [dimensionless]
-        """
-        return self.compute_coefficients(F_n_all, F_theta_all, rho, u_inf, mode)
 
     def compute_figure_of_merit(
         self,

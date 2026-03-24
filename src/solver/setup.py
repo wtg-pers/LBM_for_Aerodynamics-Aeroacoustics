@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 from src.lattice import get_lattice
-from src.domain.domain import Domain
 from src.macroscopic.compute import Macroscopic
 from src.collision.bgk import BGKCollision
 from src.streaming.stream import StreamingPull
@@ -238,15 +237,11 @@ class SimulationSetup:
         self.Nz = self._domain_config.get('Nz')  # None for 2D
 
         if self.lattice.dim == 2:
-            self._domain = Domain(self.lattice, self.xp, self.Nx, self.Ny, None)
             self.domain_shape: Tuple[int, ...] = (self.Nx, self.Ny)
             print(f"\n[1] Domain Setup (2D)")
             print(f"  Grid: {self.Nx} x {self.Ny}")
             print(f"  Total cells: {self.Nx * self.Ny:,}")
         else:
-            self._domain = Domain(
-                self.lattice, self.xp, self.Nx, self.Ny, self.Nz,
-            )
             self.domain_shape = (self.Nx, self.Ny, self.Nz)
             print(f"\n[1] Domain Setup (3D)")
             print(f"  Grid: {self.Nx} x {self.Ny} x {self.Nz}")

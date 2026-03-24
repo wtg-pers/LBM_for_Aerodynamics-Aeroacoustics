@@ -520,7 +520,7 @@ class ActuatorLineModel:
                 if len(u_n_active) > 0 else 0.0                    # [Δx/Δt]
 
         # --- C_T, C_P (dual mode) ---
-        C_T, C_P, actual_mode = rotor.compute_ct_cp(
+        C_T, C_P, actual_mode = rotor.compute_coefficients(
             bem.F_n, bem.F_theta,
             rho=self.rho_ref,
             u_inf=u_inf_used,
@@ -1077,75 +1077,3 @@ def create_multi_rotor_from_config(
         manager.add_model(al_model, name=name)
 
     return manager
-
-
-# =============================================================================
-# §3. Factory Function [single factory old version]
-# =============================================================================
-
-# def create_actuator_line_from_config(
-#     config: dict,
-#     domain_shape: Tuple[int, int, int],
-#     nu_lattice: float,
-#     polar_query: Callable,
-#     dx_phys: float = 1.0,
-#     dt_phys: float = 1.0,
-#     u_inf_lu: Optional[float] = None,
-#     coeff_mode: str = 'auto',
-# ) -> ActuatorLineModel:
-#     """Create an ActuatorLineModel from a configuration dictionary
-
-#     Expected Config Format:
-#         {
-#             "rotor": { ... },
-#             "gaussian_cutoff": 3.0,
-#             "rho_ref": 1.0,
-#             "coeff_mode": "auto"        # 'wind_turbine' | 'rotorcraft' | 'auto'
-#         }
-
-#     Args:
-#         config: AL model configuration
-#         domain_shape: (Nx, Ny, Nz)
-#         nu_lattice: Kinematic viscosity [lu²/lt]
-#         polar_query: Airfoil data query function
-#         dx_phys: Physical grid spacing [m/lu]
-#         dt_phys: Physical timestep [s/lt]
-#         u_inf_lu: Freestream velocity [Δx/Δt] or None (BEM fallback)
-#         coeff_mode: Override for coefficient mode.
-#                     If not provided, reads from config['coeff_mode'].
-
-#     Returns:
-#         Configured ActuatorLineModel instance
-#     """
-#     rotor_cfg = config.get('rotor', {})
-
-#     if 'grid' not in rotor_cfg:
-#         rotor_cfg['grid'] = {}
-#     if 'dx' not in rotor_cfg['grid']:
-#         rotor_cfg['grid']['dx'] = dx_phys          # [m/lu]
-
-#     # Create rotor (in physical units first)
-#     rotor_phys = Rotor.from_config(rotor_cfg)
-
-#     # Convert to lattice units
-#     rotor_lu = rotor_phys.to_lattice_units(
-#         length_scale=dx_phys,
-#         time_scale=dt_phys
-#     )
-
-#     # Resolve coeff_mode: explicit argument > config key > default
-#     resolved_mode = coeff_mode if coeff_mode != 'auto' \
-#         else config.get('coeff_mode', 'auto')
-
-#     return ActuatorLineModel(
-#         rotor=rotor_lu,
-#         nu=nu_lattice,
-#         domain_shape=domain_shape,
-#         polar_query=polar_query,
-#         rho_ref=config.get('rho_ref', 1.0),
-#         n_cut=config.get('gaussian_cutoff', 3.0),
-#         dx_phys=dx_phys,
-#         dt_phys=dt_phys,
-#         u_inf_lu=u_inf_lu,
-#         coeff_mode=resolved_mode,
-#     )
