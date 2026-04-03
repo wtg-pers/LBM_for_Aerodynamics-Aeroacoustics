@@ -415,18 +415,64 @@ class SimulationSetup:
                 )
             print(f"  Rotor CSV: {self.perf_csv_path}")
 
+    # def _create_lbm_components(self) -> None:
+    #     """Create core LBM operator objects.
+
+    #     The collision operator (BGKCollision) owns equilibrium and
+    #     Guo forcing internally. No separate equilibrium or forcing
+    #     objects are created.
+    #     """
+    #     self.streaming = StreamingPull(
+    #         self.xp, self.lattice, self.domain_shape,
+    #     )
+    #     self.macro = Macroscopic(self.xp, self.lattice)
+    #     self.collision = BGKCollision(self.xp, self.lattice)
     def _create_lbm_components(self) -> None:
         """Create core LBM operator objects.
-
-        The collision operator (BGKCollision) owns equilibrium and
-        Guo forcing internally. No separate equilibrium or forcing
-        objects are created.
+    
+        Collision Model Selection:
+            Reads 'collision_model' from simulation config.
+            - "bgk" (default): BGKCollision — works with D2Q9, D3Q27
+            - "cumulant":       CumulantCollision — D3Q27 only
+    
+            Additional cumulant parameters (optional):
+            - "omega_bulk": Bulk viscosity rate ω₂  [1/Δt] (default 1.0)
+            - "omega_high": High-order rate ω₃-ω₁₀  [1/Δt] (default 1.0)
+    
+        Config Example:
+            "simulation": {
+                "collision_model": "cumulant",   # or "bgk"
+                "omega_bulk": 1.0,               # optional
+                "omega_high": 1.0,               # optional
+                ...
+            }
         """
         self.streaming = StreamingPull(
             self.xp, self.lattice, self.domain_shape,
         )
         self.macro = Macroscopic(self.xp, self.lattice)
-        self.collision = BGKCollision(self.xp, self.lattice)
+    
+        # ── Collision model selection ────────────────────────────
+        model_name = self.sim_params.get('collision_model', 'bgk').lower()
+    
+        if model_name == 'cumulant':
+            from src.collision.cumulant import CumulantCollision
+            omega_bulk = self.sim_params.get('omega_bulk', 1.0)
+            omega_high = self.sim_params.get('omega_high', 1.0)
+            self.collision = CumulantCollision(
+                self.xp, self.lattice,
+                omega_bulk=omega_bulk,
+                omega_high=omega_high,
+            )
+            print(f"  Collision: Cumulant (ω_bulk={omega_bulk}, ω_high={omega_high})")
+        elif model_name == 'bgk':
+            self.collision = BGKCollision(self.xp, self.lattice)
+            print(f"  Collision: BGK")
+        else:
+            raise ValueError(
+                f"Unknown collision model: '{model_name}'. "
+                f"Available: 'bgk', 'cumulant'"
+            )
 
     def _setup_conservation(self) -> None:
         """[5.1] Conservation check setup.

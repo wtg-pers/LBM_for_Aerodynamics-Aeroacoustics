@@ -431,9 +431,25 @@ def validate_geometry_config(
         radius = config.get('radius', 0)
         if radius <= 0:
             return False, f"{geom_type}: radius must be positive"
-        
-        if radius > min(domain_shape) / 2:
-            return False, f"{geom_type}: radius too large for domain"
+ 
+        # For cylinders, check against cross-section dimensions only
+        # (exclude the extrusion axis from the size check)
+        if geom_type == 'cylinder' and lattice_dim == 3:
+            axis = config.get('axis', 'z').lower()
+            # domain_shape = (Nx, Ny, Nz)
+            axis_map = {'x': 0, 'y': 1, 'z': 2}
+            axis_idx = axis_map.get(axis, 2)
+            cross_dims = [s for i, s in enumerate(domain_shape)
+                          if i != axis_idx]  # [lu]
+            check_size = min(cross_dims)
+        else:
+            check_size = min(domain_shape)
+ 
+        if radius > check_size / 2:
+            return False, (
+                f"{geom_type}: radius {radius} too large "
+                f"(max {check_size // 2} for cross-section)"
+            )
     
     elif geom_type == 'airfoil':
         if lattice_dim != 2:

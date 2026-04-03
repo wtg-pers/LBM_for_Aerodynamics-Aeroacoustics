@@ -659,15 +659,45 @@ conservation = {
     "verbose": 0,
     "log_to_csv": True,
 }
-
+# Convergence Path (자동 선택):
+# ────────────────────────────
+#   Path A (장애물 없음): avg_energy가 sole criterion
+#   Path B (장애물 있음): Cd가 sole criterion, energy/Cl은 monitor only
 convergence = {
     "enabled": True,
-    "monitor": {
-        "energy": {"enabled": True, "threshold": 1e-6, "window": 1000},
+    "cauchy": {
+        "window_size": "auto",
+        # --- Auto Window 세부 조절 (window_size가 "auto"일 때만 유효) ---
+        # "auto_window": {
+        #     "time_coverage": 50.0,       # [-]  T_conv의 몇 배를 window로 쓸지
+        #     "min_samples": 100,          # [-]  최소 window sample 수
+        # },
+        "epsilon": 1e-5,                     # energy
+        #  에너지 평균 드리프트 < 0.001%
+        #   Path A에서 criterion으로 사용
+        #   Path B에서는 monitor only
+        "Cd_epsilon": 1e-3,                  # drag coefficient
+        #   Cd 평균 드리프트 < 0.1%
+        #   Path B에서 sole criterion으로 사용
+        #   장애물 없으면 무시됨
+        "n_required": 2,                    # [-]  연속 통과 횟수
+        #   거짓 수렴 방지. check_interval 간격으로 n_required회 연속
+        #   ε_cauchy < threshold 만족 시 최종 수렴 판정.
     },
+    # ─── 수렴/발산 시 동작 ────────────────────────────────────────────────
     "on_converged": "checkpoint_and_stop",
+    #   "checkpoint_and_stop" : 체크포인트 저장 후 종료 (기본, 권장)
+    #   "stop"               : 즉시 종료 (체크포인트 없음)
+    #   "continue"           : 수렴해도 계속 진행
+
     "on_diverged": "stop_with_checkpoint",
+    #   "stop_with_checkpoint" : 체크포인트 저장 후 종료 (기본, 권장)
+    #   "stop"                 : 즉시 종료
+
     "on_max_steps": "continue",
+    #   "continue" : max_steps 도달해도 수렴 미달이면 계속 (기본)
+    #   "warn"     : 경고 출력 후 계속
+    #   "stop"     : 종료
 }
 
 # =============================================================================
