@@ -1,5 +1,5 @@
 """
-Unit Converter for Multi-Level Grid
+Level Scaling for Multi-Level Grid
 
 Handles rescaling of physical quantities (τ, ν, f^neq) between adjacent
 grid levels under convective (acoustic) scaling.
@@ -72,8 +72,8 @@ class LevelUnits:
     omega: float
 
 
-class UnitConverter:
-    """Converts physical quantities between grid levels.
+class LevelScaler:
+    """Computes level-wise scaling of τ, ν, and f^neq for multi-level grids.
 
     Supports an arbitrary number of levels (up to max_levels) with a
     fixed refinement ratio of 2 between adjacent levels. All conversions
@@ -87,11 +87,11 @@ class UnitConverter:
             τ_{k+1} = 2 · τ_k - 0.5    (Cheylan et al., Eq. 12)
 
     Usage:
-        >>> converter = UnitConverter(tau_0=0.56, num_levels=5)
-        >>> converter.get_level_units(0).tau  # coarsest
+        >>> scaler = LevelScaler(tau_0=0.56, num_levels=5)
+        >>> scaler.get_level_units(0).tau  # coarsest
         0.56
-        >>> converter.get_level_units(4).tau  # finest
-        >>> converter.rescale_f_neq_c2f(f_neq_c, level_coarse=2)  # level 2→3
+        >>> scaler.get_level_units(4).tau  # finest
+        >>> scaler.rescale_f_neq_c2f(f_neq_c, level_coarse=2)  # level 2→3
 
     Args:
         tau_0: Relaxation time on the coarsest level (level 0).    [Δt_0]
@@ -137,49 +137,40 @@ class UnitConverter:
         #
         # Recurrence between adjacent levels (Cheylan et al., Eq. 12):
         #   τ_{k+1} = 2 · τ_k - 0.5
-        #
-        # Lattice-unit viscosity at each level:
-        #   ν_lat(k) = cs² · (τ_k - 0.5)   [dimensionless in level k's units]
-        #
-        # Physical viscosity (invariant):
-        #   ν_phys = ν_lat(k) · δx_k² / δt_k
         self._level_units: list[LevelUnits] = []
 
-        # Physical viscosity (computed once from level 0)
-        self._nu_phys: float = cs2 * (tau_0 - 0.5) * dx_0 ** 2 / dt_0
-
         for k in range(num_levels):
-            factor = self.REFINEMENT_RATIO ** k  # 2^k
+            factor = 2 ** k
             dx_k = dx_0 / factor
             dt_k = dt_0 / factor
 
-            # τ_k from physical viscosity invariance
+            # τ_k = 2^k · (τ_0 - 0.5) + 0.5
             tau_k = factor * (tau_0 - 0.5) + 0.5
+            nu_k = cs2 * (tau_k - 0.5)       # lattice viscosity at level k
             omega_k = 1.0 / tau_k
 
-            # Lattice-unit viscosity for this level
-            nu_k = cs2 * (tau_k - 0.5)  # [dimensionless in level k units]
-
-            self._level_units.append(LevelUnits(
-                level=k,
-                dx=dx_k,
-                dt=dt_k,
-                nu=nu_k,
-                tau=tau_k,
-                omega=omega_k,
-            ))
+            self._level_units.append(
+                LevelUnits(
+                    level=k,
+                    dx=dx_k,
+                    dt=dt_k,
+                    nu=nu_k,
+                    tau=tau_k,
+                    omega=omega_k,
+                )
+            )
 
     # =================================================================
-    # Public API: Level Information
+    # Access
     # =================================================================
 
     @property
     def num_levels(self) -> int:
-        """Total number of grid levels."""
+        """Total number of grid levels (M)."""
         return self._num_levels
 
     def get_level_units(self, level: int) -> LevelUnits:
-        """Get physical parameters for a specific grid level.
+        """Get the physical parameters for a given level.
 
         Args:
             level: Grid level index (0 = coarsest, M-1 = finest).
@@ -188,7 +179,7 @@ class UnitConverter:
             LevelUnits dataclass with dx, dt, nu, tau, omega.
 
         Raises:
-            IndexError: If level is out of range.
+            IndexError: If level is out of range [0, M-1].
         """
         if not 0 <= level < self._num_levels:
             raise IndexError(
@@ -197,7 +188,7 @@ class UnitConverter:
         return self._level_units[level]
 
     # =================================================================
-    # Public API: f^neq Rescaling
+    # f^neq Rescaling
     # =================================================================
 
     def rescaling_factor_c2f(self, level_coarse: int) -> float:
@@ -287,25 +278,24 @@ class UnitConverter:
         return factor * f_neq_fine
 
     # =================================================================
-    # Public API: Population Reconstruction
+    # Convenience: reconstruct full f from (f_eq, f_neq) with rescaling
     # =================================================================
 
-    def reconstruct_f_on_fine(
+    def reconstruct_f_c2f(
         self,
         f_eq: 'npt.NDArray',
         f_neq_coarse: 'npt.NDArray',
         level_coarse: int,
     ) -> 'npt.NDArray':
-        """Reconstruct full distribution on a fine-grid node from coarse data.
+        """Reconstruct fine-level distribution from coarse-level data.
 
         f_{i,fine} = f^eq_i(ρ, u) + (τ_f / 2τ_c) · f^neq_{i,coarse}
-                                                        (Lagrava Eq. 4.14)
 
-        Note: f^eq is the SAME on both grids because ρ and u are
-        continuous under convective scaling.
+        Since f^eq depends only on (ρ, u) which are continuous across the
+        interface, the same f^eq is used for both coarse and fine levels.
 
         Args:
-            f_eq: Equilibrium distribution (computed from ρ, u).
+            f_eq: Equilibrium distribution (same for both levels).
                   Shape: (Q, ...).
             f_neq_coarse: Non-equilibrium part from the coarse grid.
                           Shape: (Q, ...).
@@ -316,19 +306,18 @@ class UnitConverter:
         """
         return f_eq + self.rescale_f_neq_c2f(f_neq_coarse, level_coarse)
 
-    def reconstruct_f_on_coarse(
+    def reconstruct_f_f2c(
         self,
         f_eq: 'npt.NDArray',
         f_neq_fine: 'npt.NDArray',
         level_coarse: int,
     ) -> 'npt.NDArray':
-        """Reconstruct full distribution on a coarse-grid node from fine data.
+        """Reconstruct coarse-level distribution from fine-level data.
 
         f_{i,coarse} = f^eq_i(ρ, u) + (2τ_c / τ_f) · f^neq_{i,fine}
-                                                        (Lagrava Eq. 4.15)
 
         Args:
-            f_eq: Equilibrium distribution (computed from ρ, u).
+            f_eq: Equilibrium distribution (same for both levels).
                   Shape: (Q, ...).
             f_neq_fine: Non-equilibrium part from the fine grid.
                         Shape: (Q, ...).
@@ -346,7 +335,7 @@ class UnitConverter:
     def summary(self) -> str:
         """Return a human-readable summary of all levels."""
         lines = [
-            f"UnitConverter: {self._num_levels} levels, "
+            f"LevelScaler: {self._num_levels} levels, "
             f"refinement ratio = {self.REFINEMENT_RATIO}",
             f"{'Level':>6} {'dx':>10} {'dt':>10} {'nu':>12} "
             f"{'tau':>10} {'omega':>10}",
@@ -369,6 +358,6 @@ class UnitConverter:
 
     def __repr__(self) -> str:
         return (
-            f"UnitConverter(tau_0={self._level_units[0].tau:.4f}, "
+            f"LevelScaler(tau_0={self._level_units[0].tau:.4f}, "
             f"num_levels={self._num_levels})"
         )

@@ -11,7 +11,7 @@ Physical Context:
         - Spatial resolution:  δx_k = δx_0 / 2^k
         - Temporal resolution: δt_k = δt_0 / 2^k  (convective scaling)
         - Viscosity:           ν_k  = 2^k · ν_0
-        - Relaxation time:     τ_k  from UnitConverter
+        - Relaxation time:     τ_k  from LevelScaler
 
     The level covers a specific physical region (bounding box) of the
     overall simulation domain. Only the coarsest level (level 0) spans
@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Optional, Tuple, Dict, Any
 if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
-    from src.grid.unit_converter import LevelUnits
+    from src.grid.level_scaling import LevelUnits
 
 
 @dataclass
@@ -112,10 +112,9 @@ class GridLevel:
         dim: Number of spatial dimensions (3).
 
     Example:
-        >>> from src.grid.unit_converter import UnitConverter
-        >>> uc = UnitConverter(tau_0=0.56, num_levels=3)
-        >>> bbox = BoundingBox(0, 10, 0, 5, 0, 5)
-        >>> level_0 = GridLevel(np, 0, uc.get_level_units(0), bbox, Q=27)
+        >>> from src.grid.level_scaling import LevelScaler
+        >>> scaler = LevelScaler(tau_0=0.56, num_levels=3)
+        >>> level_0 = GridLevel(np, 0, scaler.get_level_units(0), bbox, Q=27)
         >>> level_0.shape
         (10, 5, 5)
     """
