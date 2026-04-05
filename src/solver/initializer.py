@@ -5,19 +5,16 @@ This module prepares the distribution function f for execution.
 It answers the question:
     "솔버에 맞는 초기 f를 어떻게 준비할까?"
 
-Two modes:
-    1. Fresh start:  f = f_eq(ρ₀, u₀) from collision operator's equilibrium
-    2. Restart:       f = checkpoint data + resume step
-
-Future extension:
-    - Cumulant collision may require different equilibrium computation
-    - 2-step interpolation needs (f_{n}, f_{n-1}) pair
+Three modes:
+    1. Fresh start (single grid):  f = f_eq(ρ₀, u₀)
+    2. Fresh start (MLG):          f_k = f_eq(ρ₀, u₀) for each level k
+    3. Restart:                    f = checkpoint data + resume step
 
 Design Principle:
     "솔버 모드(BGK/Cumulant/기타)에 따라 달라지는가?" → Yes → Initializer
 
 Author: LBM Development Team
-Date: 2026-03
+Date: 2026-03 (MLG integration: 2026-04)
 """
 
 from typing import TYPE_CHECKING, Any, Tuple
@@ -26,17 +23,20 @@ if TYPE_CHECKING:
     from types import ModuleType
     from src.solver.simulation import Simulation
     from src.solver.setup import SimulationSetup
+    from src.grid.multi_level_grid import MultiLevelGrid
 
 
 class SolverInitializer:
     """Initialize solver physical state (distribution function f).
 
-    Handles fresh start (equilibrium) and checkpoint restart.
-    After initialize(), the Simulation is ready for advance().
+    Handles fresh start (equilibrium) and checkpoint restart for both
+    single-grid Simulation and multi-level MultiLevelGrid.
+
+    After initialize(), the Simulation/MultiLevelGrid is ready for advance().
 
     Usage:
         >>> initializer = SolverInitializer(setup)
-        >>> start_step = initializer.initialize(sim, args)
+        >>> start_step, end_step = initializer.initialize(sim, args)
     """
 
     def __init__(self, setup: 'SimulationSetup') -> None:
@@ -50,20 +50,22 @@ class SolverInitializer:
 
     def initialize(
         self,
-        sim: 'Simulation',
+        sim: Any,
         args: Any,
     ) -> Tuple[int, int]:
         """Initialize distribution function and determine step range.
 
+        Handles both single-grid Simulation and MultiLevelGrid.
+
         Performs:
-            1. Create or restore f (fresh start / checkpoint)
-            2. Determine end_step from args + config
-            3. Wire f into Simulation (set_distribution)
-            4. Initialize conservation monitor
-            5. Print simulation info
+            1. Detect sim type (Simulation or MultiLevelGrid)
+            2. Create or restore f (fresh start / checkpoint)
+            3. Determine end_step from args + config
+            4. Wire f into Simulation/MLG (set_distribution)
+            5. Initialize conservation monitor
 
         Args:
-            sim: Simulation object (from setup.build_simulation())
+            sim: Simulation or MultiLevelGrid object
             args: Parsed CLI arguments
 
         Returns:
@@ -72,10 +74,17 @@ class SolverInitializer:
         Raises:
             RuntimeError: If restart requested but checkpoints disabled
         """
-        # ── Step 1: Create or restore f ──
-        f, start_step = self._create_distribution(args)
+        # ── Detect MLG ───────────────────────────────────────────
+        from src.grid.multi_level_grid import MultiLevelGrid
+        is_mlg = isinstance(sim, MultiLevelGrid)
 
-        # ── Step 2: Determine end step ──
+        # ── Step 1: Create or restore f ──────────────────────────
+        if is_mlg:
+            start_step = self._initialize_mlg(sim)
+        else:
+            f, start_step = self._create_distribution(args)
+
+        # ── Step 2: Determine end step ───────────────────────────
         end_step = self._determine_end_step(args, start_step)
 
         if start_step >= end_step:
@@ -87,25 +96,30 @@ class SolverInitializer:
         print(f"  Steps to run: {total_steps} "
               f"({start_step} → {end_step - 1})")
 
-        # ── Step 3: Wire f into Simulation ──
-        sim.set_distribution(f)
-        sim.step_count = start_step
+        # ── Step 3: Wire f into Simulation ───────────────────────
+        if not is_mlg:
+            sim.set_distribution(f)
+            sim.step_count = start_step
 
-        # ── Step 4: Conservation initialization ──
-        rho_init, _ = self._setup.macro.compute(f)
-        self._setup.conservation_mgr.initialize(rho_init, step=start_step)
+        # ── Step 4: Conservation initialization ──────────────────
+        if self._setup.conservation_mgr and self._setup.conservation_mgr.enabled:
+            # For MLG, use Level 0's f; for single grid, use f directly
+            f_for_monitor = sim.f
+            rho_init, _ = self._setup.macro.compute(f_for_monitor)
+            self._setup.conservation_mgr.initialize(rho_init, step=start_step)
 
-        # ── Step 5: Info ──
-        sim.print_info()
+        # ── Step 5: Info ─────────────────────────────────────────
+        if hasattr(sim, 'print_info'):
+            sim.print_info()
 
         return start_step, end_step
 
     # =====================================================================
-    # Private
+    # Private: Single-grid initialization
     # =====================================================================
 
     def _create_distribution(self, args: Any) -> Tuple[Any, int]:
-        """Create initial distribution function.
+        """Create initial distribution function (single grid).
 
         Returns:
             (f, start_step): Distribution array and starting step index
@@ -214,14 +228,75 @@ class SolverInitializer:
             u0[0] = flow_vel                                 # [Δx/Δt]
             print(f"  Initial velocity: {flow_vel} [Δx/Δt] (x-dir)")
 
-        # ── Compute f_eq ──
         # ── Compute f_eq via collision operator ──
-        #   BGK: Maxwellian f_eq = w_i·ρ·(1 + 3(c·u) + 4.5(c·u)² - 1.5|u|²)
-        #   Cumulant: may use different equilibrium (future)
         f = setup.collision.compute_equilibrium(rho0, u0)    # [dimensionless]
         print(f"  Initial total mass: {float(xp.sum(f)):.6f}")
 
         return f, 0  # start_step = 0
+
+    # =====================================================================
+    # Private: Multi-Level Grid initialization
+    # =====================================================================
+
+    def _initialize_mlg(
+        self,
+        mlg: 'MultiLevelGrid',
+    ) -> int:
+        """Initialize all levels of a MultiLevelGrid with equilibrium.
+
+        Each level gets f = f_eq(ρ₀, u₀) at its own resolution.
+        The initial velocity is the same across all levels — physical
+        velocity is continuous under convective scaling, so u₀ is
+        identical in lattice units for all levels.
+
+        Args:
+            mlg: MultiLevelGrid with uninitialized Simulation objects.
+
+        Returns:
+            start_step: Always 0 for fresh start.
+        """
+        setup = self._setup
+        xp = self.xp
+
+        physics_config = setup.sim_params.get('physics', {})
+        flow_vel = physics_config.get('initial_flow_velocity', [0.0, 0.0, 0.0])
+        dim = setup.lattice.dim
+
+        print(f"\n[5] Initializing MultiLevelGrid ({mlg.num_levels} levels)")
+
+        for k in range(mlg.num_levels):
+            level_sim = mlg.get_level(k)
+            shape = level_sim.domain_shape
+
+            # ── Build ρ₀ = 1, u₀ = initial_flow_velocity ─────────
+            rho_0 = xp.ones(shape, dtype=xp.float64)
+            u_0 = xp.zeros((dim,) + shape, dtype=xp.float64)
+
+            if isinstance(flow_vel, (list, tuple)):
+                for d in range(min(len(flow_vel), dim)):
+                    u_0[d] = flow_vel[d]
+            else:
+                u_0[0] = flow_vel
+
+            # ── f = f_eq(ρ₀, u₀) ─────────────────────────────────
+            f_k = level_sim.collision.compute_equilibrium(rho_0, u_0)
+            level_sim.set_distribution(f_k)
+
+            mem_mb = f_k.nbytes / (1024 * 1024)
+            print(f"  Level {k}: shape={shape}, τ={level_sim.tau:.4f}, "
+                  f"f size={mem_mb:.1f} MB")
+
+        total_nodes = sum(
+            mlg.get_level(k).f.size // setup.lattice.Q
+            for k in range(mlg.num_levels)
+        )
+        print(f"  Total nodes across all levels: {total_nodes:,}")
+
+        return 0  # fresh start
+
+    # =====================================================================
+    # Private: Utilities
+    # =====================================================================
 
     def _determine_end_step(self, args: Any, start_step: int) -> int:
         """Determine end step from CLI args or config.

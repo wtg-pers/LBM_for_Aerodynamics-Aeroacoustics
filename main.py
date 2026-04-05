@@ -56,6 +56,10 @@ def main():
         sim.advance()
         if output.process(step, sim) == 'stop':
             break
+    
+    import numpy as np
+    u_np = sim.u.get() if hasattr(sim.u, 'get') else sim.u
+    np.save('velocity_field.npy', u_np)
 
     # [4] Finalize
     return output.finalize(sim)

@@ -12,10 +12,11 @@ Responsibilities (Layer 1 of the 3-Layer architecture):
     [3] Boundary conditions (domain + internal obstacle)
     [4] I/O setup (directories, VTK, checkpoint, CSV)
     [5.1-5.4] Monitors & ALM (conservation, force, convergence, ALM)
+    [6] Multi-Level Grid (conditional)
     LBM component creation (streaming, equilibrium, macro, collision, forcing)
 
 Produces:
-    build_simulation()      → Simulation (without f assigned)
+    build_simulation()      → Simulation or MultiLevelGrid (if MLG enabled)
     build_output_manager()  → OutputManager
 
 Does NOT handle (→ SolverInitializer, M4):
@@ -26,7 +27,7 @@ Design Principle:
     "솔버 모드에 따라 달라지는가?" → Yes: Initializer, No: Setup
 
 Author: LBM Development Team
-Date: 2026-03
+Date: 2026-03 (MLG integration: 2026-04)
 """
 
 import os
@@ -60,6 +61,13 @@ from src.utilities.convergence import ConvergenceMonitor
 from src.solver.simulation import Simulation
 from src.solver.output_manager import OutputManager
 
+# ── MLG (Multi-Level Grid) imports ───────────────────────────────
+from src.grid.multi_level_grid import MultiLevelGrid
+from src.grid.coupling import GridCoupling
+from src.grid.overlap_manager import OverlapManager, IndexBox
+from src.grid.level_scaling import LevelScaler
+from src.grid.interpolation import CubicInterpolation, CompactSecondOrderInterpolation
+
 
 class SimulationSetup:
     """Construct the complete simulation environment from CLI args + config.
@@ -86,7 +94,7 @@ class SimulationSetup:
     def __init__(self, args: Any) -> None:
         """Build entire simulation environment from CLI args.
 
-        This constructor runs all setup steps [0]–[5.4] that were
+        This constructor runs all setup steps [0]–[6] that were
         previously in main(). After construction, all components are
         ready but the distribution function f is NOT yet initialized.
 
@@ -128,21 +136,29 @@ class SimulationSetup:
         # ── [5.4] Actuator Line Model ────────────────────────────
         self._setup_actuator_line()
 
+        # ── [6] Multi-Level Grid (conditional) ───────────────────
+        self._setup_mlg()
+
     # =====================================================================
     # Public: Build products
     # =====================================================================
 
-    def build_simulation(self) -> 'Simulation':
-        """Create Simulation object (without distribution function).
+    def build_simulation(self):
+        """Create Simulation or MultiLevelGrid (if MLG enabled).
 
-        The returned Simulation has all operators wired up but
-        set_distribution() has NOT been called yet. The caller
-        (or SolverInitializer) must call sim.set_distribution(f)
-        before sim.advance().
+        If MLG is configured in the config file, returns a MultiLevelGrid
+        that wraps multiple Simulation objects with nested time-stepping.
+        Otherwise, returns a single Simulation as before.
+
+        The returned object has set_distribution() NOT called yet.
+        The caller (or SolverInitializer) must initialize f before advance().
 
         Returns:
-            Simulation with f=None, is_ready=False
+            Simulation or MultiLevelGrid (both support advance(), rho, u, f)
         """
+        if self._mlg_enabled:
+            return self._build_mlg_simulation()
+
         return Simulation(
             xp=self.xp,
             macroscopic=self.macro,
@@ -186,7 +202,7 @@ class SimulationSetup:
         )
 
     # =====================================================================
-    # Private: Setup steps
+    # Private: Setup steps [0]–[5.4] (existing, unchanged)
     # =====================================================================
 
     def _load_config(self) -> None:
@@ -415,18 +431,6 @@ class SimulationSetup:
                 )
             print(f"  Rotor CSV: {self.perf_csv_path}")
 
-    # def _create_lbm_components(self) -> None:
-    #     """Create core LBM operator objects.
-
-    #     The collision operator (BGKCollision) owns equilibrium and
-    #     Guo forcing internally. No separate equilibrium or forcing
-    #     objects are created.
-    #     """
-    #     self.streaming = StreamingPull(
-    #         self.xp, self.lattice, self.domain_shape,
-    #     )
-    #     self.macro = Macroscopic(self.xp, self.lattice)
-    #     self.collision = BGKCollision(self.xp, self.lattice)
     def _create_lbm_components(self) -> None:
         """Create core LBM operator objects.
     
@@ -633,8 +637,7 @@ class SimulationSetup:
                 print(f"    [{i}] {name}: "
                       f"hub={model.rotor.hub_center}, "
                       f"R={model.rotor.radius:.1f} lu, "
-                      f"ω={model.rotor.omega:.6f} rad/lt, "
-                      f"blades={model.rotor.n_blades}")
+                      f"ω={model.rotor.omega:.6f} rad/lt")
         else:
             print(f"  Mode: SINGLE-ROTOR")
             self.al_model = create_actuator_line_from_config(
@@ -648,13 +651,166 @@ class SimulationSetup:
                 coeff_mode=al_cfg.get('coeff_mode', 'auto'),
                 xp=self.xp,
             )
+            print(f"    Hub: {self.al_model.rotor.hub_center}")
+            print(f"    R={self.al_model.rotor.radius:.1f} lu, "
+                  f"ω={self.al_model.rotor.omega:.6f} rad/lt")
+            print(f"    Blades: {self.al_model.rotor.n_blades}, "
+                  f"Markers: {self.al_model.rotor.total_markers}")
 
-        # ── Summary ──
-        if (hasattr(self.al_model, 'u_inf_lu')
-                and self.al_model.u_inf_lu is not None):
-            print(f"  u_inf_lu = {self.al_model.u_inf_lu:.6f} [Δx/Δt]")
+    # =====================================================================
+    # [6] Multi-Level Grid Setup (NEW)
+    # =====================================================================
+
+    def _setup_mlg(self) -> None:
+        """[6] Parse MLG config and prepare multi-level components.
+
+        Reads the 'mlg' section from config. If not present or disabled,
+        sets _mlg_enabled = False and returns immediately.
+        """
+        self._mlg_config = self.config.get('mlg', {})
+        self._mlg_enabled: bool = self._mlg_config.get('enabled', False)
+
+        if not self._mlg_enabled:
+            print(f"\n[6] Multi-Level Grid: disabled")
+            return
+
+        num_levels = self._mlg_config.get('num_levels', 1)
+        overlap_width = self._mlg_config.get('overlap_width', 2)
+        interp_name = self._mlg_config.get('interpolation', 'cubic')
+        filter_level = self._mlg_config.get('filter_level', 1)
+
+        print(f"\n[6] Multi-Level Grid Setup")
+        print(f"  Levels: {num_levels}")
+        print(f"  Overlap width: {overlap_width} coarse cells")
+        print(f"  Interpolation: {interp_name}")
+        print(f"  Filter level: {filter_level}")
+
+        # ── Level scaler ─────────────────────────────────────────
+        self._mlg_scaler = LevelScaler(
+            tau_0=self.tau, num_levels=num_levels,
+        )
+        print(f"  Level τ values: ", end="")
+        for k in range(num_levels):
+            lu = self._mlg_scaler.get_level_units(k)
+            print(f"L{k}={lu.tau:.4f} ", end="")
+        print()
+
+        # ── Interpolation scheme ─────────────────────────────────
+        if interp_name == 'cubic':
+            self._mlg_interp = CubicInterpolation()
+        elif interp_name == 'compact_second_order':
+            self._mlg_interp = CompactSecondOrderInterpolation()
         else:
-            print(f"  u_inf_lu = None (hover mode, BEM fallback)")
+            raise ValueError(f"Unknown interpolation: '{interp_name}'")
 
-        if hasattr(self.al_model, 'coeff_mode'):
-            print(f"  coeff_mode = '{self.al_model.coeff_mode}'")
+        # ── Overlap manager ──────────────────────────────────────
+        self._mlg_overlap_mgr = OverlapManager()
+        levels_config = self._mlg_config.get('levels', [])
+
+        coarse_shape = (self.Nx, self.Ny, self.Nz)
+        for k in range(1, num_levels):
+            level_cfg = levels_config[k] if k < len(levels_config) else {}
+            region_cfg = level_cfg.get('region', {})
+
+            fine_region = IndexBox(
+                x_start=region_cfg['x_min'],
+                x_end=region_cfg['x_max'],
+                y_start=region_cfg['y_min'],
+                y_end=region_cfg['y_max'],
+                z_start=region_cfg['z_min'],
+                z_end=region_cfg['z_max'],
+            )
+
+            overlap_region = self._mlg_overlap_mgr.add_level_pair(
+                coarse_shape=coarse_shape,
+                fine_region=fine_region,
+                overlap_width=overlap_width,
+            )
+
+            print(f"  Level {k}: fine shape = {overlap_region.fine_shape}, "
+                  f"excised = {overlap_region.excised.num_nodes:,} nodes")
+
+            # Next iteration: fine shape becomes the coarse shape
+            coarse_shape = overlap_region.fine_shape
+
+        self._mlg_filter_level = filter_level
+
+    def _build_mlg_simulation(self):
+        """Build a MultiLevelGrid with M Simulation objects.
+
+        Level 0 uses the existing setup components (collision, streaming,
+        BC, obstacle). Fine levels get their own streaming operator and
+        an empty DomainBCManager (coupling handles their boundaries).
+
+        Returns:
+            MultiLevelGrid with all Simulation objects (f not set yet).
+        """
+        xp = self.xp
+        num_levels = self._mlg_config['num_levels']
+        simulations = []
+        couplings = []
+
+        # ── Level 0: use existing setup ──────────────────────────
+        sim_0 = Simulation(
+            xp=xp,
+            macroscopic=self.macro,
+            collision=self.collision,
+            streaming=self.streaming,
+            bc_manager=self.domain_bc_mgr,
+            tau=self.tau,
+            domain_shape=self.domain_shape,
+            obstacle_bc=self.obstacle_bc,
+            al_model=self.al_model,
+        )
+        simulations.append(sim_0)
+
+        # ── Fine levels ──────────────────────────────────────────
+        for k in range(1, num_levels):
+            region = self._mlg_overlap_mgr.get_region(k - 1)
+            lu = self._mlg_scaler.get_level_units(k)
+            fine_shape = region.fine_shape  # (Nx_f, Ny_f, Nz_f)
+
+            # Fine level streaming (different domain shape)
+            fine_streaming = StreamingPull(
+                xp, self.lattice, fine_shape,
+            )
+
+            # Fine level BC: empty (coupling handles boundaries)
+            fine_bc_mgr = DomainBCManager(
+                xp=xp,
+                lattice=self.lattice,
+                boundaries_config={},
+                domain_shape=fine_shape,
+                verbose=False,
+            )
+
+            # Fine level simulation
+            sim_k = Simulation(
+                xp=xp,
+                macroscopic=self.macro,     # shared
+                collision=self.collision,    # shared (τ passed per-call)
+                streaming=fine_streaming,
+                bc_manager=fine_bc_mgr,
+                tau=lu.tau,
+                domain_shape=fine_shape,
+                obstacle_bc=None,           # obstacle on fine = future work
+                al_model=None,              # ALM on Level 0 only
+            )
+            simulations.append(sim_k)
+
+            # ── Coupling engine for pair (k-1, k) ────────────────
+            coupling_k = GridCoupling(
+                xp=xp,
+                lattice=self.lattice,
+                region=region,
+                scaler=self._mlg_scaler,
+                interpolation=self._mlg_interp,
+                filter_level=self._mlg_filter_level,
+            )
+            couplings.append(coupling_k)
+
+        # ── Assemble MultiLevelGrid ──────────────────────────────
+        mlg = MultiLevelGrid(levels=simulations, couplings=couplings)
+        print(f"\n  MultiLevelGrid assembled:")
+        print(f"  {mlg.summary()}")
+        return mlg

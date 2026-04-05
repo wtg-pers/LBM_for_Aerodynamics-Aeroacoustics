@@ -97,34 +97,25 @@ class MultiLevelGrid:
         levels: List['Simulation'],
         couplings: List['GridCoupling'],
     ) -> None:
-        # ── Validate ─────────────────────────────────────────────
+        # ── Validate structure ────────────────────────────────────
         if len(couplings) != len(levels) - 1:
             raise ValueError(
                 f"Need exactly {len(levels)-1} couplings for {len(levels)} "
                 f"levels, got {len(couplings)}."
             )
-        for i, lev in enumerate(levels):
-            if not lev.is_ready:
-                raise ValueError(
-                    f"Level {i} Simulation is not ready. "
-                    f"Call set_distribution() first."
-                )
 
         self._levels = levels
         self._couplings = couplings
         self._num_levels = len(levels)
         self._step_count = 0
 
-        # ── Allocate f_prev buffers for temporal interpolation ───
+        # ── f_prev buffers (allocated lazily on first advance()) ─
         # Each level (except the finest) needs f_prev for C→F half-step.
-        # f_prev[k] stores level k's f before the collide-stream step.
-        self._f_prev: List[Optional['npt.NDArray']] = []
-        for i, lev in enumerate(levels):
-            if i < self._num_levels - 1:
-                xp = lev.xp
-                self._f_prev.append(xp.copy(lev.f))
-            else:
-                self._f_prev.append(None)  # finest level doesn't need f_prev
+        # Cannot allocate here because f may not be set yet (Layer 1→2).
+        self._f_prev: List[Optional['npt.NDArray']] = [
+            None for _ in range(len(levels))
+        ]
+        self._f_prev_initialized: bool = False
 
     # =================================================================
     # Simulation-compatible interface
@@ -142,6 +133,19 @@ class MultiLevelGrid:
         Physical time advanced: δt_0 (one coarsest-level timestep).
         Total sub-steps performed: 2^(M-1) + 2^(M-2) + ... + 1 = 2^M - 1.
         """
+        # ── Lazy initialization of f_prev buffers ────────────────
+        # Deferred from __init__ because f is set by Initializer (Layer 2)
+        if not self._f_prev_initialized:
+            for i, lev in enumerate(self._levels):
+                if not lev.is_ready:
+                    raise RuntimeError(
+                        f"Level {i} Simulation is not ready. "
+                        f"Call set_distribution() on all levels first."
+                    )
+                if i < self._num_levels - 1:
+                    self._f_prev[i] = lev.xp.copy(lev.f)
+            self._f_prev_initialized = True
+
         coarse = self._levels[0]
 
         # ── Save f_prev for level 0 (temporal interpolation) ─────
@@ -160,14 +164,23 @@ class MultiLevelGrid:
     def _advance_fine(self, level_k: int) -> None:
         """Recursively advance level_k (two fine steps per coarse step).
 
-        This implements the nested time-stepping algorithm from
-        Lagrava Sec. 4.4.3. For each coarse step at level k-1,
-        level k performs two steps, with C→F coupling before each
-        and F→C coupling after both.
+        Algorithm (Lagrava Sec. 4.4.3, corrected ordering):
+            For each fine step:
+                1. fine.advance()  — collide + stream (boundary gets invalid data)
+                2. C→F coupling    — fix boundary with coarse data (acts as BC)
+                3. Recurse into finer levels (if any)
+            After both fine steps:
+                4. F→C coupling    — feed fine result back to coarse excised region
 
-        If level k+1 exists, it is recursively advanced (2 steps)
-        within each of level k's steps — yielding 4 steps total
-        for level k+1 per coarse step.
+        C→F is applied AFTER advance (not before) because:
+            - Streaming (pull) at fine boundary creates invalid incoming populations
+            - C→F immediately fixes these = acts as boundary condition
+            - Corrected boundary is ready for the NEXT step's collision
+            - This preserves mass conservation across the grid interface
+
+        Temporal interpolation for C→F:
+            - After fine step #1 (at t+δt_f):   half-step interpolation
+            - After fine step #2 (at t+δt_c):   full-step (no interpolation)
 
         Args:
             level_k: Fine level index (1, 2, ..., M-1).
@@ -181,20 +194,20 @@ class MultiLevelGrid:
         # Fine step #1: t → t + δt_f  (half of coarse step)
         # ═════════════════════════════════════════════════════════
 
-        # C→F coupling with temporal interpolation (half-step)
-        coupling.coarse_to_fine(
-            sim_coarse.f, sim_fine.f,
-            is_half_step=True,
-            f_coarse_prev=self._f_prev[level_k - 1],
-        )
-
         # Save f_prev for this level (if even finer levels exist)
         if has_finer:
             xp = sim_fine.xp
             xp.copyto(self._f_prev[level_k], sim_fine.f)
 
-        # Advance fine level
+        # Advance fine level (collide + stream)
         sim_fine.advance()
+
+        # C→F AFTER advance: fix boundary at t+δt_f (half-step interp)
+        coupling.coarse_to_fine(
+            sim_coarse.f, sim_fine.f,
+            is_half_step=True,
+            f_coarse_prev=self._f_prev[level_k - 1],
+        )
 
         # Recurse into finer levels
         if has_finer:
@@ -204,26 +217,26 @@ class MultiLevelGrid:
         # Fine step #2: t + δt_f → t + δt_c  (second half)
         # ═════════════════════════════════════════════════════════
 
-        # C→F coupling without temporal interpolation (full step)
-        coupling.coarse_to_fine(
-            sim_coarse.f, sim_fine.f,
-            is_half_step=False,
-        )
-
         # Save f_prev for this level (if even finer levels exist)
         if has_finer:
             xp = sim_fine.xp
             xp.copyto(self._f_prev[level_k], sim_fine.f)
 
-        # Advance fine level
+        # Advance fine level (collide + stream)
         sim_fine.advance()
+
+        # C→F AFTER advance: fix boundary at t+δt_c (full-step)
+        coupling.coarse_to_fine(
+            sim_coarse.f, sim_fine.f,
+            is_half_step=False,
+        )
 
         # Recurse into finer levels
         if has_finer:
             self._advance_fine(level_k + 1)
 
         # ═════════════════════════════════════════════════════════
-        # F→C feedback: overwrite coarse overlap with fine data
+        # F→C feedback: overwrite coarse excised region with fine data
         # ═════════════════════════════════════════════════════════
         coupling.fine_to_coarse(sim_fine.f, sim_coarse.f)
 

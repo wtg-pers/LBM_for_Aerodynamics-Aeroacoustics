@@ -1,9 +1,8 @@
 """
-Spatial Interpolation Schemes for Grid Coupling
+Spatial Interpolation Schemes for Grid Coupling (Vectorized)
 
 When transferring data from a coarse grid to a fine grid, fine nodes
 that do not coincide with any coarse node must be filled by interpolation.
-This module provides the interpolation stencils.
 
 Available Schemes:
     CubicInterpolation:
@@ -13,21 +12,18 @@ Available Schemes:
 
     CompactSecondOrderInterpolation:
         2-point mean interpolation (Lagrava Eq. 4.22).
-        Second-order accurate. Causes mass loss (pressure jump) at interface.
+        Second-order accurate. Causes mass loss. For testing only.
         Stencil: g(x) = (g(x+h) + g(x-h)) / 2
 
-    For boundary nodes with insufficient neighbors, an asymmetric
-    3-point scheme is used (Lagrava Eq. 4.24):
+    Boundary nodes use asymmetric 3-point scheme (Lagrava Eq. 4.24):
         g(x) = 3/8·g(x-h) + 3/4·g(x+h) - 1/8·g(x+3h)
 
-Physical Context:
-    In the multi-domain grid refinement, the fine grid has nodes at
-    positions x_f = 0, h, 2h, 3h, ... where h = δx_f. The coarse grid
-    has nodes at positions 0, 2h, 4h, ... (every other fine node).
-    Fine nodes at odd positions (h, 3h, 5h, ...) need interpolation.
+Performance:
+    All operations are fully vectorized (no Python for-loops).
+    All odd indices along the interpolation axis are filled simultaneously.
 
 Reference:
-    Lagrava Sandoval, Sec. 4.4.4 (2D/3D interpolation schemas)
+    Lagrava Sandoval, Sec. 4.4.4
 
 Author: LBM Development Team
 Date: 2026-04
@@ -44,12 +40,7 @@ if TYPE_CHECKING:
 
 
 class InterpolationScheme(ABC):
-    """Abstract base class for spatial interpolation schemes.
-
-    All schemes interpolate values at fine-grid nodes that lie between
-    coarse-grid nodes along one spatial direction (1D interpolation).
-    Multi-dimensional interpolation is built from sequential 1D passes.
-    """
+    """Abstract base class for spatial interpolation schemes."""
 
     @abstractmethod
     def interpolate_1d(
@@ -60,41 +51,42 @@ class InterpolationScheme(ABC):
     ) -> 'npt.NDArray':
         """Interpolate missing values along one axis.
 
-        Given an array where values at even indices (0, 2, 4, ...)
-        are known (from the coarse grid) and odd indices (1, 3, 5, ...)
-        need filling, compute the interpolated values.
+        Even indices (0, 2, 4, ...) are known (coarse-coincident).
+        Odd indices (1, 3, 5, ...) are filled by interpolation.
 
         Args:
             xp: Array module (numpy or cupy).
-            data: Array with known values at even-indexed positions
-                  along the specified axis. Shape: arbitrary.
+            data: Array with known values at even positions along `axis`.
             axis: Axis along which to interpolate.
 
         Returns:
-            Array with interpolated values filled at odd indices.
-            Same shape as input.
+            Array with all odd indices filled. Same shape as input.
         """
         ...
 
     @property
     @abstractmethod
     def order(self) -> int:
-        """Formal order of accuracy of this interpolation scheme."""
+        """Formal order of accuracy."""
         ...
+
+
+def _make_slice(ndim: int, axis: int, idx) -> tuple:
+    """Create an indexing tuple selecting `idx` along `axis`."""
+    s = [slice(None)] * ndim
+    s[axis] = idx
+    return tuple(s)
 
 
 class CubicInterpolation(InterpolationScheme):
     """4-point symmetric cubic interpolation (Lagrava Eq. 4.23).
 
-    Fourth-order accurate. Uses 4 neighboring coarse-grid values to
-    interpolate each fine-grid value. This is the RECOMMENDED scheme
-    for grid coupling in LBM as it preserves mass conservation across
-    the grid interface.
+    Fourth-order accurate, fully vectorized.
 
-    Stencil (interior nodes):
+    Interior stencil:
         g(x) = 9/16 · [g(x+h) + g(x-h)] - 1/16 · [g(x+3h) + g(x-3h)]
 
-    Stencil (boundary nodes, asymmetric 3rd order, Lagrava Eq. 4.24):
+    Boundary stencil (asymmetric 3rd order, Lagrava Eq. 4.24):
         g(x) = 3/8·g(x-h) + 3/4·g(x+h) - 1/8·g(x+3h)
     """
 
@@ -108,65 +100,52 @@ class CubicInterpolation(InterpolationScheme):
         data: 'npt.NDArray',
         axis: int,
     ) -> 'npt.NDArray':
-        """Interpolate using 4-point symmetric cubic stencil.
-
-        Args:
-            xp: Array module (numpy or cupy).
-            data: Array with known values at even indices along `axis`.
-            axis: Interpolation axis.
-
-        Returns:
-            Array with all values filled (even = original, odd = interpolated).
-        """
+        """Vectorized cubic interpolation along one axis."""
         result = data.copy()
         n = data.shape[axis]
+        nd = data.ndim
+        sl = lambda idx: _make_slice(nd, axis, idx)
 
-        # Helper: slice along axis
-        def _sl(idx):
-            """Create a slice object selecting index `idx` along `axis`."""
-            s = [slice(None)] * data.ndim
-            s[axis] = idx
-            return tuple(s)
+        if n < 3:
+            return result  # nothing to interpolate
 
-        # Interior odd indices: i = 1, 3, 5, ..., n-2
-        # Coarse neighbors at i-1, i+1 (distance h), i-3, i+3 (distance 3h)
-        for i in range(1, n - 1, 2):
-            # Check if we have enough neighbors for 4-point stencil
-            has_left_far = (i - 2) >= 0    # i-3 doesn't exist in fine coords,
-            has_right_far = (i + 2) < n    # but i-2 and i+2 are coarse nodes
+        # ── Interior odd indices: 3, 5, ..., n-4 ────────────────
+        # Full 4-point symmetric stencil (neighbors at i±1, i±3)
+        if n >= 7:
+            # Odd indices where i-3 >= 0 and i+3 < n
+            odd_int   = sl(slice(3, n - 3, 2))
+            left_near = sl(slice(2, n - 4, 2))    # i-1
+            right_near = sl(slice(4, n - 2, 2))   # i+1
+            left_far  = sl(slice(0, n - 6, 2))    # i-3
+            right_far = sl(slice(6, n,     2))    # i+3
 
-            # Actually, in our convention:
-            # Even indices = coarse nodes: 0, 2, 4, ...
-            # Odd indices = fine-only nodes: 1, 3, 5, ...
-            # Neighbors of odd index i:
-            #   nearest coarse: i-1, i+1
-            #   far coarse:     i-3, i+3
-            has_left_far = (i - 3) >= 0
-            has_right_far = (i + 3) < n
+            result[odd_int] = (
+                9.0 / 16.0 * (data[left_near] + data[right_near])
+                - 1.0 / 16.0 * (data[left_far] + data[right_far])
+            )
 
-            if has_left_far and has_right_far:
-                # Full 4-point symmetric cubic (Eq. 4.23)
-                result[_sl(i)] = (
-                    9.0 / 16.0 * (data[_sl(i - 1)] + data[_sl(i + 1)])
-                    - 1.0 / 16.0 * (data[_sl(i - 3)] + data[_sl(i + 3)])
-                )
-            elif not has_left_far and has_right_far:
-                # Left boundary: asymmetric 3-point (Eq. 4.24, mirrored)
-                result[_sl(i)] = (
-                    3.0 / 8.0 * data[_sl(i - 1)]
-                    + 3.0 / 4.0 * data[_sl(i + 1)]
-                    - 1.0 / 8.0 * data[_sl(i + 3)]
-                )
-            elif has_left_far and not has_right_far:
-                # Right boundary: asymmetric 3-point
-                result[_sl(i)] = (
-                    3.0 / 8.0 * data[_sl(i + 1)]
-                    + 3.0 / 4.0 * data[_sl(i - 1)]
-                    - 1.0 / 8.0 * data[_sl(i - 3)]
-                )
-            else:
-                # Fallback: 2-point linear (only 2 neighbors)
-                result[_sl(i)] = 0.5 * (data[_sl(i - 1)] + data[_sl(i + 1)])
+        # ── Left boundary: index 1 ──────────────────────────────
+        if n >= 5:
+            # Asymmetric 3-point (Eq. 4.24, left boundary)
+            result[sl(1)] = (
+                3.0 / 8.0 * data[sl(0)]
+                + 3.0 / 4.0 * data[sl(2)]
+                - 1.0 / 8.0 * data[sl(4)]
+            )
+        elif n >= 3:
+            # Fallback: 2-point linear
+            result[sl(1)] = 0.5 * (data[sl(0)] + data[sl(2)])
+
+        # ── Right boundary: index n-2 (if it's odd) ─────────────
+        if n >= 5 and (n - 2) % 2 == 1:
+            # Asymmetric 3-point (Eq. 4.24, right boundary)
+            result[sl(n - 2)] = (
+                3.0 / 8.0 * data[sl(n - 1)]
+                + 3.0 / 4.0 * data[sl(n - 3)]
+                - 1.0 / 8.0 * data[sl(n - 5)]
+            )
+        elif n >= 3 and (n - 2) % 2 == 1:
+            result[sl(n - 2)] = 0.5 * (data[sl(n - 3)] + data[sl(n - 1)])
 
         return result
 
@@ -174,12 +153,10 @@ class CubicInterpolation(InterpolationScheme):
 class CompactSecondOrderInterpolation(InterpolationScheme):
     """2-point mean interpolation (Lagrava Eq. 4.22).
 
-    Second-order accurate. Simple average of two nearest coarse neighbors.
-    WARNING: Causes mass loss (pressure discontinuity) at grid interfaces.
-    Provided for comparison testing only.
+    Second-order accurate, fully vectorized.
+    WARNING: Causes mass loss at grid interfaces.
 
-    Stencil:
-        g(x) = (g(x+h) + g(x-h)) / 2
+    Stencil: g(x) = (g(x+h) + g(x-h)) / 2
     """
 
     @property
@@ -192,25 +169,20 @@ class CompactSecondOrderInterpolation(InterpolationScheme):
         data: 'npt.NDArray',
         axis: int,
     ) -> 'npt.NDArray':
-        """Interpolate using 2-point mean stencil.
-
-        Args:
-            xp: Array module (numpy or cupy).
-            data: Array with known values at even indices along `axis`.
-            axis: Interpolation axis.
-
-        Returns:
-            Array with all values filled.
-        """
+        """Vectorized 2-point mean interpolation."""
         result = data.copy()
         n = data.shape[axis]
+        nd = data.ndim
+        sl = lambda idx: _make_slice(nd, axis, idx)
 
-        def _sl(idx):
-            s = [slice(None)] * data.ndim
-            s[axis] = idx
-            return tuple(s)
+        if n < 3:
+            return result
 
-        for i in range(1, n - 1, 2):
-            result[_sl(i)] = 0.5 * (data[_sl(i - 1)] + data[_sl(i + 1)])
+        # All odd indices: 1, 3, 5, ..., n-2
+        odd      = sl(slice(1, n - 1, 2))
+        left     = sl(slice(0, n - 2, 2))    # i-1
+        right    = sl(slice(2, n,     2))    # i+1
+
+        result[odd] = 0.5 * (data[left] + data[right])
 
         return result
