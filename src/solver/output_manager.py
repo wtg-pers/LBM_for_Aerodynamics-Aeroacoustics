@@ -87,6 +87,7 @@ class OutputManager:
         L_ref_lu: Optional[float] = None,
         u_ref_lu: Optional[float] = None,
         config_path: Optional[str] = None,
+        mlg_vtk_writer: Optional[object] = None,
     ) -> None:
         """Initialize OutputManager with all I/O components.
 
@@ -151,6 +152,7 @@ class OutputManager:
         self.L_ref_lu = L_ref_lu
         self.u_ref_lu = u_ref_lu
         self.config_path = config_path
+        self.mlg_vtk_writer = mlg_vtk_writer
 
         # ── Progress tracking state ──
         self._last_drift: float = 0.0
@@ -289,8 +291,15 @@ class OutputManager:
         # ── Final macroscopic recompute ──
         rho_final, u_final = self.macroscopic.compute(sim.f)
 
-        # ── Final VTK ──
-        if self.vtk_writer is not None:
+        # ── Final MLG VTK ──
+        if self.mlg_vtk_writer is not None:
+            from src.grid.multi_level_grid import MultiLevelGrid
+            if isinstance(sim, MultiLevelGrid):
+                self.mlg_vtk_writer.write(
+                    step=final_step, mlg=sim, time=float(final_step))
+
+        # ── Final VTK (single grid only) ──
+        if self.vtk_writer is not None and self.mlg_vtk_writer is None:
             extra_vectors_vtk = {}
             if sim.body_force is not None:
                 extra_vectors_vtk['body_force'] = sim.body_force
@@ -317,6 +326,7 @@ class OutputManager:
             self.checkpoint_mgr.save(
                 step=final_step, f=sim.f, rho=rho_final,
                 u=u_final, tau=self.tau, config=self.sim_params,
+                extra_data=self._build_checkpoint_extra(sim),
             )
 
         # ── Final conservation ──
@@ -425,6 +435,14 @@ class OutputManager:
         if step % self.output_interval != 0:
             return
 
+        # ── MLG: write per-level .vti + .vth ───────────────
+        if self.mlg_vtk_writer is not None:
+            from src.grid.multi_level_grid import MultiLevelGrid
+            if isinstance(sim, MultiLevelGrid):
+                self.mlg_vtk_writer.write(step=step, mlg=sim, time=float(step))
+                # Skip redundant single-grid .vti (level0.vti already covers it)
+                return
+
         extra_vectors_vtk = {}
         if sim.body_force is not None:
             extra_vectors_vtk['body_force'] = sim.body_force
@@ -501,6 +519,7 @@ class OutputManager:
                         step=step, f=sim.f,
                         rho=sim.rho, u=sim.u,
                         tau=self.tau, config=self.sim_params,
+                        extra_data=self._build_checkpoint_extra(sim),
                     )
             return 'stop'
 
@@ -518,9 +537,19 @@ class OutputManager:
                 return 'stop'
 
         return 'continue'
+    
+    def _build_checkpoint_extra(self, sim) -> dict:
+        """Build extra_data dict for MLG checkpoint (fine level f arrays)."""
+        extra = {}
+        if self.mlg_vtk_writer is not None:
+            from src.grid.multi_level_grid import MultiLevelGrid
+            if isinstance(sim, MultiLevelGrid):
+                extra['num_levels'] = sim.num_levels
+                for k in range(1, sim.num_levels):
+                    extra[f'f_level_{k}'] = sim.get_level(k).f
+        return extra if extra else None
 
     def _save_checkpoint(self, step: int, sim: 'Simulation') -> None:
-        """Save checkpoint at checkpoint_interval."""
         if self.checkpoint_mgr is None:
             return
         if step <= 0 or step % self.checkpoint_interval != 0:
@@ -529,6 +558,7 @@ class OutputManager:
         self.checkpoint_mgr.save(
             step=step, f=sim.f, rho=sim.rho, u=sim.u,
             tau=self.tau, config=self.sim_params,
+            extra_data=self._build_checkpoint_extra(sim),
         )
 
     # =====================================================================

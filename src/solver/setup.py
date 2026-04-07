@@ -31,6 +31,8 @@ Date: 2026-03 (MLG integration: 2026-04)
 """
 
 import os
+import sys
+import io
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -94,50 +96,105 @@ class SimulationSetup:
     def __init__(self, args: Any) -> None:
         """Build entire simulation environment from CLI args.
 
-        This constructor runs all setup steps [0]–[6] that were
-        previously in main(). After construction, all components are
-        ready but the distribution function f is NOT yet initialized.
-
-        Args:
-            args: Parsed CLI arguments from parse_args()
+        Default: detailed log → file only, compact summary → terminal.
+        Use --verbose to also echo detailed log to terminal.
         """
         self._args = args
+        self._verbose = getattr(args, 'verbose', False)
 
-        # ── [0] Configuration Loading ────────────────────────────
-        self._load_config()
+        # ── Capture detailed output to buffer ────────────────────
+        self._log_buffer = io.StringIO()
+        self._original_stdout = sys.stdout
+        sys.stdout = self._LogTee(
+            self._log_buffer, self._original_stdout,
+            echo=self._verbose,
+        )
 
-        # ── Device + Lattice ─────────────────────────────────────
-        self._setup_device_and_lattice()
+        try:
+            # ── [0] Configuration Loading ────────────────────────
+            self._load_config()
 
-        # ── [1] Domain ───────────────────────────────────────────
-        self._setup_domain()
+            # ── Device + Lattice ─────────────────────────────────
+            self._setup_device_and_lattice()
 
-        # ── [2] Physics Parameters ───────────────────────────────
-        self._extract_physics()
+            # ── [1] Domain ───────────────────────────────────────
+            self._setup_domain()
 
-        # ── [3] Boundary Conditions ──────────────────────────────
-        self._setup_boundaries()
+            # ── [2] Physics Parameters ───────────────────────────
+            self._extract_physics()
 
-        # ── [4] I/O (directories, writers, CSV) ──────────────────
-        self._setup_io()
+            # ── [3] Boundary Conditions ──────────────────────────
+            self._setup_boundaries()
 
-        # ── LBM Components ───────────────────────────────────────
-        self._create_lbm_components()
+            # ── [4] I/O (directories, writers, CSV) ──────────────
+            self._setup_io()
 
-        # ── [5.1] Conservation Monitor ───────────────────────────
-        self._setup_conservation()
+            # ── LBM Components ───────────────────────────────────
+            self._create_lbm_components()
 
-        # ── [5.2] Force Calculation ──────────────────────────────
-        self._setup_force_calculation()
+            # ── [5.1] Conservation Monitor ───────────────────────
+            self._setup_conservation()
 
-        # ── [5.3] Convergence Monitor ────────────────────────────
-        self._setup_convergence()
+            # ── [5.2] Force Calculation ──────────────────────────
+            self._setup_force_calculation()
 
-        # ── [5.4] Actuator Line Model ────────────────────────────
-        self._setup_actuator_line()
+            # ── [5.3] Convergence Monitor ────────────────────────
+            self._setup_convergence()
 
-        # ── [6] Multi-Level Grid (conditional) ───────────────────
-        self._setup_mlg()
+            # ── [5.4] Actuator Line Model ────────────────────────
+            self._setup_actuator_line()
+
+            # ── [6] Multi-Level Grid (conditional) ───────────────
+            self._setup_mlg()
+
+        finally:
+            sys.stdout = self._original_stdout
+
+        # ── Write detailed log to file ───────────────────────────
+        log_dir = getattr(self, '_csv_dir', './results/csv')
+        os.makedirs(log_dir, exist_ok=True)
+        self._log_path = os.path.join(log_dir, 'setup_log.txt')
+        with open(self._log_path, 'w') as f:
+            f.write(self._log_buffer.getvalue())
+
+        # ── Print compact summary to terminal ────────────────────
+        self._print_summary()
+
+    # =====================================================================
+    # Internal: Log capture utility
+    # =====================================================================
+
+    class _LogTee:
+        """Writes to buffer and optionally echoes to terminal."""
+
+        def __init__(self, buffer, terminal, echo: bool = False):
+            self._buffer = buffer
+            self._terminal = terminal
+            self._echo = echo
+
+        def write(self, text):
+            self._buffer.write(text)
+            if self._echo:
+                self._terminal.write(text)
+
+        def flush(self):
+            self._buffer.flush()
+            if self._echo:
+                self._terminal.flush()
+
+    def start_log_capture(self) -> None:
+        """Redirect stdout to log buffer (call before build/init)."""
+        self._original_stdout = sys.stdout
+        sys.stdout = self._LogTee(
+            self._log_buffer, self._original_stdout,
+            echo=self._verbose,
+        )
+
+    def stop_log_capture(self) -> None:
+        """Restore stdout and update log file."""
+        sys.stdout = self._original_stdout
+        with open(self._log_path, 'w') as f:
+            f.write(self._log_buffer.getvalue())
 
     # =====================================================================
     # Public: Build products
@@ -199,6 +256,7 @@ class SimulationSetup:
             L_ref_lu=self.L_ref_lu,
             u_ref_lu=self.u_ref_lu,
             config_path=self._args.config,
+            mlg_vtk_writer=self._mlg_vtk_writer if self._mlg_enabled else None,
         )
 
     # =====================================================================
@@ -671,6 +729,7 @@ class SimulationSetup:
         self._mlg_enabled: bool = self._mlg_config.get('enabled', False)
 
         if not self._mlg_enabled:
+            self._mlg_vtk_writer = None
             print(f"\n[6] Multi-Level Grid: disabled")
             return
 
@@ -704,21 +763,44 @@ class SimulationSetup:
             raise ValueError(f"Unknown interpolation: '{interp_name}'")
 
         # ── Overlap manager ──────────────────────────────────────
+        # All regions in config are in Level 0 (physical) coordinates.
+        # For Level k (k≥2), we convert to parent fine grid local coords.
         self._mlg_overlap_mgr = OverlapManager()
         levels_config = self._mlg_config.get('levels', [])
 
         coarse_shape = (self.Nx, self.Ny, self.Nz)
+
+        # Track each level's physical origin and spacing for coord conversion
+        level_origins = [(0.0, 0.0, 0.0)]   # Level 0 origin
+        level_spacings = [(1.0, 1.0, 1.0)]  # Level 0 spacing
+
         for k in range(1, num_levels):
             level_cfg = levels_config[k] if k < len(levels_config) else {}
             region_cfg = level_cfg.get('region', {})
 
+            # Config values are in L0 physical coordinates
+            x_min_phys = region_cfg['x_min']
+            x_max_phys = region_cfg['x_max']
+            y_min_phys = region_cfg['y_min']
+            y_max_phys = region_cfg['y_max']
+            z_min_phys = region_cfg['z_min']
+            z_max_phys = region_cfg['z_max']
+
+            # Convert to parent (Level k-1) local coordinates
+            po = level_origins[k - 1]     # parent origin in physical coords
+            pd = level_spacings[k - 1]    # parent spacing
+
+            local_x_min = round((x_min_phys - po[0]) / pd[0])
+            local_x_max = round((x_max_phys - po[0]) / pd[0])
+            local_y_min = round((y_min_phys - po[1]) / pd[1])
+            local_y_max = round((y_max_phys - po[1]) / pd[1])
+            local_z_min = round((z_min_phys - po[2]) / pd[2])
+            local_z_max = round((z_max_phys - po[2]) / pd[2])
+
             fine_region = IndexBox(
-                x_start=region_cfg['x_min'],
-                x_end=region_cfg['x_max'],
-                y_start=region_cfg['y_min'],
-                y_end=region_cfg['y_max'],
-                z_start=region_cfg['z_min'],
-                z_end=region_cfg['z_max'],
+                x_start=local_x_min, x_end=local_x_max,
+                y_start=local_y_min, y_end=local_y_max,
+                z_start=local_z_min, z_end=local_z_max,
             )
 
             overlap_region = self._mlg_overlap_mgr.add_level_pair(
@@ -727,13 +809,43 @@ class SimulationSetup:
                 overlap_width=overlap_width,
             )
 
-            print(f"  Level {k}: fine shape = {overlap_region.fine_shape}, "
-                  f"excised = {overlap_region.excised.num_nodes:,} nodes")
+            # Compute this level's physical origin and spacing
+            fdc = overlap_region.fine_domain_coarse
+            lu_k = self._mlg_scaler.get_level_units(k)
+            new_origin = (
+                po[0] + fdc.x_start * pd[0],
+                po[1] + fdc.y_start * pd[1],
+                po[2] + fdc.z_start * pd[2],
+            )
+            new_spacing = (lu_k.dx, lu_k.dx, lu_k.dx)
+            level_origins.append(new_origin)
+            level_spacings.append(new_spacing)
+
+            print(f"  Level {k}: phys region x[{x_min_phys},{x_max_phys}] "
+                  f"y[{y_min_phys},{y_max_phys}] z[{z_min_phys},{z_max_phys}]")
+            print(f"            fine shape = {overlap_region.fine_shape}, "
+                  f"excised = {overlap_region.excised.num_nodes:,} nodes, "
+                  f"origin = ({new_origin[0]:.1f}, {new_origin[1]:.1f}, {new_origin[2]:.1f})")
 
             # Next iteration: fine shape becomes the coarse shape
             coarse_shape = overlap_region.fine_shape
 
         self._mlg_filter_level = filter_level
+
+        # ── MLG VTK writer ───────────────────────────────────────
+        from src.io.mlg_vtk_writer import MLGVTKWriter
+        vtk_out_dir = './results/vtk'
+        if self.vtk_writer is not None:
+            vtk_out_dir = self.vtk_writer.output_dir
+        self._mlg_vtk_writer = MLGVTKWriter(
+            output_dir=vtk_out_dir,
+            coarse_shape=(self.Nx, self.Ny, self.Nz),
+            overlap_mgr=self._mlg_overlap_mgr,
+            scaler=self._mlg_scaler,
+            num_levels=num_levels,
+            precision=self._vtk_config.get('precision', 'float32'),
+        )
+        print(f"  {self._mlg_vtk_writer.get_info()}")
 
     def _build_mlg_simulation(self):
         """Build a MultiLevelGrid with M Simulation objects.
@@ -814,3 +926,125 @@ class SimulationSetup:
         print(f"\n  MultiLevelGrid assembled:")
         print(f"  {mlg.summary()}")
         return mlg
+
+    # =====================================================================
+    # Summary (printed to terminal after all setup)
+    # =====================================================================
+
+    def _print_summary(self) -> None:
+        """Print compact simulation summary to terminal."""
+        sep = "-" * 70
+        print(f"\n{sep}")
+        print(f" Simulation Summary")
+        print(f"{sep}")
+
+        # ── Config & Device ──────────────────────────────────────
+        device_name = "CPU (NumPy)"
+        if self.xp.__name__ == 'cupy':
+            try:
+                dev = self.xp.cuda.Device()
+                device_name = f"{dev.name} (GPU)"
+            except Exception:
+                device_name = "GPU (CuPy)"
+
+        config_name = os.path.basename(self._args.config)
+        lattice_model = self.sim_params.get('lattice_model', 'D3Q27')
+        print(f" Config : {config_name}")
+        print(f" Device : {device_name}")
+        print(f" Lattice: {lattice_model}")
+
+        # ── Grid ─────────────────────────────────────────────────
+        Q = self.lattice.Q
+        if self._mlg_enabled:
+            num_levels = self._mlg_config['num_levels']
+            total_nodes = 0
+            total_updates = 0
+            total_mem = 0.0
+            grid_lines = []
+
+            for k in range(num_levels):
+                if k == 0:
+                    shape = (self.Nx, self.Ny, self.Nz)
+                    tau_k = self.tau
+                else:
+                    region = self._mlg_overlap_mgr.get_region(k - 1)
+                    shape = region.fine_shape
+                    tau_k = self._mlg_scaler.get_level_units(k).tau
+
+                nodes = shape[0] * shape[1] * shape[2]
+                steps = 2 ** k
+                updates = nodes * steps
+                mem = nodes * Q * 8 / (1024 * 1024)
+
+                total_nodes += nodes
+                total_updates += updates
+                total_mem += mem
+
+                grid_lines.append(
+                    f"          L{k}: {shape[0]:>4}x{shape[1]:<4}x{shape[2]:<4}"
+                    f" ({nodes:>9,}) x{steps} = {updates:>11,} updates  "
+                    f"tau={tau_k:.4f}"
+                )
+
+            interp = self._mlg_config.get('interpolation', 'cubic')
+            ow = self._mlg_config.get('overlap_width', 2)
+            print(f" Grid   : {num_levels} levels (MLG), "
+                  f"{total_nodes:,} total nodes")
+            for line in grid_lines:
+                print(line)
+            print(f"          Total: {total_updates:,} updates/coarse step"
+                  f" | {total_mem:.1f} MB")
+            print(f"          Interp: {interp} | Overlap: {ow} cells")
+        else:
+            if self.lattice.dim == 2:
+                cells = self.Nx * self.Ny
+                print(f" Grid   : {self.Nx} x {self.Ny} = "
+                      f"{cells:,} cells")
+            else:
+                cells = self.Nx * self.Ny * self.Nz
+                print(f" Grid   : {self.Nx} x {self.Ny} x {self.Nz} = "
+                      f"{cells:,} cells")
+
+        # ── Physics ──────────────────────────────────────────────
+        cs = (1.0 / 3.0) ** 0.5
+        Ma_str = ""
+        if self.u_ref_lu:
+            Ma = self.u_ref_lu / cs
+            Ma_str = f", Ma={Ma:.3f}"
+        print(f" Physics: Re={self.Re}, tau={self.tau:.4f}, "
+              f"nu={self.nu_lu:.4f}{Ma_str}")
+
+        # ── BC summary ───────────────────────────────────────────
+        bc_cfg = self.config.get('boundaries', {})
+        bc_parts = []
+        for key, cfg in bc_cfg.items():
+            loc = cfg.get('location', key)
+            method = cfg.get('method', '?')
+            if 'inlet' in method:
+                vel = cfg.get('velocity', '?')
+                bc_parts.append(f"{loc}=inlet(u={vel})")
+            elif 'outlet' in method:
+                rho = cfg.get('rho', cfg.get('rho_target', '?'))
+                bc_parts.append(f"{loc}=outlet(rho={rho})")
+            elif 'wall' in method:
+                bc_parts.append(f"{loc}=wall")
+            else:
+                bc_parts.append(f"{loc}={method}")
+
+        if bc_parts:
+            mid = (len(bc_parts) + 1) // 2
+            line1 = '  '.join(bc_parts[:mid])
+            line2 = '  '.join(bc_parts[mid:])
+            print(f" BC     : {line1}")
+            if line2:
+                print(f"          {line2}")
+
+        # ── Time ─────────────────────────────────────────────────
+        ckpt_str = (f"Ckpt: {self.checkpoint_interval}"
+                    if self.checkpoint_mgr else "Ckpt: off")
+        print(f" Time   : {self.config_max_steps:,} steps | "
+              f"VTK: {self.output_interval} | {ckpt_str}")
+
+        # ── Log file ─────────────────────────────────────────────
+        print(f" Log    : {self._log_path}")
+        print(sep)

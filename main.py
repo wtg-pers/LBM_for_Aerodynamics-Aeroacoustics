@@ -10,6 +10,8 @@ Usage:
     python main.py --config configs/input_config.py
     python main.py --config configs/NTNU_BT1_config.py
     python main.py --restart-latest --extend 10000
+
+Author: LBM Development Team
 """
 
 import os, sys
@@ -36,12 +38,15 @@ def main():
 
     # [1] Setup — 시뮬레이션 환경 구성
     setup = SimulationSetup(args)
+
+    # [2] Build & Initialize — 상세 로그는 파일로
+    setup.start_log_capture()
     sim    = setup.build_simulation()
     output = setup.build_output_manager()
 
-    # [2] Initialization — 솔버 물리 상태 초기화
     initializer = SolverInitializer(setup)
     start_step, end_step = initializer.initialize(sim, args)
+    setup.stop_log_capture()
 
     if start_step >= end_step:
         return True
@@ -56,10 +61,6 @@ def main():
         sim.advance()
         if output.process(step, sim) == 'stop':
             break
-    
-    import numpy as np
-    u_np = sim.u.get() if hasattr(sim.u, 'get') else sim.u
-    np.save('velocity_field.npy', u_np)
 
     # [4] Finalize
     return output.finalize(sim)
