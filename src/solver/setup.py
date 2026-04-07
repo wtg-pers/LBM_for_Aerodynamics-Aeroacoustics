@@ -286,6 +286,8 @@ class SimulationSetup:
 
     def _setup_device_and_lattice(self) -> None:
         """Device selection + lattice creation + validation."""
+        import numpy as np
+
         device_mode = self.sim_params.get('device_mode')
         device_id = (self._args.gpu
                      if self._args.gpu is not None
@@ -293,8 +295,19 @@ class SimulationSetup:
 
         self.xp: 'ModuleType' = setup_library(device_mode, device_id=device_id)
 
+        # ── Computation precision ────────────────────────────────
+        precision_str = self.sim_params.get('precision', 'float64')
+        _precision_map = {'float32': np.float32, 'float64': np.float64}
+        if precision_str not in _precision_map:
+            raise ValueError(
+                f"Unknown precision: '{precision_str}'. "
+                f"Available: 'float32', 'float64'"
+            )
+        self.compute_dtype = _precision_map[precision_str]
+        print(f"\n  Computation precision: {precision_str}")
+
         lattice_model = self.sim_params.get('lattice_model', 'D3Q27')
-        self.lattice = get_lattice(lattice_model, self.xp)
+        self.lattice = get_lattice(lattice_model, self.xp, dtype=self.compute_dtype)
         self._dimension = self.sim_params.get('dimension')
 
         print(f"\n[0] Validating Lattice Model ({lattice_model})...")

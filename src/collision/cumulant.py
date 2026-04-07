@@ -116,8 +116,9 @@ class CumulantCollision(CollisionOperator):
             )
 
         # ── Lattice constants on device ──────────────────────────
-        self._c = xp.asarray(lattice.c, dtype=xp.float64)   # (3, 27)  [Δx/Δt]
-        self._w = xp.asarray(lattice.w, dtype=xp.float64)   # (27,)    [dimensionless]
+        self._dtype = lattice.dtype
+        self._c = xp.asarray(lattice.c, dtype=self._dtype)   # (3, 27)  [Δx/Δt]
+        self._w = xp.asarray(lattice.w, dtype=self._dtype)   # (27,)    [dimensionless]
         self._cs2: float = float(lattice.cs2)                # 1/3      [Δx²/Δt²]
         self._inv_cs2: float = 1.0 / self._cs2              # 3.0      [Δt²/Δx²]
         self._inv_cs4: float = 1.0 / (self._cs2 ** 2)       # 9.0      [Δt⁴/Δx⁴]
@@ -247,7 +248,7 @@ class CumulantCollision(CollisionOperator):
 
         # c_i · u  for each direction i  →  shape (Q, Nx, Ny, Nz)
         # c: (3, Q), u: (3, Nx, Ny, Nz) → einsum → (Q, Nx, Ny, Nz)
-        cu = xp.einsum('dq,d...->q...', self._c.astype(xp.float64), u)
+        cu = xp.einsum('dq,d...->q...', self._c.astype(self._dtype), u)
         # [Δx/Δt · Δx/Δt = Δx²/Δt²]
 
         # |u|² = u_x² + u_y² + u_z²  →  shape (Nx, Ny, Nz)
@@ -971,11 +972,11 @@ class CumulantCollision(CollisionOperator):
         prefactor = 1.0 - 0.5 / tau
 
         # c_i · u → (Q, Nx, Ny, Nz)  [Δx²/Δt²]
-        cu = xp.einsum('dq,d...->q...', self._c.astype(xp.float64), u)
+        cu = xp.einsum('dq,d...->q...', self._c.astype(self._dtype), u)
 
         # (c_i - u) / cs²  →  (dim, Q, Nx, Ny, Nz)  [Δt/Δx]
         # c_i · u · c_i / cs⁴  →  (dim, Q, Nx, Ny, Nz)
-        c_3d = self._c.astype(xp.float64)  # (3, Q)
+        c_3d = self._c.astype(self._dtype)  # (3, Q)
         # Expand c to broadcast with (Nx, Ny, Nz)
         ndim_spatial = u.ndim - 1
         for _ in range(ndim_spatial):

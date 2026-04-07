@@ -67,8 +67,9 @@ class BGKCollision(CollisionOperator):
         super().__init__(xp, lattice)
 
         # ── Precompute lattice constants on device ──
-        self._c = xp.asarray(lattice.c, dtype=xp.float64)   # (dim, Q)  [Δx/Δt]
-        self._w = xp.asarray(lattice.w, dtype=xp.float64)   # (Q,)      [dimensionless]
+        self._dtype = lattice.dtype
+        self._c = xp.asarray(lattice.c, dtype=self._dtype)   # (dim, Q)  [Δx/Δt]
+        self._w = xp.asarray(lattice.w, dtype=self._dtype)   # (Q,)      [dimensionless]
         self._cs2: float = float(lattice.cs2)                # 1/3       [Δx²/Δt²]
 
         # Guo forcing constants
@@ -194,7 +195,7 @@ class BGKCollision(CollisionOperator):
         # ── Term 1: (c_iα − u_α) · F_α / cs² ───────────────────
         # c_i · F : (Q, Nx, Ny[, Nz])
         ci_dot_F = xp.einsum(
-            'dq, d... -> q...', c.astype(xp.float64), force,
+            'dq, d... -> q...', c.astype(self._dtype), force,
         )
         # u · F : (Nx, Ny[, Nz])
         u_dot_F = xp.sum(u * force, axis=0)
@@ -204,7 +205,7 @@ class BGKCollision(CollisionOperator):
         # ── Term 2: (c_iβ · u_β) · (c_iα · F_α) / cs⁴ ─────────
         # c_i · u : (Q, Nx, Ny[, Nz])
         ci_dot_u = xp.einsum(
-            'dq, d... -> q...', c.astype(xp.float64), u,
+            'dq, d... -> q...', c.astype(self._dtype), u,
         )
         term2 = ci_dot_u * ci_dot_F * self._inv_cs4
 

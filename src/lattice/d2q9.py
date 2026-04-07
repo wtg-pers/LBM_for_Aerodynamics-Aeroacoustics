@@ -54,6 +54,8 @@ Date: 2026-02
 
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
@@ -84,15 +86,17 @@ class D2Q9:
         0.4444444444444444
     """
     
-    def __init__(self, xp: 'ModuleType') -> None:
+    def __init__(self, xp: 'ModuleType', dtype=np.float64) -> None:
         """Initialize D2Q9 lattice model
-        
+
         Args:
             xp: Array module (numpy or cupy) for GPU/CPU compatibility
+            dtype: Computation precision (np.float32 or np.float64)
         """
         self.xp = xp
         self.Q = 9       # Number of discrete velocities  [dimensionless]
         self.dim = 2     # Spatial dimensions  [dimensionless]
+        self.dtype = dtype  # Computation precision (float32 or float64)
         
         # =====================================================================
         # Lattice Velocity Vectors c_i
@@ -133,7 +137,7 @@ class D2Q9:
             4.0/9.0,                              # i=0: rest
             1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0,  # i=1-4: axis
             1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0  # i=5-8: diagonal
-        ], dtype=xp.float64)
+        ], dtype=dtype)
         
         # =====================================================================
         # Speed of Sound Squared

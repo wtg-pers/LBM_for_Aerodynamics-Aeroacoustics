@@ -39,31 +39,39 @@ from .d3q27 import D3Q27
 __all__ = ['D2Q9', 'D3Q27']
 
 
-def get_lattice(model_name: str, xp):
-    """Factory function to get lattice by name
-    
+def get_lattice(model_name: str, xp, dtype=None):
+    """Factory function to get lattice by name.
+
     Args:
         model_name: Lattice model name ('D2Q9', 'D3Q27')
         xp: Array module (numpy or cupy)
-        
+        dtype: Computation precision (np.float32 or np.float64).
+               Default None → np.float64.
+
     Returns:
         Lattice instance
-        
+
     Raises:
         ValueError: If model_name is not recognized
-        
+
     Example:
         >>> lattice = get_lattice('D2Q9', np)
+        >>> lattice = get_lattice('D3Q27', cp, dtype=np.float32)
     """
+    import numpy as np
+
     models = {
         'D2Q9': D2Q9,
         'd2q9': D2Q9,
         'D3Q27': D3Q27,
         'd3q27': D3Q27,
     }
-    
+
     if model_name not in models:
         available = ', '.join(sorted(set(k.upper() for k in models.keys())))
         raise ValueError(f"Unknown lattice model: '{model_name}'. Available: {available}")
-    
-    return models[model_name](xp)
+
+    if dtype is None:
+        dtype = np.float64
+
+    return models[model_name](xp, dtype=dtype)

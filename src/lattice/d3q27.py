@@ -1,9 +1,12 @@
+import numpy as np
+
 
 class D3Q27:
-    def __init__(self, xp):
+    def __init__(self, xp, dtype=np.float64):
         self.xp = xp
         self.Q = 27
         self.dim = 3
+        self.dtype = dtype      # Computation precision (float32 or float64)
         self.c = xp.array([
             [0,
             1, -1, 0, 0, 0, 0,
@@ -22,7 +25,7 @@ class D3Q27:
         self.w = xp.array([8/27] +
                            [2/27]*6 +
                            [1/54]*12 +
-                           [1/216]*8, dtype=float)
+                           [1/216]*8, dtype=dtype)
         
         self.opp = self._compute_opposite_indices()
         

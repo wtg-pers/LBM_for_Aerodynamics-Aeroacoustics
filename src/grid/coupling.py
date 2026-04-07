@@ -77,8 +77,9 @@ class GridCoupling:
         self._filter_level = filter_level
 
         # ── Lattice constants on device ──────────────────────────
-        self._c = xp.asarray(lattice.c, dtype=xp.float64)    # (dim, Q)
-        w = xp.asarray(lattice.w, dtype=xp.float64)           # (Q,)
+        self._dtype = lattice.dtype
+        self._c = xp.asarray(lattice.c, dtype=self._dtype)    # (dim, Q)
+        w = xp.asarray(lattice.w, dtype=self._dtype)           # (Q,)
         self._w = w
         self._cs2: float = float(lattice.cs2)
         self._Q: int = int(lattice.Q)

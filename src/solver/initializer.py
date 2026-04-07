@@ -122,13 +122,14 @@ class SolverInitializer:
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")
         physics_config = setup.sim_params.get('physics', {})
         flow_vel = physics_config.get('initial_flow_velocity', 0.0)
+        dtype = setup.compute_dtype
 
         if setup.lattice.dim == 2:
-            rho0 = xp.ones((setup.Nx, setup.Ny), dtype=xp.float64)
-            u0 = xp.zeros((2, setup.Nx, setup.Ny), dtype=xp.float64)
+            rho0 = xp.ones((setup.Nx, setup.Ny), dtype=dtype)
+            u0 = xp.zeros((2, setup.Nx, setup.Ny), dtype=dtype)
         else:
-            rho0 = xp.ones((setup.Nx, setup.Ny, setup.Nz), dtype=xp.float64)
-            u0 = xp.zeros((3, setup.Nx, setup.Ny, setup.Nz), dtype=xp.float64)
+            rho0 = xp.ones((setup.Nx, setup.Ny, setup.Nz), dtype=dtype)
+            u0 = xp.zeros((3, setup.Nx, setup.Ny, setup.Nz), dtype=dtype)
 
         if isinstance(flow_vel, (list, tuple)):
             for d in range(min(len(flow_vel), setup.lattice.dim)):
@@ -156,12 +157,14 @@ class SolverInitializer:
 
         print(f"\n[5] Initializing MultiLevelGrid ({mlg.num_levels} levels)")
 
+        dtype = setup.compute_dtype
+
         for k in range(mlg.num_levels):
             level_sim = mlg.get_level(k)
             shape = level_sim.domain_shape
 
-            rho_0 = xp.ones(shape, dtype=xp.float64)
-            u_0 = xp.zeros((dim,) + shape, dtype=xp.float64)
+            rho_0 = xp.ones(shape, dtype=dtype)
+            u_0 = xp.zeros((dim,) + shape, dtype=dtype)
             if isinstance(flow_vel, (list, tuple)):
                 for d in range(min(len(flow_vel), dim)):
                     u_0[d] = flow_vel[d]
@@ -236,8 +239,9 @@ class SolverInitializer:
                 print(f"  Level {k}: not in checkpoint, init equilibrium")
                 shape = level_sim.domain_shape
                 dim = setup.lattice.dim
-                rho_0 = xp.ones(shape, dtype=xp.float64)
-                u_0 = xp.zeros((dim,) + shape, dtype=xp.float64)
+                dtype = setup.compute_dtype
+                rho_0 = xp.ones(shape, dtype=dtype)
+                u_0 = xp.zeros((dim,) + shape, dtype=dtype)
 
                 physics_config = setup.sim_params.get('physics', {})
                 flow_vel = physics_config.get('initial_flow_velocity',
