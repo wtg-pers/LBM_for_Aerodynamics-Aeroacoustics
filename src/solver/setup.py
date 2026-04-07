@@ -51,6 +51,7 @@ from src.boundary.domain_bc_manager import DomainBCManager
 from src.boundary.wall import HalfwayBounceBack
 from src.boundary.geometry_manager import (
     create_geometry_mask, validate_geometry_config,
+    create_fine_level_geometry_config,
 )
 
 from src.utilities.device import setup_library
@@ -771,8 +772,10 @@ class SimulationSetup:
         coarse_shape = (self.Nx, self.Ny, self.Nz)
 
         # Track each level's physical origin and spacing for coord conversion
-        level_origins = [(0.0, 0.0, 0.0)]   # Level 0 origin
-        level_spacings = [(1.0, 1.0, 1.0)]  # Level 0 spacing
+        # Stored as instance variables so _build_mlg_simulation() can access
+        # them for fine-level obstacle coordinate transformation.
+        self._mlg_level_origins = [(0.0, 0.0, 0.0)]   # Level 0 origin
+        self._mlg_level_spacings = [(1.0, 1.0, 1.0)]  # Level 0 spacing
 
         for k in range(1, num_levels):
             level_cfg = levels_config[k] if k < len(levels_config) else {}
@@ -787,8 +790,8 @@ class SimulationSetup:
             z_max_phys = region_cfg['z_max']
 
             # Convert to parent (Level k-1) local coordinates
-            po = level_origins[k - 1]     # parent origin in physical coords
-            pd = level_spacings[k - 1]    # parent spacing
+            po = self._mlg_level_origins[k - 1]     # parent origin in physical coords
+            pd = self._mlg_level_spacings[k - 1]    # parent spacing
 
             local_x_min = round((x_min_phys - po[0]) / pd[0])
             local_x_max = round((x_max_phys - po[0]) / pd[0])
@@ -818,8 +821,8 @@ class SimulationSetup:
                 po[2] + fdc.z_start * pd[2],
             )
             new_spacing = (lu_k.dx, lu_k.dx, lu_k.dx)
-            level_origins.append(new_origin)
-            level_spacings.append(new_spacing)
+            self._mlg_level_origins.append(new_origin)
+            self._mlg_level_spacings.append(new_spacing)
 
             print(f"  Level {k}: phys region x[{x_min_phys},{x_max_phys}] "
                   f"y[{y_min_phys},{y_max_phys}] z[{z_min_phys},{z_max_phys}]")
@@ -896,6 +899,46 @@ class SimulationSetup:
                 verbose=False,
             )
 
+            # ── Fine-level obstacle ──────────────────────────────
+            # Physical process: same obstacle geometry, higher resolution.
+            # The obstacle center/radius in L0 coords are transformed to
+            # fine-level local coords using the level's physical origin
+            # and grid spacing.
+            #
+            # Coordinate mapping:
+            #   cx_fine = (cx_L0 - origin_x) / dx_fine
+            #   radius_fine = radius_L0 / dx_fine
+            #
+            # This means the obstacle has 2^k times more grid points
+            # on level k (e.g., D=20 at L0 → D=40 at L1).
+            fine_obstacle_bc = None
+            internal_geom = self.config.get('internal_geometry', {})
+            if internal_geom:
+                fine_origin = self._mlg_level_origins[k]
+                fine_geom_config = create_fine_level_geometry_config(
+                    geometry_config=internal_geom,
+                    fine_origin_phys=fine_origin,
+                    fine_shape=fine_shape,
+                    dx_fine=lu.dx,
+                    dx_coarse=1.0,
+                    verbose=True,
+                )
+
+                if fine_geom_config:
+                    fine_mask, fine_geom_info = create_geometry_mask(
+                        xp, self.lattice, fine_shape,
+                        fine_geom_config,
+                        characteristic_length=None,
+                        verbose=True,
+                    )
+                    n_solid = int(xp.sum(fine_mask))
+                    if fine_geom_info['type'] != 'none' and n_solid > 0:
+                        fine_obstacle_bc = HalfwayBounceBack(
+                            xp, self.lattice, fine_mask,
+                        )
+                        print(f"    Level {k}: HalfwayBounceBack with "
+                              f"{n_solid:,} solid nodes")
+
             # Fine level simulation
             sim_k = Simulation(
                 xp=xp,
@@ -905,7 +948,7 @@ class SimulationSetup:
                 bc_manager=fine_bc_mgr,
                 tau=lu.tau,
                 domain_shape=fine_shape,
-                obstacle_bc=None,           # obstacle on fine = future work
+                obstacle_bc=fine_obstacle_bc,
                 al_model=None,              # ALM on Level 0 only
             )
             simulations.append(sim_k)

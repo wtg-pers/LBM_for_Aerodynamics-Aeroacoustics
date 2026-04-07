@@ -533,3 +533,413 @@ def create_airfoil_obstacle(
     return create_airfoil_2d_mask(
         xp, domain_shape, naca, chord, center, aoa, num_points=150
     )
+
+
+# =============================================================================
+# Fine-Level Geometry Coordinate Transformation (MLG support)
+# =============================================================================
+
+def create_fine_level_geometry_config(
+    geometry_config: Dict[str, Any],
+    fine_origin_phys: Tuple[float, float, float],
+    fine_shape: Tuple[int, int, int],
+    dx_fine: float,
+    dx_coarse: float = 1.0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Transform L0 obstacle config to fine-level local coordinates.
+
+    Physical Meaning:
+        An obstacle defined in Level 0 lattice coordinates must be
+        re-expressed in the fine grid's local coordinate system.
+        The fine grid has:
+          - A different origin (offset from L0)
+          - A finer spacing (dx_fine = dx_0 / 2^k)
+
+        This means the obstacle occupies MORE grid points on the fine
+        grid (e.g., a sphere with D=20 at L0 becomes D=40 at L1).
+
+    Coordinate Mapping (L0 physical → fine local):
+        cx_local = (cx_L0 - origin_x) / dx_fine
+        cy_local = (cy_L0 - origin_y) / dx_fine
+        cz_local = (cz_L0 - origin_z) / dx_fine
+        radius_local = radius_L0 / dx_fine
+
+    Args:
+        geometry_config: Original internal_geometry config dict.
+                         All coordinates are in L0 lattice units.
+        fine_origin_phys: Physical origin (ox, oy, oz) of the fine
+                          domain in L0 lattice units. This is the
+                          overlap-expanded start, NOT the user region.
+        fine_shape: Fine domain dimensions (Nx_f, Ny_f, Nz_f).
+        dx_fine: Fine grid spacing in L0 lattice units (= 1.0 / 2^k).
+        dx_coarse: Coarse (L0) grid spacing (= 1.0 for level 0).
+        verbose: Print transformation details.
+
+    Returns:
+        New geometry config dict with coordinates in fine local units.
+        Returns empty dict if obstacle doesn't intersect fine domain
+        or no obstacle is configured.
+
+    Example:
+        L0: sphere at center=(50, 25, 25), R=10
+        Fine L1: origin=(28, 18, 18), dx_fine=0.5
+        → local center = ((50-28)/0.5, (25-18)/0.5, (25-18)/0.5)
+                        = (44.0, 14.0, 14.0)
+        → local radius = 10 / 0.5 = 20.0
+        → D goes from 20 (L0) to 40 (L1) grid points
+    """
+    # ── Find active 3D geometry type ────────────────────────────
+    geometry_types_3d = ['cylinder', 'sphere', 'box']
+    active_type = None
+    active_config = None
+
+    for gtype in geometry_types_3d:
+        if gtype in geometry_config:
+            gcfg = geometry_config[gtype]
+            if gcfg.get('enabled', False):
+                active_type = gtype
+                active_config = dict(gcfg)  # shallow copy
+                break
+
+    if active_type is None:
+        return {}
+
+    ox, oy, oz = fine_origin_phys
+    Nx_f, Ny_f, Nz_f = fine_shape
+
+    # ── Sphere ──────────────────────────────────────────────────
+    if active_type == 'sphere':
+        cx, cy, cz = active_config['center']
+        radius = active_config['radius']
+
+        # Transform to fine local coordinates
+        cx_local = (cx - ox) / dx_fine
+        cy_local = (cy - oy) / dx_fine
+        cz_local = (cz - oz) / dx_fine
+        r_local = radius / dx_fine
+
+        # Intersection test: sphere bounding box vs fine domain
+        if (cx_local + r_local < 0 or cx_local - r_local > Nx_f - 1 or
+            cy_local + r_local < 0 or cy_local - r_local > Ny_f - 1 or
+            cz_local + r_local < 0 or cz_local - r_local > Nz_f - 1):
+            if verbose:
+                print(f"    Sphere does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            'sphere': {
+                'enabled': True,
+                'center': (cx_local, cy_local, cz_local),
+                'radius': r_local,
+            }
+        }
+        if verbose:
+            print(f"    Fine obstacle (sphere): "
+                  f"center=({cx_local:.1f}, {cy_local:.1f}, {cz_local:.1f}), "
+                  f"R={r_local:.1f} [fine lu]  "
+                  f"(L0: center=({cx}, {cy}, {cz}), R={radius})")
+
+        return new_config
+
+    # ── Cylinder ────────────────────────────────────────────────
+    elif active_type == 'cylinder':
+        center_2d = active_config['center']   # cross-section center
+        radius = active_config['radius']
+        axis = active_config.get('axis', 'z')
+
+        # Map 2D cross-section center to fine local coords
+        # center_2d is (c_perp1, c_perp2) in the plane ⊥ axis
+        if axis == 'z':
+            new_center = (
+                (center_2d[0] - ox) / dx_fine,
+                (center_2d[1] - oy) / dx_fine,
+            )
+        elif axis == 'y':
+            new_center = (
+                (center_2d[0] - ox) / dx_fine,
+                (center_2d[1] - oz) / dx_fine,
+            )
+        elif axis == 'x':
+            new_center = (
+                (center_2d[0] - oy) / dx_fine,
+                (center_2d[1] - oz) / dx_fine,
+            )
+        else:
+            raise ValueError(f"Unknown cylinder axis: '{axis}'")
+
+        r_local = radius / dx_fine
+
+        new_cfg = {
+            'cylinder': {
+                'enabled': True,
+                'center': new_center,
+                'radius': r_local,
+                'axis': axis,
+            }
+        }
+
+        # Transform axis_range if present
+        axis_range = active_config.get('axis_range', None)
+        if axis_range is not None:
+            axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
+            origin_along_axis = fine_origin_phys[axis_idx]
+            new_cfg['cylinder']['axis_range'] = (
+                (axis_range[0] - origin_along_axis) / dx_fine,
+                (axis_range[1] - origin_along_axis) / dx_fine,
+            )
+
+        # Copy optional height/axis_center if present
+        if 'height' in active_config:
+            new_cfg['cylinder']['height'] = active_config['height'] / dx_fine
+        if 'axis_center' in active_config:
+            axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
+            ac = active_config['axis_center']
+            new_cfg['cylinder']['axis_center'] = (
+                (ac - fine_origin_phys[axis_idx]) / dx_fine
+            )
+
+        if verbose:
+            print(f"    Fine obstacle (cylinder): "
+                  f"center={new_center}, R={r_local:.1f}, axis={axis} "
+                  f"[fine lu]")
+
+        return new_cfg
+
+    # ── Box ─────────────────────────────────────────────────────
+    elif active_type == 'box':
+        cmin = active_config['corner_min']
+        cmax = active_config['corner_max']
+
+        new_min = tuple(
+            (c - o) / dx_fine for c, o in zip(cmin, fine_origin_phys)
+        )
+        new_max = tuple(
+            (c - o) / dx_fine for c, o in zip(cmax, fine_origin_phys)
+        )
+
+        # Intersection test
+        if any(mn > s - 1 for mn, s in zip(new_min, fine_shape)):
+            if verbose:
+                print(f"    Box does not intersect fine domain — skipped")
+            return {}
+        if any(mx < 0 for mx in new_max):
+            if verbose:
+                print(f"    Box does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            'box': {
+                'enabled': True,
+                'corner_min': new_min,
+                'corner_max': new_max,
+            }
+        }
+        if verbose:
+            print(f"    Fine obstacle (box): "
+                  f"min={new_min}, max={new_max} [fine lu]")
+
+        return new_config
+
+    return {}
+
+
+# =============================================================================
+# Fine-Level Geometry Coordinate Transformation (for MLG)
+# =============================================================================
+
+def create_fine_level_geometry_config(
+    geometry_config: Dict[str, Any],
+    fine_origin_phys: Tuple[float, float, float],
+    fine_shape: Tuple[int, int, int],
+    dx_fine: float,
+    dx_coarse: float = 1.0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Transform L0 obstacle config to fine-level local coordinates.
+
+    Physical Meaning:
+        An obstacle defined in Level 0 physical coordinates must be
+        re-expressed in the fine grid's local coordinate system before
+        a mask can be generated at fine resolution. This involves two
+        geometric operations:
+
+        1. Origin shift:  subtract fine domain's physical start point
+        2. Scale change:  divide by fine grid spacing (dx_k = dx_0 / 2^k)
+
+    Coordinate Mapping (for sphere center as example):
+        cx_local = (cx_L0 - ox) / dx_fine
+        cy_local = (cy_L0 - oy) / dx_fine
+        cz_local = (cz_L0 - oz) / dx_fine
+        radius_local = radius_L0 / dx_fine
+
+    At fine resolution the obstacle has MORE grid points:
+        D_L0 = 2R/dx_0,  D_fine = 2R/dx_fine = D_L0 × (dx_0/dx_fine)
+
+    Args:
+        geometry_config: Original internal_geometry config dict (L0 coords).
+            Example: {'sphere': {'enabled': True, 'center': (50,25,25),
+                      'radius': 10}}
+        fine_origin_phys: Physical origin (ox, oy, oz) of the fine domain
+            in L0 lattice units. This is the overlap-EXPANDED start point
+            (fine_domain_coarse.x_start, etc.), NOT the user-specified
+            region start.  [L0 lattice units]
+        fine_shape: Fine grid dimensions (Nx_f, Ny_f, Nz_f).
+            [fine lattice units]
+        dx_fine: Fine grid spacing in L0 lattice units (= dx_0 / 2^k).
+            For Level 1: dx_fine = 0.5, Level 2: dx_fine = 0.25, etc.
+        dx_coarse: Coarse (L0) grid spacing (= 1.0 for level 0).
+        verbose: Print transformation details.
+
+    Returns:
+        New geometry config dict with coordinates in fine local units,
+        or empty dict if obstacle doesn't intersect fine domain.
+
+    Example:
+        >>> # L0 sphere at (50, 25, 25), R=10
+        >>> # Fine L1: origin=(28, 8, 8), dx=0.5
+        >>> cfg = create_fine_level_geometry_config(
+        ...     {'sphere': {'enabled': True, 'center': (50,25,25), 'radius': 10}},
+        ...     fine_origin_phys=(28.0, 8.0, 8.0),
+        ...     fine_shape=(108, 88, 88),
+        ...     dx_fine=0.5,
+        ... )
+        >>> cfg['sphere']['center']   # (44.0, 34.0, 34.0)
+        >>> cfg['sphere']['radius']   # 20.0
+    """
+    # ── Find active geometry type ──────────────────────────────
+    geometry_types_3d = ['cylinder', 'sphere', 'box']
+    active_type = None
+    active_config = None
+
+    for gtype in geometry_types_3d:
+        if gtype in geometry_config:
+            gcfg = geometry_config[gtype]
+            if gcfg.get('enabled', False):
+                active_type = gtype
+                active_config = dict(gcfg)  # shallow copy
+                break
+
+    if active_type is None:
+        return {}  # No obstacle configured
+
+    ox, oy, oz = fine_origin_phys
+    Nx_f, Ny_f, Nz_f = fine_shape
+    new_config: Dict[str, Any] = {}
+
+    # ── Sphere ─────────────────────────────────────────────────
+    if active_type == 'sphere':
+        cx, cy, cz = active_config['center']
+        radius = active_config['radius']
+
+        # Transform: L0 physical → fine local
+        cx_local = (cx - ox) / dx_fine
+        cy_local = (cy - oy) / dx_fine
+        cz_local = (cz - oz) / dx_fine
+        r_local = radius / dx_fine
+
+        # Intersection test: sphere bounding box vs fine domain
+        if (cx_local + r_local < 0 or cx_local - r_local > Nx_f - 1 or
+            cy_local + r_local < 0 or cy_local - r_local > Ny_f - 1 or
+            cz_local + r_local < 0 or cz_local - r_local > Nz_f - 1):
+            if verbose:
+                print(f"    Sphere does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            'sphere': {
+                'enabled': True,
+                'center': (cx_local, cy_local, cz_local),
+                'radius': r_local,
+            }
+        }
+        if verbose:
+            print(f"    Fine obstacle (sphere): center=({cx_local:.1f}, "
+                  f"{cy_local:.1f}, {cz_local:.1f}), R={r_local:.1f} "
+                  f"[fine lu]")
+            print(f"      (L0 original: center=({cx}, {cy}, {cz}), "
+                  f"R={radius} [L0 lu])")
+
+    # ── Cylinder ───────────────────────────────────────────────
+    elif active_type == 'cylinder':
+        center_2d = active_config['center']  # cross-section center
+        radius = active_config['radius']
+        axis = active_config.get('axis', 'z')
+
+        # The 2D center is in the plane perpendicular to the axis.
+        # axis='z' → center=(cx, cy), axis='y' → center=(cx, cz),
+        # axis='x' → center=(cy, cz)
+        if axis == 'z':
+            c0_local = (center_2d[0] - ox) / dx_fine
+            c1_local = (center_2d[1] - oy) / dx_fine
+        elif axis == 'y':
+            c0_local = (center_2d[0] - ox) / dx_fine
+            c1_local = (center_2d[1] - oz) / dx_fine
+        elif axis == 'x':
+            c0_local = (center_2d[0] - oy) / dx_fine
+            c1_local = (center_2d[1] - oz) / dx_fine
+        else:
+            raise ValueError(f"Unknown cylinder axis: '{axis}'")
+
+        r_local = radius / dx_fine
+
+        new_config = {
+            'cylinder': {
+                'enabled': True,
+                'center': (c0_local, c1_local),
+                'radius': r_local,
+                'axis': axis,
+            }
+        }
+
+        # Transform axis_range if specified
+        axis_range = active_config.get('axis_range', None)
+        if axis_range is not None:
+            axis_origin = {'x': ox, 'y': oy, 'z': oz}[axis]
+            new_config['cylinder']['axis_range'] = (
+                (axis_range[0] - axis_origin) / dx_fine,
+                (axis_range[1] - axis_origin) / dx_fine,
+            )
+
+        if verbose:
+            print(f"    Fine obstacle (cylinder): center=({c0_local:.1f}, "
+                  f"{c1_local:.1f}), R={r_local:.1f}, axis={axis} [fine lu]")
+
+    # ── Box ────────────────────────────────────────────────────
+    elif active_type == 'box':
+        cmin = active_config['corner_min']
+        cmax = active_config['corner_max']
+
+        new_min = (
+            (cmin[0] - ox) / dx_fine,
+            (cmin[1] - oy) / dx_fine,
+            (cmin[2] - oz) / dx_fine,
+        )
+        new_max = (
+            (cmax[0] - ox) / dx_fine,
+            (cmax[1] - oy) / dx_fine,
+            (cmax[2] - oz) / dx_fine,
+        )
+
+        # Intersection test
+        if (new_max[0] < 0 or new_min[0] > Nx_f - 1 or
+            new_max[1] < 0 or new_min[1] > Ny_f - 1 or
+            new_max[2] < 0 or new_min[2] > Nz_f - 1):
+            if verbose:
+                print(f"    Box does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            'box': {
+                'enabled': True,
+                'corner_min': new_min,
+                'corner_max': new_max,
+            }
+        }
+        if verbose:
+            print(f"    Fine obstacle (box): min=({new_min[0]:.1f}, "
+                  f"{new_min[1]:.1f}, {new_min[2]:.1f}), "
+                  f"max=({new_max[0]:.1f}, {new_max[1]:.1f}, "
+                  f"{new_max[2]:.1f}) [fine lu]")
+
+    return new_config
