@@ -40,9 +40,9 @@ if TYPE_CHECKING:
 class Simulation:
     """Core LBM simulation state and single-step physics.
 
-    This class owns the distribution function buffers (f, f_post, f_new)
+    This class owns the distribution function buffers (f, f_post)
     and all physical operators. One call to `advance()` performs exactly
-    one LBM timestep.
+    one LBM timestep. Streaming writes directly to f (no f_new buffer).
 
     Attributes:
         f:          Current distribution function (Q, Nx, Ny[, Nz])  [dimensionless]
@@ -120,31 +120,61 @@ class Simulation:
 
         # ── Distribution buffers (populated by set_distribution()) ──
         self.f: Optional['npt.NDArray'] = None       # Current distribution  [dimensionless]
-        self._f_new: Optional['npt.NDArray'] = None  # Post-streaming buffer [dimensionless]
         self._f_post: Optional['npt.NDArray'] = None # Post-collision buffer [dimensionless]
 
         # ── Counters ──
         self.step_count: int = 0
         self._is_ready: bool = False
 
+        # ── Fused CUDA kernel (lazy init) ──
+        self._fused_kernel = None
+        self._use_fused: bool = False
+
     # =====================================================================
     # Public Interface
     # =====================================================================
 
     def set_distribution(self, f: 'npt.NDArray') -> None:
-        """Set distribution function and allocate work buffers.
+        """Set distribution function and allocate work buffer.
 
         This is the bridge between Initialization and Execution:
         after calling this, advance() can be called.
+
+        Only one work buffer (f_post) is allocated. Streaming writes
+        directly back to f (pull scheme: source=f_post, dest=f, no conflict).
+
+        If running on GPU with BGK D3Q27, a fused CUDA kernel is used
+        for macroscopic + collision (single kernel launch instead of ~15).
 
         Args:
             f: Initial distribution function, shape (Q, Nx, Ny[, Nz])
                [dimensionless]
         """
         self.f = f
-        self._f_new = self.xp.empty_like(f)
         self._f_post = self.xp.empty_like(f)
         self._is_ready = True
+
+        # ── Try to initialize fused CUDA kernel ──
+        self._use_fused = False
+        self._fused_is_cumulant = False
+        if self.xp.__name__ == 'cupy' and len(self.domain_shape) == 3:
+            from src.collision.bgk import BGKCollision
+            from src.collision.cumulant import CumulantCollision
+            if isinstance(self.collision, BGKCollision):
+                try:
+                    from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
+                    self._fused_kernel = BGKCollideKernelD3Q27()
+                    self._use_fused = True
+                except Exception:
+                    pass
+            elif isinstance(self.collision, CumulantCollision):
+                try:
+                    from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
+                    self._fused_kernel = CumulantCollideKernelD3Q27()
+                    self._use_fused = True
+                    self._fused_is_cumulant = True
+                except Exception:
+                    pass
 
     @property
     def is_ready(self) -> bool:
@@ -172,9 +202,8 @@ class Simulation:
             3. Velocity Corr:   u += F/(2ρ)         (Guo, 2002)
             4. Collision:       f* = collide(f, ρ, u, τ, F)
                                 (equilibrium + forcing internally)
-            5. Streaming:       f' = f*(x - c_i)    (pull scheme)
+            5. Streaming:       f = f*(x - c_i)     (pull, writes to f directly)
             6. Boundary Cond:   domain faces + obstacles
-            7. Buffer Swap:     f ← f'
 
         After calling advance():
             - self.rho, self.u, self.body_force are updated
@@ -190,48 +219,138 @@ class Simulation:
                 "Simulation not ready: call set_distribution() first"
             )
 
+        if self._use_fused and self.al_model is None:
+            self._advance_fused()
+        elif self._use_fused and self.al_model is not None:
+            self._advance_fused_with_alm()
+        else:
+            self._advance_default()
+
+    def _advance_default(self) -> None:
+        """Default advance path using CuPy array operations."""
+
         # ─── Step 1: Macroscopic Variables ───────────────────────────
-        #   ρ(x) = Σ_i f_i(x)                    [dimensionless]
-        #   u(x) = Σ_i c_i·f_i(x) / ρ(x)        [Δx/Δt]
         self.rho, self.u = self.macroscopic.compute(self.f)
 
         # ─── Step 2: Body Force (ALM pipeline) ──────────────────────
-        #   F(x) from Actuator Line Model (BEM → Gaussian spreading)
-        #   Returns None if no ALM is active
         self.body_force = self._compute_body_force(self.u, self.rho)
 
         # ─── Step 3: Guo Velocity Correction ────────────────────────
-        #   u_corrected = u_raw + F / (2ρ)        [Δx/Δt]
-        #   (Guo et al. 2002, Eq.4: ρu = Σξ_i·f_i + F·Δt/2)
-        #   In lattice units (Δt=1): u += F/(2ρ)
         u = self.u
         if self.body_force is not None:
             u = u + self.body_force / (2.0 * self.rho[None, ...])
-            self.u = u  # Store force-corrected velocity for output
+            self.u = u
 
-        # ─── Step 4: Collision (equilibrium + forcing + relaxation) ──
-        #   f* = f − ω(f − f_eq) + S_i
-        #   Equilibrium and Guo forcing are computed internally
-        #   by the collision operator.
+        # ─── Step 4: Collision ───────────────────────────────────────
         self.collision.collide(
             self.f, self._f_post, self.rho, u, self.tau, self.body_force
         )
 
-        # ─── Step 5: Streaming (Pull scheme) ─────────────────────────
-        #   f'(x, t+1) = f*(x - c_i, t)
-        self.streaming.compute(self._f_post, self._f_new)
+        # ─── Step 5: Streaming ───────────────────────────────────────
+        self.streaming.compute(self._f_post, self.f)
 
         # ─── Step 6: Boundary Conditions ─────────────────────────────
-        #   Phase 1: Domain faces (equilibrium, Neumann, etc.)
-        self.bc_manager.apply_all(self._f_new, self._f_post)
-
-        #   Phase 2: Internal obstacles (HalfwayBounceBack)
+        self.bc_manager.apply_all(self.f, self._f_post)
         if self.obstacle_bc is not None:
-            self.obstacle_bc.apply_with_reset(self._f_new, self._f_post)
+            self.obstacle_bc.apply_with_reset(self.f, self._f_post)
 
-        # ─── Step 7: Buffer Swap ─────────────────────────────────────
-        #   f ← f'  (new becomes current)
-        self.f, self._f_new = self._f_new, self.f
+        self.step_count += 1
+
+    def _advance_fused(self) -> None:
+        """Fused CUDA kernel path (no ALM): macro + collision in 1 launch."""
+        xp = self.xp
+        N = 1
+        for d in self.domain_shape:
+            N *= d
+
+        # Allocate rho/u if needed (first call)
+        if self.rho is None:
+            self.rho = xp.empty(self.domain_shape, dtype=self.f.dtype)
+            self.u = xp.empty((len(self.domain_shape),) + self.domain_shape,
+                              dtype=self.f.dtype)
+
+        # ─── Fused: macro + collision (1 kernel launch) ─────────────
+        omega = 1.0 / self.tau
+        if self._fused_is_cumulant:
+            self._fused_kernel.launch(
+                f_in=self.f,
+                f_post=self._f_post,
+                rho_out=self.rho,
+                u_out=self.u,
+                force=None,
+                omega_1=omega,
+                omega_bulk=self.collision.omega_bulk,
+                omega_high=self.collision.omega_3,
+                N=N,
+            )
+        else:
+            self._fused_kernel.launch(
+                f_in=self.f,
+                f_post=self._f_post,
+                rho_out=self.rho,
+                u_out=self.u,
+                force=None,
+                omega=omega,
+                N=N,
+            )
+        self.body_force = None
+
+        # ─── Streaming (1 CuPy operation) ───────────────────────────
+        self.streaming.compute(self._f_post, self.f)
+
+        # ─── Boundary Conditions ─────────────────────────────────────
+        self.bc_manager.apply_all(self.f, self._f_post)
+        if self.obstacle_bc is not None:
+            self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+
+        self.step_count += 1
+
+    def _advance_fused_with_alm(self) -> None:
+        """Fused path with ALM: macro → ALM → fused collision."""
+        xp = self.xp
+        N = 1
+        for d in self.domain_shape:
+            N *= d
+
+        # ─── Step 1: Macroscopic (needed by ALM before collision) ───
+        self.rho, self.u = self.macroscopic.compute(self.f)
+
+        # ─── Step 2: Body Force (ALM pipeline) ──────────────────────
+        self.body_force = self._compute_body_force(self.u, self.rho)
+
+        # ─── Step 3+4: Guo correction + collision (fused kernel) ────
+        omega = 1.0 / self.tau
+        if self._fused_is_cumulant:
+            self._fused_kernel.launch(
+                f_in=self.f,
+                f_post=self._f_post,
+                rho_out=self.rho,
+                u_out=self.u,
+                force=self.body_force,
+                omega_1=omega,
+                omega_bulk=self.collision.omega_bulk,
+                omega_high=self.collision.omega_3,
+                N=N,
+            )
+        else:
+            self._fused_kernel.launch(
+                f_in=self.f,
+                f_post=self._f_post,
+                rho_out=self.rho,
+                u_out=self.u,
+                force=self.body_force,
+                omega=omega,
+                N=N,
+            )
+
+        # ─── Step 5: Streaming ───────────────────────────────────────
+        self.streaming.compute(self._f_post, self.f)
+
+        # ─── Step 6: Boundary Conditions ─────────────────────────────
+        self.bc_manager.apply_all(self.f, self._f_post)
+        if self.obstacle_bc is not None:
+            self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+
         self.step_count += 1
 
     # =====================================================================
