@@ -315,19 +315,36 @@ class ConservationManager:
         if self.log_to_csv:
             os.makedirs(self.csv_dir, exist_ok=True)
             csv_path = os.path.join(self.csv_dir, 'mass_conservation.csv')
-            
-            self._csv_file = open(csv_path, 'w', newline='')
-            
+
             # Header: step, domain_drift, [cv_name_drift, ...]
             fieldnames = ['step', 'domain_drift']
             for cv in self.control_volumes:
                 fieldnames.append(f'{cv.name}_drift')
-            
-            self._csv_writer = csv.writer(self._csv_file)
-            self._csv_writer.writerow(fieldnames)
-            self._csv_file.flush()
-            
-            print(f"  CSV log: {csv_path}")
+
+            if step > 0 and os.path.exists(csv_path):
+                # Restart: keep rows with step < current start_step
+                kept_lines = []
+                with open(csv_path, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    for row in reader:
+                        if row and int(row[0]) < step:
+                            kept_lines.append(row)
+
+                self._csv_file = open(csv_path, 'w', newline='')
+                self._csv_writer = csv.writer(self._csv_file)
+                self._csv_writer.writerow(fieldnames)
+                for row in kept_lines:
+                    self._csv_writer.writerow(row)
+                self._csv_file.flush()
+                print(f"  CSV log: {csv_path} (appending from step {step}, "
+                      f"{len(kept_lines)} previous rows kept)")
+            else:
+                self._csv_file = open(csv_path, 'w', newline='')
+                self._csv_writer = csv.writer(self._csv_file)
+                self._csv_writer.writerow(fieldnames)
+                self._csv_file.flush()
+                print(f"  CSV log: {csv_path}")
     
     def check(self, rho: 'npt.NDArray', step: int,
               verbose: bool = None) -> Dict[str, Any]:

@@ -88,6 +88,7 @@ class OutputManager:
         u_ref_lu: Optional[float] = None,
         config_path: Optional[str] = None,
         mlg_vtk_writer: Optional[object] = None,
+        mlg_force_level: Optional[int] = None,
     ) -> None:
         """Initialize OutputManager with all I/O components.
 
@@ -153,6 +154,7 @@ class OutputManager:
         self.u_ref_lu = u_ref_lu
         self.config_path = config_path
         self.mlg_vtk_writer = mlg_vtk_writer
+        self._mlg_force_level = mlg_force_level
 
         # ── Progress tracking state ──
         self._last_drift: float = 0.0
@@ -274,19 +276,61 @@ class OutputManager:
                     print(f"\n  ✗ ERROR: Max steps without convergence")
 
         # ── MLUPS ──
-        if self.domain_shape is not None:
-            total_cells = 1
+        # For MLG: each level k advances 2^k times per coarse step.
+        # Total lattice updates per coarse step = Σ N_k × 2^k
+        from src.grid.multi_level_grid import MultiLevelGrid
+        if isinstance(sim, MultiLevelGrid):
+            updates_per_step = 0
+            for k in range(sim.num_levels):
+                level = sim.get_level(k)
+                n_k = 1
+                for d in level.domain_shape:
+                    n_k *= d
+                updates_per_step += n_k * (2 ** k)
+        elif self.domain_shape is not None:
+            updates_per_step = 1
             for n in self.domain_shape:
-                total_cells *= n
+                updates_per_step *= n
         else:
-            total_cells = 0
-        mlups = (total_cells * total_steps) / elapsed / 1e6 if elapsed > 0 else 0.0
+            updates_per_step = 0
+        mlups = (updates_per_step * total_steps) / elapsed / 1e6 if elapsed > 0 else 0.0
+
+        # ── Save performance to CSV ──
+        # Determine CSV directory from existing managers
+        _csv_dir = None
+        if self.force_mgr is not None:
+            _csv_dir = getattr(self.force_mgr, 'csv_dir', None)
+        if _csv_dir is None and self.conservation_mgr is not None:
+            _csv_dir = getattr(self.conservation_mgr, 'csv_dir', None)
+        if _csv_dir is None:
+            _csv_dir = './results/csv'
+        perf_path = os.path.join(_csv_dir, 'performance.csv')
+        try:
+            _csv_dir = os.path.dirname(perf_path)
+            if _csv_dir:
+                os.makedirs(_csv_dir, exist_ok=True)
+            with open(perf_path, 'w', newline='') as pf:
+                import csv as _csv
+                pw = _csv.writer(pf)
+                pw.writerow(['start_step', 'end_step', 'total_steps',
+                             'elapsed_sec', 'updates_per_step', 'mlups',
+                             'is_mlg', 'num_levels'])
+                pw.writerow([
+                    self._start_step, self._end_step, total_steps,
+                    f"{elapsed:.3f}", updates_per_step, f"{mlups:.2f}",
+                    isinstance(sim, MultiLevelGrid),
+                    sim.num_levels if isinstance(sim, MultiLevelGrid) else 1,
+                ])
+        except Exception:
+            pass  # non-critical
 
         # ── Summary header ──
         print("\n" + "=" * 70)
         print(f"[7] Summary")
         print(f"  Completed: step {self._start_step} → {final_step}")
         print(f"  Time: {elapsed:.2f}s | MLUPS: {mlups:.2f}")
+        if isinstance(sim, MultiLevelGrid):
+            print(f"  (updates/coarse step: {updates_per_step:,})")
 
         # ── Final macroscopic recompute ──
         rho_final, u_final = self.macroscopic.compute(sim.f)
@@ -374,14 +418,26 @@ class OutputManager:
     # =====================================================================
 
     def _process_force(self, step: int, sim: 'Simulation') -> None:
-        """MEM force calculation (if enabled and at correct interval)."""
+        """MEM force calculation (if enabled and at correct interval).
+
+        For MLG: uses the finest level's f_post where the obstacle exists,
+        because L0's f_post is captured before F→C coupling and does not
+        reflect the fine-grid solution.
+        """
         if self.force_mgr is None:
             return
         if not self.force_mgr.should_compute(step):
             return
 
+        # Select f_post from the correct level
+        if (self._mlg_force_level is not None
+                and hasattr(sim, 'get_level')):
+            f_post = sim.get_level(self._mlg_force_level).f_post
+        else:
+            f_post = sim.f_post
+
         force_result = self.force_mgr.compute_and_log(
-            step, sim.f_post, verbose=False,
+            step, f_post, verbose=False,
         )
         if force_result:
             self._last_Cd = force_result['Cd']

@@ -1,35 +1,26 @@
 """
-Sphere Drag Validation — Re=100, 2-Level MLG
+Sphere Drag — Re=100,000, 3-Level MLG, Cumulant Collision
 
-Validates fine-level obstacle support by comparing drag coefficient:
-  - MLG enabled:  L0 at D/dx=20, L1 at D/dx=40  (sphere in fine region)
-  - MLG disabled: Single grid at D/dx=20          (set mlg.enabled = False)
+High-Re turbulent flow past a sphere.
+Cumulant collision is REQUIRED (BGK unstable above Re~8,000).
 
-Physical Setup:
-  - Steady, axisymmetric flow past a sphere at Re=100
-  - Uniform inlet velocity, no-slip walls (sides), sponge outlet
-  - Blockage ratio: π(D/2)² / (Ny×Nz) ≈ 1.2%
+Resolution:
+  L0: D/dx = 20  (coarse, far-field)
+  L1: D/dx = 40  (near-wake)
+  L2: D/dx = 80  (sphere surface, force measurement)
 
-Reference Values (Re=100):
-  - Johnson & Patel 1999:  Cd ≈ 1.09
-  - Geier et al. 2015:    Cd ≈ 1.09 (Cumulant LBM)
-  - Clift, Grace, Weber:  Cd ≈ 1.087
+Reference (Geier et al. 2015, Fig. 11):
+  Re=100,000: Cd ≈ 0.4–0.5 (turbulent, unsteady)
+  Geier used 5-level with D=256 at finest — our D=80 is coarser,
+  so this is primarily a stability/code validation test.
 
-Domain Layout:
-  ──────────────────────────────────────────────────────
-  │          ┌──────────────────────┐                  │
-  │  inlet   │   Fine L1 region     │          outlet  │
-  │ ───→     │      ● sphere        │           ───→   │
-  │  x=0     │                      │          x=300   │
-  │          └──────────────────────┘                  │
-  ──────────────────────────────────────────────────────
-  Sphere: D=20, center=(100, 80, 80)  [L0 lattice units]
-  Fine:   x∈[60,200], y∈[40,120], z∈[40,120]
-          → 2D upstream, 5D downstream, ±2D lateral
+Stability:
+  τ_0 = 0.50003 (ω → 2), τ_2 = 0.50012 at finest level.
+  Cumulant handles this; BGK would immediately diverge.
 
 Usage:
-    python main.py --config configs/mlg_sphere_drag_Re100.py
-    python main.py --config configs/mlg_sphere_drag_Re100.py --verbose
+    python main.py --config configs/mlg_sphere_drag_Re100k.py
+    python main.py --config configs/mlg_sphere_drag_Re100k.py --verbose
 
 Author: LBM Development Team
 Date: 2026-04
@@ -40,84 +31,94 @@ import numpy as np
 # =============================================================================
 # §1. PHYSICAL PARAMETERS
 # =============================================================================
-RE = 100
-D = 20                          # Sphere diameter  [lattice units]  (coarse test)
+RE = 100000
+D = 20                          # Sphere diameter  [lattice units]
 U_INLET = 0.05                  # Inlet velocity   [Δx/Δt]
 RHO = 1.0                       # Reference density [dimensionless]
 
-# Domain dimensions
-Nx = 200 
-Ny = 100
-Nz = 100
+# Domain: 20D × 8D × 8D
+Nx = 300
+Ny = 160
+Nz = 160
 
-# Sphere position: 5D from inlet, centered in y-z
-CENTER_X = Nx // 4
-CENTER_Y = Ny // 2
-CENTER_Z = Nz // 2
+# Sphere position: 3D from inlet, centered in y-z
+CENTER_X = 3 * D                # = 60
+CENTER_Y = Ny // 2              # = 80
+CENTER_Z = Nz // 2              # = 80
 
-RESOLUTION = D                  # Characteristic length = sphere diameter
+RESOLUTION = D
 
 # =============================================================================
 # §2. DERIVED LATTICE PARAMETERS
 #
-#   Re = U·D / ν  →  ν = U·D / Re
-#   τ = 0.5 + 3ν  (BGK relaxation time)
-#   Ma = U / cs   (cs = 1/√3 for D3Q27)
+#   ν = U·D / Re = 1e-5   (very small → τ close to 0.5)
+#   τ = 0.5 + 3ν = 0.50003
+#   Ma = U / cs ≈ 0.087
+#
+#   Level τ values (convective scaling):
+#     L0: τ = 0.50003  (ω = 1.99988)
+#     L1: τ = 0.50006  (ω = 1.99976)
+#     L2: τ = 0.50012  (ω = 1.99952)
 # =============================================================================
-NU_LU = U_INLET * D / RE       # = 0.01  [Δx²/Δt]
-TAU = 0.5 + 3.0 * NU_LU       # = 0.53  [Δt]
+NU_LU = U_INLET * D / RE       # = 1e-5  [Δx²/Δt]
+TAU = 0.5 + 3.0 * NU_LU       # = 0.50003
 
 CS = 1.0 / np.sqrt(3.0)
-MA = U_INLET / CS              # ≈ 0.087
+MA = U_INLET / CS
 
-assert TAU > 0.5, f"UNSTABLE: τ = {TAU:.4f}"
+assert TAU > 0.5, f"UNSTABLE: τ = {TAU:.8f}"
 assert MA < 0.3, f"COMPRESSIBILITY: Ma = {MA:.3f} > 0.3"
 
-# Sphere frontal area: A = π(D/2)² = πD²/4
-# ForceManager computes A_ref = char_length × span_length
-# → span_length = πD/4 to yield correct A_ref for sphere
-A_FRONTAL = np.pi * (D / 2) ** 2   # ≈ 314.16  [Δx²]
-SPAN_FOR_SPHERE = A_FRONTAL / D     # = πD/4 ≈ 15.71  [Δx]
+# Sphere frontal area
+A_FRONTAL = np.pi * (D / 2) ** 2
+SPAN_FOR_SPHERE = A_FRONTAL / D     # πD/4
+BLOCKAGE = A_FRONTAL / (Ny * Nz) * 100
 
-BLOCKAGE = A_FRONTAL / (Ny * Nz) * 100  # ≈ 1.23%
-
-print(f"  [Sphere Drag] Re={RE}, D={D}, τ={TAU:.4f}, Ma={MA:.4f}")
-print(f"  ν = {NU_LU:.6f}, U = {U_INLET}")
+print(f"  [Sphere Re=100k] D={D}, τ={TAU:.8f}, Ma={MA:.4f}")
+print(f"  ν = {NU_LU:.2e}, τ-0.5 = {TAU-0.5:.2e}")
 print(f"  Sphere center: ({CENTER_X}, {CENTER_Y}, {CENTER_Z})")
-print(f"  Frontal area: {A_FRONTAL:.2f}, Blockage: {BLOCKAGE:.2f}%")
+print(f"  Blockage: {BLOCKAGE:.2f}%")
 
 # =============================================================================
-# §3. MLG CONFIGURATION (2-Level)
+# §3. MLG CONFIGURATION (3-Level)
 #
-#   Level 0: full domain, D/dx = 20
-#   Level 1: fine region around sphere, D/dx = 40 (2× resolution)
+#   Level 0: full domain, D/dx=20
+#   Level 1: near-wake region, D/dx=40
+#   Level 2: sphere surface region, D/dx=80
 #
-#   Fine region margins:
-#     upstream:   2D before sphere center  (captures stagnation region)
-#     downstream: 5D after sphere center   (captures near-wake)
-#     lateral:    ±2D from sphere center   (captures separation zone)
+#   L1: 2D upstream, 8D downstream, ±2D lateral (captures turbulent wake)
+#   L2: 1D upstream, 4D downstream, ±1D lateral (sphere + separation)
 # =============================================================================
 OVERLAP_WIDTH = 2
 INTERP_SCHEME = "cubic"
 FILTER_LEVEL = 1
 
-FINE_X_MIN = 30
-FINE_X_MAX = 120
-FINE_Y_MIN = 30
-FINE_Y_MAX = 70
-FINE_Z_MIN = 30
-FINE_Z_MAX = 70
+# Level 1 region (compact: 1D up, 3D down, ±1D lateral)
+L1_X_MIN = CENTER_X - 1 * D        # = 40
+L1_X_MAX = CENTER_X + 5 * D        # = 120
+L1_Y_MIN = CENTER_Y - 1 * D        # = 60
+L1_Y_MAX = CENTER_Y + 1 * D        # = 100
+L1_Z_MIN = CENTER_Z - 1 * D        # = 60
+L1_Z_MAX = CENTER_Z + 1 * D        # = 100
+
+# Level 2 region (tight: 0.6D up, 1.2D down, ±0.6D lateral)
+L2_M = int(0.6 * D)                # = 12
+L2_X_MIN = CENTER_X - L2_M         # = 48
+L2_X_MAX = CENTER_X + int(1.2 * D) # = 84
+L2_Y_MIN = CENTER_Y - L2_M         # = 68
+L2_Y_MAX = CENTER_Y + L2_M         # = 92
+L2_Z_MIN = CENTER_Z - L2_M         # = 68
+L2_Z_MAX = CENTER_Z + L2_M         # = 92
 
 # =============================================================================
 # §4. SIMULATION SETTINGS
 # =============================================================================
 simulation = {
     "device_mode": "gpu",
-    "precision": "float32",         # "float32" (fast test) or "float64" (production)
-    "validate_lattice": False,
+    "precision": "float32",
     "dimension": 3,
     "lattice_model": "D3Q27",
-    "collision_model": "cumulant",
+    "collision_model": "cumulant",      # REQUIRED for Re=100k (BGK unstable)
 
     "domain": {"Nx": Nx, "Ny": Ny, "Nz": Nz},
 
@@ -132,26 +133,24 @@ simulation = {
     },
 
     "time": {
-        "max_steps": 20000,
+        "max_steps": 50000,
         "output_interval": 500,
-        "checkpoint_interval": 5000,
+        "checkpoint_interval": 10000,
     },
 }
 
 # =============================================================================
 # §5. BOUNDARY CONDITIONS
 #
-#   Physical setup for external flow past a sphere:
-#     - Inlet (xmin):  Uniform velocity  U = (U_inlet, 0, 0)
-#     - Outlet (xmax): Sponge layer (non-reflecting, absorbs wake structures)
-#     - Walls (y,z):   No-slip walls (blockage ~1.2%, acceptable for Re=100)
+#   Far-field: regularized_inlet on all sides (uniform freestream)
+#   Outlet: sponge layer (absorbs turbulent wake structures)
 # =============================================================================
 boundaries = {
     "inlet":      {"location": "xmin", "method": "regularized_inlet",
                    "velocity": U_INLET, "rho": RHO},
     "outlet":     {"location": "xmax", "method": "sponge",
                    "velocity": [U_INLET, 0, 0], "density": RHO,
-                   "thickness": 10, "sigma_max": 0.1},
+                   "thickness": 15, "sigma_max": 0.1},
     "wall_south": {"location": "ymin", "method": "regularized_inlet",
                    "velocity": U_INLET, "rho": RHO},
     "wall_north": {"location": "ymax", "method": "regularized_inlet",
@@ -164,10 +163,6 @@ boundaries = {
 
 # =============================================================================
 # §6. INTERNAL GEOMETRY — Sphere
-#
-#   Sphere at domain center (y,z), 5D from inlet (x).
-#   L0: D/dx = 20  (20 grid points per diameter)
-#   L1: D/dx = 40  (40 grid points per diameter, auto-generated by MLG)
 # =============================================================================
 internal_geometry = {
     "sphere": {
@@ -178,23 +173,26 @@ internal_geometry = {
 }
 
 # =============================================================================
-# §7. MLG — 2 Levels
-#
-#   To run single-grid comparison: set "enabled": False
+# §7. MLG — 3 Levels
 # =============================================================================
 mlg = {
     "enabled": True,
-    "num_levels": 2,
+    "num_levels": 3,
     "overlap_width": OVERLAP_WIDTH,
     "interpolation": INTERP_SCHEME,
     "filter_level": FILTER_LEVEL,
     "levels": [
-        {},  # Level 0 = full domain
+        {},  # Level 0: D=20
 
-        # Level 1: fine region around sphere
-        {"region": {"x_min": FINE_X_MIN, "x_max": FINE_X_MAX,
-                    "y_min": FINE_Y_MIN, "y_max": FINE_Y_MAX,
-                    "z_min": FINE_Z_MIN, "z_max": FINE_Z_MAX}},
+        # Level 1: D=40, near-wake
+        {"region": {"x_min": L1_X_MIN, "x_max": L1_X_MAX,
+                    "y_min": L1_Y_MIN, "y_max": L1_Y_MAX,
+                    "z_min": L1_Z_MIN, "z_max": L1_Z_MAX}},
+
+        # Level 2: D=80, sphere surface
+        {"region": {"x_min": L2_X_MIN, "x_max": L2_X_MAX,
+                    "y_min": L2_Y_MIN, "y_max": L2_Y_MAX,
+                    "z_min": L2_Z_MIN, "z_max": L2_Z_MAX}},
     ],
 }
 
@@ -209,26 +207,26 @@ conservation = {
 }
 
 # =============================================================================
-# §9. CONVERGENCE DETECTION (Cauchy criterion on Cd)
+# §9. CONVERGENCE DETECTION
 #
-#   Re=100 is steady axisymmetric flow → Cd converges to constant value.
-#   Cauchy criterion: |μ_new − μ_old| / |μ_old| < ε_Cd
+#   Re=100,000 is turbulent → Cd oscillates, no true steady state.
+#   Cauchy criterion on Cd mean: detect when mean Cd stabilizes.
+#   Use larger epsilon since periodic fluctuations exist.
 #
-#   Convective time scale: T_conv = D / U = 20 / 0.05 = 400 steps
-#   Window = 50 × T_conv / probe_interval = 50 × 400 / 10 = 2000 samples
+#   T_conv = D / U = 400 steps
 # =============================================================================
 convergence = {
     "enabled": True,
 
     "cauchy": {
         "window_size": "auto",
-        "epsilon": 1e-5,            # Kinetic energy threshold
-        "Cd_epsilon": 1e-3,         # Drag coefficient threshold
+        "epsilon": 1e-4,            # Kinetic energy (relaxed for turbulent)
+        "Cd_epsilon": 5e-3,         # Cd mean drift threshold (relaxed)
 
-        "n_required": 3,            # 3 consecutive passes for robust detection
+        "n_required": 3,
 
         "auto_window": {
-            "time_coverage": 50.0,  # Window spans 50 × T_conv
+            "time_coverage": 50.0,
             "min_samples": 200,
         },
     },
@@ -240,25 +238,17 @@ convergence = {
 
 # =============================================================================
 # §10. FORCE CALCULATION
-#
-#   Momentum Exchange Method (MEM) for sphere drag/lift:
-#     Cd = Fx / (0.5 · ρ · U² · A_frontal)
-#     A_frontal = π(D/2)²  (sphere frontal area)
-#
-#   In ForceManager: A_ref = char_length × span_length
-#   → char_length = D, span_length = πD/4
-#   → A_ref = D × πD/4 = πD²/4 = A_frontal  ✓
 # =============================================================================
 force_calculation = {
     "enabled": True,
     "interval": 10,
-    "start_step": 500,              # Skip initial transient (~1.25 T_conv)
+    "start_step": 1000,             # Skip longer transient for high Re
 
     "reference": {
         "rho": RHO,
         "velocity": U_INLET,
         "char_length": D,
-        "span_length": SPAN_FOR_SPHERE,     # πD/4 ≈ 15.71  → A = πD²/4
+        "span_length": SPAN_FOR_SPHERE,
     },
 
     "log": {

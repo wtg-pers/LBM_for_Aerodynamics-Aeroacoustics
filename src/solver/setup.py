@@ -155,7 +155,7 @@ class SimulationSetup:
         log_dir = getattr(self, '_csv_dir', './results/csv')
         os.makedirs(log_dir, exist_ok=True)
         self._log_path = os.path.join(log_dir, 'setup_log.txt')
-        with open(self._log_path, 'w') as f:
+        with open(self._log_path, 'w', encoding='utf-8') as f:
             f.write(self._log_buffer.getvalue())
 
         # ── Print compact summary to terminal ────────────────────
@@ -194,7 +194,7 @@ class SimulationSetup:
     def stop_log_capture(self) -> None:
         """Restore stdout and update log file."""
         sys.stdout = self._original_stdout
-        with open(self._log_path, 'w') as f:
+        with open(self._log_path, 'w', encoding='utf-8') as f:
             f.write(self._log_buffer.getvalue())
 
     # =====================================================================
@@ -258,6 +258,7 @@ class SimulationSetup:
             u_ref_lu=self.u_ref_lu,
             config_path=self._args.config,
             mlg_vtk_writer=self._mlg_vtk_writer if self._mlg_enabled else None,
+            mlg_force_level=getattr(self, '_mlg_force_level', None),
         )
 
     # =====================================================================
@@ -310,13 +311,21 @@ class SimulationSetup:
         self.lattice = get_lattice(lattice_model, self.xp, dtype=self.compute_dtype)
         self._dimension = self.sim_params.get('dimension')
 
-        print(f"\n[0] Validating Lattice Model ({lattice_model})...")
-        validator = LatticeValidator(self.xp)
-        is_valid, _ = validator.validate_all(
-            self.lattice.c, self.lattice.w, self.lattice.cs2, verbose=True,
-        )
-        if not is_valid:
-            raise RuntimeError("Lattice validation failed!")
+        # ── Lattice validation (optional) ────────────────────────
+        # Skipped by default for known models. Enable via config:
+        #   "simulation": {"validate_lattice": true}
+        if self.sim_params.get('validate_lattice', False):
+            import numpy as _np
+            print(f"\n[0] Validating Lattice Model ({lattice_model})...")
+            _val_lattice = get_lattice(lattice_model, _np, dtype=_np.float64)
+            validator = LatticeValidator(self.xp)
+            is_valid, _ = validator.validate_all(
+                _val_lattice.c, _val_lattice.w, _val_lattice.cs2, verbose=True,
+            )
+            if not is_valid:
+                raise RuntimeError("Lattice validation failed!")
+        else:
+            print(f"\n[0] Lattice: {lattice_model} (precision: {precision_str})")
 
     def _setup_domain(self) -> None:
         """[1] Domain setup."""
@@ -351,9 +360,7 @@ class SimulationSetup:
         self.config_max_steps: int = tc.get('max_steps', 10000)
         self.output_interval: int = tc.get('output_interval', 500)
         self.checkpoint_interval: int = tc.get('checkpoint_interval', 2000)
-        self._force_interval: int = tc.get(
-            'probe_interval', fc.get('interval', 10),
-        )
+        self._force_interval: int = fc.get('interval', 10)
 
         print(f"\n[2] Physics Parameters")
         print(f"  Re = {self.Re}")
@@ -490,18 +497,19 @@ class SimulationSetup:
             print("  Checkpoint: disabled")
 
         # ── Rotor CSV ──
+        # CSV is opened by SolverInitializer after start_step is known,
+        # so that restart preserves existing data.
         self.perf_csv_path: Optional[str] = None
+        self._perf_csv_header = (
+            'step,time_lt,time_phys,revolutions,'
+            'thrust_lu,torque_lu,power_lu,'
+            'C_T,C_P,coeff_mode,u_inf_used,FM\n'
+        )
         if self.al_enabled:
             self.perf_csv_path = os.path.join(
                 self._csv_dir, 'rotor_performance.csv',
             )
-            with open(self.perf_csv_path, 'w') as fh:
-                fh.write(
-                    'step,time_lt,time_phys,revolutions,'
-                    'thrust_lu,torque_lu,power_lu,'
-                    'C_T,C_P,coeff_mode,u_inf_used,FM\n'
-                )
-            print(f"  Rotor CSV: {self.perf_csv_path}")
+            print(f"  Rotor CSV: {self.perf_csv_path} (opened at init)")
 
     def _create_lbm_components(self) -> None:
         """Create core LBM operator objects.
@@ -981,6 +989,50 @@ class SimulationSetup:
         mlg = MultiLevelGrid(levels=simulations, couplings=couplings)
         print(f"\n  MultiLevelGrid assembled:")
         print(f"  {mlg.summary()}")
+
+        # ── MLG force: measure on finest level with obstacle ─────
+        # Physical reason: the finest level has the most accurate
+        # representation of the obstacle surface and flow field.
+        # L0 f_post is captured before F→C coupling, so it does not
+        # reflect the fine-grid solution.
+        self._mlg_force_level: Optional[int] = None
+        if self.force_mgr is not None:
+            for k in range(num_levels - 1, -1, -1):
+                if simulations[k].obstacle_bc is not None and k > 0:
+                    lu_k = self._mlg_scaler.get_level_units(k)
+                    scale = 1.0 / lu_k.dx   # = 2^k
+
+                    fc = self._force_config
+                    ref_config = fc.get('reference', {})
+                    fine_force_config = {
+                        'enabled': True,
+                        'interval': self._force_interval,
+                        'start_step': fc.get('start_step', 0),
+                        'reference': {
+                            'rho': self.force_mgr.rho_ref,
+                            'velocity': self.force_mgr.u_ref,
+                            'char_length': self.force_mgr.char_length * scale,
+                            'span_length': self.force_mgr.span_length * scale,
+                        },
+                        'log': {'enabled': True, 'filename': 'force_history'},
+                    }
+
+                    self.force_mgr.close()
+                    self.force_mgr = ForceManager(
+                        xp=xp,
+                        lattice=self.lattice,
+                        solid_mask=simulations[k].obstacle_bc.solid_mask,
+                        config=fine_force_config,
+                        wall_bc=simulations[k].obstacle_bc,
+                        csv_dir=self._csv_dir,
+                    )
+                    self.force_mgr.initialize()
+                    self._mlg_force_level = k
+                    print(f"\n  Force measurement: Level {k} "
+                          f"(D_fine={self.force_mgr.char_length:.0f} "
+                          f"[fine lu])")
+                    break
+
         return mlg
 
     # =====================================================================

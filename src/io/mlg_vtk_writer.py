@@ -169,6 +169,12 @@ class MLGVTKWriter:
             if rho is None or u is None:
                 continue
 
+            # Extract solid mask from obstacle BC (if present)
+            solid_mask = None
+            if (level_sim.obstacle_bc is not None
+                    and hasattr(level_sim.obstacle_bc, 'solid_mask')):
+                solid_mask = level_sim.obstacle_bc.solid_mask
+
             # File in level subdirectory
             vti_filename = f"{prefix}_{step:08d}_level{k}.vti"
             vti_filepath = os.path.join(self._level_dirs[k], vti_filename)
@@ -180,6 +186,7 @@ class MLGVTKWriter:
                 spacing=info['spacing'],
                 rho=rho,
                 u=u,
+                solid_mask=solid_mask,
             )
 
             # Relative path from .vth location (vtk/vth/) to .vti (vtk/level{k}/)
@@ -211,6 +218,7 @@ class MLGVTKWriter:
         spacing: Tuple[float, float, float],
         rho: np.ndarray,
         u: np.ndarray,
+        solid_mask: Optional[np.ndarray] = None,
     ) -> None:
         """Write a single level's data as VTK ImageData (.vti).
 
@@ -243,11 +251,6 @@ class MLGVTKWriter:
             u_np.transpose(3, 2, 1, 0)
         ).astype(dtype).tobytes()
 
-        u_mag = np.sqrt(np.sum(u_np ** 2, axis=0))
-        u_mag_flat = np.ascontiguousarray(
-            u_mag.transpose(2, 1, 0)
-        ).astype(dtype).tobytes()
-
         # ── Build XML ────────────────────────────────────────────
         ox, oy, oz = origin
         sx, sy, sz = spacing
@@ -255,8 +258,17 @@ class MLGVTKWriter:
         data_arrays = [
             ('density', vtk_type, 1, rho_flat),
             ('velocity', vtk_type, 3, u_interleaved),
-            ('velocity_magnitude', vtk_type, 1, u_mag_flat),
         ]
+
+        if solid_mask is not None:
+            if hasattr(solid_mask, 'get'):
+                mask_np = solid_mask.get()
+            else:
+                mask_np = np.asarray(solid_mask)
+            mask_flat = np.ascontiguousarray(
+                mask_np.astype(np.int8).transpose(2, 1, 0)
+            ).tobytes()
+            data_arrays.append(('solid_mask', 'Int8', 1, mask_flat))
 
         xml_lines = [
             '<?xml version="1.0"?>',

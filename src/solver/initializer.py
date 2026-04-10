@@ -13,6 +13,7 @@ Author: LBM Development Team
 Date: 2026-03 (MLG checkpoint restart: 2026-04)
 """
 
+import os
 from typing import TYPE_CHECKING, Any, Tuple
 
 if TYPE_CHECKING:
@@ -73,6 +74,37 @@ class SolverInitializer:
             f_for_monitor = sim.f
             rho_init, _ = self._setup.macro.compute(f_for_monitor)
             self._setup.conservation_mgr.initialize(rho_init, step=start_step)
+
+        # ── Step 4b: Open CSV files (with start_step for restart) ─
+        if self._setup.force_mgr is not None:
+            self._setup.force_mgr.open_csv(start_step=start_step)
+
+        # Rotor CSV: open with start_step awareness
+        if self._setup.perf_csv_path is not None:
+            path = self._setup.perf_csv_path
+            header = self._setup._perf_csv_header
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+            if start_step > 0 and os.path.exists(path):
+                # Restart: keep rows < start_step
+                kept = []
+                with open(path, 'r') as f:
+                    _ = f.readline()  # skip old header
+                    for line in f:
+                        if line.strip():
+                            step_val = int(line.split(',')[0])
+                            if step_val < start_step:
+                                kept.append(line)
+                with open(path, 'w') as f:
+                    f.write(header)
+                    f.writelines(kept)
+                print(f"  Rotor CSV: {path} (kept {len(kept)} rows, "
+                      f"appending from step {start_step})")
+            else:
+                # Fresh start: write header only
+                with open(path, 'w') as f:
+                    f.write(header)
+                print(f"  Rotor CSV: {path}")
 
         # ── Step 5: Info ─────────────────────────────────────────
         if hasattr(sim, 'print_info'):

@@ -308,31 +308,60 @@ class ForceManager:
         self._csv_writer = None
     
     def initialize(self) -> None:
-        """Initialize force manager (setup CSV logging)"""
+        """Print force manager info. CSV is opened later by open_csv()."""
         if not self.enabled:
             print("  Force calculation: disabled")
             return
-        
-        # Print force calculator info
+
         print(f"  {self.force_calc.get_info()}")
         print(f"  Reference: ρ={self.rho_ref}, U={self.u_ref}, D={self.char_length}, Lz={self.span_length}")
         print(f"  Interval: every {self.interval} steps (start from step {self.start_step})")
-        
-        if self.log_enabled:
-            os.makedirs(self.csv_dir, exist_ok=True)
-            csv_path = os.path.join(self.csv_dir, f"{self.log_filename}.csv")
-            
+
+    def open_csv(self, start_step: int = 0) -> None:
+        """Open CSV log file. Called by SolverInitializer after start_step is known.
+
+        Args:
+            start_step: First step of this run. If > 0 (restart),
+                        existing CSV rows up to start_step are preserved
+                        and new data is appended.
+        """
+        if not self.enabled or not self.log_enabled:
+            return
+
+        os.makedirs(self.csv_dir, exist_ok=True)
+        csv_path = os.path.join(self.csv_dir, f"{self.log_filename}.csv")
+
+        if self.dim == 2:
+            fieldnames = ['step', 'Fx', 'Fy', 'Cd', 'Cl']
+        else:
+            fieldnames = ['step', 'Fx', 'Fy', 'Fz', 'Cd', 'Cl', 'Cz']
+
+        if start_step > 0 and os.path.exists(csv_path):
+            # Restart: keep rows with step < start_step
+            kept_lines = []
+            with open(csv_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if int(row['step']) < start_step:
+                        kept_lines.append(row)
+
             self._csv_file = open(csv_path, 'w', newline='')
-            
-            if self.dim == 2:
-                fieldnames = ['step', 'Fx', 'Fy', 'Cd', 'Cl']
-            else:
-                fieldnames = ['step', 'Fx', 'Fy', 'Fz', 'Cd', 'Cl', 'Cz']
-            
-            self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
+            self._csv_writer = csv.DictWriter(
+                self._csv_file, fieldnames=fieldnames,
+            )
             self._csv_writer.writeheader()
-            
-            print(f"  CSV log: {csv_path}")
+            for row in kept_lines:
+                self._csv_writer.writerow(row)
+            self._csv_file.flush()
+            print(f"  Force CSV: {csv_path} (kept {len(kept_lines)} rows, "
+                  f"appending from step {start_step})")
+        else:
+            self._csv_file = open(csv_path, 'w', newline='')
+            self._csv_writer = csv.DictWriter(
+                self._csv_file, fieldnames=fieldnames,
+            )
+            self._csv_writer.writeheader()
+            print(f"  Force CSV: {csv_path}")
     
     def should_compute(self, step: int) -> bool:
         """Check if force should be computed at this step"""
