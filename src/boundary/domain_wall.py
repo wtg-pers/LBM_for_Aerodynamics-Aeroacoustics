@@ -143,57 +143,114 @@ class DomainWallBounceBack(BoundaryCondition):
     
     def _apply_2d(self, f: 'npt.NDArray', f_post: Optional['npt.NDArray']) -> None:
         """Apply for 2D domain"""
-        f_source = f_post if f_post is not None else f
-        
         incoming = self.incoming_indices
         incoming_opp = self.incoming_opp
         x_sl = self.x_slice
-        
         Nx, Ny = f.shape[1], f.shape[2]
         loc = self.location.value
-        
+
+        if f_post is not None:
+            f_source = f_post
+        else:
+            # In-place: save outgoing before overwriting
+            f_source = f
+
+        # For domain walls, incoming and outgoing are different q indices
+        # at the same face nodes. Direction-pair conflict is possible when
+        # f_source = f, so we save all source values first.
+        if f_post is None:
+            saved = {}
+            if loc in ['ymin', 'south']:
+                for i_opp in incoming_opp:
+                    saved[i_opp] = f[i_opp, x_sl, 0].copy()
+            elif loc in ['ymax', 'north']:
+                for i_opp in incoming_opp:
+                    saved[i_opp] = f[i_opp, x_sl, Ny-1].copy()
+            elif loc in ['xmin', 'west']:
+                for i_opp in incoming_opp:
+                    saved[i_opp] = f[i_opp, 0, :].copy()
+            elif loc in ['xmax', 'east']:
+                for i_opp in incoming_opp:
+                    saved[i_opp] = f[i_opp, Nx-1, :].copy()
+            f_source_data = saved
+        else:
+            f_source_data = None
+
         if loc in ['ymin', 'south']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, 0] = f_source[i_opp, x_sl, 0]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, x_sl, 0]
+                f[i, x_sl, 0] = src
         elif loc in ['ymax', 'north']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, Ny-1] = f_source[i_opp, x_sl, Ny-1]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, x_sl, Ny-1]
+                f[i, x_sl, Ny-1] = src
         elif loc in ['xmin', 'west']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, 0, :] = f_source[i_opp, 0, :]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, 0, :]
+                f[i, 0, :] = src
         elif loc in ['xmax', 'east']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, Nx-1, :] = f_source[i_opp, Nx-1, :]
-    
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, Nx-1, :]
+                f[i, Nx-1, :] = src
+
     def _apply_3d(self, f: 'npt.NDArray', f_post: Optional['npt.NDArray']) -> None:
         """Apply for 3D domain"""
-        f_source = f_post if f_post is not None else f
-        
         incoming = self.incoming_indices
         incoming_opp = self.incoming_opp
         x_sl = self.x_slice
-        
         Nx, Ny, Nz = f.shape[1], f.shape[2], f.shape[3]
         loc = self.location.value
-        
+
+        if f_post is not None:
+            f_source = f_post
+            f_source_data = None
+        else:
+            # In-place: save outgoing before overwriting
+            f_source_data = {}
+            if loc in ['ymin', 'south']:
+                for i_opp in incoming_opp:
+                    f_source_data[i_opp] = f[i_opp, x_sl, 0, :].copy()
+            elif loc in ['ymax', 'north']:
+                for i_opp in incoming_opp:
+                    f_source_data[i_opp] = f[i_opp, x_sl, Ny-1, :].copy()
+            elif loc in ['zmin', 'bottom']:
+                for i_opp in incoming_opp:
+                    f_source_data[i_opp] = f[i_opp, x_sl, :, 0].copy()
+            elif loc in ['zmax', 'top']:
+                for i_opp in incoming_opp:
+                    f_source_data[i_opp] = f[i_opp, x_sl, :, Nz-1].copy()
+            elif loc in ['xmin', 'west']:
+                for i_opp in incoming_opp:
+                    f_source_data[i_opp] = f[i_opp, 0, :, :].copy()
+            elif loc in ['xmax', 'east']:
+                for i_opp in incoming_opp:
+                    f_source_data[i_opp] = f[i_opp, Nx-1, :, :].copy()
+            f_source = None
+
         if loc in ['ymin', 'south']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, 0, :] = f_source[i_opp, x_sl, 0, :]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, x_sl, 0, :]
+                f[i, x_sl, 0, :] = src
         elif loc in ['ymax', 'north']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, Ny-1, :] = f_source[i_opp, x_sl, Ny-1, :]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, x_sl, Ny-1, :]
+                f[i, x_sl, Ny-1, :] = src
         elif loc in ['zmin', 'bottom']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, :, 0] = f_source[i_opp, x_sl, :, 0]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, x_sl, :, 0]
+                f[i, x_sl, :, 0] = src
         elif loc in ['zmax', 'top']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, x_sl, :, Nz-1] = f_source[i_opp, x_sl, :, Nz-1]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, x_sl, :, Nz-1]
+                f[i, x_sl, :, Nz-1] = src
         elif loc in ['xmin', 'west']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, 0, :, :] = f_source[i_opp, 0, :, :]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, 0, :, :]
+                f[i, 0, :, :] = src
         elif loc in ['xmax', 'east']:
             for i, i_opp in zip(incoming, incoming_opp):
-                f[i, Nx-1, :, :] = f_source[i_opp, Nx-1, :, :]
+                src = f_source_data[i_opp] if f_source_data else f_source[i_opp, Nx-1, :, :]
+                f[i, Nx-1, :, :] = src
     
     def get_info(self) -> str:
         """Return information string"""

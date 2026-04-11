@@ -188,6 +188,9 @@ class Simulation:
         Needed by MEM (Momentum Exchange Method) force calculation.
         Valid after the most recent advance() call.
 
+        In streaming-fused mode (ping-pong), f itself is the post-collision
+        state after swap, so f_post returns f.
+
         Returns:
             Post-collision f, shape (Q, Nx, Ny[, Nz])  [dimensionless]
         """

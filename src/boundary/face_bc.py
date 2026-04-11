@@ -419,25 +419,41 @@ class DomainBounceBackBC(FaceBC):
                     Required for correct half-way bounce-back.
                     Falls back to f if None (on-node BB, less accurate).
         """
-        if f_post is None:
-            f_src = f       # Fallback: on-node BB (less accurate)
-        else:
-            f_src = f_post  # Correct: half-way BB from pre-streaming state
-        
         if self.dim == 2:
             face_sl = self.node_map.get_face_slice_2d(self.location)
-            for k in range(len(self.incoming)):
-                i_in = int(self.incoming[k])
-                i_opp = int(self.opposites[k])
-                f[i_in, face_sl[0], face_sl[1]] = \
-                    f_src[i_opp, face_sl[0], face_sl[1]]
+            if f_post is not None:
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_opp = int(self.opposites[k])
+                    f[i_in, face_sl[0], face_sl[1]] = \
+                        f_post[i_opp, face_sl[0], face_sl[1]]
+            else:
+                # In-place: save outgoing first
+                saved = {}
+                for k in range(len(self.incoming)):
+                    i_opp = int(self.opposites[k])
+                    saved[i_opp] = f[i_opp, face_sl[0], face_sl[1]].copy()
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_opp = int(self.opposites[k])
+                    f[i_in, face_sl[0], face_sl[1]] = saved[i_opp]
         else:
             face_sl = self.node_map.get_face_slice_3d(self.location)
-            for k in range(len(self.incoming)):
-                i_in = int(self.incoming[k])
-                i_opp = int(self.opposites[k])
-                f[i_in, face_sl[0], face_sl[1], face_sl[2]] = \
-                    f_src[i_opp, face_sl[0], face_sl[1], face_sl[2]]
+            if f_post is not None:
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_opp = int(self.opposites[k])
+                    f[i_in, face_sl[0], face_sl[1], face_sl[2]] = \
+                        f_post[i_opp, face_sl[0], face_sl[1], face_sl[2]]
+            else:
+                saved = {}
+                for k in range(len(self.incoming)):
+                    i_opp = int(self.opposites[k])
+                    saved[i_opp] = f[i_opp, face_sl[0], face_sl[1], face_sl[2]].copy()
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_opp = int(self.opposites[k])
+                    f[i_in, face_sl[0], face_sl[1], face_sl[2]] = saved[i_opp]
     
     def get_info(self) -> str:
         n_inc = len(self.incoming)

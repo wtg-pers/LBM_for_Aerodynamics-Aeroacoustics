@@ -150,56 +150,47 @@ class HalfwayBounceBack:
             self.n_boundary_links = int(xp.sum(self.needs_bounce))
     
     def apply(self, f: 'npt.NDArray', f_post: Optional['npt.NDArray'] = None) -> None:
-        """Apply half-way bounce-back boundary condition
-        
-        IMPORTANT: This must be called AFTER streaming.
-        
-        The bounce-back requires the post-collision distribution from
-        the previous time step. Two usage patterns:
-        
-        Pattern 1 (Simple): 
-            Store f_post before streaming, pass to apply()
-            
-        Pattern 2 (Memory efficient):
-            For symmetric equilibrium, use current f as approximation
-        
+        """Apply half-way bounce-back boundary condition.
+
+        Physical process:
+            At fluid nodes adjacent to solid, the outgoing distribution
+            toward the wall bounces back:  f_ī(x) = f_i*(x)
+
+        Two modes:
+            f_post provided: f_source = f_post (separate post-collision array)
+            f_post = None:   f_source = f itself (post-collision stored in f,
+                             e.g. streaming-fused kernel). Uses save-then-write
+                             to avoid direction-pair conflicts.
+
         Args:
-            f: Distribution function after streaming, shape (Q, Nx, Ny[, Nz])
+            f: Distribution function, shape (Q, Nx, Ny[, Nz]).
                Modified in-place.
-            f_post: Post-collision distribution from before streaming.
-                   If None, uses f itself (approximation, less accurate).
+            f_post: Post-collision distribution. If None, reads from f.
         """
         xp = self.xp
         opp = self.opp
-        
-        if f_post is None:
-            # Approximation: use current f
-            # This works because for half-way BB, we need f_i* from the same node
-            # After streaming, f[opp[i], x] came from neighbor, but we want
-            # the value that was at x before streaming
-            # This approximation works for steady flows
-            f_source = f
+
+        if f_post is not None:
+            # Standard path: separate source array, no conflict
+            for i in range(1, self.Q):
+                i_opp = int(opp[i])
+                mask = self.needs_bounce[i]
+                if xp.any(mask):
+                    f[i_opp][mask] = f_post[i][mask]
         else:
-            f_source = f_post
-        
-        # Apply bounce-back for each direction
-        for i in range(1, self.Q):  # Skip rest direction
-            i_opp = int(opp[i])
-            
-            # Where this direction needs bounce-back
-            mask = self.needs_bounce[i]
-            
-            if xp.any(mask):
-                # f_opp[i](x) = f_i*(x)  (what was going out comes back)
-                # Since we're after streaming, we need to use f_source
-                # which has the pre-streaming (post-collision) values
-                
-                # Actually, for proper HWBB after streaming:
-                # The distribution f[i] at boundary fluid nodes came from
-                # solid nodes (invalid). We replace it with bounced value.
-                # f[opp[i], x] = f_source[i, x]
-                
-                f[i_opp][mask] = f_source[i][mask]
+            # In-place path: f is both source and target.
+            # Save outgoing distributions first to avoid direction-pair
+            # conflicts (e.g. writing f[opp_q] before reading f[opp_q]
+            # when both q and opp_q are boundary at the same node).
+            saved = {}
+            for i in range(1, self.Q):
+                mask = self.needs_bounce[i]
+                if xp.any(mask):
+                    saved[i] = f[i][mask].copy()
+
+            for i, vals in saved.items():
+                i_opp = int(opp[i])
+                f[i_opp][self.needs_bounce[i]] = vals
     
     def apply_simple(self, f: 'npt.NDArray') -> None:
         """Simplified bounce-back using symmetry
@@ -375,24 +366,26 @@ class MovingWallBounceBack(HalfwayBounceBack):
         if rho is None:
             rho = xp.sum(f, axis=0)
         
-        f_source = f if f_post is None else f_post
-        if f_post is None:
-            import warnings
-            warnings.warn("f_post not provided; using post-streaming f as approximation. "
-                        "This is only accurate for steady-state flows.", 
-                        UserWarning)
-            f_source = f
-        
-        for i in range(1, self.Q):
-            i_opp = int(opp[i])
-            mask = self.needs_bounce[i]
-            
-            if xp.any(mask):
-                # c_i · u_wall
+        if f_post is not None:
+            # Standard path: separate source array
+            for i in range(1, self.Q):
+                i_opp = int(opp[i])
+                mask = self.needs_bounce[i]
+                if xp.any(mask):
+                    c_dot_u = xp.sum(c[:, i:i+1] * self.u_wall, axis=0)
+                    correction = 2 * w[i] * rho * c_dot_u / self.cs2
+                    f[i_opp][mask] = f_post[i][mask] - correction[mask]
+        else:
+            # In-place path: save outgoing distributions first
+            saved = {}
+            for i in range(1, self.Q):
+                mask = self.needs_bounce[i]
+                if xp.any(mask):
+                    saved[i] = f[i][mask].copy()
+
+            for i, vals in saved.items():
+                i_opp = int(opp[i])
+                mask = self.needs_bounce[i]
                 c_dot_u = xp.sum(c[:, i:i+1] * self.u_wall, axis=0)
-                
-                # Momentum correction term
                 correction = 2 * w[i] * rho * c_dot_u / self.cs2
-                
-                # Bounce-back with correction
-                f[i_opp][mask] = f_source[i][mask] - correction[mask]
+                f[i_opp][mask] = vals - correction[mask]
