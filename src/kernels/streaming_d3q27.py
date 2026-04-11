@@ -7,8 +7,8 @@ Eliminates precomputed index arrays (saves 324 B/node of GPU memory).
 Pull scheme: f_next[q, x, y, z] = f_post[q, x-cx, y-cy, z-cz]
 
 Memory traffic per node (float32):
-    Read:  27 × 4B = 108B  (f_post from 27 neighbors)
-    Write: 27 × 4B = 108B  (f_next at current node)
+    Read:  27 x 4B = 108B  (f_post from 27 neighbors)
+    Write: 27 x 4B = 108B  (f_next at current node)
     Total: 216B
 
 Author: LBM Development Team
@@ -97,8 +97,8 @@ class StreamingKernelD3Q27:
         """Launch streaming kernel.
 
         Args:
-            f_post: Post-collision distribution (27, Nx*Ny*Nz) — read
-            f_next: Streamed output (27, Nx*Ny*Nz) — written
+            f_post: Post-collision distribution (27, Nx*Ny*Nz) -- read
+            f_next: Streamed output (27, Nx*Ny*Nz) -- written
             Nx, Ny, Nz: Domain dimensions
         """
         if self._kernel is None:

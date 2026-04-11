@@ -66,6 +66,11 @@ class SolverInitializer:
 
         # ── Step 3: Wire f into Simulation ───────────────────────
         if not is_mlg:
+            # On restart with Esoteric, f is already in Esoteric layout
+            if should_restart and hasattr(self, '_last_checkpoint_state'):
+                eso_step = self._last_checkpoint_state.get('esoteric_step', None)
+                if eso_step is not None:
+                    sim._esoteric_f_already_set = True
             sim.set_distribution(f)
             sim.step_count = start_step
 
@@ -106,6 +111,18 @@ class SolverInitializer:
                     f.write(header)
                 print(f"  Rotor CSV: {path}")
 
+        # ── Step 4c: Esoteric parity restore on restart ─────────
+        if (start_step > 0
+                and hasattr(sim, '_use_esoteric') and sim._use_esoteric):
+            # Restore esoteric_step from checkpoint extra_data
+            # The checkpoint f is already in Esoteric memory layout
+            if hasattr(self, '_last_checkpoint_state'):
+                eso_step = self._last_checkpoint_state.get('esoteric_step', start_step)
+                sim._esoteric_step = eso_step
+                print(f"  Esoteric parity restored: step {eso_step}")
+            else:
+                sim._esoteric_step = start_step
+
         # ── Step 5: Info ─────────────────────────────────────────
         if hasattr(sim, 'print_info'):
             sim.print_info()
@@ -134,6 +151,7 @@ class SolverInitializer:
         f = xp.asarray(state['f'])
         completed_step = state['step']
         start_step = completed_step + 1
+        self._last_checkpoint_state = state  # store for esoteric parity
         print(f"  Loaded step {completed_step}, resuming from step {start_step}")
         return f, start_step
 

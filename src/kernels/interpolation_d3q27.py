@@ -5,8 +5,8 @@ Replaces 3 sequential CuPy interpolate_1d calls with a single
 CUDA kernel that fills all odd indices in 3D simultaneously.
 
 Stencil (Lagrava Eq. 4.23):
-    Interior: g(x) = 9/16·[g(x+h)+g(x-h)] - 1/16·[g(x+3h)+g(x-3h)]
-    Boundary: g(x) = 3/8·g(x-h) + 3/4·g(x+h) - 1/8·g(x+3h)
+    Interior: g(x) = 9/16*[g(x+h)+g(x-h)] - 1/16*[g(x+3h)+g(x-3h)]
+    Boundary: g(x) = 3/8*g(x-h) + 3/4*g(x+h) - 1/8*g(x+3h)
 
 Input:  f[Q, Nx_f, Ny_f, Nz_f] with values at even indices (coarse nodes)
 Output: f with all odd indices filled by interpolation
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 _CUBIC_INTERP_3D_KERNEL = r'''
 extern "C" __global__
 void cubic_interp_3d(
-    float* __restrict__ f,     // (Q, Nx, Ny, Nz) — modified in-place
+    float* __restrict__ f,     // (Q, Nx, Ny, Nz) -- modified in-place
     const int Q,
     const int Nx, const int Ny, const int Nz
 ) {
@@ -57,7 +57,7 @@ void cubic_interp_3d(
     //   Right boundary (i=n-2):     3/8*g[n-1] + 3/4*g[n-3] - 1/8*g[n-5]
     //   Fallback (n<5):             0.5*(g[i-1]+g[i+1])
 
-    // Strategy: interpolate sequentially x → y → z
+    // Strategy: interpolate sequentially x -> y -> z
     // But we need intermediate values at partially-interpolated nodes.
     // Instead, use the factored approach:
     //   For a node (ox, oy, oz):
@@ -79,11 +79,11 @@ void cubic_interp_3d(
     // This is still faster than CuPy because: 1 kernel launch per axis
     // instead of multiple CuPy operations per axis.
 
-    // This kernel is NOT used — see cubic_interp_1d below.
+    // This kernel is NOT used -- see cubic_interp_1d below.
     return;
 }
 
-// ─── 1D cubic interpolation kernel ─────────────────────────
+// --- 1D cubic interpolation kernel -------------------------
 // Fills all odd indices along one axis in a single kernel launch.
 // axis: 1=x, 2=y, 3=z (0=Q, skipped)
 
@@ -92,7 +92,7 @@ void cubic_interp_1d_x(
     float* __restrict__ f,
     const int Q, const int Nx, const int Ny, const int Nz
 ) {
-    // Thread per (q, iy, iz) — process all odd ix for this fiber
+    // Thread per (q, iy, iz) -- process all odd ix for this fiber
     int NyNz = Ny * Nz;
     int total = Q * Ny * Nz;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;

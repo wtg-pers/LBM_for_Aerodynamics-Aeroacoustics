@@ -38,8 +38,8 @@ D = 16                          # Sphere diameter  [lattice units]
 U_INLET = 0.05                  # Inlet velocity   [Δx/Δt]
 RHO = 1.0
 
-# Domain: 20D × 10D × 10D
-Nx = 320
+# Domain: 15D × 10D × 10D
+Nx = 15 * D                     # = 240
 Ny = 160
 Nz = 160
 
@@ -87,30 +87,29 @@ OVERLAP_WIDTH = 2
 INTERP_SCHEME = "cubic"
 FILTER_LEVEL = 1
 
-# Level 1: wake capture
-L1_X_MIN = CENTER_X - 1 * D            # = 32
-L1_X_MAX = CENTER_X + 3 * D            # = 96
-L1_Y_MIN = CENTER_Y - 1 * D            # = 64
-L1_Y_MAX = CENTER_Y + 1 * D            # = 96
-L1_Z_MIN = CENTER_Z - 1 * D            # = 64
-L1_Z_MAX = CENTER_Z + 1 * D            # = 96
+# Level 1: wake capture (1.5D up, 7D down, ±1.5D lateral)
+L1_X_MIN = CENTER_X - int(1.5 * D)     # = 24
+L1_X_MAX = CENTER_X + 7 * D            # = 160  (7D downstream)
+L1_Y_MIN = CENTER_Y - int(1.5 * D)     # = 56
+L1_Y_MAX = CENTER_Y + int(1.5 * D)     # = 104
+L1_Z_MIN = CENTER_Z - int(1.5 * D)     # = 56
+L1_Z_MAX = CENTER_Z + int(1.5 * D)     # = 104
 
-# Level 2: separation zone
-L2_X_MIN = CENTER_X - int(0.75 * D)    # = 36
-L2_X_MAX = CENTER_X + int(1.5 * D)     # = 72
-L2_Y_MIN = CENTER_Y - int(0.75 * D)    # = 68
-L2_Y_MAX = CENTER_Y + int(0.75 * D)    # = 92
-L2_Z_MIN = CENTER_Z - int(0.75 * D)    # = 68
-L2_Z_MAX = CENTER_Z + int(0.75 * D)    # = 92
+# Level 2: separation zone (1D up, 4D down, ±1D lateral)
+L2_X_MIN = CENTER_X - 1 * D            # = 32
+L2_X_MAX = CENTER_X + 4 * D            # = 112  (4D downstream)
+L2_Y_MIN = CENTER_Y - 1 * D            # = 64
+L2_Y_MAX = CENTER_Y + 1 * D            # = 96
+L2_Z_MIN = CENTER_Z - 1 * D            # = 64
+L2_Z_MAX = CENTER_Z + 1 * D            # = 96
 
-# Level 3: sphere surface (force measurement)
-L3_M = int(0.6 * D)                    # = 9
-L3_X_MIN = CENTER_X - L3_M             # = 39
-L3_X_MAX = CENTER_X + 1 * D            # = 64
-L3_Y_MIN = CENTER_Y - L3_M             # = 71
-L3_Y_MAX = CENTER_Y + L3_M             # = 89
-L3_Z_MIN = CENTER_Z - L3_M             # = 71
-L3_Z_MAX = CENTER_Z + L3_M             # = 89
+# Level 3: sphere surface + near separation (1D up, 2D down, ±1D lateral)
+L3_X_MIN = CENTER_X - 1 * D            # = 32
+L3_X_MAX = CENTER_X + 2 * D            # = 80  (2D downstream)
+L3_Y_MIN = CENTER_Y - 1 * D            # = 64
+L3_Y_MAX = CENTER_Y + 1 * D            # = 96
+L3_Z_MIN = CENTER_Z - 1 * D            # = 64
+L3_Z_MAX = CENTER_Z + 1 * D            # = 96
 
 # =============================================================================
 # §4. SIMULATION SETTINGS

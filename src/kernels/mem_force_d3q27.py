@@ -1,11 +1,11 @@
 """
 CUDA Momentum Exchange Method (MEM) Force Kernel for D3Q27
 
-Replaces Python double loop (dim × Q = 78 iterations) with a
+Replaces Python double loop (dim x Q = 78 iterations) with a
 GPU parallel reduction.
 
 Physical formula:
-    F_d = Σ_{boundary links} 2 * c_i[d] * f_i^post(x_fluid)
+    F_d = Sum_{boundary links} 2 * c_i[d] * f_i^post(x_fluid)
 
 Strategy:
     Each thread handles one spatial node, accumulates force for all
@@ -26,7 +26,7 @@ extern "C" __global__
 void mem_force_d3q27(
     const float* __restrict__ f_post,       // (27, N)
     const bool*  __restrict__ needs_bounce,  // (27, N)
-    float*       __restrict__ force_xyz,     // (3,) output — atomicAdd
+    float*       __restrict__ force_xyz,     // (3,) output -- atomicAdd
     const int N
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,7 +70,7 @@ void mem_force_d3q27(
 class MEMForceKernelD3Q27:
     """CUDA MEM force kernel for D3Q27.
 
-    Replaces Python dim×Q loop with a single GPU kernel.
+    Replaces Python dimxQ loop with a single GPU kernel.
     Uses atomicAdd for parallel reduction.
 
     Usage:

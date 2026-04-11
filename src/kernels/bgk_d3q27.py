@@ -5,15 +5,15 @@ Replaces: macroscopic.compute() + Guo correction + bgk.collide()
 with a single CUDA kernel launch.
 
 Physical Process (per node):
-    1. Compute ρ = Σ f_i,  u = Σ c_i f_i / ρ
-    2. Guo correction: u += F/(2ρ)  (if force present)
-    3. Equilibrium: f_eq = w_i ρ (1 + 3c·u + 4.5(c·u)² - 1.5|u|²)
-    4. BGK relaxation: f_post = f - ω(f - f_eq)
+    1. Compute rho = Sum f_i,  u = Sum c_i f_i / rho
+    2. Guo correction: u += F/(2rho)  (if force present)
+    3. Equilibrium: f_eq = w_i rho (1 + 3c*u + 4.5(c*u)^2 - 1.5|u|^2)
+    4. BGK relaxation: f_post = f - omega(f - f_eq)
     5. Guo source term: f_post += S_i  (if force present)
 
 Memory traffic per node (float32):
-    Read:  27 × 4B = 108B  (f)  +  12B (force, if present)
-    Write: 27 × 4B = 108B  (f_post)  +  4B (rho)  +  12B (u)
+    Read:  27 x 4B = 108B  (f)  +  12B (force, if present)
+    Write: 27 x 4B = 108B  (f_post)  +  4B (rho)  +  12B (u)
     Total: 232B  (vs ~1500B+ for CuPy multi-launch path)
 
 Author: LBM Development Team
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
 
-# ─── CUDA kernel source code ──────────────────────────────────
+# --- CUDA kernel source code ----------------------------------
 
 _BGK_D3Q27_KERNEL = r'''
 extern "C" __global__
@@ -43,7 +43,7 @@ void bgk_collide_d3q27(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    // ── D3Q27 lattice constants (hardcoded for performance) ──
+    // -- D3Q27 lattice constants (hardcoded for performance) --
     // Velocity vectors c[dim][Q]
     const int cx[27] = {
         0,  1,-1, 0, 0, 0, 0,
@@ -73,7 +73,7 @@ void bgk_collide_d3q27(
         1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f
     };
 
-    // ── Step 1: Load f and compute macroscopic ──────────────
+    // -- Step 1: Load f and compute macroscopic --------------
     float f_local[27];
     float rho = 0.0f;
     float mom_x = 0.0f, mom_y = 0.0f, mom_z = 0.0f;
@@ -92,7 +92,7 @@ void bgk_collide_d3q27(
     float uy = mom_y * inv_rho;
     float uz = mom_z * inv_rho;
 
-    // ── Step 2: Guo velocity correction ─────────────────────
+    // -- Step 2: Guo velocity correction ---------------------
     float Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
     if (force != NULL) {
         Fx = force[0 * N + idx];
@@ -104,15 +104,15 @@ void bgk_collide_d3q27(
         uz += Fz * half_inv_rho;
     }
 
-    // ── Step 3: Write macroscopic output ────────────────────
+    // -- Step 3: Write macroscopic output --------------------
     rho_out[idx] = rho;
     u_out[0 * N + idx] = ux;
     u_out[1 * N + idx] = uy;
     u_out[2 * N + idx] = uz;
 
-    // ── Step 4: BGK collision ───────────────────────────────
-    //   f_eq = w_i ρ (1 + 3(c·u) + 4.5(c·u)² - 1.5|u|²)
-    //   f_post = f - ω(f - f_eq)
+    // -- Step 4: BGK collision -------------------------------
+    //   f_eq = w_i rho (1 + 3(c*u) + 4.5(c*u)^2 - 1.5|u|^2)
+    //   f_post = f - omega(f - f_eq)
     float usqr = ux*ux + uy*uy + uz*uz;
 
     for (int q = 0; q < 27; q++) {
@@ -121,21 +121,21 @@ void bgk_collide_d3q27(
         f_local[q] = f_local[q] - omega * (f_local[q] - f_eq);
     }
 
-    // ── Step 5: Guo forcing source term ─────────────────────
-    //   S_i = (1 - 1/(2τ)) w_i [(c_i-u)/cs² + (c_i·u)c_i/cs⁴] · F
+    // -- Step 5: Guo forcing source term ---------------------
+    //   S_i = (1 - 1/(2tau)) w_i [(c_i-u)/cs^2 + (c_i*u)c_i/cs^4] * F
     if (force != NULL) {
-        float prefactor = 1.0f - 0.5f * omega;  // (1 - 1/(2τ))
+        float prefactor = 1.0f - 0.5f * omega;  // (1 - 1/(2tau))
 
         for (int q = 0; q < 27; q++) {
             float cxq = (float)cx[q], cyq = (float)cy[q], czq = (float)cz[q];
 
-            // (c_i · F) and (c_i · u)
+            // (c_i * F) and (c_i * u)
             float ci_dot_F = cxq*Fx + cyq*Fy + czq*Fz;
             float ci_dot_u = cxq*ux + cyq*uy + czq*uz;
             float u_dot_F  = ux*Fx + uy*Fy + uz*Fz;
 
-            // term1 = (c_i·F - u·F) * 3.0  (inv_cs2 = 3)
-            // term2 = (c_i·u)(c_i·F) * 9.0  (inv_cs4 = 9)
+            // term1 = (c_i*F - u*F) * 3.0  (inv_cs2 = 3)
+            // term2 = (c_i*u)(c_i*F) * 9.0  (inv_cs4 = 9)
             float S_i = prefactor * w[q] * (
                 (ci_dot_F - u_dot_F) * 3.0f +
                 ci_dot_u * ci_dot_F * 9.0f
@@ -145,7 +145,7 @@ void bgk_collide_d3q27(
         }
     }
 
-    // ── Step 6: Write post-collision output ─────────────────
+    // -- Step 6: Write post-collision output -----------------
     for (int q = 0; q < 27; q++) {
         f_post[q * N + idx] = f_local[q];
     }
@@ -153,7 +153,7 @@ void bgk_collide_d3q27(
 '''
 
 
-# ─── FP16 shifted collision kernel ───────────────────────────
+# --- FP16 shifted collision kernel ---------------------------
 
 _BGK_D3Q27_FP16S_KERNEL = r'''
 #include <cuda_fp16.h>
@@ -171,7 +171,7 @@ void bgk_collide_d3q27_fp16s(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    // ── D3Q27 lattice constants ─────────────────────────────
+    // -- D3Q27 lattice constants -----------------------------
     const int cx[27] = {
         0,  1,-1, 0, 0, 0, 0,
         1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0,
@@ -198,7 +198,7 @@ void bgk_collide_d3q27_fp16s(
         1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f
     };
 
-    // ── Step 1: Load FP16 shifted → restore to FP32 ────────
+    // -- Step 1: Load FP16 shifted -> restore to FP32 --------
     //   f_stored = FP16(f - w),  f = FP32(f_stored) + w
     float f_local[27];
     float rho = 0.0f;
@@ -218,7 +218,7 @@ void bgk_collide_d3q27_fp16s(
     float uy = mom_y * inv_rho;
     float uz = mom_z * inv_rho;
 
-    // ── Step 2: Guo velocity correction ─────────────────────
+    // -- Step 2: Guo velocity correction ---------------------
     float Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
     if (force != NULL) {
         Fx = force[0 * N + idx];
@@ -230,13 +230,13 @@ void bgk_collide_d3q27_fp16s(
         uz += Fz * half_inv_rho;
     }
 
-    // ── Step 3: Write macroscopic (FP32) ────────────────────
+    // -- Step 3: Write macroscopic (FP32) --------------------
     rho_out[idx] = rho;
     u_out[0 * N + idx] = ux;
     u_out[1 * N + idx] = uy;
     u_out[2 * N + idx] = uz;
 
-    // ── Step 4: BGK collision (all FP32) ────────────────────
+    // -- Step 4: BGK collision (all FP32) --------------------
     float usqr = ux*ux + uy*uy + uz*uz;
     for (int q = 0; q < 27; q++) {
         float cu = (float)cx[q]*ux + (float)cy[q]*uy + (float)cz[q]*uz;
@@ -244,7 +244,7 @@ void bgk_collide_d3q27_fp16s(
         f_local[q] = f_local[q] - omega * (f_local[q] - f_eq);
     }
 
-    // ── Step 5: Guo source term (FP32) ──────────────────────
+    // -- Step 5: Guo source term (FP32) ----------------------
     if (force != NULL) {
         float prefactor = 1.0f - 0.5f * omega;
         for (int q = 0; q < 27; q++) {
@@ -259,7 +259,7 @@ void bgk_collide_d3q27_fp16s(
         }
     }
 
-    // ── Step 6: Write FP32 → FP16 shifted ───────────────────
+    // -- Step 6: Write FP32 -> FP16 shifted -------------------
     //   f_stored = FP16(f_post - w)
     for (int q = 0; q < 27; q++) {
         f_post[q * N + idx] = __float2half(f_local[q] - w[q]);
@@ -268,7 +268,7 @@ void bgk_collide_d3q27_fp16s(
 '''
 
 
-# ─── Fused pull-collide kernel (streaming integrated) ────────
+# --- Fused pull-collide kernel (streaming integrated) --------
 
 _BGK_D3Q27_STREAM_COLLIDE_KERNEL = r'''
 extern "C" __global__
@@ -285,13 +285,13 @@ void bgk_stream_collide_d3q27(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    // 1D → 3D index
+    // 1D -> 3D index
     int iz = idx / (Nx * Ny);
     int rem = idx - iz * Nx * Ny;
     int iy = rem / Nx;
     int ix = rem - iy * Nx;
 
-    // ── D3Q27 lattice constants ─────────────────────────────
+    // -- D3Q27 lattice constants -----------------------------
     const int cx[27] = {
         0,  1,-1, 0, 0, 0, 0,
         1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0,
@@ -318,7 +318,7 @@ void bgk_stream_collide_d3q27(
         1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f
     };
 
-    // ── Step 1: Pull from neighbors (streaming) ─────────────
+    // -- Step 1: Pull from neighbors (streaming) -------------
     float f_local[27];
     float rho = 0.0f;
     float mom_x = 0.0f, mom_y = 0.0f, mom_z = 0.0f;
@@ -342,7 +342,7 @@ void bgk_stream_collide_d3q27(
     float uy = mom_y * inv_rho;
     float uz = mom_z * inv_rho;
 
-    // ── Step 2: Guo velocity correction ─────────────────────
+    // -- Step 2: Guo velocity correction ---------------------
     float Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
     if (force != NULL) {
         Fx = force[0 * N + idx];
@@ -354,13 +354,13 @@ void bgk_stream_collide_d3q27(
         uz += Fz * half_inv_rho;
     }
 
-    // ── Step 3: Write macroscopic ───────────────────────────
+    // -- Step 3: Write macroscopic ---------------------------
     rho_out[idx] = rho;
     u_out[0 * N + idx] = ux;
     u_out[1 * N + idx] = uy;
     u_out[2 * N + idx] = uz;
 
-    // ── Step 4: BGK collision ───────────────────────────────
+    // -- Step 4: BGK collision -------------------------------
     float usqr = ux*ux + uy*uy + uz*uz;
     for (int q = 0; q < 27; q++) {
         float cu = (float)cx[q]*ux + (float)cy[q]*uy + (float)cz[q]*uz;
@@ -368,7 +368,7 @@ void bgk_stream_collide_d3q27(
         f_local[q] = f_local[q] - omega * (f_local[q] - f_eq);
     }
 
-    // ── Step 5: Guo source term ─────────────────────────────
+    // -- Step 5: Guo source term -----------------------------
     if (force != NULL) {
         float prefactor = 1.0f - 0.5f * omega;
         for (int q = 0; q < 27; q++) {
@@ -383,7 +383,7 @@ void bgk_stream_collide_d3q27(
         }
     }
 
-    // ── Step 6: Write post-collision to destination ─────────
+    // -- Step 6: Write post-collision to destination ---------
     //   f_dst = post-collision (serves as f_post for BC)
     for (int q = 0; q < 27; q++) {
         f_dst[q * N + idx] = f_local[q];
@@ -392,7 +392,7 @@ void bgk_stream_collide_d3q27(
 '''
 
 
-# ─── Python wrappers ─────────────────────────────────────────
+# --- Python wrappers -----------------------------------------
 
 class BGKCollideKernelD3Q27:
     """Fused BGK collision kernel for D3Q27.
@@ -436,12 +436,12 @@ class BGKCollideKernelD3Q27:
         """Launch the fused collision kernel.
 
         Args:
-            f_in:    Input distribution (27, N) — read only
-            f_post:  Post-collision output (27, N) — written
-            rho_out: Density output (N,) — written
-            u_out:   Velocity output (3, N) — written
+            f_in:    Input distribution (27, N) -- read only
+            f_post:  Post-collision output (27, N) -- written
+            rho_out: Density output (N,) -- written
+            u_out:   Velocity output (3, N) -- written
             force:   Body force (3, N) or None
-            omega:   Relaxation rate 1/τ
+            omega:   Relaxation rate 1/tau
             N:       Total number of spatial nodes
         """
         if self._kernel is None:
@@ -471,7 +471,7 @@ class BGKStreamCollideKernelD3Q27:
 
     Combines streaming (pull from neighbors) + macroscopic + collision
     into a single CUDA kernel launch. Uses ping-pong buffers:
-    f_src (previous step) → f_dst (this step).
+    f_src (previous step) -> f_dst (this step).
 
     f_dst contains post-collision values = f_post for BC.
 
@@ -506,13 +506,13 @@ class BGKStreamCollideKernelD3Q27:
         """Launch fused pull-collide kernel.
 
         Args:
-            f_src: Source distribution (27, N) — previous step, read only
-            f_dst: Destination distribution (27, N) — this step, written
+            f_src: Source distribution (27, N) -- previous step, read only
+            f_dst: Destination distribution (27, N) -- this step, written
                    (= post-collision, serves as f_post for BC)
             rho_out: Density output (N,)
             u_out:   Velocity output (3, N)
             force:   Body force (3, N) or None
-            omega:   Relaxation rate 1/τ
+            omega:   Relaxation rate 1/tau
             Nx, Ny, Nz: Domain dimensions
         """
         if self._kernel is None:
@@ -572,10 +572,10 @@ class BGKCollideKernelD3Q27_FP16S:
         """Launch FP16S collision kernel.
 
         Args:
-            f_in:    FP16 shifted input (27, N) — float16(f - w)
-            f_post:  FP16 shifted output (27, N) — float16(f_post - w)
-            rho_out: Density (N,) — FP32
-            u_out:   Velocity (3, N) — FP32
+            f_in:    FP16 shifted input (27, N) -- float16(f - w)
+            f_post:  FP16 shifted output (27, N) -- float16(f_post - w)
+            rho_out: Density (N,) -- FP32
+            u_out:   Velocity (3, N) -- FP32
             force:   Body force (3, N) FP32 or None
             omega:   Relaxation rate
             N:       Total nodes

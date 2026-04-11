@@ -126,9 +126,12 @@ class Simulation:
         self.step_count: int = 0
         self._is_ready: bool = False
 
-        # ── Fused CUDA kernel (lazy init) ──
+        # ── CUDA kernel mode (lazy init) ──
         self._fused_kernel = None
         self._use_fused: bool = False
+        self._use_esoteric: bool = False
+        self._esoteric_kernel = None
+        self._esoteric_step: int = 0
 
     # =====================================================================
     # Public Interface
@@ -156,45 +159,46 @@ class Simulation:
 
         # ── Try to initialize CUDA kernels ──
         self._use_fused = False
+        self._use_esoteric = False
         self._fused_is_cumulant = False
-        self._streaming_kernel = None
         self._hwbb_kernel = None
 
         if self.xp.__name__ == 'cupy' and len(self.domain_shape) == 3:
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
 
-            # Collision kernel
+            # Try Esoteric Pull first (highest priority for BGK)
             if isinstance(self.collision, BGKCollision):
                 try:
-                    from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
-                    self._fused_kernel = BGKCollideKernelD3Q27()
-                    self._use_fused = True
-                except Exception:
-                    pass
-            elif isinstance(self.collision, CumulantCollision):
-                try:
-                    from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
-                    self._fused_kernel = CumulantCollideKernelD3Q27()
-                    self._use_fused = True
-                    self._fused_is_cumulant = True
+                    self._init_esoteric(f)
                 except Exception:
                     pass
 
-            # Streaming kernel
-            try:
-                from src.kernels.streaming_d3q27 import StreamingKernelD3Q27
-                self._streaming_kernel = StreamingKernelD3Q27()
-            except Exception:
-                pass
+            # Fallback: fused collision kernel
+            if not self._use_esoteric:
+                if isinstance(self.collision, BGKCollision):
+                    try:
+                        from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
+                        self._fused_kernel = BGKCollideKernelD3Q27()
+                        self._use_fused = True
+                    except Exception:
+                        pass
+                elif isinstance(self.collision, CumulantCollision):
+                    try:
+                        from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
+                        self._fused_kernel = CumulantCollideKernelD3Q27()
+                        self._use_fused = True
+                        self._fused_is_cumulant = True
+                    except Exception:
+                        pass
 
-            # HWBB kernel
-            if self.obstacle_bc is not None:
-                try:
-                    from src.kernels.bounce_back_d3q27 import HWBBKernelD3Q27
-                    self._hwbb_kernel = HWBBKernelD3Q27()
-                except Exception:
-                    pass
+                # HWBB kernel (only needed in non-Esoteric mode)
+                if self.obstacle_bc is not None:
+                    try:
+                        from src.kernels.bounce_back_d3q27 import HWBBKernelD3Q27
+                        self._hwbb_kernel = HWBBKernelD3Q27()
+                    except Exception:
+                        pass
 
     @property
     def is_ready(self) -> bool:
@@ -208,12 +212,14 @@ class Simulation:
         Needed by MEM (Momentum Exchange Method) force calculation.
         Valid after the most recent advance() call.
 
-        In streaming-fused mode (ping-pong), f itself is the post-collision
-        state after swap, so f_post returns f.
+        In Esoteric mode, f_post is not available (single buffer).
+        MEM force needs adaptation for Esoteric ordering.
 
         Returns:
             Post-collision f, shape (Q, Nx, Ny[, Nz])  [dimensionless]
         """
+        if self._use_esoteric:
+            return None
         return self._f_post
 
     def advance(self) -> None:
@@ -242,12 +248,208 @@ class Simulation:
                 "Simulation not ready: call set_distribution() first"
             )
 
-        if self._use_fused and self.al_model is None:
+        if self._use_esoteric:
+            self._advance_esoteric()
+        elif self._use_fused and self.al_model is None:
             self._advance_fused()
         elif self._use_fused and self.al_model is not None:
             self._advance_fused_with_alm()
         else:
             self._advance_default()
+
+    # =====================================================================
+    # Esoteric Pull path
+    # =====================================================================
+
+    def _init_esoteric(self, f: 'npt.NDArray') -> None:
+        """Initialize Esoteric Pull mode.
+
+        Converts f to Esoteric memory layout, creates node_type and BC
+        parameter arrays, and initializes the Esoteric kernel.
+
+        Args:
+            f: Initial distribution in standard D3Q27 ordering (27, Nx, Ny, Nz)
+        """
+        from src.kernels.esoteric_d3q27 import (
+            EsotericBGKKernelD3Q27,
+            convert_f_std_to_esoteric,
+            init_f_esoteric,
+            NODE_FLUID, NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN,
+        )
+        xp = self.xp
+        Nx, Ny, Nz = self.domain_shape
+        N = Nx * Ny * Nz
+
+        # Convert f from standard to Esoteric direction ordering
+        # (skip if f is already in Esoteric layout, e.g. checkpoint restart)
+        if not getattr(self, '_esoteric_f_already_set', False):
+            f_eso = convert_f_std_to_esoteric(xp, f)
+            self.f = init_f_esoteric(xp, f_eso, t_start=0)
+        else:
+            self.f = f
+        self._f_post = None  # not needed in Esoteric mode
+
+        # Build node_type array from BC config
+        node_type = xp.zeros((Nx, Ny, Nz), dtype=xp.int8)  # all FLUID
+
+        # Mark solid nodes: internal obstacle
+        if self.obstacle_bc is not None:
+            solid = self.obstacle_bc.solid_mask  # (Nx, Ny, Nz) bool
+            node_type[solid] = NODE_SOLID
+
+        # Mark domain boundary faces from bc_manager
+        bc_rho = xp.ones((Nx, Ny, Nz), dtype=xp.float32)
+        bc_ux = xp.zeros((Nx, Ny, Nz), dtype=xp.float32)
+        bc_uy = xp.zeros((Nx, Ny, Nz), dtype=xp.float32)
+        bc_uz = xp.zeros((Nx, Ny, Nz), dtype=xp.float32)
+
+        for face_bc in self.bc_manager.face_bcs:
+            loc = face_bc.location.value
+            cfg = face_bc.config
+
+            # Determine face slice
+            if loc in ('xmin', 'west'):
+                sl = (0, slice(None), slice(None))
+            elif loc in ('xmax', 'east'):
+                sl = (Nx-1, slice(None), slice(None))
+            elif loc in ('ymin', 'south'):
+                sl = (slice(None), 0, slice(None))
+            elif loc in ('ymax', 'north'):
+                sl = (slice(None), Ny-1, slice(None))
+            elif loc in ('zmin', 'bottom'):
+                sl = (slice(None), slice(None), 0)
+            elif loc in ('zmax', 'top'):
+                sl = (slice(None), slice(None), Nz-1)
+            else:
+                continue
+
+            # Map BC type to node_type
+            method = cfg.method if hasattr(cfg, 'method') else ''
+            bc_type = cfg.bc_type.value if hasattr(cfg, 'bc_type') else ''
+
+            if 'wall' in method or 'bounce' in method:
+                node_type[sl] = NODE_SOLID
+            elif 'neumann' in method:
+                node_type[sl] = NODE_NEUMANN
+            else:
+                # Equilibrium or regularized inlet/outlet → EQ_BC
+                node_type[sl] = NODE_EQ_BC
+                # Set BC parameters
+                if hasattr(cfg, 'density') and cfg.density is not None:
+                    bc_rho[sl] = float(cfg.density)
+                if hasattr(cfg, 'velocity') and cfg.velocity is not None:
+                    vel = cfg.velocity
+                    if isinstance(vel, (int, float)):
+                        bc_ux[sl] = float(vel)
+                    elif isinstance(vel, (list, tuple)):
+                        if len(vel) > 0:
+                            bc_ux[sl] = float(vel[0])
+                        if len(vel) > 1:
+                            bc_uy[sl] = float(vel[1])
+                        if len(vel) > 2:
+                            bc_uz[sl] = float(vel[2])
+
+        # Sponge layers: mark slab nodes as NODE_SPONGE
+        from src.kernels.esoteric_d3q27 import NODE_SPONGE
+        for sponge_bc in self.bc_manager.sponge_layers:
+            sb = sponge_bc
+            loc = sb.location.value if hasattr(sb, 'location') else ''
+            L = sb.thickness if hasattr(sb, 'thickness') else 0
+            if L <= 0:
+                continue
+            # Sponge sigma profile and target
+            sigma_1d = sb._sigma if hasattr(sb, '_sigma') else None
+            if sigma_1d is None:
+                continue
+            sigma_1d_np = sigma_1d.get() if hasattr(sigma_1d, 'get') else sigma_1d
+            rho_inf = float(sb.rho_inf) if hasattr(sb, 'rho_inf') else 1.0
+            u_inf = sb.u_inf.get() if hasattr(sb.u_inf, 'get') else sb.u_inf
+
+            for layer_i in range(L):
+                sigma_val = float(sigma_1d_np[layer_i])
+                if loc in ('xmax', 'east'):
+                    ix = Nx - 1 - layer_i
+                    sl = (ix, slice(None), slice(None))
+                elif loc in ('xmin', 'west'):
+                    ix = layer_i
+                    sl = (ix, slice(None), slice(None))
+                else:
+                    continue  # TODO: y/z sponge
+
+                node_type[sl] = NODE_SPONGE
+                bc_rho[sl] = rho_inf
+                bc_ux[sl] = float(u_inf[0])
+                bc_uy[sl] = float(u_inf[1]) if len(u_inf) > 1 else 0.0
+                # Reuse bc_uz as sigma for sponge nodes
+                bc_uz[sl] = sigma_val
+
+        # Store as flat arrays
+        self._eso_node_type = node_type.ravel()
+        self._eso_bc_rho = bc_rho.ravel()
+        self._eso_bc_ux = bc_ux.ravel()
+        self._eso_bc_uy = bc_uy.ravel()
+        self._eso_bc_uz = bc_uz.ravel()
+        self._esoteric_step = 0
+
+        # Allocate macroscopic arrays
+        self.rho = xp.empty(self.domain_shape, dtype=xp.float32)
+        self.u = xp.empty((3,) + self.domain_shape, dtype=xp.float32)
+
+        # Convert needs_bounce to Esoteric ordering + force accumulator
+        self._eso_needs_bounce = None
+        self._eso_force_out = None
+        if self.obstacle_bc is not None and hasattr(self.obstacle_bc, 'needs_bounce'):
+            from src.kernels.esoteric_d3q27 import _STD_TO_ESO
+            nb_std = self.obstacle_bc.needs_bounce  # (27, Nx, Ny, Nz) bool
+            nb_eso = xp.empty_like(nb_std)
+            for eso_q in range(27):
+                std_q = _STD_TO_ESO[eso_q]
+                nb_eso[eso_q] = nb_std[std_q]
+            self._eso_needs_bounce = nb_eso.reshape(27, N)
+            self._eso_force_out = xp.zeros(3, dtype=xp.float32)
+
+        # Create kernel
+        self._esoteric_kernel = EsotericBGKKernelD3Q27()
+        self._use_esoteric = True
+
+    def _advance_esoteric(self) -> None:
+        """Esoteric Pull advance: single kernel launch per step.
+
+        Physical process (inside kernel):
+            1. Load (Esoteric Pull streaming part 2/2)
+            2. Macroscopic: rho, u
+            3. BC check + Collision (or BC override)
+            4. MEM Force (optional, at boundary links)
+            5. Store (Esoteric Pull streaming part 1/2)
+        """
+        Nx, Ny, Nz = self.domain_shape
+        omega = 1.0 / self.tau
+
+        # Force calculation: only compute at force_interval steps
+        # (to avoid unnecessary atomicAdd overhead every step)
+        force_out = None
+        if self._eso_force_out is not None:
+            self._eso_force_out.fill(0)
+            force_out = self._eso_force_out
+
+        self._esoteric_kernel.launch(
+            self.f, self.rho, self.u,
+            self._eso_node_type,
+            self._eso_bc_rho, self._eso_bc_ux,
+            self._eso_bc_uy, self._eso_bc_uz,
+            omega, Nx, Ny, Nz,
+            t_step=self._esoteric_step,
+            needs_bounce=self._eso_needs_bounce,
+            force_out=force_out,
+        )
+
+        self.body_force = None
+        self._esoteric_step += 1
+        self.step_count += 1
+
+    # =====================================================================
+    # Standard (non-Esoteric) paths
+    # =====================================================================
 
     def _advance_default(self) -> None:
         """Default advance path using CuPy array operations."""
@@ -319,11 +521,7 @@ class Simulation:
         self.body_force = None
 
         # ─── Streaming ───────────────────────────────────────────────
-        if self._streaming_kernel is not None:
-            Nx, Ny, Nz = self.domain_shape
-            self._streaming_kernel.launch(self._f_post, self.f, Nx, Ny, Nz)
-        else:
-            self.streaming.compute(self._f_post, self.f)
+        self.streaming.compute(self._f_post, self.f)
 
         # ─── Boundary Conditions ─────────────────────────────────────
         self.bc_manager.apply_all(self.f, self._f_post)
@@ -383,11 +581,7 @@ class Simulation:
             )
 
         # ─── Step 5: Streaming ───────────────────────────────────────
-        if self._streaming_kernel is not None:
-            Nx, Ny, Nz = self.domain_shape
-            self._streaming_kernel.launch(self._f_post, self.f, Nx, Ny, Nz)
-        else:
-            self.streaming.compute(self._f_post, self.f)
+        self.streaming.compute(self._f_post, self.f)
 
         # ─── Step 6: Boundary Conditions ─────────────────────────────
         self.bc_manager.apply_all(self.f, self._f_post)

@@ -66,7 +66,18 @@ class StreamingPull:
         self.shape = shape
         self.Q = lattice.Q
 
-        self._precompute_indices()
+        # Skip precomputing index arrays if CUDA streaming kernel is available
+        # (saves 4 × Q × N × 4B = 324 B/node of GPU memory)
+        self._use_cuda = False
+        if xp.__name__ == 'cupy' and self.dim == 3:
+            try:
+                from src.kernels.streaming_d3q27 import StreamingKernelD3Q27
+                self._cuda_kernel = StreamingKernelD3Q27()
+                self._use_cuda = True
+            except Exception:
+                self._precompute_indices()
+        else:
+            self._precompute_indices()
 
     def _precompute_indices(self) -> None:
         """Precompute source indices for pull scheme
@@ -139,16 +150,19 @@ class StreamingPull:
     
     def compute(self, f_post: 'npt.NDArray', f_next: 'npt.NDArray') -> None:
         """Perform streaming step (out-of-place)
-        
+
         Implements: f_i(x, t+1) = f_i^post(x - c_i, t)
-        
+
         Args:
             f_post: Post-collision distribution, shape (Q, Nx, Ny[, Nz])
                    [dimensionless]
             f_next: Output buffer for streamed distribution
                    [dimensionless] - Modified in-place
         """
-        if self.dim == 2:
+        if self._use_cuda:
+            Nx, Ny, Nz = self.shape
+            self._cuda_kernel.launch(f_post, f_next, Nx, Ny, Nz)
+        elif self.dim == 2:
             f_next[:] = f_post[self.q_idx, self.src_x, self.src_y]
         else:
             f_next[:] = f_post[self.q_idx, self.src_x, self.src_y, self.src_z]

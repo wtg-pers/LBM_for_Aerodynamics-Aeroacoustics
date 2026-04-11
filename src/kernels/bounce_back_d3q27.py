@@ -6,11 +6,11 @@ Each thread handles one spatial node, processing all 27 directions.
 
 Physical process:
     At fluid nodes adjacent to solid, the outgoing distribution
-    toward the wall bounces back:  f[ī, x] = f_post[i, x]
+    toward the wall bounces back:  f[i_opp, x] = f_post[i, x]
 
 Memory traffic per boundary node (float32):
-    Read:  needs_bounce (27 × 1B) + f_post source (~13 × 4B avg)
-    Write: f destination (~13 × 4B avg)
+    Read:  needs_bounce (27 x 1B) + f_post source (~13 x 4B avg)
+    Write: f destination (~13 x 4B avg)
 
 Author: LBM Development Team
 Date: 2026-04
@@ -155,7 +155,7 @@ class HWBBKernelD3Q27:
         """Apply bounce-back.
 
         Args:
-            f:            Post-streaming distribution (27, N) — modified
+            f:            Post-streaming distribution (27, N) -- modified
             f_post:       Post-collision source (27, N), or None for in-place
             needs_bounce: Boundary link mask (27, N) bool
             N:            Total spatial nodes
@@ -186,7 +186,7 @@ class HWBBKernelD3Q27:
         """Reset solid nodes to equilibrium.
 
         Args:
-            f:          Distribution (27, N) — modified
+            f:          Distribution (27, N) -- modified
             solid_mask: Boolean mask (N,) True=solid
             N:          Total nodes
         """

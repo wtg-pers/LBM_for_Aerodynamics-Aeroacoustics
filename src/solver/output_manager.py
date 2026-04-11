@@ -429,16 +429,40 @@ class OutputManager:
         if not self.force_mgr.should_compute(step):
             return
 
-        # Select f_post from the correct level
-        if (self._mlg_force_level is not None
-                and hasattr(sim, 'get_level')):
-            f_post = sim.get_level(self._mlg_force_level).f_post
+        # Esoteric mode: force computed inside kernel, read from accumulator
+        if hasattr(sim, '_use_esoteric') and sim._use_esoteric:
+            if sim._eso_force_out is not None:
+                forces = tuple(float(sim._eso_force_out[d]) for d in range(3))
+                coeffs = self.force_mgr.force_calc.get_coefficients(
+                    forces,
+                    rho_ref=self.force_mgr.rho_ref,
+                    u_ref=self.force_mgr.u_ref,
+                    char_length=self.force_mgr.char_length,
+                    span_length=self.force_mgr.span_length,
+                )
+                force_result = {
+                    'step': step,
+                    'Fx': forces[0], 'Fy': forces[1], 'Fz': forces[2],
+                    'Cd': coeffs['Cd'], 'Cl': coeffs['Cl'],
+                    'Cz': coeffs.get('Cz', 0.0),
+                }
+                self.force_mgr.history.append(force_result)
+                if self.force_mgr._csv_writer is not None:
+                    self.force_mgr._csv_writer.writerow(force_result)
+                    self.force_mgr._csv_file.flush()
+            else:
+                force_result = None
         else:
-            f_post = sim.f_post
+            # Standard mode: compute from f_post
+            if (self._mlg_force_level is not None
+                    and hasattr(sim, 'get_level')):
+                f_post = sim.get_level(self._mlg_force_level).f_post
+            else:
+                f_post = sim.f_post
 
-        force_result = self.force_mgr.compute_and_log(
-            step, f_post, verbose=False,
-        )
+            force_result = self.force_mgr.compute_and_log(
+                step, f_post, verbose=False,
+            )
         if force_result:
             self._last_Cd = force_result['Cd']
             self._last_Cl = force_result['Cl']
@@ -595,14 +619,18 @@ class OutputManager:
         return 'continue'
     
     def _build_checkpoint_extra(self, sim) -> dict:
-        """Build extra_data dict for MLG checkpoint (fine level f arrays)."""
+        """Build extra_data dict for checkpoint."""
         extra = {}
+        # MLG: save fine level f arrays
         if self.mlg_vtk_writer is not None:
             from src.grid.multi_level_grid import MultiLevelGrid
             if isinstance(sim, MultiLevelGrid):
                 extra['num_levels'] = sim.num_levels
                 for k in range(1, sim.num_levels):
                     extra[f'f_level_{k}'] = sim.get_level(k).f
+        # Esoteric: save parity step for correct restart
+        if hasattr(sim, '_use_esoteric') and sim._use_esoteric:
+            extra['esoteric_step'] = sim._esoteric_step
         return extra if extra else None
 
     def _save_checkpoint(self, step: int, sim: 'Simulation') -> None:

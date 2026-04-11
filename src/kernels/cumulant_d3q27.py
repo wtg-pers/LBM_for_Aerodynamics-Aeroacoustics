@@ -5,14 +5,14 @@ Replaces: macroscopic.compute() + Guo correction + cumulant.collide()
 with a single CUDA kernel launch.
 
 Physical Process (per node, Geier et al. 2015):
-    1. Compute ρ, u from f
-    2. Guo correction: u += F/(2ρ)
-    3. f → K[3][3][3] via Chimera forward (Eqs. 43-45)
-    4. Central moments → cumulants (Eqs. 46-54)
+    1. Compute rho, u from f
+    2. Guo correction: u += F/(2rho)
+    3. f -> K[3][3][3] via Chimera forward (Eqs. 43-45)
+    4. Central moments -> cumulants (Eqs. 46-54)
     5. Relax cumulants with Galilean correction (Eqs. 55-80)
-    6. Cumulants → central moments (Eqs. 81-84)
+    6. Cumulants -> central moments (Eqs. 81-84)
     7. Force sign-flip of 1st moments (Eqs. 85-87)
-    8. K[3][3][3] → f* via Chimera backward (Eqs. 88-96)
+    8. K[3][3][3] -> f* via Chimera backward (Eqs. 88-96)
     9. Add Guo source term S_i
 
 Register budget (float32):
@@ -47,7 +47,7 @@ void cumulant_collide_d3q27(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    // ── D3Q27 lattice constants ─────────────────────────────
+    // -- D3Q27 lattice constants -----------------------------
     const int cx[27] = {
         0,  1,-1, 0, 0, 0, 0,
         1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0,
@@ -74,16 +74,16 @@ void cumulant_collide_d3q27(
         1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f, 1.0f/216.0f
     };
 
-    // q → (i,j,k) mapping: i=cx+1, j=cy+1, k=cz+1
-    // ijk_to_q[i][j][k] → flat index q
+    // q -> (i,j,k) mapping: i=cx+1, j=cy+1, k=cz+1
+    // ijk_to_q[i][j][k] -> flat index q
     // Built from cx,cy,cz arrays above.
     int ijk_to_q[3][3][3];
     for (int q = 0; q < 27; q++)
         ijk_to_q[cx[q]+1][cy[q]+1][cz[q]+1] = q;
 
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     // Step 1: Load f, compute macroscopic
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     float f_local[27];
     float rho = 0.0f;
     float mom_x = 0.0f, mom_y = 0.0f, mom_z = 0.0f;
@@ -102,9 +102,9 @@ void cumulant_collide_d3q27(
     float uy = mom_y * inv_rho;
     float uz = mom_z * inv_rho;
 
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     // Step 2: Guo velocity correction
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     float Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
     if (force != NULL) {
         Fx = force[0 * N + idx];
@@ -122,22 +122,22 @@ void cumulant_collide_d3q27(
     u_out[1 * N + idx] = uy;
     u_out[2 * N + idx] = uz;
 
-    // ══════════════════════════════════════════════════════════
-    // Step 3: Reshape f_local to K[3][3][3] (flat → ijk)
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
+    // Step 3: Reshape f_local to K[3][3][3] (flat -> ijk)
+    // ==========================================================
     float K[3][3][3];
     for (int q = 0; q < 27; q++) {
         int i = cx[q] + 1, j = cy[q] + 1, k = cz[q] + 1;
         K[i][j][k] = f_local[q];
     }
 
-    // ══════════════════════════════════════════════════════════
-    // Step 4: Forward Chimera transform — f → central moments
-    //   z-direction → y-direction → x-direction
+    // ==========================================================
+    // Step 4: Forward Chimera transform -- f -> central moments
+    //   z-direction -> y-direction -> x-direction
     //   Each: m0 = d_m + d_0 + d_p
     //         m1 = -d_m + d_p - v*m0
-    //         m2 = d_m + d_p - 2v*m1 - v²*m0
-    // ══════════════════════════════════════════════════════════
+    //         m2 = d_m + d_p - 2v*m1 - v^2*m0
+    // ==========================================================
 
     // z-direction (vel = uz)
     for (int i = 0; i < 3; i++) {
@@ -169,13 +169,13 @@ void cumulant_collide_d3q27(
             K[0][j][k] = m0; K[1][j][k] = m1; K[2][j][k] = m2;
         }
     }
-    // Now K[a][b][c] = κ_{abc} (central moments)
+    // Now K[a][b][c] = kappa_{abc} (central moments)
 
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     // Step 5: Forward cumulant transform (Eqs. 46-54)
-    //   Orders 0-3: C = κ (no change)
+    //   Orders 0-3: C = kappa (no change)
     //   Order 4+: subtract lower-order products
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
 
     // Save originals for order 6 (Eq. 54)
     float k220_o = K[2][2][0], k202_o = K[2][0][2], k022_o = K[0][2][2];
@@ -202,7 +202,7 @@ void cumulant_collide_d3q27(
                    + 4.0f*K[1][1][0]*K[1][1][1]
                    + 2.0f*(K[0][1][1]*K[2][1][0] + K[1][0][1]*K[1][2][0])) * inv_rho;
 
-    // Order 6: C_{222} (Eq. 54) — uses ORIGINAL 4th-order values
+    // Order 6: C_{222} (Eq. 54) -- uses ORIGINAL 4th-order values
     float inv_rho2 = inv_rho * inv_rho;
     K[2][2][2] -= (
         4.0f*K[1][1][1]*K[1][1][1]
@@ -218,9 +218,9 @@ void cumulant_collide_d3q27(
         + 2.0f*K[2][0][0]*K[0][2][0]*K[0][0][2]
     ) * inv_rho2;
 
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     // Step 6: Relax cumulants (Eqs. 55-80, Galilean correction)
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     float w1 = omega_1;
     float w2 = omega_bulk;
     float w3 = omega_high, w4 = omega_high, w5 = omega_high;
@@ -293,9 +293,9 @@ void cumulant_collide_d3q27(
     // 6th order (Eq. 80)
     K[2][2][2] *= (1.0f - w10);
 
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     // Step 7: Backward cumulant transform (Eqs. 81-84)
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     inv_rho2 = inv_rho * inv_rho;
 
     // Order 4 (Eq. 82)
@@ -333,22 +333,22 @@ void cumulant_collide_d3q27(
         + 2.0f*K[2][0][0]*K[0][2][0]*K[0][0][2]
     ) * inv_rho2;
 
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     // Step 7b: Force sign-flip (Eqs. 85-87)
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
     if (force != NULL) {
         K[1][0][0] = -K[1][0][0];
         K[0][1][0] = -K[0][1][0];
         K[0][0][1] = -K[0][0][1];
     }
 
-    // ══════════════════════════════════════════════════════════
-    // Step 8: Backward Chimera — central moments → f*
-    //   x-direction → y-direction → z-direction
-    //   f_0   = m0(1-v²) - 2v·m1 - m2
-    //   f_{-} = 0.5(m0(v²-v) + m1(2v-1) + m2)
-    //   f_{+} = 0.5(m0(v²+v) + m1(2v+1) + m2)
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
+    // Step 8: Backward Chimera -- central moments -> f*
+    //   x-direction -> y-direction -> z-direction
+    //   f_0   = m0(1-v^2) - 2v*m1 - m2
+    //   f_{-} = 0.5(m0(v^2-v) + m1(2v-1) + m2)
+    //   f_{+} = 0.5(m0(v^2+v) + m1(2v+1) + m2)
+    // ==========================================================
 
     // x-direction (vel = ux)
     float ux2 = ux * ux;
@@ -382,9 +382,9 @@ void cumulant_collide_d3q27(
     }
     // Now K[i][j][k] = f*_{ijk} (post-collision)
 
-    // ══════════════════════════════════════════════════════════
-    // Step 9: Write f_post (ijk → flat) + Guo source term
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
+    // Step 9: Write f_post (ijk -> flat) + Guo source term
+    // ==========================================================
     if (force != NULL) {
         float pf = 1.0f - 0.5f * omega_1;  // Guo prefactor
         for (int q = 0; q < 27; q++) {
@@ -406,7 +406,7 @@ void cumulant_collide_d3q27(
 '''
 
 
-# ─── Streaming-fused version: pull from neighbors + collide ──
+# --- Streaming-fused version: pull from neighbors + collide --
 
 _CUMULANT_D3Q27_STREAM_COLLIDE_KERNEL = (
     _CUMULANT_D3Q27_KERNEL
@@ -425,7 +425,7 @@ _CUMULANT_D3Q27_STREAM_COLLIDE_KERNEL = (
         '    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n'
         '    if (idx >= N) return;\n'
         '\n'
-        '    // 1D → 3D index\n'
+        '    // 1D -> 3D index\n'
         '    int iz = idx / (Nx * Ny);\n'
         '    int rem = idx - iz * Nx * Ny;\n'
         '    int iy = rem / Nx;\n'
@@ -550,9 +550,9 @@ class CumulantCollideKernelD3Q27:
             rho_out:    Density output (N,)
             u_out:      Velocity output (3, N)
             force:      Body force (3, N) or None
-            omega_1:    Shear relaxation rate 1/τ
-            omega_bulk: Bulk viscosity rate ω₂
-            omega_high: Higher-order rate ω₃-ω₁₀
+            omega_1:    Shear relaxation rate 1/tau
+            omega_bulk: Bulk viscosity rate omega_2
+            omega_high: Higher-order rate omega_3-omega_1_0
             N:          Total spatial nodes
         """
         if self._kernel is None:
