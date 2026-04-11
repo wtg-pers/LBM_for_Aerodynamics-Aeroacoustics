@@ -154,12 +154,17 @@ class Simulation:
         self._f_post = self.xp.empty_like(f)
         self._is_ready = True
 
-        # ── Try to initialize fused CUDA kernel ──
+        # ── Try to initialize CUDA kernels ──
         self._use_fused = False
         self._fused_is_cumulant = False
+        self._streaming_kernel = None
+        self._hwbb_kernel = None
+
         if self.xp.__name__ == 'cupy' and len(self.domain_shape) == 3:
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
+
+            # Collision kernel
             if isinstance(self.collision, BGKCollision):
                 try:
                     from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
@@ -173,6 +178,21 @@ class Simulation:
                     self._fused_kernel = CumulantCollideKernelD3Q27()
                     self._use_fused = True
                     self._fused_is_cumulant = True
+                except Exception:
+                    pass
+
+            # Streaming kernel
+            try:
+                from src.kernels.streaming_d3q27 import StreamingKernelD3Q27
+                self._streaming_kernel = StreamingKernelD3Q27()
+            except Exception:
+                pass
+
+            # HWBB kernel
+            if self.obstacle_bc is not None:
+                try:
+                    from src.kernels.bounce_back_d3q27 import HWBBKernelD3Q27
+                    self._hwbb_kernel = HWBBKernelD3Q27()
                 except Exception:
                     pass
 
@@ -298,13 +318,29 @@ class Simulation:
             )
         self.body_force = None
 
-        # ─── Streaming (1 CuPy operation) ───────────────────────────
-        self.streaming.compute(self._f_post, self.f)
+        # ─── Streaming ───────────────────────────────────────────────
+        if self._streaming_kernel is not None:
+            Nx, Ny, Nz = self.domain_shape
+            self._streaming_kernel.launch(self._f_post, self.f, Nx, Ny, Nz)
+        else:
+            self.streaming.compute(self._f_post, self.f)
 
         # ─── Boundary Conditions ─────────────────────────────────────
         self.bc_manager.apply_all(self.f, self._f_post)
         if self.obstacle_bc is not None:
-            self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+            if self._hwbb_kernel is not None:
+                N = 1
+                for d in self.domain_shape:
+                    N *= d
+                self._hwbb_kernel.apply(
+                    self.f, self._f_post,
+                    self.obstacle_bc.needs_bounce, N,
+                )
+                self._hwbb_kernel.reset_solid(
+                    self.f, self.obstacle_bc.solid_mask, N,
+                )
+            else:
+                self.obstacle_bc.apply_with_reset(self.f, self._f_post)
 
         self.step_count += 1
 
@@ -347,12 +383,25 @@ class Simulation:
             )
 
         # ─── Step 5: Streaming ───────────────────────────────────────
-        self.streaming.compute(self._f_post, self.f)
+        if self._streaming_kernel is not None:
+            Nx, Ny, Nz = self.domain_shape
+            self._streaming_kernel.launch(self._f_post, self.f, Nx, Ny, Nz)
+        else:
+            self.streaming.compute(self._f_post, self.f)
 
         # ─── Step 6: Boundary Conditions ─────────────────────────────
         self.bc_manager.apply_all(self.f, self._f_post)
         if self.obstacle_bc is not None:
-            self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+            if self._hwbb_kernel is not None:
+                self._hwbb_kernel.apply(
+                    self.f, self._f_post,
+                    self.obstacle_bc.needs_bounce, N,
+                )
+                self._hwbb_kernel.reset_solid(
+                    self.f, self.obstacle_bc.solid_mask, N,
+                )
+            else:
+                self.obstacle_bc.apply_with_reset(self.f, self._f_post)
 
         self.step_count += 1
 
