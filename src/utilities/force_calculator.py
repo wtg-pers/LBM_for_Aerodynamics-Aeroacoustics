@@ -104,7 +104,16 @@ class MomentumExchangeForce:
         
         # Count boundary links for info
         self.n_boundary_links = int(xp.sum(self.needs_bounce))
-        
+
+        # Try CUDA kernel for 3D
+        self._cuda_kernel = None
+        if self.dim == 3 and xp.__name__ == 'cupy':
+            try:
+                from src.kernels.mem_force_d3q27 import MEMForceKernelD3Q27
+                self._cuda_kernel = MEMForceKernelD3Q27()
+            except Exception:
+                pass
+
         # Storage for time history
         self.force_history: List[Dict[str, Any]] = []
     
@@ -170,33 +179,37 @@ class MomentumExchangeForce:
     
     def compute(self, f_post: 'npt.NDArray') -> Tuple:
         """Compute total force on solid using momentum exchange
-        
+
         Mathematical Formula:
         ---------------------
         F = Σ_{boundary links} 2 * c_i * f_i^post(x_fluid)
-        
+
         Args:
             f_post: Post-collision distribution, shape (Q, Nx, Ny) or (Q, Nx, Ny, Nz)
                    [dimensionless] - MUST be post-collision, pre-streaming!
-        
+
         Returns:
             (Fx, Fy) for 2D or (Fx, Fy, Fz) for 3D  [lattice units]
         """
+        # Try CUDA kernel for 3D
+        if self.dim == 3 and self._cuda_kernel is not None:
+            N = 1
+            for d in f_post.shape[1:]:
+                N *= d
+            return self._cuda_kernel.compute(f_post, self.needs_bounce, N)
+
+        # Fallback: Python loop (2D or no CUDA)
         xp = self.xp
         c = self.c
-        
-        # Force in each direction
+
         forces = []
         for d in range(self.dim):
-            # F_d = Σ_i Σ_x (2 * c_i[d] * f_i(x)) where needs_bounce[i,x] is True
             F_d = 0.0
-            for i in range(1, self.Q):  # Skip rest direction
-                # f_i at boundary links
+            for i in range(1, self.Q):
                 f_boundary = f_post[i] * self.needs_bounce[i]
-                # Momentum exchange: 2 * c_i * f_i
                 F_d += 2.0 * float(c[d, i]) * float(xp.sum(f_boundary))
             forces.append(F_d)
-        
+
         return tuple(forces)
     
     def get_coefficients(self, forces: Tuple, 

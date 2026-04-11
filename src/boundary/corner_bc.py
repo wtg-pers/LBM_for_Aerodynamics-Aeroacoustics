@@ -81,26 +81,102 @@ class CornerBC:
         self.cs2 = lattice.cs2
         
         self.domain_shape = node_map.domain_shape
-    
+
+        # ── Pre-cache edge/corner f_eq where possible ────────────
+        # Edges/corners with constant target (no extrapolation needed)
+        # get their f_eq computed once at init, not every step.
+        self._cached_edges = []    # (index_tuple, f_eq_array)
+        self._uncached_edges = []  # edges that need runtime extrapolation
+        self._cached_corners = []
+        self._uncached_corners = []
+
+        self._precache_edges_and_corners()
+
+    def _precache_edges_and_corners(self) -> None:
+        """Pre-compute f_eq for edges/corners with constant targets."""
+        from src.boundary.regularized_utils import compute_f_eq
+        xp = self.xp
+
+        for edge in self.node_map.edge_nodes:
+            faces = [edge.face_a, edge.face_b]
+            if hasattr(edge, 'face_c'):
+                faces.append(edge.face_c)
+            types = set(fc.bc_type for fc in faces)
+
+            # Check if target is constant (no extrapolation needed)
+            needs_extrap = (BCType.NEUMANN in types
+                           or (BCType.WALL in types and BCType.PRESSURE not in types
+                               and BCType.VELOCITY not in types
+                               and BCType.SPONGE not in types))
+
+            if not needs_extrap and self.dim == 3:
+                # Constant target: compute f_eq once
+                # Use dummy rho_ext to resolve target
+                free_ax = edge.free_axis
+                n_free = self.domain_shape[free_ax]
+                rho_dummy = xp.ones(n_free, dtype=xp.float64)
+                u_dummy = xp.zeros((self.dim, n_free), dtype=xp.float64)
+                rho_t, u_t = self._resolve_target(faces, rho_dummy, u_dummy)
+                f_eq = compute_f_eq(xp, rho_t, u_t, self.c, self.w, self.cs2)
+
+                # Build index
+                fixed_axes = sorted(edge.position.keys())
+                edge_idx = [None, None, None]
+                for ax in range(3):
+                    if ax == free_ax:
+                        edge_idx[ax] = slice(None)
+                    else:
+                        edge_idx[ax] = edge.position[ax]
+
+                self._cached_edges.append((edge_idx, f_eq))
+            else:
+                self._uncached_edges.append(edge)
+
+        for corner in self.node_map.corner_nodes:
+            faces = [corner.face_a, corner.face_b, corner.face_c]
+            types = set(fc.bc_type for fc in faces)
+
+            needs_extrap = (BCType.NEUMANN in types
+                           or (BCType.WALL in types and BCType.PRESSURE not in types
+                               and BCType.VELOCITY not in types
+                               and BCType.SPONGE not in types))
+
+            if not needs_extrap:
+                rho_dummy = xp.ones(1, dtype=xp.float64)
+                u_dummy = xp.zeros((self.dim, 1), dtype=xp.float64)
+                rho_t, u_t = self._resolve_target(faces, rho_dummy, u_dummy)
+                f_eq = compute_f_eq(xp, rho_t, u_t, self.c, self.w, self.cs2)
+
+                pos = corner.position
+                self._cached_corners.append(
+                    ((pos[0], pos[1], pos[2]), f_eq.ravel()))
+            else:
+                self._uncached_corners.append(corner)
+
     # =========================================================================
     # Main Apply
     # =========================================================================
-    
+
     def apply(self, f: 'npt.NDArray') -> None:
         """Apply equilibrium BC at all edge and corner nodes.
-        
-        Called AFTER face BCs in the time loop. Since face BCs only write
-        to flat nodes, this fills the remaining edge/corner nodes.
-        
-        Args:
-            f: Distribution function, modified in-place. shape (Q, Nx, Ny[, Nz])
+
+        Pre-cached edges/corners: direct write (fast).
+        Uncached: runtime computation (original path).
         """
-        # Edges
-        for edge in self.node_map.edge_nodes:
+        # Cached edges: direct write, no computation
+        for edge_idx, f_eq in self._cached_edges:
+            f[:, edge_idx[0], edge_idx[1], edge_idx[2]] = f_eq
+
+        # Cached corners: direct write
+        for (ix, iy, iz), f_eq in self._cached_corners:
+            f[:, ix, iy, iz] = f_eq
+
+        # Uncached edges: original path (with extrapolation)
+        for edge in self._uncached_edges:
             self._apply_edge(f, edge)
-        
-        # Corners (3D only)
-        for corner in self.node_map.corner_nodes:
+
+        # Uncached corners: original path
+        for corner in self._uncached_corners:
             self._apply_corner(f, corner)
     
     # =========================================================================

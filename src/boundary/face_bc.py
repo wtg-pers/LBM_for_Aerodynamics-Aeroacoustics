@@ -133,14 +133,19 @@ class FaceBC:
         """Apply BC on flat nodes of a 3D face."""
         xp = self.xp
         loc = self.location
-        
+
         face_sl = self.node_map.get_face_slice_3d(loc)
+
+        # Equilibrium with constant target: use cached f_eq
+        if not self.use_regularized and hasattr(self, '_cached_f_eq_3d'):
+            f[:, face_sl[0], face_sl[1], face_sl[2]] = self._cached_f_eq_3d
+            return
+
         int_sl = self.node_map.get_interior_slice_3d(loc)
-        
         f_int = f[:, int_sl[0], int_sl[1], int_sl[2]]
-        
+
         rho_t, u_t = self._get_target_rho_u(f_int)
-        
+
         if self.use_regularized:
             Pi_neq = compute_Pi_neq(xp, f_int, self.c, self.w, self.cs2)
             f_new = reconstruct_f_regularized(
@@ -148,7 +153,7 @@ class FaceBC:
             )
         else:
             f_new = compute_f_eq(xp, rho_t, u_t, self.c, self.w, self.cs2)
-        
+
         f[:, face_sl[0], face_sl[1], face_sl[2]] = f_new
     
     def _get_target_rho_u(self, f_int: 'npt.NDArray') -> Tuple['npt.NDArray', 'npt.NDArray']:
@@ -203,7 +208,7 @@ class VelocityDirichletBC(FaceBC):
         """Setup velocity array matching flat node shape."""
         xp = self.xp
         velocity = self.config.velocity
-        
+
         if self.dim == 2:
             face_sl = self.node_map.get_face_slice_2d(self.location)
             dummy = xp.zeros(self.node_map.domain_shape)
@@ -212,15 +217,23 @@ class VelocityDirichletBC(FaceBC):
             face_sl = self.node_map.get_face_slice_3d(self.location)
             dummy = xp.zeros(self.node_map.domain_shape)
             flat_shape = dummy[face_sl[0], face_sl[1], face_sl[2]].shape
-        
+
         self.u_target = xp.zeros((self.dim,) + flat_shape, dtype=xp.float64)
         self.rho_target = xp.full(flat_shape, self.config.density, dtype=xp.float64)
-        
+
         if isinstance(velocity, (int, float)):
-            self.u_target[0, ...] = float(velocity)       # [Δx/Δt]
+            self.u_target[0, ...] = float(velocity)
         elif isinstance(velocity, (list, tuple)):
             for d in range(min(len(velocity), self.dim)):
-                self.u_target[d, ...] = float(velocity[d])  # [Δx/Δt]
+                self.u_target[d, ...] = float(velocity[d])
+
+        # Cache f_eq for equilibrium mode (constant target → same every step)
+        if not self.use_regularized and self.dim == 3:
+            from src.boundary.regularized_utils import compute_f_eq
+            self._cached_f_eq_3d = compute_f_eq(
+                xp, self.rho_target, self.u_target,
+                self.c, self.w, self.cs2,
+            )
     
     def _get_target_rho_u(self, f_int: 'npt.NDArray') -> Tuple['npt.NDArray', 'npt.NDArray']:
         """Target: ρ = ρ₀ (prescribed), u = u_target (prescribed)."""

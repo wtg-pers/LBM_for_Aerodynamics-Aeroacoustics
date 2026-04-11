@@ -76,6 +76,15 @@ class GridCoupling:
         self._interp = interpolation
         self._filter_level = filter_level
 
+        # ── CUDA interpolation kernel (if available) ─────────────
+        self._cuda_interp = None
+        if xp.__name__ == 'cupy':
+            try:
+                from src.kernels.interpolation_d3q27 import CubicInterpolationKernel3D
+                self._cuda_interp = CubicInterpolationKernel3D()
+            except Exception:
+                pass
+
         # ── Lattice constants on device ──────────────────────────
         self._dtype = lattice.dtype
         self._c = xp.asarray(lattice.c, dtype=self._dtype)    # (dim, Q)
@@ -290,9 +299,13 @@ class GridCoupling:
         f_fine[:, 0::2, 0::2, 0::2] = f_coarse_nodes
 
         # Interpolate odd indices: axis 1=x, 2=y, 3=z
-        f_fine = self._interp.interpolate_1d(xp, f_fine, axis=1)
-        f_fine = self._interp.interpolate_1d(xp, f_fine, axis=2)
-        f_fine = self._interp.interpolate_1d(xp, f_fine, axis=3)
+        if self._cuda_interp is not None:
+            self._cuda_interp.interpolate(
+                f_fine, self._Q, Nx_f, Ny_f, Nz_f)
+        else:
+            f_fine = self._interp.interpolate_1d(xp, f_fine, axis=1)
+            f_fine = self._interp.interpolate_1d(xp, f_fine, axis=2)
+            f_fine = self._interp.interpolate_1d(xp, f_fine, axis=3)
 
         return f_fine
 
