@@ -77,6 +77,7 @@ class Simulation:
         domain_shape: Tuple[int, ...],
         obstacle_bc: Optional['HalfwayBounceBack'] = None,
         al_model: Optional[object] = None,
+        sgs_cfg: Optional[dict] = None,
     ) -> None:
         """Initialize Simulation with all physical operators.
 
@@ -93,6 +94,9 @@ class Simulation:
             obstacle_bc: Internal obstacle BC (HalfwayBounceBack), optional
             al_model: Actuator Line model (ActuatorLineModel or
                       MultiRotorManager), optional
+            sgs_cfg: Validated SGS config dict with keys
+                     {enabled, model, Cs, Cw}, or None for SGS-disabled.
+                     Produced by src.turbulence.sgs.parse_sgs_config.
         """
         # ── Array module ──
         self.xp = xp
@@ -109,6 +113,12 @@ class Simulation:
         # ── Actuator Line ──
         self.al_model = al_model
 
+        # ── SGS / turbulence model ──
+        # Default to disabled if caller did not supply a parsed dict.
+        self._sgs_cfg = sgs_cfg if sgs_cfg is not None else {
+            "enabled": False, "model": "off", "Cs": 0.18, "Cw": 0.5,
+        }
+
         # ── Parameters ──
         self.tau: float = tau                        # [Δt]
         self.domain_shape: Tuple[int, ...] = domain_shape  # [lu]
@@ -117,6 +127,9 @@ class Simulation:
         self.rho: Optional['npt.NDArray'] = None     # [dimensionless]
         self.u: Optional['npt.NDArray'] = None       # [Δx/Δt] (force-corrected)
         self.body_force: Optional['npt.NDArray'] = None  # [lattice force / lu³]
+        # SGS eddy viscosity buffer (lattice units). Allocated in
+        # set_distribution() iff SGS is enabled. None -> kernel skips writing.
+        self.nu_t: Optional['npt.NDArray'] = None    # [lu²/lt]
 
         # ── Distribution buffers (populated by set_distribution()) ──
         self.f: Optional['npt.NDArray'] = None       # Current distribution  [dimensionless]
@@ -126,12 +139,25 @@ class Simulation:
         self.step_count: int = 0
         self._is_ready: bool = False
 
-        # ── CUDA kernel mode (lazy init) ──
+        # ── Fused CUDA kernel (lazy init) ──
         self._fused_kernel = None
         self._use_fused: bool = False
-        self._use_esoteric: bool = False
-        self._esoteric_kernel = None
-        self._esoteric_step: int = 0
+
+        # ── WALE pre-pass kernels (lazy init for sgs_model="wale") ──
+        # The WALE eddy-viscosity needs u globally before collision so the
+        # gradient stencil can read neighbours. We compute (rho, u) via a
+        # macro pre-pass, then nu_t via a separate kernel, then run the
+        # cumulant collide reading nu_t from a buffer.
+        self._macro_kernel = None
+        self._wale_kernel = None
+        self._u_buf = None      # (dim, N) flat for pre-pass writes
+        self._rho_buf = None    # (N,)     flat
+        self._nu_t_in = None    # (N,)     fed to cumulant WALE branch
+
+        # ── Obstacle BC kernel (lazy init in set_distribution) ──
+        # Only one of _hwbb_kernel / _ibb_kernel is set at a time, depending
+        # on isinstance(obstacle_bc, ...). Both None → Python path.
+        self._ibb_kernel = None
 
     # =====================================================================
     # Public Interface
@@ -157,48 +183,155 @@ class Simulation:
         self._f_post = self.xp.empty_like(f)
         self._is_ready = True
 
+        # ── SGS eddy-viscosity output buffer ──
+        # Allocate iff a non-trivial SGS model is in use, so the kernel can
+        # write nu_t per cell for diagnostics / VTK export.
+        if self._sgs_cfg["model"] in ("smagorinsky", "wale", "dyn_smag"):
+            self.nu_t = self.xp.zeros(self.domain_shape, dtype=f.dtype)
+        else:
+            self.nu_t = None
+
+        # ── WALE pre-pass scratch buffers ──
+        # The cumulant collide WALE branch reads nu_t from a flat (N,) buffer.
+        # The pre-pass kernels write into flat (N,) and (dim, N) views.
+        if self._sgs_cfg["model"] in ("wale", "dyn_smag"):
+            N = 1
+            for d in self.domain_shape:
+                N *= int(d)
+            dim = len(self.domain_shape)
+            self._rho_buf = self.xp.empty(N, dtype=f.dtype)
+            self._u_buf   = self.xp.empty((dim, N), dtype=f.dtype)
+            self._nu_t_in = self.xp.empty(N, dtype=f.dtype)
+
         # ── Try to initialize CUDA kernels ──
         self._use_fused = False
-        self._use_esoteric = False
         self._fused_is_cumulant = False
+        # (streaming CUDA kernel is now handled inside StreamingPull)
         self._hwbb_kernel = None
+
+        # Track whether the fused kernel is the D2Q9 variant (different
+        # launch signature: omega_3 + omega_4 instead of omega_high).
+        self._fused_is_d2q9 = False
 
         if self.xp.__name__ == 'cupy' and len(self.domain_shape) == 3:
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
 
-            # Try Esoteric Pull first (highest priority for BGK)
+            sgs_model = self._sgs_cfg["model"]   # "off" | "smagorinsky" | "wale" | "dyn_smag"
+            # Cumulant collide branch: dyn_smag reuses the WALE block (both
+            # just read nu_t from a buffer). sgs_model_kernel -> what the
+            # cumulant kernel template is built with.
+            sgs_model_kernel = "wale" if sgs_model == "dyn_smag" else sgs_model
+
+            # Collision kernel
             if isinstance(self.collision, BGKCollision):
+                if self._sgs_cfg["enabled"]:
+                    raise NotImplementedError(
+                        "SGS turbulence models are wired to the cumulant "
+                        "collision only; BGK + SGS is not supported."
+                    )
                 try:
-                    self._init_esoteric(f)
+                    from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
+                    self._fused_kernel = BGKCollideKernelD3Q27()
+                    self._use_fused = True
+                except Exception:
+                    pass
+            elif isinstance(self.collision, CumulantCollision):
+                try:
+                    from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
+                    self._fused_kernel = CumulantCollideKernelD3Q27(sgs_model=sgs_model_kernel)
+                    self._use_fused = True
+                    self._fused_is_cumulant = True
+                    if sgs_model != "off":
+                        print(f"  [fused kernel] D3Q27 cumulant + SGS={sgs_model}")
                 except Exception:
                     pass
 
-            # Fallback: fused collision kernel
-            if not self._use_esoteric:
-                if isinstance(self.collision, BGKCollision):
-                    try:
-                        from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
-                        self._fused_kernel = BGKCollideKernelD3Q27()
-                        self._use_fused = True
-                    except Exception:
-                        pass
-                elif isinstance(self.collision, CumulantCollision):
-                    try:
-                        from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
-                        self._fused_kernel = CumulantCollideKernelD3Q27()
-                        self._use_fused = True
-                        self._fused_is_cumulant = True
-                    except Exception:
-                        pass
+                # WALE / dyn_smag pre-pass kernels (3D)
+                # Both feed nu_t to the cumulant collide WALE branch.
+                if sgs_model == "wale":
+                    from src.kernels.macro_d3q27 import MacroKernelD3Q27
+                    from src.kernels.wale_d3q27 import WALEKernelD3Q27
+                    self._macro_kernel = MacroKernelD3Q27()
+                    self._wale_kernel  = WALEKernelD3Q27()
+                elif sgs_model == "dyn_smag":
+                    from src.kernels.macro_d3q27 import MacroKernelD3Q27
+                    from src.kernels.dyn_smag_d3q27 import DynSmagKernelD3Q27
+                    self._macro_kernel = MacroKernelD3Q27()
+                    self._wale_kernel  = DynSmagKernelD3Q27()
 
-                # HWBB kernel (only needed in non-Esoteric mode)
-                if self.obstacle_bc is not None:
+            # Obstacle BC kernel: dispatch on type (HWBB vs IBB).
+            if self.obstacle_bc is not None:
+                from src.boundary.wall import HalfwayBounceBack
+                if type(self.obstacle_bc) is HalfwayBounceBack:
                     try:
                         from src.kernels.bounce_back_d3q27 import HWBBKernelD3Q27
                         self._hwbb_kernel = HWBBKernelD3Q27()
                     except Exception:
                         pass
+                else:
+                    try:
+                        from src.boundary.interpolated_wall import InterpolatedBounceBack
+                        if isinstance(self.obstacle_bc, InterpolatedBounceBack):
+                            from src.kernels.interpolated_wall_d3q27 import IBBKernelD3Q27
+                            self._ibb_kernel = IBBKernelD3Q27()
+                    except Exception:
+                        pass
+
+        elif self.xp.__name__ == 'cupy' and len(self.domain_shape) == 2:
+            # D2Q9 fused path (currently only Cumulant). Kernel is float32-only.
+            import numpy as _np
+            is_f32 = (self.f.dtype == _np.float32)
+
+            if is_f32:
+                from src.collision.cumulant_d2q9 import CumulantCollisionD2Q9
+
+                if isinstance(self.collision, CumulantCollisionD2Q9):
+                    sgs_model = self._sgs_cfg["model"]
+                    sgs_model_kernel = "wale" if sgs_model == "dyn_smag" else sgs_model
+                    try:
+                        from src.kernels.cumulant_d2q9 import CumulantCollideKernelD2Q9
+                        self._fused_kernel = CumulantCollideKernelD2Q9(
+                            sgs_model=sgs_model_kernel,
+                        )
+                        self._use_fused = True
+                        self._fused_is_cumulant = True
+                        self._fused_is_d2q9 = True
+                    except Exception:
+                        pass
+
+                # WALE / dyn_smag pre-pass kernels (2D)
+                if self._sgs_cfg["model"] == "wale":
+                    from src.kernels.macro_d2q9 import MacroKernelD2Q9
+                    from src.kernels.wale_d2q9 import WALEKernelD2Q9
+                    self._macro_kernel = MacroKernelD2Q9()
+                    self._wale_kernel  = WALEKernelD2Q9()
+                elif self._sgs_cfg["model"] == "dyn_smag":
+                    from src.kernels.macro_d2q9 import MacroKernelD2Q9
+                    from src.kernels.dyn_smag_d2q9 import DynSmagKernelD2Q9
+                    self._macro_kernel = MacroKernelD2Q9()
+                    self._wale_kernel  = DynSmagKernelD2Q9()
+
+                # Obstacle BC kernel: dispatch on exact type.
+                # Plain HalfwayBounceBack → HWBBKernelD2Q9
+                # InterpolatedBounceBack  → IBBKernelD2Q9
+                # MovingWallBounceBack / others → Python path.
+                if self.obstacle_bc is not None:
+                    from src.boundary.wall import HalfwayBounceBack
+                    if type(self.obstacle_bc) is HalfwayBounceBack:
+                        try:
+                            from src.kernels.bounce_back_d2q9 import HWBBKernelD2Q9
+                            self._hwbb_kernel = HWBBKernelD2Q9()
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            from src.boundary.interpolated_wall import InterpolatedBounceBack
+                            if isinstance(self.obstacle_bc, InterpolatedBounceBack):
+                                from src.kernels.interpolated_wall_d2q9 import IBBKernelD2Q9
+                                self._ibb_kernel = IBBKernelD2Q9()
+                        except Exception:
+                            pass
 
     @property
     def is_ready(self) -> bool:
@@ -212,15 +345,60 @@ class Simulation:
         Needed by MEM (Momentum Exchange Method) force calculation.
         Valid after the most recent advance() call.
 
-        In Esoteric mode, f_post is not available (single buffer).
-        MEM force needs adaptation for Esoteric ordering.
+        In streaming-fused mode (ping-pong), f itself is the post-collision
+        state after swap, so f_post returns f.
 
         Returns:
             Post-collision f, shape (Q, Nx, Ny[, Nz])  [dimensionless]
         """
-        if self._use_esoteric:
-            return None
         return self._f_post
+
+    # =====================================================================
+    # Diagnostic: NaN/Inf trap
+    # =====================================================================
+
+    def _check_nan(self, where: str) -> None:
+        """Detect non-finite values in rho/u and abort with location info.
+
+        Runs every step when enabled; lightweight single reductions on GPU.
+        Set Simulation.nan_trap_enabled = False on class to disable.
+        """
+        if not getattr(self, 'nan_trap_enabled', True):
+            return
+        xp = self.xp
+        if self.rho is None or self.u is None:
+            return
+
+        rho_bad = bool(xp.any(~xp.isfinite(self.rho)))
+        u_bad = bool(xp.any(~xp.isfinite(self.u)))
+        if not (rho_bad or u_bad):
+            return
+
+        if rho_bad:
+            bad_mask = ~xp.isfinite(self.rho)
+            field = 'rho'
+        else:
+            bad_mask = xp.any(~xp.isfinite(self.u), axis=0)
+            field = 'u'
+
+        n_bad = int(bad_mask.sum())
+        bad_idx = xp.argwhere(bad_mask)
+        loc = tuple(int(v) for v in bad_idx[0])
+
+        rho_finite = xp.where(xp.isfinite(self.rho), self.rho, xp.float64(1.0))
+        u_sq = xp.where(xp.isfinite(self.u), self.u, xp.float64(0.0)) ** 2
+        u_mag_sq = xp.sum(u_sq, axis=0)
+        rho_min = float(xp.min(rho_finite))
+        rho_max = float(xp.max(rho_finite))
+        u_max = float(xp.sqrt(xp.max(u_mag_sq)))
+
+        raise RuntimeError(
+            f"[NaN trap @ {where}] step={self.step_count}, "
+            f"domain={self.domain_shape}, bad_field='{field}', "
+            f"first_bad_loc(x,y,z)={loc}, n_bad={n_bad}, "
+            f"rho_finite_range=[{rho_min:.4g}, {rho_max:.4g}], "
+            f"|u|_max_finite={u_max:.4g}"
+        )
 
     def advance(self) -> None:
         """Perform one LBM timestep.
@@ -248,214 +426,19 @@ class Simulation:
                 "Simulation not ready: call set_distribution() first"
             )
 
-        if self._use_esoteric:
-            self._advance_esoteric()
-        elif self._use_fused and self.al_model is None:
+        if self._use_fused and self.al_model is None:
             self._advance_fused()
         elif self._use_fused and self.al_model is not None:
             self._advance_fused_with_alm()
         else:
             self._advance_default()
 
-    # =====================================================================
-    # Esoteric Pull path
-    # =====================================================================
-
-    def _init_esoteric(self, f: 'npt.NDArray') -> None:
-        """Initialize Esoteric Pull mode.
-
-        Converts f to Esoteric memory layout, creates node_type and BC
-        parameter arrays, and initializes the Esoteric kernel.
-
-        Args:
-            f: Initial distribution in standard D3Q27 ordering (27, Nx, Ny, Nz)
-        """
-        from src.kernels.esoteric_d3q27 import (
-            EsotericBGKKernelD3Q27,
-            convert_f_std_to_esoteric,
-            init_f_esoteric,
-            NODE_FLUID, NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN,
-        )
-        xp = self.xp
-        Nx, Ny, Nz = self.domain_shape
-        N = Nx * Ny * Nz
-
-        # Convert f from standard to Esoteric direction ordering
-        # (skip if f is already in Esoteric layout, e.g. checkpoint restart)
-        if not getattr(self, '_esoteric_f_already_set', False):
-            f_eso = convert_f_std_to_esoteric(xp, f)
-            self.f = init_f_esoteric(xp, f_eso, t_start=0)
-        else:
-            self.f = f
-        self._f_post = None  # not needed in Esoteric mode
-
-        # Build node_type array from BC config
-        node_type = xp.zeros((Nx, Ny, Nz), dtype=xp.int8)  # all FLUID
-
-        # Mark solid nodes: internal obstacle
-        if self.obstacle_bc is not None:
-            solid = self.obstacle_bc.solid_mask  # (Nx, Ny, Nz) bool
-            node_type[solid] = NODE_SOLID
-
-        # Mark domain boundary faces from bc_manager
-        bc_rho = xp.ones((Nx, Ny, Nz), dtype=xp.float32)
-        bc_ux = xp.zeros((Nx, Ny, Nz), dtype=xp.float32)
-        bc_uy = xp.zeros((Nx, Ny, Nz), dtype=xp.float32)
-        bc_uz = xp.zeros((Nx, Ny, Nz), dtype=xp.float32)
-
-        for face_bc in self.bc_manager.face_bcs:
-            loc = face_bc.location.value
-            cfg = face_bc.config
-
-            # Determine face slice
-            if loc in ('xmin', 'west'):
-                sl = (0, slice(None), slice(None))
-            elif loc in ('xmax', 'east'):
-                sl = (Nx-1, slice(None), slice(None))
-            elif loc in ('ymin', 'south'):
-                sl = (slice(None), 0, slice(None))
-            elif loc in ('ymax', 'north'):
-                sl = (slice(None), Ny-1, slice(None))
-            elif loc in ('zmin', 'bottom'):
-                sl = (slice(None), slice(None), 0)
-            elif loc in ('zmax', 'top'):
-                sl = (slice(None), slice(None), Nz-1)
-            else:
-                continue
-
-            # Map BC type to node_type
-            method = cfg.method if hasattr(cfg, 'method') else ''
-            bc_type = cfg.bc_type.value if hasattr(cfg, 'bc_type') else ''
-
-            if 'wall' in method or 'bounce' in method:
-                node_type[sl] = NODE_SOLID
-            elif 'neumann' in method:
-                node_type[sl] = NODE_NEUMANN
-            else:
-                # Equilibrium or regularized inlet/outlet → EQ_BC
-                node_type[sl] = NODE_EQ_BC
-                # Set BC parameters
-                if hasattr(cfg, 'density') and cfg.density is not None:
-                    bc_rho[sl] = float(cfg.density)
-                if hasattr(cfg, 'velocity') and cfg.velocity is not None:
-                    vel = cfg.velocity
-                    if isinstance(vel, (int, float)):
-                        bc_ux[sl] = float(vel)
-                    elif isinstance(vel, (list, tuple)):
-                        if len(vel) > 0:
-                            bc_ux[sl] = float(vel[0])
-                        if len(vel) > 1:
-                            bc_uy[sl] = float(vel[1])
-                        if len(vel) > 2:
-                            bc_uz[sl] = float(vel[2])
-
-        # Sponge layers: mark slab nodes as NODE_SPONGE
-        from src.kernels.esoteric_d3q27 import NODE_SPONGE
-        for sponge_bc in self.bc_manager.sponge_layers:
-            sb = sponge_bc
-            loc = sb.location.value if hasattr(sb, 'location') else ''
-            L = sb.thickness if hasattr(sb, 'thickness') else 0
-            if L <= 0:
-                continue
-            # Sponge sigma profile and target
-            sigma_1d = sb._sigma if hasattr(sb, '_sigma') else None
-            if sigma_1d is None:
-                continue
-            sigma_1d_np = sigma_1d.get() if hasattr(sigma_1d, 'get') else sigma_1d
-            rho_inf = float(sb.rho_inf) if hasattr(sb, 'rho_inf') else 1.0
-            u_inf = sb.u_inf.get() if hasattr(sb.u_inf, 'get') else sb.u_inf
-
-            for layer_i in range(L):
-                sigma_val = float(sigma_1d_np[layer_i])
-                if loc in ('xmax', 'east'):
-                    ix = Nx - 1 - layer_i
-                    sl = (ix, slice(None), slice(None))
-                elif loc in ('xmin', 'west'):
-                    ix = layer_i
-                    sl = (ix, slice(None), slice(None))
-                else:
-                    continue  # TODO: y/z sponge
-
-                node_type[sl] = NODE_SPONGE
-                bc_rho[sl] = rho_inf
-                bc_ux[sl] = float(u_inf[0])
-                bc_uy[sl] = float(u_inf[1]) if len(u_inf) > 1 else 0.0
-                # Reuse bc_uz as sigma for sponge nodes
-                bc_uz[sl] = sigma_val
-
-        # Store as flat arrays
-        self._eso_node_type = node_type.ravel()
-        self._eso_bc_rho = bc_rho.ravel()
-        self._eso_bc_ux = bc_ux.ravel()
-        self._eso_bc_uy = bc_uy.ravel()
-        self._eso_bc_uz = bc_uz.ravel()
-        self._esoteric_step = 0
-
-        # Allocate macroscopic arrays
-        self.rho = xp.empty(self.domain_shape, dtype=xp.float32)
-        self.u = xp.empty((3,) + self.domain_shape, dtype=xp.float32)
-
-        # Convert needs_bounce to Esoteric ordering + force accumulator
-        self._eso_needs_bounce = None
-        self._eso_force_out = None
-        if self.obstacle_bc is not None and hasattr(self.obstacle_bc, 'needs_bounce'):
-            from src.kernels.esoteric_d3q27 import _STD_TO_ESO
-            nb_std = self.obstacle_bc.needs_bounce  # (27, Nx, Ny, Nz) bool
-            nb_eso = xp.empty_like(nb_std)
-            for eso_q in range(27):
-                std_q = _STD_TO_ESO[eso_q]
-                nb_eso[eso_q] = nb_std[std_q]
-            self._eso_needs_bounce = nb_eso.reshape(27, N)
-            self._eso_force_out = xp.zeros(3, dtype=xp.float32)
-
-        # Create kernel
-        self._esoteric_kernel = EsotericBGKKernelD3Q27()
-        self._use_esoteric = True
-
-    def _advance_esoteric(self) -> None:
-        """Esoteric Pull advance: single kernel launch per step.
-
-        Physical process (inside kernel):
-            1. Load (Esoteric Pull streaming part 2/2)
-            2. Macroscopic: rho, u
-            3. BC check + Collision (or BC override)
-            4. MEM Force (optional, at boundary links)
-            5. Store (Esoteric Pull streaming part 1/2)
-        """
-        Nx, Ny, Nz = self.domain_shape
-        omega = 1.0 / self.tau
-
-        # Force calculation: only compute at force_interval steps
-        # (to avoid unnecessary atomicAdd overhead every step)
-        force_out = None
-        if self._eso_force_out is not None:
-            self._eso_force_out.fill(0)
-            force_out = self._eso_force_out
-
-        self._esoteric_kernel.launch(
-            self.f, self.rho, self.u,
-            self._eso_node_type,
-            self._eso_bc_rho, self._eso_bc_ux,
-            self._eso_bc_uy, self._eso_bc_uz,
-            omega, Nx, Ny, Nz,
-            t_step=self._esoteric_step,
-            needs_bounce=self._eso_needs_bounce,
-            force_out=force_out,
-        )
-
-        self.body_force = None
-        self._esoteric_step += 1
-        self.step_count += 1
-
-    # =====================================================================
-    # Standard (non-Esoteric) paths
-    # =====================================================================
-
     def _advance_default(self) -> None:
         """Default advance path using CuPy array operations."""
 
         # ─── Step 1: Macroscopic Variables ───────────────────────────
         self.rho, self.u = self.macroscopic.compute(self.f)
+        self._check_nan("default:post-macro")
 
         # ─── Step 2: Body Force (ALM pipeline) ──────────────────────
         self.body_force = self._compute_body_force(self.u, self.rho)
@@ -494,20 +477,45 @@ class Simulation:
             self.u = xp.empty((len(self.domain_shape),) + self.domain_shape,
                               dtype=self.f.dtype)
 
+        # ─── WALE / dyn_smag pre-pass: f -> rho, u (flat) -> nu_t_in ──
+        if self._sgs_cfg["model"] in ("wale", "dyn_smag"):
+            self._wale_pre_pass(N)
+
         # ─── Fused: macro + collision (1 kernel launch) ─────────────
         omega = 1.0 / self.tau
         if self._fused_is_cumulant:
-            self._fused_kernel.launch(
-                f_in=self.f,
-                f_post=self._f_post,
-                rho_out=self.rho,
-                u_out=self.u,
-                force=None,
-                omega_1=omega,
-                omega_bulk=self.collision.omega_bulk,
-                omega_high=self.collision.omega_3,
-                N=N,
-            )
+            if self._fused_is_d2q9:
+                ob = self.collision.omega_bulk
+                self._fused_kernel.launch(
+                    f_in=self.f,
+                    f_post=self._f_post,
+                    rho_out=self.rho,
+                    u_out=self.u,
+                    force=None,
+                    omega_1=omega,
+                    omega_bulk=omega if ob is None else ob,
+                    omega_3=self.collision.omega_3,
+                    omega_4=self.collision.omega_4,
+                    N=N,
+                    Cs=self._sgs_cfg["Cs"],
+                    nu_t_out=self.nu_t,
+                    nu_t_in=self._nu_t_in,
+                )
+            else:
+                self._fused_kernel.launch(
+                    f_in=self.f,
+                    f_post=self._f_post,
+                    rho_out=self.rho,
+                    u_out=self.u,
+                    force=None,
+                    omega_1=omega,
+                    omega_bulk=self.collision.omega_bulk,
+                    omega_high=self.collision.omega_3,
+                    N=N,
+                    Cs=self._sgs_cfg["Cs"],
+                    nu_t_out=self.nu_t,
+                    nu_t_in=self._nu_t_in,
+                )
         else:
             self._fused_kernel.launch(
                 f_in=self.f,
@@ -519,6 +527,7 @@ class Simulation:
                 N=N,
             )
         self.body_force = None
+        self._check_nan("fused:post-collision")
 
         # ─── Streaming ───────────────────────────────────────────────
         self.streaming.compute(self._f_post, self.f)
@@ -526,21 +535,95 @@ class Simulation:
         # ─── Boundary Conditions ─────────────────────────────────────
         self.bc_manager.apply_all(self.f, self._f_post)
         if self.obstacle_bc is not None:
-            if self._hwbb_kernel is not None:
-                N = 1
-                for d in self.domain_shape:
-                    N *= d
-                self._hwbb_kernel.apply(
-                    self.f, self._f_post,
-                    self.obstacle_bc.needs_bounce, N,
-                )
-                self._hwbb_kernel.reset_solid(
-                    self.f, self.obstacle_bc.solid_mask, N,
-                )
-            else:
-                self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+            self._apply_obstacle_bc()
 
         self.step_count += 1
+
+    def _wale_pre_pass(self, N: int) -> None:
+        """Compute (rho, u) from f and nu_t from u via the SGS pre-pass —
+        feeds the cumulant collide WALE branch. Same buffer pipeline
+        works for both WALE and Dynamic Smagorinsky; only the second
+        kernel launch differs."""
+        model = self._sgs_cfg["model"]
+        if len(self.domain_shape) == 2:
+            Nx, Ny = self.domain_shape
+            self._macro_kernel.launch(
+                self.f, self._rho_buf,
+                self._u_buf[0], self._u_buf[1], N,
+            )
+            if model == "wale":
+                self._wale_kernel.launch(
+                    self._u_buf[0], self._u_buf[1], self._nu_t_in,
+                    Nx, Ny, Cw=float(self._sgs_cfg["Cw"]), dx=1.0,
+                )
+            else:  # dyn_smag
+                self._wale_kernel.launch(
+                    self._u_buf[0], self._u_buf[1], self._nu_t_in,
+                    Nx, Ny,
+                    dx=1.0,
+                    Cs_max=float(self._sgs_cfg["Cs_max"]),
+                    alpha_sq=float(self._sgs_cfg["alpha_sq"]),
+                )
+        else:
+            Nx, Ny, Nz = self.domain_shape
+            self._macro_kernel.launch(
+                self.f, self._rho_buf,
+                self._u_buf[0], self._u_buf[1], self._u_buf[2], N,
+            )
+            if model == "wale":
+                self._wale_kernel.launch(
+                    self._u_buf[0], self._u_buf[1], self._u_buf[2],
+                    self._nu_t_in,
+                    Nx, Ny, Nz, Cw=float(self._sgs_cfg["Cw"]), dx=1.0,
+                )
+            else:  # dyn_smag
+                self._wale_kernel.launch(
+                    self._u_buf[0], self._u_buf[1], self._u_buf[2],
+                    self._nu_t_in,
+                    Nx, Ny, Nz,
+                    dx=1.0,
+                    Cs_max=float(self._sgs_cfg["Cs_max"]),
+                    alpha_sq=float(self._sgs_cfg["alpha_sq"]),
+                )
+
+    def _apply_obstacle_bc(self) -> None:
+        """Dispatch obstacle BC application across HWBB / IBB / Python paths."""
+        N = 1
+        for d in self.domain_shape:
+            N *= d
+
+        if self._hwbb_kernel is not None:
+            self._hwbb_kernel.apply(
+                self.f, self._f_post,
+                self.obstacle_bc.needs_bounce, N,
+            )
+            self._hwbb_kernel.reset_solid(
+                self.f, self.obstacle_bc.solid_mask, N,
+            )
+        elif self._ibb_kernel is not None:
+            if len(self.domain_shape) == 2:
+                Nx, Ny = self.domain_shape
+                self._ibb_kernel.apply(
+                    self.f, self._f_post,
+                    self.obstacle_bc.needs_bounce,
+                    self.obstacle_bc.q_fraction,
+                    Nx, Ny,
+                )
+            else:
+                Nx, Ny, Nz = self.domain_shape
+                self._ibb_kernel.apply(
+                    self.f, self._f_post,
+                    self.obstacle_bc.link_cell,
+                    self.obstacle_bc.link_dir,
+                    self.obstacle_bc.link_q,
+                    self.obstacle_bc.n_links,
+                    Nx, Ny, Nz,
+                )
+            self._ibb_kernel.reset_solid(
+                self.f, self.obstacle_bc.solid_mask, N,
+            )
+        else:
+            self.obstacle_bc.apply_with_reset(self.f, self._f_post)
 
     def _advance_fused_with_alm(self) -> None:
         """Fused path with ALM: macro → ALM → fused collision."""
@@ -552,23 +635,57 @@ class Simulation:
         # ─── Step 1: Macroscopic (needed by ALM before collision) ───
         self.rho, self.u = self.macroscopic.compute(self.f)
 
+        # Ensure rho/u dtype matches f for fused CUDA kernel
+        # (macroscopic.compute uses tensordot which promotes to float64
+        #  via int32 c × float32 f, but the kernel writes float32)
+        dtype = self.f.dtype
+        if self.rho.dtype != dtype:
+            self.rho = self.rho.astype(dtype)
+        if self.u.dtype != dtype:
+            self.u = self.u.astype(dtype)
+
+        self._check_nan("fused+alm:post-macro")
+
         # ─── Step 2: Body Force (ALM pipeline) ──────────────────────
         self.body_force = self._compute_body_force(self.u, self.rho)
+
+        # Ensure dtype matches f (ALM returns float64, kernel expects float32)
+        if self.body_force is not None and self.body_force.dtype != self.f.dtype:
+            self.body_force = self.body_force.astype(self.f.dtype)
 
         # ─── Step 3+4: Guo correction + collision (fused kernel) ────
         omega = 1.0 / self.tau
         if self._fused_is_cumulant:
-            self._fused_kernel.launch(
-                f_in=self.f,
-                f_post=self._f_post,
-                rho_out=self.rho,
-                u_out=self.u,
-                force=self.body_force,
-                omega_1=omega,
-                omega_bulk=self.collision.omega_bulk,
-                omega_high=self.collision.omega_3,
-                N=N,
-            )
+            if self._fused_is_d2q9:
+                ob = self.collision.omega_bulk
+                self._fused_kernel.launch(
+                    f_in=self.f,
+                    f_post=self._f_post,
+                    rho_out=self.rho,
+                    u_out=self.u,
+                    force=self.body_force,
+                    omega_1=omega,
+                    omega_bulk=omega if ob is None else ob,
+                    omega_3=self.collision.omega_3,
+                    omega_4=self.collision.omega_4,
+                    N=N,
+                    Cs=self._sgs_cfg["Cs"],
+                    nu_t_out=self.nu_t,
+                )
+            else:
+                self._fused_kernel.launch(
+                    f_in=self.f,
+                    f_post=self._f_post,
+                    rho_out=self.rho,
+                    u_out=self.u,
+                    force=self.body_force,
+                    omega_1=omega,
+                    omega_bulk=self.collision.omega_bulk,
+                    omega_high=self.collision.omega_3,
+                    N=N,
+                    Cs=self._sgs_cfg["Cs"],
+                    nu_t_out=self.nu_t,
+                )
         else:
             self._fused_kernel.launch(
                 f_in=self.f,
@@ -586,16 +703,7 @@ class Simulation:
         # ─── Step 6: Boundary Conditions ─────────────────────────────
         self.bc_manager.apply_all(self.f, self._f_post)
         if self.obstacle_bc is not None:
-            if self._hwbb_kernel is not None:
-                self._hwbb_kernel.apply(
-                    self.f, self._f_post,
-                    self.obstacle_bc.needs_bounce, N,
-                )
-                self._hwbb_kernel.reset_solid(
-                    self.f, self.obstacle_bc.solid_mask, N,
-                )
-            else:
-                self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+            self._apply_obstacle_bc()
 
         self.step_count += 1
 

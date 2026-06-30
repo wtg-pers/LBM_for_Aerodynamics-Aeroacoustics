@@ -85,6 +85,7 @@ class BladeSection:
     twist: float                    # [degrees] local pitch angle
     airfoil: str = 'default'        # airfoil identifier
     is_active: bool = True          # generates aerodynamic force?
+    sweep: float = 0.0              # [degrees] LE sweep angle Λ (0 = unswept)
 
 
 # =============================================================================
@@ -184,10 +185,19 @@ class Blade:
         self.marker_r: np.ndarray = np.array([])       # [m]
         self.marker_chord: np.ndarray = np.array([])    # [m]
         self.marker_twist: np.ndarray = np.array([])    # [degrees]
+        self.marker_sweep: np.ndarray = np.array([])    # [degrees] LE sweep Λ
         self.marker_airfoil: List[str] = []
         self.marker_dr: float = 0.0                     # [m]
         self.marker_epsilon: np.ndarray = np.array([])  # [m]
         self.marker_active: np.ndarray = np.array([], dtype=bool)
+
+        # Gaussian projection-width (ε) taper controls.
+        # "default" reproduces ε = max(chord/4, 2·Δx) exactly; "tip_taper"
+        # narrows ε toward the tip (Diaz 2023 §2.1.4) to reduce tip-vortex
+        # over-smearing. Set by Rotor.from_config; see set_lattice_spacing().
+        self.epsilon_mode: str = "default"      # "default" | "tip_taper"
+        self.epsilon_tip_factor: float = 1.0    # tip ε target = max(factor·2·Δx, 2·Δx)
+        self.epsilon_taper_start: float = 0.7   # r/R where taper begins
 
         # Coordinate system (set by Rotor or explicitly)
         # If None, falls back to legacy hardcoded X-axis rotation
@@ -205,6 +215,7 @@ class Blade:
         r_arr = np.array([s.r for s in self.sections])
         chord_arr = np.array([s.chord for s in self.sections])
         twist_arr = np.array([s.twist for s in self.sections])
+        sweep_arr = np.array([s.sweep for s in self.sections])
 
         # Choose interpolation method based on number of sections
         if len(self.sections) <= 2:
@@ -219,6 +230,11 @@ class Blade:
         )
         self._twist_interp: Callable[[float], float] = sp_interp.interp1d(
             r_arr, twist_arr, kind=kind, fill_value='extrapolate'
+        )
+        # Sweep Λ(r): always LINEAR — the LE sweep is a piecewise-linear ramp
+        # (0 inboard, swept tip), and cubic would overshoot the break.
+        self._sweep_interp: Callable[[float], float] = sp_interp.interp1d(
+            r_arr, sweep_arr, kind='linear', fill_value='extrapolate'
         )
 
         # Build airfoil lookup: find nearest section for airfoil ID
@@ -306,6 +322,7 @@ class Blade:
         # Interpolate properties at each marker
         self.marker_chord = self._chord_interp(self.marker_r)    # [m]
         self.marker_twist = self._twist_interp(self.marker_r)    # [degrees]
+        self.marker_sweep = self._sweep_interp(self.marker_r)    # [degrees] Λ
 
         # Airfoil and active flag (nearest-neighbor lookup)
         self.marker_airfoil = [self._get_airfoil_at_r(r) for r in self.marker_r]
@@ -319,9 +336,19 @@ class Blade:
     def set_lattice_spacing(self, dx: float) -> None:
         """Set the Gaussian filter width based on lattice spacing
 
-        The regularization parameter ε for each marker is:
+        The baseline regularization parameter ε for each marker is:
 
             ε_j = max(c_a(r_j) / 4, 2 · Δx)    (Watanabe et al., Eq. 13 note)
+
+        When ``self.epsilon_mode == "tip_taper"`` the baseline is linearly
+        blended toward a narrower tip value beyond ``epsilon_taper_start``
+        (Diaz 2023 §2.1.4) to reduce tip-vortex over-smearing:
+
+            t   = clip((r/R - taper_start)/(1 - taper_start), 0, 1)
+            ε_j = (1 - t)·ε_base + t·max(epsilon_tip_factor·2·Δx, 2·Δx)
+
+        The ``"default"`` branch is byte-identical to the original formula so
+        existing results stay bit-reproducible.
 
         Args:
             dx: Lattice spacing  [m or lattice units]
@@ -329,10 +356,22 @@ class Blade:
         if self.n_markers == 0:
             raise RuntimeError("Call generate_markers() before set_lattice_spacing()")
 
-        self.marker_epsilon = np.maximum(
+        eps_base = np.maximum(
             self.marker_chord / 4.0,
             2.0 * dx
         )  # [same units as chord and dx]
+
+        if self.epsilon_mode == "tip_taper":
+            r_norm = self.marker_r / self.r_tip                      # [dimensionless]
+            taper_start = self.epsilon_taper_start
+            t = np.clip(
+                (r_norm - taper_start) / (1.0 - taper_start),
+                0.0, 1.0,
+            )                                                        # [dimensionless]
+            eps_tip = max(self.epsilon_tip_factor * 2.0 * dx, 2.0 * dx)  # ≥ floor
+            self.marker_epsilon = (1.0 - t) * eps_base + t * eps_tip
+        else:
+            self.marker_epsilon = eps_base
 
     # -----------------------------------------------------------------
     # §2.3 Coordinate System Integration
@@ -455,34 +494,21 @@ class Blade:
         F_n: np.ndarray,
         F_theta: np.ndarray,
         theta: float,
-        rotation_sign: float = 1.0
+        rotation_sign: float = 1.0,
+        thrust_axis: 'Optional[np.ndarray]' = None,
     ) -> np.ndarray:
         """Project normal/tangential forces to global (x, y, z) frame
-
-        Extended Watanabe Convention (counter-rotation support):
-            F^AL = coord_system.project_force_to_global(
-                F_n, F_theta, theta, rotation_sign)
-
-        rotation_sign accounts for the blade's rotation direction:
-            ω > 0 → rotation_sign = +1
-            ω < 0 → rotation_sign = -1 (counter-rotating rotor)
-
-        Sign Convention:
-            F^AL is the aerodynamic force ON THE BLADE from the fluid.
-            The body force applied to the fluid (Eq. 13) is -F^AL.
 
         Args:
             F_n:     Normal forces, shape (n_markers,)     [N or lattice force]
             F_theta: Tangential forces, shape (n_markers,) [N or lattice force]
             theta:   Azimuth angle  [radians]
             rotation_sign: sign(ω), +1.0 or -1.0  [-]
+            thrust_axis: Unit vector for thrust projection  [dimensionless]
+                         Default: rotation axis (n_axis)
 
         Returns:
             F_global: shape (n_markers, 3) — (F_x, F_y, F_z)
-                      [N or lattice force units]
-
-        Raises:
-            RuntimeError: If coord_system has not been set.
         """
         if self._coord_system is None:
             raise RuntimeError(
@@ -490,7 +516,9 @@ class Blade:
                 "Use Rotor to create blades with a coordinate system."
             )
         return self._coord_system.project_force_to_global(
-            F_n, F_theta, theta, rotation_sign=rotation_sign
+            F_n, F_theta, theta,
+            rotation_sign=rotation_sign,
+            thrust_axis=thrust_axis,
         )
 
     # -----------------------------------------------------------------
@@ -736,6 +764,7 @@ class Blade:
                 twist=float(sec_dict['twist']),
                 airfoil=sec_dict.get('airfoil', 'default'),
                 is_active=sec_dict.get('active', True),
+                sweep=float(sec_dict.get('sweep', 0.0)),
             ))
         return cls(sections)
 
@@ -772,10 +801,18 @@ class Blade:
                 twist=s.twist,                  # [degrees] — unchanged
                 airfoil=s.airfoil,
                 is_active=s.is_active,
+                sweep=s.sweep,                  # [degrees] — unchanged
             ))
         
         new_blade = Blade(new_sections)
-        
+
+        # Carry the ε-taper controls onto the lattice-unit blade so that the
+        # final set_lattice_spacing(dx=1.0) in Rotor.to_lattice_units honors
+        # the requested mode (a fresh Blade() otherwise resets them to default).
+        new_blade.epsilon_mode = self.epsilon_mode
+        new_blade.epsilon_tip_factor = self.epsilon_tip_factor
+        new_blade.epsilon_taper_start = self.epsilon_taper_start
+
         # Copy marker generation state if markers were generated
         if self.n_markers > 0:
             new_blade.generate_markers(n_radial=self.n_markers)

@@ -28,7 +28,7 @@ void streaming_pull_d3q27(
     float*       __restrict__ f_next,
     const int Nx, const int Ny, const int Nz
 ) {
-    int N = Nx * Ny * Nz;
+    long long N = (long long)Nx * Ny * Nz;   // 64-bit: q*N overflows int32 at N>~79.5M
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 

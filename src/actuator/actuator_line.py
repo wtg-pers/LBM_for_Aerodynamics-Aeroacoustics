@@ -65,6 +65,7 @@ from .interpolation import (
     interpolate_velocity_batch,
     interpolate_velocity_batch_fast,
     interpolate_velocity_batch_gpu,
+    sample_velocity_alt,
 )
 from .spreading import (
     spread_forces_to_grid,
@@ -110,6 +111,9 @@ class BEMResult:
     F_D: np.ndarray             # [lattice force]
     F_n: np.ndarray             # [lattice force]
     F_theta: np.ndarray         # [lattice force]
+    # Smearing-correction diagnostics (None unless eps_correction is active)
+    w_corr: np.ndarray = None           # [Δx/Δt]  added downwash per marker
+    alpha_uncorrected: np.ndarray = None  # [degrees] alpha before correction
 
 
 # =============================================================================
@@ -169,6 +173,7 @@ class ActuatorLineModel:
         u_inf_lu: Optional[float] = None,
         coeff_mode: str = 'auto',
         xp=None,
+        sound_speed: Optional[float] = None,
     ) -> None:
         """Initialize the Actuator Line model
 
@@ -200,6 +205,7 @@ class ActuatorLineModel:
         self.n_cut = n_cut
         self.dx_phys = dx_phys          # [m/lu]
         self.dt_phys = dt_phys          # [s/lt]
+        self.a_phys = sound_speed       # [m/s] free-stream sound speed or None
         self.u_inf_lu = u_inf_lu        # [Δx/Δt] or None
         self.coeff_mode = coeff_mode    # 'wind_turbine' | 'rotorcraft' | 'auto'
         self.xp = xp if xp is not None else np   # array backend
@@ -214,19 +220,71 @@ class ActuatorLineModel:
         self._last_positions: Optional[np.ndarray] = None
         self._last_forces_global: Optional[np.ndarray] = None
         self._step_count: int = 0
+        self.ramp_steps: int = 0
+        self._ramp_factor: float = 1.0
+
+        # ── Prandtl tip/root loss correction ──
+        self.prandtl_loss: bool = False
+        self._prandtl_tip: bool = True
+        self._prandtl_root: bool = True
+        # Effective-radius ε offset for Prandtl: R_tip_eff = R_tip - ε_tip.
+        # True (default) reproduces the existing non-standard behavior; False
+        # uses the textbook R_tip_eff = R_tip (matches BEMT / standard Prandtl,
+        # and decouples the tip-loss from the ε taper).
+        self._prandtl_eps_offset: bool = True
+
+        # Smearing (viscous-core) correction — recovers the tip induced-velocity
+        # deficit of the finite-ε ALM (Dağ & Sørensen 2020). Default OFF →
+        # bit-identical. See _viscous_core_correction / docs/alm_tip_overprediction_record_kr.md.
+        self._eps_corr: bool = False
+        self._eps_corr_target: str = "inviscid"   # "inviscid" | "opt"
+        self._eps_opt_factor: float = 0.25        # ε_opt = factor·chord (target="opt")
+        self._eps_corr_relax: float = 1.0         # under-relaxation on w_corr
+        # Correction method: "dag" (single-pass, current) | "kleine" (Kleine 2022
+        # non-iterative linear solve, Phase 1 — patch_notes/kleine_smearing_correction/).
+        self._eps_corr_method: str = "dag"
+        self._kleine_A: dict = {}                 # per-blade influence matrix cache
+        self._kleine_gamma_prev: dict = {}        # per-blade Γⁿ⁻¹ (warm-start persist)
+        # Kleine wake model: "straight" (Phase 1 semi-infinite, default) |
+        # "free" (Phase 2 convected free-vortex wake → captures tip rollup).
+        self._kleine_wake_mode: str = "straight"
+        self._kleine_wake_nw: int = 50            # free-wake length [timesteps]
+        self._kleine_wake: dict = {}              # per-blade FreeWake (Phase 2)
+        # Phase 2 perf (patch_notes/kleine_freewake_perf/):
+        #   A) throttle the free-wake influence-matrix rebuild — the wake convects
+        #      slowly, so a cached A is a good approximation between rebuilds.
+        #      _kleine_rebuild_every == 1 (default) → rebuild every step (exact,
+        #      bit-identical to the original Phase 2). >1 → cheaper approximation.
+        #   C) cache the dΓ/dr gradient matrix (depends only on the fixed r).
+        self._kleine_A_free: dict = {}            # per-blade free-wake A cache (A)
+        self._kleine_G: dict = {}                 # per-blade dΓ/dr matrix cache (C)
+        self._kleine_rebuild_every: int = 1       # rebuild free-wake A every N steps
+        self._kleine_wake_steps: int = 0          # free-wake step counter (cadence)
+
+        # Velocity sampler mode (A/B study — patch_notes/almlbm_sampler_ab/).
+        # "gaussian" (default) → bit-identical §6 path. Alternatives isolate the
+        # tip-inflow contribution of the ±3ε sampling kernel:
+        #   "point" (B-i), "aniso" (B-ii), "mask_disk" (B-iii).
+        self._sampling_mode: str = "gaussian"
+        self._sampling_eps_r_factor: float = 0.5  # B-ii: ε_r = factor·ε (radial)
 
         # ═══════════════════════════════════════════════════════════════════
         # NEW: Detect multi-airfoil support
         # ═══════════════════════════════════════════════════════════════════
         self._multi_airfoil = False
+        self._polar_wants_mach = False
         try:
             sig = inspect.signature(polar_query)
             param_names = list(sig.parameters.keys())
-            # Check if has 'airfoil_name' parameter or has 3+ parameters
-            self._multi_airfoil = ('airfoil_name' in param_names or 
-                                   len(param_names) >= 3)
+            # Name-based detection (robust to extra optional args like 'mach').
+            self._multi_airfoil = ('airfoil_name' in param_names)
+            # Mach-pass: tapered/variable-chord rotors expose a 'mach' arg so
+            # the section Mach can be passed directly (the Re→M constant-chord
+            # trick breaks under taper).  When absent, behavior is unchanged.
+            self._polar_wants_mach = ('mach' in param_names)
         except (ValueError, TypeError):
             self._multi_airfoil = False
+            self._polar_wants_mach = False
 
     # -----------------------------------------------------------------
     # §2.1 Main Time Step
@@ -284,10 +342,26 @@ class ActuatorLineModel:
         epsilon_all = self.rotor.get_all_marker_epsilon()    # (N_total,) [lu]
         active_all = self.rotor.get_all_marker_active()      # (N_total,) bool
 
-        u_markers = interpolate_velocity_batch_gpu(
-            u_field, positions, epsilon_all,
-            xp=xp, n_cut=self.n_cut
-        )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
+        if self._sampling_mode == "gaussian":
+            u_markers = interpolate_velocity_batch_gpu(
+                u_field, positions, epsilon_all,
+                xp=xp, n_cut=self.n_cut
+            )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
+        else:
+            # A/B alternatives (B-i/B-ii/B-iii) — patch_notes/almlbm_sampler_ab/
+            u_markers = sample_velocity_alt(
+                self._sampling_mode, u_field, positions, epsilon_all,
+                xp=xp, n_cut=self.n_cut,
+                hub=np.asarray(self.rotor.hub_center, dtype=np.float64),
+                axis=np.asarray(self.rotor.rotation_axis, dtype=np.float64),
+                radius=float(self.rotor.radius),
+                eps_r_factor=self._sampling_eps_r_factor,
+            )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
+
+        # --- Phase 2 free-wake: convect + shed (before BEM uses it) ---
+        if (self._eps_corr and self._eps_corr_method == "kleine"
+                and self._kleine_wake_mode == "free"):
+            self._convect_and_shed_wake(u_field, positions, dt, xp)
 
         # --- Step 4-7: BEM force calculation (CPU, small arrays) ---
         bem_result = self._compute_bem_forces(u_markers)
@@ -317,7 +391,306 @@ class ActuatorLineModel:
         )
 
         self._step_count += 1
+
+        # Force ramp-up
+        if self.ramp_steps > 0 and self._step_count <= self.ramp_steps:
+            self._ramp_factor = float(self._step_count) / float(self.ramp_steps)
+            self._F_grid *= self._ramp_factor
+        else:
+            self._ramp_factor = 1.0
+
         return self._F_grid
+
+    # -----------------------------------------------------------------
+    # §2.2a Prandtl Tip/Root Loss Correction
+    # -----------------------------------------------------------------
+
+    def _compute_prandtl_factor(
+        self,
+        r: np.ndarray,
+        phi_deg: np.ndarray,
+    ) -> np.ndarray:
+        """Prandtl combined tip/root loss factor.
+
+        F_pr = F_tip × F_root  ∈ [0, 1]
+
+        where:
+            f_tip  = B·(R_tip,eff  - r) / (2·r·sin|φ|)
+            f_root = B·(r - R_root,eff) / (2·r·sin|φ|)
+            F      = (2/π)·arccos(exp(-f))
+
+        Effective radii account for Gaussian force spreading:
+            R_tip,eff  = R_tip  - ε_tip   (tip marker epsilon)
+            R_root,eff = R_root + ε_root  (root marker epsilon)
+
+        Args:
+            r:       Marker radial positions  [lu], shape (n_markers,)
+            phi_deg: Flow angle per marker    [degrees], shape (n_markers,)
+
+        Returns:
+            F_pr: Combined correction factor, shape (n_markers,)
+        """
+        rotor = self.rotor
+        blade = rotor.blades[0]
+        B = rotor.n_blades
+
+        R_tip = rotor.radius                          # [lu]
+        R_root = blade.marker_r[0] - blade.marker_dr / 2  # [lu] start of active span
+
+        if self._prandtl_eps_offset:
+            # Non-standard (legacy default): shrink effective radii by the
+            # local ε to account for Gaussian force spreading.
+            eps_tip = blade.marker_epsilon[-1]             # [lu] tip marker
+            eps_root = blade.marker_epsilon[0]             # [lu] root marker
+            R_tip_eff = R_tip - eps_tip
+            R_root_eff = R_root + eps_root
+        else:
+            # Standard Prandtl (matches BEMT): effective radius = actual radius.
+            # Decoupled from the ε taper → smooth roll-off, no hard-zero band.
+            R_tip_eff = R_tip
+            R_root_eff = R_root
+
+        sin_phi = np.abs(np.sin(np.radians(phi_deg)))
+        sin_phi = np.maximum(sin_phi, 1e-4)            # avoid division by zero
+
+        F_pr = np.ones_like(r, dtype=np.float64)
+
+        if self._prandtl_tip:
+            f_tip = B * np.maximum(R_tip_eff - r, 0.0) / (2.0 * r * sin_phi)
+            F_tip = (2.0 / np.pi) * np.arccos(np.clip(np.exp(-f_tip), -1.0, 1.0))
+            F_pr *= F_tip
+
+        if self._prandtl_root:
+            f_root = B * np.maximum(r - R_root_eff, 0.0) / (2.0 * r * sin_phi)
+            F_root = (2.0 / np.pi) * np.arccos(np.clip(np.exp(-f_root), -1.0, 1.0))
+            F_pr *= F_root
+
+        return F_pr
+
+    def _lookup_cl_cd(self, alpha_deg, Re, u_rel, Mach, blade, n):
+        """Per-marker CL/CD polar lookup (multi-airfoil and/or Mach-pass aware).
+
+        Extracted from the BEM loop so the smearing correction can re-query at
+        the corrected angle of attack.  Behavior is identical to the original
+        inline loop (active & u_rel≥1e-10 markers only; others remain 0).
+        """
+        active = blade.marker_active
+        CL = np.zeros(n, dtype=np.float64)
+        CD = np.zeros(n, dtype=np.float64)
+        for j in range(n):
+            if not active[j] or u_rel[j] < 1e-10:
+                continue
+            a_deg = float(alpha_deg[j])
+            re_j = float(Re[j])
+            if self._multi_airfoil:
+                name = blade.marker_airfoil[j]
+                if Mach is not None:
+                    CL[j], CD[j] = self.polar_query(a_deg, re_j, name,
+                                                    mach=float(Mach[j]))
+                else:
+                    CL[j], CD[j] = self.polar_query(a_deg, re_j, name)
+            else:
+                if Mach is not None:
+                    CL[j], CD[j] = self.polar_query(a_deg, re_j,
+                                                    mach=float(Mach[j]))
+                else:
+                    CL[j], CD[j] = self.polar_query(a_deg, re_j)
+        return CL, CD
+
+    def _viscous_core_correction(self, r, eps, Gamma, chord, dr):
+        """Missing tip induced velocity from Gaussian-smeared trailed vortices.
+
+        Implements the viscous-core de-induction (Dağ & Sørensen 2020): a
+        finite-ε ALM sheds trailed vortices with a Lamb-Oseen core = ε, which
+        under-induce the downwash (worst at the tip → over-loading).  This adds
+        back the missing part along the span.
+
+            Γ(i)   = ½ c_i u_rel_i CL_i                (bound circulation, set by caller)
+            Γw(m)  = Γ_inboard − Γ_outboard           (trailed vortex at panel edge)
+            w(i)   = −(1/4π) Σ_m Γw(m)/d_im · K(d_im)  (added downwash)
+            K = exp(−(d/ε)²)                           target="inviscid"
+              = exp(−(d/ε)²) − exp(−(d/ε_opt)²)        target="opt"  (ε_opt=factor·c)
+
+        Trailed vortices sit at panel EDGES (offset ±dr/2 from the cell-centred
+        markers) → distances are finite; the bound (self) vortex is excluded by
+        construction.  All lattice units; w_corr [Δx/Δt] is ADDED to u_n.
+        The sign (−1/4π) gives a downwash (positive u_n) at the tip, verified by
+        the C_T / tip-φ A/B.
+        """
+        N = len(r)
+        # Trailed vorticity = dΓ/dr at the control points (markers). np.gradient
+        # uses one-sided differences at the ends → captures the strong tip
+        # gradient without the edge-panel endpoint artifact.
+        gradG = np.gradient(Gamma, r)               # dΓ/dr [Δx/Δt]
+        use_opt = (self._eps_corr_target == "opt")
+        eps_opt = np.maximum(self._eps_opt_factor * chord, 1e-9)  # [lu]
+        inv4pi = 1.0 / (4.0 * np.pi)
+        w = np.zeros(N)                             # [Δx/Δt]
+        for i in range(N):
+            d = r[i] - r                            # control→control [lu]; d[i]=0
+            far = np.abs(d) > 1e-9                   # exclude self-term (i=j)
+            safe_d = np.where(far, d, 1.0)           # avoid 0-division at i=j
+            # Regularized lifting-line kernel (→ 0 at d=0, no singularity):
+            #   inviscid target: exp(−(d/ε)²)/d, self-term (i=j) excluded
+            #   opt target:      [exp(−(d/ε)²) − exp(−(d/ε_opt)²)]/d  (regular)
+            if use_opt:
+                K = np.exp(-(d / eps) ** 2) - np.exp(-(d / eps_opt) ** 2)
+            else:
+                K = np.exp(-(d / eps) ** 2)
+            kernel = np.where(far, K / safe_d, 0.0)
+            # w = −(1/4π) ∫ (dΓ/dr)·kernel dr   → added downwash (sign by A/B)
+            w[i] = -inv4pi * np.sum(gradG * kernel) * dr
+        return w
+
+    def _kleine_w_corr(self, k, blade, u_n, u_theta, cos_sweep, chord, dr,
+                       CL, active, n):
+        """Total deficit downwash via Kleine (2022) non-iterative solve (Phase 1).
+
+        Returns w_corr [Δx/Δt] (same role as the Dağ single-pass: u_n += w_corr).
+        Uses the SAME deficit kernel as Dağ (influence_matrix == _viscous_core_
+        correction(inviscid)) but solves the implicit Γ–w coupling in one linear
+        system (Kleine Eq. 5.15) instead of a single pass. Re/Mach are frozen at
+        the linearization point †; ∂C_l/∂α from polar_slope. Falls back to the
+        Dağ single pass on a singular / non-finite solve.
+        See patch_notes/kleine_smearing_correction/.
+        """
+        from .smearing_correction import (
+            influence_matrix, correct_noniterative, freewake_influence,
+            _gradient_matrix)
+        from .polar_slope import lift_curve_slope_batch
+        rotor = self.rotor
+        r = blade.marker_r
+        eps = blade.marker_epsilon
+        twist = blade.marker_twist
+
+        # Influence matrix A_ik = ∂w_i/∂Γ_k.
+        wake = self._kleine_wake.get(k)
+        if self._kleine_wake_mode == "free" and wake is not None and len(wake) >= 2:
+            # Phase 2: build from the convected free-wake geometry. B·axial →
+            # A = Δr·(B @ G). The rebuild (freewake_influence) is the per-step
+            # bottleneck, so throttle it: rebuild every `_kleine_rebuild_every`
+            # steps (default 1 = every step, exact), else reuse the cached A —
+            # the wake convects slowly so this is a good approximation. A blade
+            # whose cache is empty/stale (cold start) always rebuilds.
+            A = self._kleine_A_free.get(k)
+            need_rebuild = (
+                A is None or A.shape[0] != n
+                or (self._kleine_wake_steps % self._kleine_rebuild_every == 0))
+            if need_rebuild:
+                ctrl3d = self._last_positions[k * n:(k + 1) * n]
+                # Axial (downwash) projection direction. The sign tracks the
+                # rotation sense so the free-wake downwash matches the rotation-
+                # invariant Phase 1 / Dağ de-induction (verified vs straight).
+                axis = -np.sign(rotor.omega) * np.asarray(
+                    rotor.rotation_axis, dtype=np.float64)
+                B = freewake_influence(ctrl3d, wake.rings, eps, axis)
+                G = self._kleine_G.get(k)                  # (C) cache dΓ/dr
+                if G is None or G.shape[0] != n:
+                    G = _gradient_matrix(r)
+                    self._kleine_G[k] = G
+                A = dr * (B @ G)
+                self._kleine_A_free[k] = A
+        else:
+            # Phase 1: straight semi-infinite (cached; also the free-wake
+            # cold-start fallback while < 2 rings).
+            A = self._kleine_A.get(k)
+            if A is None or A.shape[0] != n:
+                A = influence_matrix(r, eps, dr)
+                self._kleine_A[k] = A
+
+        # Tangential rel. velocity (matches rotor.recompute_velocity_triangle).
+        rsign = np.sign(rotor.omega)
+        u_tan = np.abs(rotor.omega) * r - rsign * u_theta
+
+        # Γⁿ⁻¹ (persist for warm-start); cold start = uncorrected Γ.
+        u_aero0 = np.sqrt(u_n ** 2 + u_tan ** 2) * cos_sweep
+        Gprev = self._kleine_gamma_prev.get(k)
+        if Gprev is None or len(Gprev) != n:
+            Gprev = np.where(active, 0.5 * chord * u_aero0 * CL, 0.0)
+
+        # Freeze Re/Mach at the linearization point † (u_n† = u_n + A Γⁿ⁻¹).
+        u_aero_d = np.sqrt((u_n + A @ Gprev) ** 2 + u_tan ** 2) * cos_sweep
+        Re_d = u_aero_d * chord / (self.nu + 1e-30)
+        if self._polar_wants_mach and self.a_phys:
+            Mach_d = u_aero_d * (self.dx_phys / self.dt_phys) / self.a_phys
+        else:
+            Mach_d = None
+        multi = self._multi_airfoil
+        names = blade.marker_airfoil if multi else None
+
+        def cl_eval(a_deg):
+            cl, _ = self._lookup_cl_cd(a_deg, Re_d, u_aero_d, Mach_d, blade, n)
+            return cl
+
+        def dcl_eval(a_deg):
+            return lift_curve_slope_batch(
+                self.polar_query, a_deg, Re_d, active,
+                multi_airfoil=multi, marker_airfoil=names,
+                mach=Mach_d, delta_deg=1.0)
+
+        try:
+            _, _, Gnew, w = correct_noniterative(
+                r, chord, dr, eps, u_n, u_tan, twist, cl_eval, dcl_eval,
+                Gprev, A=A, active=active)
+            # Safety net: a non-finite, or physically-unreasonable (downwash
+            # exceeding ~half the tangential scale) solve signals an
+            # ill-conditioned/unstable fixed point → fall back to Dağ this step
+            # (do NOT persist the bad Γ; keep the previous Γ for warm-start).
+            scale = float(np.max(np.abs(u_tan))) + 1e-30
+            if (not np.all(np.isfinite(w))) or (float(np.max(np.abs(w))) > 0.5 * scale):
+                raise np.linalg.LinAlgError("Kleine correction out of bounds")
+            self._kleine_gamma_prev[k] = Gnew
+            return w
+        except np.linalg.LinAlgError:
+            # Fallback: Dağ single pass (keeps the run alive on a bad solve).
+            Gamma = np.where(active, 0.5 * chord * u_aero0 * CL, 0.0)
+            return self._eps_corr_relax * self._viscous_core_correction(
+                r, eps, Gamma, chord, dr)
+
+    def _convect_and_shed_wake(self, u_field, positions, dt, xp):
+        """Phase 2 free-vortex wake update (call once per step, before BEM).
+
+        Convect every existing wake ring by the sampled (un-corrected) CFD
+        velocity — Kleine §3.4 uses the CFD, not the corrected, velocity — via
+        trilinear point sampling, then shed a new ring at the current marker
+        positions. Per-blade state in self._kleine_wake.
+        """
+        from .smearing_correction import FreeWake
+        from .interpolation import _sample_trilinear
+        rotor = self.rotor
+        npb = rotor.markers_per_blade
+        is_np = (xp.__name__ == 'numpy')
+        self._kleine_wake_steps += 1               # drives the A-rebuild cadence
+
+        for k in range(rotor.n_blades):
+            if self._kleine_wake.get(k) is None:
+                self._kleine_wake[k] = FreeWake(self._kleine_wake_nw)
+
+        # (B) Convect: gather EVERY ring of EVERY blade into ONE point list and
+        # sample the CFD velocity in a single trilinear call (one kernel launch
+        # + one device→host copy), instead of one tiny call per ring. The per-
+        # point gather is independent, so this is bit-identical to per-ring
+        # sampling. Kleine §3.4 convects by the un-corrected CFD velocity.
+        index = []                                 # (blade_k, ring_i, n_points)
+        chunks = []
+        for k in range(rotor.n_blades):
+            rings = self._kleine_wake[k].rings
+            for i in range(len(rings)):
+                index.append((k, i, rings[i].shape[0]))
+                chunks.append(rings[i])
+        if chunks:
+            stacked = np.concatenate(chunks, axis=0)           # (M,3) [lu]
+            v = _sample_trilinear(u_field, stacked, xp)
+            v = v if is_np else xp.asnumpy(v)                  # single D2H
+            off = 0
+            for (k, i, m) in index:
+                self._kleine_wake[k].rings[i] = (
+                    self._kleine_wake[k].rings[i] + dt * v[off:off + m])
+                off += m
+
+        # Shed a new ring at the current marker positions (after convection).
+        for k in range(rotor.n_blades):
+            self._kleine_wake[k].shed(positions[k * npb:(k + 1) * npb])
 
     # -----------------------------------------------------------------
     # §2.2 BEM Force Computation
@@ -364,6 +737,8 @@ class ActuatorLineModel:
         F_D_all = np.zeros(n_total, dtype=np.float64)       # [lattice force]
         F_n_all = np.zeros(n_total, dtype=np.float64)       # [lattice force]
         F_theta_all = np.zeros(n_total, dtype=np.float64)   # [lattice force]
+        w_corr_all = np.zeros(n_total, dtype=np.float64)    # [Δx/Δt] smearing corr
+        alpha_pre_all = np.zeros(n_total, dtype=np.float64)  # [deg] pre-correction α
 
         # Process each blade
         for k in range(rotor.n_blades):
@@ -392,48 +767,80 @@ class ActuatorLineModel:
             dr = blade.marker_dr             # [lu]
             active = blade.marker_active     # bool
 
+            # --- Swept-tip correction (simple sweep / cross-flow principle) ---
+            # A section swept by Λ feels only the velocity normal to its leading
+            # edge, V_n = u_rel·cos Λ.  Using V_n for the polar Mach/Re and the
+            # dynamic pressure reduces effective tip Mach (drag-rise relief) and
+            # load on swept markers.  Λ=0 (unswept) → cos=1 → byte-identical.
+            if blade.marker_sweep.size:
+                cos_sweep = np.cos(np.radians(blade.marker_sweep))
+            else:
+                cos_sweep = 1.0
+            u_aero = u_rel * cos_sweep       # [Δx/Δt] velocity normal to LE
+
             # --- Reynolds number ---
-            # Re = u_rel · c_a / ν   [dimensionless]
-            Re = u_rel * chord / (self.nu + 1e-30)
+            # Re = V_n · c_a / ν   [dimensionless]
+            Re = u_aero * chord / (self.nu + 1e-30)
             Re_all[idx_start:idx_end] = Re
 
-            # --- Airfoil polar lookup ---
-            CL = np.zeros(n_per_blade, dtype=np.float64)
-            CD = np.zeros(n_per_blade, dtype=np.float64)
+            # --- Section Mach (Mach-pass) ---
+            # M = V_n · (dx_phys/dt_phys) / a   — physical relative Mach (sweep-
+            # corrected).  dx_phys/dt_phys is the level-correct velocity scale
+            # (level-invariant under convective scaling).  Computed ONLY when the
+            # polar declares a 'mach' arg (tapered/variable-chord rotors); for
+            # constant-chord polars Mach is None and the calls below are
+            # byte-identical to the original Reynolds-only lookup.
+            if self._polar_wants_mach and self.a_phys:
+                Mach = u_aero * (self.dx_phys / self.dt_phys) / self.a_phys
+            else:
+                Mach = None
 
-            for j in range(n_per_blade):
-                if not active[j]:
-                    continue
-                if u_rel[j] < 1e-10:        # No flow → no force
-                    continue
+            # --- Airfoil polar lookup (α unchanged; V_n drives Mach/Re) ---
+            CL, CD = self._lookup_cl_cd(alpha_deg, Re, u_aero, Mach,
+                                        blade, n_per_blade)
 
-                # ═══════════════════════════════════════════════════════════
-                # MODIFIED: Support multi-airfoil polar query
-                # ═══════════════════════════════════════════════════════════
-                if self._multi_airfoil:
-                    # Multi-airfoil mode: pass airfoil name
-                    airfoil_name = blade.marker_airfoil[j]
-                    cl_j, cd_j = self.polar_query(
-                        float(alpha_deg[j]),      # [degrees]
-                        float(Re[j]),             # [dimensionless]
-                        airfoil_name              # [string]
-                    )
+            # --- Smearing (viscous-core) correction (optional; default off) ---
+            # Recover the finite-ε tip induced-velocity deficit (Dağ & Sørensen
+            # 2020): add the missing downwash, recompute the velocity triangle,
+            # and re-query the polars at the corrected angle of attack. The LBM
+            # timestep loop provides the closure (single pass, no inner loop).
+            if self._eps_corr and np.any(active):
+                alpha_pre_all[idx_start:idx_end] = alpha_deg
+                if self._eps_corr_method == "kleine":
+                    # Kleine 2022 non-iterative linear solve (Phase 1).
+                    w_corr = self._kleine_w_corr(
+                        k, blade, u_n, u_theta, cos_sweep, chord, dr,
+                        CL, active, n_per_blade)
                 else:
-                    # Single airfoil mode: original 2-argument call
-                    cl_j, cd_j = self.polar_query(
-                        float(alpha_deg[j]),      # [degrees]
-                        float(Re[j])              # [dimensionless]
-                    )
-                CL[j] = cl_j
-                CD[j] = cd_j
+                    # Dağ single-pass (default).
+                    Gamma = np.where(active, 0.5 * chord * u_aero * CL, 0.0)  # [lu²/lt]
+                    w_corr = self._eps_corr_relax * self._viscous_core_correction(
+                        blade.marker_r, blade.marker_epsilon, Gamma, chord, dr)
+                u_n = u_n + np.where(active, w_corr, 0.0)        # added downwash
+                u_rel, phi_deg, alpha_deg = \
+                    rotor.recompute_velocity_triangle(k, u_n, u_theta)
+                u_aero = u_rel * cos_sweep                       # sweep-corrected
+                Re = u_aero * chord / (self.nu + 1e-30)
+                if self._polar_wants_mach and self.a_phys:
+                    Mach = u_aero * (self.dx_phys / self.dt_phys) / self.a_phys
+                CL, CD = self._lookup_cl_cd(alpha_deg, Re, u_aero, Mach,
+                                            blade, n_per_blade)
+                # overwrite pre-correction kinematics in the output arrays
+                u_n_all[idx_start:idx_end] = u_n
+                u_rel_all[idx_start:idx_end] = u_rel
+                phi_all[idx_start:idx_end] = phi_deg
+                alpha_all[idx_start:idx_end] = alpha_deg
+                Re_all[idx_start:idx_end] = Re
+                w_corr_all[idx_start:idx_end] = np.where(active, w_corr, 0.0)
 
             CL_all[idx_start:idx_end] = CL
             CD_all[idx_start:idx_end] = CD
 
             # --- Lift and drag forces (Eq. 9-10) ---
-            # F_L = 0.5 · ρ · u_rel² · c_a · Δr · CL   [lattice force]
-            # F_D = 0.5 · ρ · u_rel² · c_a · Δr · CD   [lattice force]
-            q = 0.5 * self.rho_ref * u_rel ** 2          # [lattice pressure]
+            # F_L = 0.5 · ρ · V_n² · c_a · Δr · CL   [lattice force]
+            # F_D = 0.5 · ρ · V_n² · c_a · Δr · CD   [lattice force]
+            # Dynamic pressure uses the LE-normal velocity (sweep): q=½ρ(u_rel cosΛ)².
+            q = 0.5 * self.rho_ref * u_aero ** 2         # [lattice pressure]
             F_L = q * chord * dr * CL                     # [lattice force]
             F_D = q * chord * dr * CD                     # [lattice force]
 
@@ -441,19 +848,26 @@ class ActuatorLineModel:
             F_L[~active] = 0.0
             F_D[~active] = 0.0
 
-            F_L_all[idx_start:idx_end] = F_L
-            F_D_all[idx_start:idx_end] = F_D
-
-            # --- Project to normal/tangential (Eq. 11-12) ---
-            # F_n = F_L·cos(φ) + F_D·sin(φ)     [lattice force]
-            # F_θ = F_L·sin(φ) - F_D·cos(φ)     [lattice force]
+            # --- Project to normal/tangential (Leishman / FAST convention) ---
+            # F_n = F_L·cos(φ) - F_D·sin(φ)     [lattice force]
+            # F_θ = F_L·sin(φ) + F_D·cos(φ)     [lattice force]
             phi_rad = np.radians(phi_deg)                # [radians]
             cos_phi = np.cos(phi_rad)                    # [dimensionless]
             sin_phi = np.sin(phi_rad)                    # [dimensionless]
 
-            F_n = F_L * cos_phi + F_D * sin_phi          # [lattice force]
-            F_theta = F_L * sin_phi - F_D * cos_phi      # [lattice force]
+            F_n = F_L * cos_phi - F_D * sin_phi          # [lattice force]
+            F_theta = F_L * sin_phi + F_D * cos_phi      # [lattice force]
 
+            # --- Prandtl tip/root loss correction ---
+            if self.prandtl_loss:
+                F_pr = self._compute_prandtl_factor(blade.marker_r, phi_deg)
+                F_n *= F_pr
+                F_theta *= F_pr
+                F_L *= F_pr
+                F_D *= F_pr
+
+            F_L_all[idx_start:idx_end] = F_L
+            F_D_all[idx_start:idx_end] = F_D
             F_n_all[idx_start:idx_end] = F_n
             F_theta_all[idx_start:idx_end] = F_theta
 
@@ -470,6 +884,8 @@ class ActuatorLineModel:
             F_D=F_D_all,
             F_n=F_n_all,
             F_theta=F_theta_all,
+            w_corr=w_corr_all,
+            alpha_uncorrected=alpha_pre_all,
         )
 
     # -----------------------------------------------------------------
@@ -578,11 +994,14 @@ class ActuatorLineModel:
             'r': r,                             # [lu]
             'r_R': r_norm,                      # [dimensionless]
             'chord': blade.marker_chord,        # [lu]
+            'epsilon': blade.marker_epsilon,    # [lu] Gaussian projection width
             'twist': blade.marker_twist,        # [degrees]
             'active': blade.marker_active,
-            'u_rel': bem.u_rel[idx_s:idx_e],    # [Δx/Δt]
-            'phi': bem.phi[idx_s:idx_e],        # [degrees]
-            'alpha': bem.alpha[idx_s:idx_e],    # [degrees]
+            'u_n': bem.u_n[idx_s:idx_e],        # [Δx/Δt] axial (induced) velocity
+            'u_theta': bem.u_theta[idx_s:idx_e],# [Δx/Δt] tangential velocity
+            'u_rel': bem.u_rel[idx_s:idx_e],    # [Δx/Δt] effective velocity
+            'phi': bem.phi[idx_s:idx_e],        # [degrees] induced angle
+            'alpha': bem.alpha[idx_s:idx_e],    # [degrees] effective AoA
             'Re': bem.Re[idx_s:idx_e],          # [dimensionless]
             'CL': bem.CL[idx_s:idx_e],          # [dimensionless]
             'CD': bem.CD[idx_s:idx_e],          # [dimensionless]
@@ -915,6 +1334,7 @@ def create_actuator_line_from_config(
     u_inf_lu: Optional[float] = None,
     coeff_mode: str = 'auto',
     xp=None,
+    sound_speed: Optional[float] = None,
 ) -> 'ActuatorLineModel':
     """Create a SINGLE ActuatorLineModel from config  (unchanged API)
 
@@ -940,6 +1360,13 @@ def create_actuator_line_from_config(
     if 'dx' not in rotor_cfg['grid']:
         rotor_cfg['grid']['dx'] = dx_phys   # [m/lu]
 
+    # ε-taper controls are specified at the actuator_line level; forward them
+    # into rotor_cfg so Rotor.from_config sees them (a per-rotor override placed
+    # directly under 'rotor' takes precedence).
+    for _eps_key in ('epsilon_mode', 'epsilon_tip_factor', 'epsilon_taper_start'):
+        if _eps_key in config and _eps_key not in rotor_cfg:
+            rotor_cfg[_eps_key] = config[_eps_key]
+
     rotor_phys = Rotor.from_config(rotor_cfg)
     rotor_lu = rotor_phys.to_lattice_units(
         length_scale=dx_phys, time_scale=dt_phys
@@ -948,7 +1375,7 @@ def create_actuator_line_from_config(
     resolved_mode = coeff_mode if coeff_mode != 'auto' \
         else config.get('coeff_mode', 'auto')
 
-    return ActuatorLineModel(
+    model = ActuatorLineModel(
         rotor=rotor_lu,
         nu=nu_lattice,
         domain_shape=domain_shape,
@@ -960,7 +1387,48 @@ def create_actuator_line_from_config(
         u_inf_lu=u_inf_lu,
         coeff_mode=resolved_mode,
         xp=xp,
+        sound_speed=sound_speed,
     )
+
+    # Prandtl tip/root loss
+    prandtl = config.get('prandtl_loss', False)
+    if isinstance(prandtl, dict):
+        model.prandtl_loss = prandtl.get('enabled', True)
+        model._prandtl_tip = prandtl.get('tip', True)
+        model._prandtl_root = prandtl.get('root', True)
+        # eps_offset True (default) = legacy R_tip_eff = R - ε_tip;
+        # False = standard R_tip_eff = R_tip (BEMT-consistent, ε-decoupled).
+        model._prandtl_eps_offset = prandtl.get('eps_offset', True)
+    else:
+        model.prandtl_loss = bool(prandtl)
+
+    # Smearing (viscous-core) correction (bool-or-dict; default off → inert).
+    ec = config.get('eps_correction', False)
+    if isinstance(ec, dict):
+        model._eps_corr = ec.get('enabled', True)
+        model._eps_corr_target = ec.get('target', 'inviscid')
+        model._eps_opt_factor = ec.get('eps_opt_factor', 0.25)
+        model._eps_corr_relax = ec.get('relax', 1.0)
+        model._eps_corr_method = ec.get('method', 'dag')  # "dag" | "kleine"
+        model._kleine_wake_mode = ec.get('wake', 'straight')  # "straight" | "free"
+        model._kleine_wake_nw = int(ec.get('n_w', 50))
+        # Phase 2 perf: rebuild the free-wake influence matrix every N steps
+        # (1 = every step, exact/bit-identical; >1 = cheaper approximation).
+        model._kleine_rebuild_every = max(1, int(ec.get('rebuild_every', 1)))
+    else:
+        model._eps_corr = bool(ec)
+
+    # Velocity sampler mode (A/B study — patch_notes/almlbm_sampler_ab/).
+    # dict: {"mode": ..., "eps_r_factor": ...}; or shorthand string "point".
+    # Absent / "gaussian" → bit-identical baseline (§6 path).
+    samp = config.get('sampling', None)
+    if isinstance(samp, dict):
+        model._sampling_mode = samp.get('mode', 'gaussian')
+        model._sampling_eps_r_factor = samp.get('eps_r_factor', 0.5)
+    elif isinstance(samp, str):
+        model._sampling_mode = samp
+
+    return model
 
 
 def create_multi_rotor_from_config(
@@ -973,6 +1441,7 @@ def create_multi_rotor_from_config(
     u_inf_lu: Optional[float] = None,
     coeff_mode: str = 'auto',
     xp=None,
+    sound_speed: Optional[float] = None,
 ) -> MultiRotorManager:
     """Create a MultiRotorManager from config containing 'rotors' list
 
@@ -1039,6 +1508,10 @@ def create_multi_rotor_from_config(
         'gaussian_cutoff': config.get('gaussian_cutoff', 3.0),
         'rho_ref': config.get('rho_ref', 1.0),
         'coeff_mode': config.get('coeff_mode', coeff_mode),
+        'epsilon_mode': config.get('epsilon_mode', 'default'),
+        'epsilon_tip_factor': config.get('epsilon_tip_factor', 1.0),
+        'epsilon_taper_start': config.get('epsilon_taper_start', 0.7),
+        'sampling': config.get('sampling', None),
     }
 
     # ── Create each rotor ──
@@ -1057,6 +1530,16 @@ def create_multi_rotor_from_config(
             'coeff_mode': rotor_entry.get(
                 'coeff_mode', shared_defaults['coeff_mode']
             ),
+            'epsilon_mode': rotor_entry.get(
+                'epsilon_mode', shared_defaults['epsilon_mode']
+            ),
+            'epsilon_tip_factor': rotor_entry.get(
+                'epsilon_tip_factor', shared_defaults['epsilon_tip_factor']
+            ),
+            'epsilon_taper_start': rotor_entry.get(
+                'epsilon_taper_start', shared_defaults['epsilon_taper_start']
+            ),
+            'sampling': rotor_entry.get('sampling', shared_defaults['sampling']),
         }
 
         # Per-rotor u_inf override
@@ -1072,6 +1555,7 @@ def create_multi_rotor_from_config(
             u_inf_lu=rotor_u_inf,
             coeff_mode=single_config['coeff_mode'],
             xp=xp,
+            sound_speed=sound_speed,
         )
 
         manager.add_model(al_model, name=name)

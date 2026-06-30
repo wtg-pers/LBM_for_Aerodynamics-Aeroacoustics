@@ -5,23 +5,29 @@ Volume-based damping that drives distributions toward equilibrium
 near domain boundaries. NOT a face BC — operates on a buffer zone
 of configurable thickness.
 
-Physics:
-    f_i(x) ← f_i(x) + σ(x) · [f_eq(ρ∞, U∞) - f_i(x)]
-    
-    Equivalently:
-    f_i(x) ← (1 - σ(x)) · f_i(x) + σ(x) · f_eq_i(ρ∞, U∞)
-    
-    where σ(x) is a spatial damping profile:
-        σ(x) = σ_max · (d/L)²
-        
-        d = distance from inner edge of sponge layer  [lattice units]
-        L = sponge thickness  [lattice units]
-        σ_max = maximum damping coefficient  [dimensionless, 0 < σ ≤ 1]
+Two-stage application (encapsulated in apply()):
+    Stage A — Neumann cleanup at boundary face:
+        Streaming with periodic-wrap leaves "wrap-around garbage" in the
+        incoming populations of the boundary row. Without cleanup, only a
+        σ_max fraction is replaced each step, so (1 − σ_max) of the garbage
+        survives → can grow unboundedly. SpongeLayerBC owns its own
+        NeumannBC so the partner is guaranteed regardless of σ_max.
+
+    Stage B — Volume damping over the buffer slab:
+        f_i(x) ← f_i(x) + σ(x) · [f_eq(ρ∞, U∞) − f_i(x)]
+        Equivalently:
+        f_i(x) ← (1 − σ(x)) · f_i(x) + σ(x) · f_eq_i(ρ∞, U∞)
+
+        with quadratic ramp:
+            σ(x) = σ_max · (d/L)²
+            d = distance from inner edge of sponge layer  [lattice units]
+            L = sponge thickness                          [lattice units]
+            σ_max = maximum damping coefficient           [0 < σ ≤ 1]
 
 Performance:
-    Only the slab of nodes within the buffer zone is accessed and
-    modified each time step.  Memory footprint and compute cost scale
-    with  Q × L × (transverse area)  instead of  Q × N_total.
+    Only the slab of nodes within the buffer zone is accessed for the
+    volume damping; Stage A only touches the boundary face row. Memory
+    and compute scale with  Q × L × (transverse area), not  Q × N_total.
 
 Usage in config:
     "farfield_sponge": {
@@ -33,7 +39,9 @@ Usage in config:
         "strength": 0.5         # σ_max [dimensionless]
     }
 
-Applied AFTER face BCs and corner BCs in the time loop (Phase 3).
+Applied in Phase 3 of the time loop (after face BCs and corner BCs).
+SpongeLayerBC is now self-contained: callers no longer need to register
+a separate NeumannBC for the sponge face.
 
 References:
     - Israeli & Orszag, J. Comp. Phys. 41, 1981
@@ -50,21 +58,26 @@ if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
 
-from .bc_config import FaceConfig, FaceLocation
+from .bc_config import FaceConfig, FaceLocation, BCType
 from .regularized_utils import compute_f_eq
 
 
 class SpongeLayerBC:
     """Volume-based sponge layer for non-reflecting boundaries.
-    
+
     Damps distributions toward equilibrium in a buffer zone near
     the domain boundary. The damping increases quadratically from
     the inner edge (σ = 0) to the boundary (σ = σ_max).
-    
+
+    Self-contained: the apply() method first runs a Neumann cleanup on
+    the boundary face row (via an internally-held NeumannBC) to remove
+    streaming wrap-around garbage, then performs the volume damping.
+    Callers do NOT need to register a separate NeumannBC.
+
     **Slab-only optimisation**: only the L nodes within the buffer
-    zone are touched each time step, avoiding full-domain temporaries
-    that would otherwise dominate GPU bandwidth.
-    
+    zone are touched by Stage B (volume damping); Stage A (Neumann
+    cleanup) only touches the boundary row.
+
     Attributes:
         location: Which face the sponge is attached to
         thickness: Buffer zone depth  [lattice units]
@@ -72,17 +85,20 @@ class SpongeLayerBC:
         u_inf: Freestream velocity  [Δx/Δt]
         rho_inf: Freestream density  [dimensionless]
     """
-    
+
     def __init__(self, xp: 'ModuleType', lattice: 'object',
                  config: FaceConfig,
-                 domain_shape: Tuple[int, ...]) -> None:
+                 domain_shape: Tuple[int, ...],
+                 node_map: 'object') -> None:
         """Initialize sponge layer.
-        
+
         Args:
             xp: Array module (numpy or cupy)
             lattice: Lattice model
             config: FaceConfig with extra['thickness'] and extra['sigma_max']
             domain_shape: (Nx, Ny) or (Nx, Ny, Nz)  [lattice units]
+            node_map: NodeMap — provides flat-slice geometry for the
+                internal NeumannBC base layer.
         """
         self.xp = xp
         self.lattice = lattice
@@ -91,18 +107,30 @@ class SpongeLayerBC:
         self.c = xp.asarray(lattice.c)
         self.w = xp.asarray(lattice.w)
         self.cs2 = lattice.cs2
-        
+
         self.location = config.location
         self.domain_shape = domain_shape
-        
+
         # Physical parameters
         self.rho_inf = config.density                                # [dimensionless]
         self.thickness = int(config.extra.get('thickness', 20))      # [lattice units]
         self.sigma_max = float(config.extra.get('sigma_max', 0.5))   # [dimensionless]
-        
+
         # Setup velocity and precompute damping
         self._setup_velocity(config.velocity)
         self._setup_damping()
+
+        # Compose with NeumannBC for Stage A (boundary-face wrap-around cleanup).
+        # Composition over duplication: re-uses NeumannBC's incoming-direction
+        # logic and slice handling, and guarantees this base partner is always
+        # active regardless of σ_max value.
+        from .face_bc import NeumannBC
+        neumann_config = FaceConfig(
+            location=config.location,
+            bc_type=BCType.NEUMANN,
+            method='neumann',
+        )
+        self._neumann_base = NeumannBC(xp, lattice, neumann_config, node_map)
     
     def _setup_velocity(self, velocity: Union[float, list]) -> None:
         """Build freestream velocity vector.
@@ -179,15 +207,25 @@ class SpongeLayerBC:
         )  # shape (Q, ..., L, ...)
     
     def apply(self, f: 'npt.NDArray') -> None:
-        """Apply sponge damping to the buffer zone only.
-        
-        f[slab] ← f[slab] + σ · (f_eq∞ − f[slab])
-        
-        Only L layers are read/written, not the full domain.
-        
+        """Apply sponge BC: Neumann cleanup + volume damping.
+
+        Stage A — Neumann cleanup on boundary face flat nodes:
+            Replace incoming populations (those that streamed in via
+            wrap-around) with values from the interior neighbour. Without
+            this, only σ_max of the wrap-around garbage is overwritten by
+            Stage B each step; the rest survives and can grow.
+
+        Stage B — Volume damping over buffer slab:
+            f[slab] ← f[slab] + σ · (f_eq∞ − f[slab])
+            Only L layers are read/written.
+
         Args:
             f: Distribution function, modified in-place (Q, Nx, Ny[, Nz])
         """
+        # Stage A: clean wrap-around garbage at boundary face
+        self._neumann_base.apply(f)
+
+        # Stage B: volume damping toward (ρ∞, U∞)
         f_slab = f[self._slab_idx]
         f_slab += self.sigma_slab * (self.f_eq_slab - f_slab)
     

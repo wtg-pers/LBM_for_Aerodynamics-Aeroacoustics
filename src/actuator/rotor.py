@@ -354,20 +354,18 @@ class Rotor:
     ) -> np.ndarray:
         """Project forces on ALL blades to global frame
 
-        Automatically applies rotation_sign = sign(ω) so that
-        counter-rotating rotors (ω < 0) project tangential forces
-        in the correct global direction.
+        Uses self.thrust_axis (set via config or default = rotation axis)
+        to determine the direction of the normal force projection.
 
         Args:
             F_n_all:     Normal forces, shape (N_b * n_markers,)  [N or lu_force]
             F_theta_all: Tangential forces, shape (N_b * n_markers,) [N or lu_force]
-                         Ordered as [blade_0_markers, blade_1_markers, ...]
 
         Returns:
             F_global: shape (N_b * n_markers, 3) — (F_x, F_y, F_z)
-                      [N or lu_force]
         """
-        rotation_sign = float(np.sign(self.omega))  # [-]
+        rotation_sign = float(np.sign(self.omega))
+        t_axis = getattr(self, 'thrust_axis', None)
 
         F_global = np.zeros((self.total_markers, 3), dtype=np.float64)
 
@@ -379,10 +377,11 @@ class Rotor:
                 F_n=F_n_all[i_start:i_end],
                 F_theta=F_theta_all[i_start:i_end],
                 theta=self.theta[k],
-                rotation_sign=rotation_sign       # ← 역회전 지원
-            )  # [N or lu_force]
+                rotation_sign=rotation_sign,
+                thrust_axis=t_axis,
+            )
 
-        return F_global  # [N or lu_force]
+        return F_global
 
     # -----------------------------------------------------------------
     # §1.4 Velocity Decomposition Helpers
@@ -497,10 +496,26 @@ class Rotor:
         phi_rad = np.arctan2(u_n, u_tangential_rel)            # [rad]
         phi_deg = np.degrees(phi_rad)                          # [degrees]
 
-        # Angle of attack (Eq. 8)
-        alpha_deg = phi_deg - blade.marker_twist               # [degrees]
+        # Angle of attack: α = θ (twist/pitch) - φ (flow angle)
+        alpha_deg = blade.marker_twist - phi_deg               # [degrees]
 
         return u_rel, phi_deg, alpha_deg, u_n, u_theta
+
+    def recompute_velocity_triangle(self, blade_idx, u_n, u_theta):
+        """Recompute (u_rel, phi_deg, alpha_deg) from an overridden axial
+        velocity u_n and the unchanged tangential u_theta.
+
+        Mirrors the triangle of compute_relative_velocity (Eq. 6-8) exactly; used
+        by the ALM smearing correction after it adds the missing downwash to u_n.
+        """
+        blade = self.blades[blade_idx]
+        rotation_sign = np.sign(self.omega)
+        blade_speed = np.abs(self.omega) * blade.marker_r          # |ω|·r
+        u_tangential_rel = blade_speed - rotation_sign * u_theta
+        u_rel = np.sqrt(u_n**2 + u_tangential_rel**2)
+        phi_deg = np.degrees(np.arctan2(u_n, u_tangential_rel))
+        alpha_deg = blade.marker_twist - phi_deg
+        return u_rel, phi_deg, alpha_deg
 
     # -----------------------------------------------------------------
     # §1.5 Marker Property Access (Aggregated)
@@ -1017,6 +1032,13 @@ class Rotor:
         blade_cfg = config.get('blade', {})
         blade = Blade.from_config(blade_cfg)
 
+        # ε-projection-width taper controls (default → bit-identical baseline ε).
+        # Assigned before set_lattice_spacing so both the physical pass here and
+        # the later lattice-unit pass (Rotor.to_lattice_units) honor the mode.
+        blade.epsilon_mode = config.get('epsilon_mode', 'default')
+        blade.epsilon_tip_factor = config.get('epsilon_tip_factor', 1.0)
+        blade.epsilon_taper_start = config.get('epsilon_taper_start', 0.7)
+
         # Grid
         grid_cfg = config.get('grid', {})
 
@@ -1053,8 +1075,9 @@ class Rotor:
         # Rotation axis (3D vector, e.g. [1, 0, 0])
         rotation_axis = config.get('rotation_axis', [1, 0, 0])
         inflow_direction = config.get('inflow_direction', None)
+        thrust_direction = config.get('thrust_direction', None)
 
-        return cls(
+        rotor = cls(
             blade_prototype=blade,
             n_blades=config.get('n_blades', 3),
             hub_center=hub_center,
@@ -1063,6 +1086,13 @@ class Rotor:
             rotation_axis=rotation_axis,
             inflow_direction=inflow_direction,
         )
+
+        # thrust_axis: direction for F_n projection (default: rotation_axis)
+        if thrust_direction is not None:
+            td = np.array(thrust_direction, dtype=np.float64)
+            rotor.thrust_axis = td / np.linalg.norm(td)
+
+        return rotor
 
     # =================================================================
     # §3. Unit Conversion Support
@@ -1110,5 +1140,9 @@ class Rotor:
             omega=omega_lu,
             theta_0=self.theta[0]
         )
+
+        # Preserve thrust_axis (dimensionless, no scaling needed)
+        if hasattr(self, 'thrust_axis'):
+            rotor_lu.thrust_axis = self.thrust_axis
 
         return rotor_lu

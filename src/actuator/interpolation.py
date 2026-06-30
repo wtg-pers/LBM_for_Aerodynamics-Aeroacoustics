@@ -802,3 +802,204 @@ def verify_gpu_interpolation(
         'u_cpu': u_cpu,
         'u_gpu': u_gpu,
     }
+
+
+# =============================================================================
+# §7. Alternative Velocity Samplers (A/B study)
+# =============================================================================
+#
+# See patch_notes/almlbm_sampler_ab/ and docs/almlbm_paper_analysis_kr.md §2①.
+#
+# The baseline sampler (§6 interpolate_velocity_batch_gpu, mode "gaussian") is
+# the isotropic ±3ε Gaussian average. These add three opt-in alternatives that
+# isolate the tip-inflow contribution of the sampling kernel (analysis (b)):
+#   - "point"      : trilinear (8-node) interpolation, no spatial filter   (B-i)
+#   - "aniso"      : anisotropic Gaussian, radial width ε_r = factor·ε     (B-ii)
+#   - "mask_disk"  : isotropic Gaussian, off-disk nodes (cyl radius > R)
+#                    dropped from the weighted average                     (B-iii)
+# All are xp-generic (numpy CPU / cupy GPU) and return numpy (BEM is CPU-only).
+# Mode "gaussian" is NOT routed here — the caller keeps the bit-identical §6 path.
+# =============================================================================
+
+
+def sample_velocity_alt(
+    mode: str,
+    u_field: 'npt.NDArray',
+    marker_positions: 'npt.NDArray',
+    marker_epsilon: 'npt.NDArray',
+    xp,
+    n_cut: float = 3.0,
+    hub: 'npt.NDArray' = None,
+    axis: 'npt.NDArray' = None,
+    radius: float = None,
+    eps_r_factor: float = 0.5,
+) -> 'npt.NDArray':
+    """Dispatch to an alternative velocity sampler (B-i / B-ii / B-iii).
+
+    Args:
+        mode: "point" | "aniso" | "mask_disk"  (NOT "gaussian" — use §6).
+        u_field: (3, Nx, Ny, Nz)  [Δx/Δt]  (numpy or cupy)
+        marker_positions: (N_markers, 3)  [lu]
+        marker_epsilon: (N_markers,)  [lu]
+        xp: numpy or cupy
+        n_cut: Gaussian cutoff in units of ε  [dimensionless]
+        hub: Rotor hub center (3,)  [lu]   — needed for "aniso", "mask_disk"
+        axis: Rotor rotation axis (3,)  [unit] — needed for "aniso", "mask_disk"
+        radius: Rotor tip radius R  [lu]   — needed for "mask_disk"
+        eps_r_factor: Radial width factor ε_r = factor·ε — "aniso" only
+
+    Returns:
+        u_markers: (N_markers, 3)  [Δx/Δt]  — always numpy (BEM is CPU).
+    """
+    if mode == "point":
+        u = _sample_trilinear(u_field, marker_positions, xp)
+    elif mode == "aniso":
+        u = _sample_aniso(u_field, marker_positions, marker_epsilon, xp,
+                          n_cut, hub, axis, eps_r_factor)
+    elif mode == "mask_disk":
+        u = _sample_mask_disk(u_field, marker_positions, marker_epsilon, xp,
+                              n_cut, hub, axis, radius)
+    else:
+        raise ValueError(
+            f"Unknown sampling mode {mode!r} "
+            "(expected 'point', 'aniso', or 'mask_disk')"
+        )
+    if xp.__name__ != 'numpy':
+        u = xp.asnumpy(u)
+    return u  # (N_markers, 3) numpy [Δx/Δt]
+
+
+def _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut):
+    """Build the shared (N, S, S, S) stencil tensors (mirrors §6.2).
+
+    Returns a dict of arrays on xp's device:
+        gx_c, gy_c, gz_c : clipped int32 grid indices for safe gather
+        dx, dy, dz       : float64 offsets g - marker  [lu]
+        d_sq             : squared distance  [lu²]
+        valid            : bool — node inside the domain
+        pos              : (N,3) marker positions  [lu]
+        eps              : (N,)  per-marker ε  [lu]
+    """
+    _, Nx, Ny, Nz = u_field.shape
+    eps_max = float(np.max(marker_epsilon))                 # [lu]
+    half = int(np.ceil(n_cut * eps_max)) + 1                # [lu] stencil half-width
+    pos = xp.asarray(marker_positions, dtype=xp.float64)    # (N,3) [lu]
+    eps = xp.asarray(marker_epsilon, dtype=xp.float64)      # (N,)  [lu]
+
+    offsets = xp.arange(-half, half + 1, dtype=xp.float64)
+    ox, oy, oz = xp.meshgrid(offsets, offsets, offsets, indexing='ij')
+
+    ix0 = xp.round(pos[:, 0]).astype(xp.int32)
+    iy0 = xp.round(pos[:, 1]).astype(xp.int32)
+    iz0 = xp.round(pos[:, 2]).astype(xp.int32)
+
+    gx = ix0[:, None, None, None] + ox[None, :, :, :].astype(xp.int32)
+    gy = iy0[:, None, None, None] + oy[None, :, :, :].astype(xp.int32)
+    gz = iz0[:, None, None, None] + oz[None, :, :, :].astype(xp.int32)
+
+    valid = (
+        (gx >= 0) & (gx < Nx) &
+        (gy >= 0) & (gy < Ny) &
+        (gz >= 0) & (gz < Nz)
+    )
+    gx_c = xp.clip(gx, 0, Nx - 1)
+    gy_c = xp.clip(gy, 0, Ny - 1)
+    gz_c = xp.clip(gz, 0, Nz - 1)
+
+    dx = gx.astype(xp.float64) - pos[:, 0, None, None, None]   # [lu]
+    dy = gy.astype(xp.float64) - pos[:, 1, None, None, None]
+    dz = gz.astype(xp.float64) - pos[:, 2, None, None, None]
+    d_sq = dx * dx + dy * dy + dz * dz                          # [lu²]
+
+    return {'gx_c': gx_c, 'gy_c': gy_c, 'gz_c': gz_c,
+            'dx': dx, 'dy': dy, 'dz': dz, 'd_sq': d_sq,
+            'valid': valid, 'pos': pos, 'eps': eps}
+
+
+def _alt_gather(u_field, st, weights, xp):
+    """Normalized weighted gather: u_j = Σ w·u / Σ w  per marker."""
+    n = weights.shape[0]
+    W = xp.maximum(xp.sum(weights, axis=(1, 2, 3)), 1e-30)     # (N,)
+    out = xp.zeros((n, 3), dtype=xp.float64)
+    for d in range(3):
+        u_local = u_field[d, st['gx_c'], st['gy_c'], st['gz_c']]  # (N,S,S,S)
+        out[:, d] = xp.sum(u_local * weights, axis=(1, 2, 3)) / W
+    return out  # (N,3) [Δx/Δt]
+
+
+def _sample_trilinear(u_field, marker_positions, xp):
+    """B-i: trilinear interpolation from the 8 surrounding nodes (no filter)."""
+    _, Nx, Ny, Nz = u_field.shape
+    n = marker_positions.shape[0]
+    pos = xp.asarray(marker_positions, dtype=xp.float64)
+    i0 = xp.floor(pos[:, 0]).astype(xp.int32); fx = pos[:, 0] - i0
+    j0 = xp.floor(pos[:, 1]).astype(xp.int32); fy = pos[:, 1] - j0
+    k0 = xp.floor(pos[:, 2]).astype(xp.int32); fz = pos[:, 2] - k0
+
+    out = xp.zeros((n, 3), dtype=xp.float64)
+    for cx, wx in ((0, 1.0 - fx), (1, fx)):
+        ix = xp.clip(i0 + cx, 0, Nx - 1)
+        for cy, wy in ((0, 1.0 - fy), (1, fy)):
+            iy = xp.clip(j0 + cy, 0, Ny - 1)
+            for cz, wz in ((0, 1.0 - fz), (1, fz)):
+                iz = xp.clip(k0 + cz, 0, Nz - 1)
+                w = wx * wy * wz                              # (N,)
+                for d in range(3):
+                    out[:, d] += w * u_field[d, ix, iy, iz]
+    return out  # (N,3) [Δx/Δt]
+
+
+def _sample_aniso(u_field, marker_positions, marker_epsilon, xp,
+                  n_cut, hub, axis, eps_r_factor):
+    """B-ii: anisotropic Gaussian — radial width ε_r=factor·ε, ε_⊥=ε."""
+    st = _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut)
+    eps = st['eps']
+    rcut_sq = ((n_cut * eps) ** 2)[:, None, None, None]
+    eps_sq = (eps ** 2)[:, None, None, None]
+    eps_r_sq = ((eps_r_factor * eps) ** 2)[:, None, None, None]
+
+    hub = xp.asarray(hub, dtype=xp.float64)
+    axis = xp.asarray(axis, dtype=xp.float64)
+    axis = axis / xp.sqrt(xp.sum(axis * axis))
+
+    # Per-marker radial unit vector ê_r = normalize((p-hub)_⊥axis)
+    ph = st['pos'] - hub[None, :]                              # (N,3)
+    pa = ph[:, 0] * axis[0] + ph[:, 1] * axis[1] + ph[:, 2] * axis[2]
+    er = ph - pa[:, None] * axis[None, :]                      # (N,3)
+    er = er / xp.maximum(xp.sqrt(xp.sum(er * er, axis=1)), 1e-30)[:, None]
+
+    # Radial / perpendicular split of the offset d
+    d_r = (st['dx'] * er[:, 0, None, None, None] +
+           st['dy'] * er[:, 1, None, None, None] +
+           st['dz'] * er[:, 2, None, None, None])              # (N,S,S,S)
+    d_perp_sq = xp.maximum(st['d_sq'] - d_r * d_r, 0.0)
+    arg = d_r * d_r / eps_r_sq + d_perp_sq / eps_sq
+
+    weights = xp.where(st['valid'] & (st['d_sq'] <= rcut_sq),
+                       xp.exp(-arg), 0.0)
+    return _alt_gather(u_field, st, weights, xp)
+
+
+def _sample_mask_disk(u_field, marker_positions, marker_epsilon, xp,
+                      n_cut, hub, axis, radius):
+    """B-iii: isotropic Gaussian, off-disk nodes (cyl radius > R) dropped."""
+    st = _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut)
+    eps = st['eps']
+    rcut_sq = ((n_cut * eps) ** 2)[:, None, None, None]
+    eps_sq = (eps ** 2)[:, None, None, None]
+
+    hub = xp.asarray(hub, dtype=xp.float64)
+    axis = xp.asarray(axis, dtype=xp.float64)
+    axis = axis / xp.sqrt(xp.sum(axis * axis))
+
+    # Node global positions g = marker + d; cylindrical radius from rotor axis
+    gpx = st['pos'][:, 0, None, None, None] + st['dx'] - hub[0]
+    gpy = st['pos'][:, 1, None, None, None] + st['dy'] - hub[1]
+    gpz = st['pos'][:, 2, None, None, None] + st['dz'] - hub[2]
+    ax_comp = gpx * axis[0] + gpy * axis[1] + gpz * axis[2]    # axial proj
+    cyl_sq = xp.maximum((gpx * gpx + gpy * gpy + gpz * gpz) - ax_comp * ax_comp, 0.0)
+
+    weights = xp.where(
+        st['valid'] & (st['d_sq'] <= rcut_sq) & (cyl_sq <= radius * radius),
+        xp.exp(-st['d_sq'] / eps_sq), 0.0)
+    return _alt_gather(u_field, st, weights, xp)

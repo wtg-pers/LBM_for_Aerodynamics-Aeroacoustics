@@ -38,7 +38,7 @@ void bgk_collide_d3q27(
     float*       __restrict__ u_out,      // (3, N) velocity output
     const float* __restrict__ force,      // (3, N) body force or NULL
     const float omega,                     // relaxation rate 1/tau
-    const int N                            // total nodes = Nx*Ny*Nz
+    const long long N                      // total nodes = Nx*Ny*Nz (64-bit: q*N overflow)
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -166,7 +166,7 @@ void bgk_collide_d3q27_fp16s(
     float*        __restrict__ u_out,     // (3, N) FP32
     const float*  __restrict__ force,     // (3, N) or NULL, FP32
     const float omega,
-    const int N
+    const long long N
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -281,7 +281,7 @@ void bgk_stream_collide_d3q27(
     const float omega,
     const int Nx, const int Ny, const int Nz
 ) {
-    int N = Nx * Ny * Nz;
+    long long N = (long long)Nx * Ny * Nz;   // 64-bit: q*N overflows int32 at N>~79.5M
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
@@ -461,7 +461,7 @@ class BGKCollideKernelD3Q27:
                 f_in, f_post, rho_out, u_out,
                 force_arg,
                 cp.float32(omega),
-                cp.int32(N),
+                cp.int64(N),
             ),
         )
 
@@ -595,6 +595,6 @@ class BGKCollideKernelD3Q27_FP16S:
                 f_in, f_post, rho_out, u_out,
                 force_arg,
                 cp.float32(omega),
-                cp.int32(N),
+                cp.int64(N),
             ),
         )

@@ -628,68 +628,52 @@ class RotorCoordinateSystem:
         F_n: Union[float, np.ndarray],
         F_theta: Union[float, np.ndarray],
         theta: float,
-        rotation_sign: float = 1.0
+        rotation_sign: float = 1.0,
+        thrust_axis: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Project local forces to global coordinate frame
-        
-        Force Projection (extended for counter-rotation):
-            F^AL = F_n·n̂ + rotation_sign · F_θ·ê_θ(θ)
-        
-        where ê_θ(θ) = -sin(θ)·ê_ref + cos(θ)·ê_perp (tangent vector)
-        
-        The rotation_sign accounts for the fact that F_theta from BEM
-        is computed in the blade-local frame (where blade always moves
-        in the "positive" direction). When projected to the global frame:
-            ω > 0: rotation_sign = +1 → F_theta acts in +ê_θ direction
-            ω < 0: rotation_sign = -1 → F_theta acts in -ê_θ direction
-        
-        For HAWT_X_AXIS with ω > 0:
-            F^AL = (F_n, -F_θ·sin(θ), F_θ·cos(θ))
-        
-        Convention difference from Watanabe:
-            Watanabe uses radial projection:  (F_n, F_θ·cos(θ), -F_θ·sin(θ))
-            Our code uses tangent projection: (F_n, -F_θ·sin(θ), F_θ·cos(θ))
-            Both yield correct torque for uniform inflow; the tangent form
-            ensures azimuth-independent torque for arbitrary rotation axes.
-        
-        Torque conservation proof:
-            Q = (r × F^AL) · n̂ = F_θ · r   (constant for all θ)
-        
-        Sign Convention (IMPORTANT):
-            F_n > 0:  Force on blade in +n̂ direction
+
+        Force Projection:
+            F^AL = F_n·t̂ + rotation_sign · F_θ·ê_θ(θ)
+
+        where t̂ = thrust_axis (default: n_axis = rotation axis).
+
+        The thrust_axis allows decoupling the thrust direction from
+        the rotation axis, analogous to Star-CCM+'s Virtual Disk
+        disk-direction vector.
+
+        Sign Convention:
+            F_n > 0:  Force on blade in +t̂ direction (thrust)
             F_θ > 0:  Force on blade in +ê_θ direction (drives rotation)
-            
+
             The BODY FORCE on fluid (Eq. 13) is -F^AL:
-                F_body = -F^AL = -F_n·n̂ - rotation_sign·F_θ·ê_θ(θ)
-        
+                F_body = -F_n·t̂ - rotation_sign·F_θ·ê_θ(θ)
+
         Args:
             F_n: Normal (axial) force(s)  [N or lattice force]
-                 Scalar or shape (N,)
             F_theta: Tangential force(s)  [N or lattice force]
-                     Scalar or shape (N,)
             theta: Azimuth angle  [radians]
             rotation_sign: sign(ω), +1.0 or -1.0  [-]
-                           Controls global direction of tangential force.
-                           Default +1.0 preserves backward compatibility.
-        
+            thrust_axis: Unit vector for F_n projection  [dimensionless]
+                         Default: self.n_axis (rotation axis)
+
         Returns:
             F_global: Force ON BLADE in global frame
-                      Shape (3,) if inputs are scalar, (N, 3) if arrays
         """
         e_tan = self.tangent_vector(theta)
-        
+        t_axis = self.n_axis if thrust_axis is None else thrust_axis
+
         F_n = np.asarray(F_n)
         F_theta = np.asarray(F_theta)
-        
-        # ★ rotation_sign: 블레이드 로컬 F_theta → 글로벌 방향 반영 ★
-        F_theta_global = rotation_sign * F_theta   # [N or lattice force]
-        
+
+        F_theta_global = rotation_sign * F_theta
+
         is_scalar = (F_n.ndim == 0)
-        
+
         if is_scalar:
-            return float(F_n) * self.n_axis + float(F_theta_global) * e_tan
+            return float(F_n) * t_axis + float(F_theta_global) * e_tan
         else:
-            return (F_n[:, None] * self.n_axis[None, :] +
+            return (F_n[:, None] * t_axis[None, :] +
                     F_theta_global[:, None] * e_tan[None, :])
     
     # -----------------------------------------------------------------

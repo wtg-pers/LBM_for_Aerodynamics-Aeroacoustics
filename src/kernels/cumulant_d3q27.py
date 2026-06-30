@@ -31,9 +31,9 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
 
-_CUMULANT_D3Q27_KERNEL = r'''
+_CUMULANT_D3Q27_TEMPLATE = r'''
 extern "C" __global__
-void cumulant_collide_d3q27(
+void {{KERNEL_NAME}}(
     const float* __restrict__ f_in,
     float*       __restrict__ f_post,
     float*       __restrict__ rho_out,
@@ -42,7 +42,7 @@ void cumulant_collide_d3q27(
     const float omega_1,        // shear: 1/tau
     const float omega_bulk,     // bulk viscosity rate
     const float omega_high,     // higher-order rate (omega_3-10)
-    const int N
+    const long long N{{SGS_PARAM}}
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -226,7 +226,7 @@ void cumulant_collide_d3q27(
     float w3 = omega_high, w4 = omega_high, w5 = omega_high;
     float w6 = omega_high, w7 = omega_high, w8 = omega_high;
     float w9 = omega_high, w10 = omega_high;
-
+{{SGS_BLOCK}}
     float C200 = K[2][0][0], C020 = K[0][2][0], C002 = K[0][0][2];
 
     // Galilean correction (Eqs. 58-60)
@@ -406,7 +406,106 @@ void cumulant_collide_d3q27(
 '''
 
 
-# --- Streaming-fused version: pull from neighbors + collide --
+# SGS branch templates (substituted into "{{SGS_BLOCK}}" slot).
+
+_SGS_BLOCK_OFF = ""
+
+_SGS_BLOCK_WALE = r'''
+    // -- SGS WALE: read pre-computed nu_t from buffer ------------
+    //   tau_total = tau_0 + 3 * nu_t        (linear, no quadratic)
+    //   w1        = 1 / tau_total
+    {
+        float tau0_wale = 1.0f / omega_1;
+        float nu_t_in   = (nu_t_in_buf != NULL) ? nu_t_in_buf[idx] : 0.0f;
+        float tau_t_wale = tau0_wale + 3.0f * nu_t_in;
+        w1 = 1.0f / tau_t_wale;
+        if (nu_t_out != NULL) {
+            nu_t_out[idx] = nu_t_in;
+        }
+    }
+'''
+
+_SGS_BLOCK_SMAG = r'''
+    // -- SGS Smagorinsky inline (Stiebler 2011 Eq. 12) -----------
+    //   Pi^neq components from central moments K[a][b][c]:
+    //     Pi^neq_xx = K[2][0][0] - rho * cs2     (eq value rho * cs2)
+    //     Pi^neq_yy = K[0][2][0] - rho * cs2
+    //     Pi^neq_zz = K[0][0][2] - rho * cs2
+    //     Pi^neq_xy = K[1][1][0]                  (eq value 0)
+    //     Pi^neq_xz = K[1][0][1]
+    //     Pi^neq_yz = K[0][1][1]
+    //   Q         = sqrt( 2 * Pi:Pi )
+    //   tau_total = ( tau_0 + sqrt(tau_0^2 + 18 Cs^2 Q) ) / 2
+    //   w1        = 1 / tau_total      (only w1 modified; others unchanged)
+    //   nu_t (lu) = (tau_total - tau_0) / 3       (Stiebler decomposition)
+    {
+        const float cs2_sgs = 1.0f / 3.0f;
+        float Pi_xx_sgs = K[2][0][0] - rho * cs2_sgs;
+        float Pi_yy_sgs = K[0][2][0] - rho * cs2_sgs;
+        float Pi_zz_sgs = K[0][0][2] - rho * cs2_sgs;
+        float Pi_xy_sgs = K[1][1][0];
+        float Pi_xz_sgs = K[1][0][1];
+        float Pi_yz_sgs = K[0][1][1];
+        float Q_sgs = sqrtf(2.0f * (
+              Pi_xx_sgs * Pi_xx_sgs
+            + Pi_yy_sgs * Pi_yy_sgs
+            + Pi_zz_sgs * Pi_zz_sgs
+            + 2.0f * (Pi_xy_sgs * Pi_xy_sgs
+                    + Pi_xz_sgs * Pi_xz_sgs
+                    + Pi_yz_sgs * Pi_yz_sgs)));
+        float tau0_sgs = 1.0f / omega_1;
+        float tau_t_sgs = 0.5f * (tau0_sgs
+                          + sqrtf(tau0_sgs * tau0_sgs + 18.0f * Cs * Cs * Q_sgs));
+        w1 = 1.0f / tau_t_sgs;
+        if (nu_t_out != NULL) {
+            nu_t_out[idx] = (tau_t_sgs - tau0_sgs) * (1.0f / 3.0f);
+        }
+    }
+'''
+
+
+def _build_kernel_d3q27(sgs_model: str) -> tuple[str, str]:
+    """Return (kernel_source, kernel_name) for the given SGS variant.
+
+    sgs_model:
+        "off"         -- byte-equivalent to pre-SGS implementation.
+        "smagorinsky" -- inline Pi^neq -> tau_total quadratic.
+        "wale"        -- not yet implemented (stage B).
+    """
+    if sgs_model == "off":
+        name = "cumulant_collide_d3q27"
+        sgs_param = ""
+        sgs_block = _SGS_BLOCK_OFF
+    elif sgs_model == "smagorinsky":
+        name = "cumulant_collide_d3q27_smag"
+        # Two extra params on top of the SGS-off signature: Cs and the
+        # optional nu_t output buffer (NULL -> skip writing).
+        sgs_param = ",\n    const float Cs,\n    float* __restrict__ nu_t_out"
+        sgs_block = _SGS_BLOCK_SMAG
+    elif sgs_model == "wale":
+        name = "cumulant_collide_d3q27_wale"
+        # WALE reads nu_t (pre-computed from u via WALEKernelD3Q27) and writes
+        # back the same nu_t to nu_t_out for VTK diagnostics. No Cs/Cw passed:
+        # those are baked into nu_t_in_buf at the WALE kernel stage.
+        sgs_param = (",\n    const float* __restrict__ nu_t_in_buf"
+                     ",\n    float* __restrict__ nu_t_out")
+        sgs_block = _SGS_BLOCK_WALE
+    else:
+        raise ValueError(f"Unsupported sgs_model: {sgs_model!r}")
+
+    src = (_CUMULANT_D3Q27_TEMPLATE
+           .replace("{{KERNEL_NAME}}", name)
+           .replace("{{SGS_PARAM}}", sgs_param)
+           .replace("{{SGS_BLOCK}}", sgs_block))
+    return src, name
+
+
+# Materialise the SGS-off source for the streaming-fused variant below.
+_CUMULANT_D3Q27_KERNEL, _ = _build_kernel_d3q27("off")
+
+
+# --- Streaming-fused version (SGS-off only; not currently used in production
+#     simulation loop but retained for completeness) -----------------------
 
 _CUMULANT_D3Q27_STREAM_COLLIDE_KERNEL = (
     _CUMULANT_D3Q27_KERNEL
@@ -415,13 +514,13 @@ _CUMULANT_D3Q27_STREAM_COLLIDE_KERNEL = (
         'void cumulant_stream_collide_d3q27(',
     )
     .replace(
-        '    const int N\n'
+        '    const long long N\n'
         ') {\n'
         '    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n'
         '    if (idx >= N) return;',
         '    const int Nx, const int Ny, const int Nz\n'
         ') {\n'
-        '    int N = Nx * Ny * Nz;\n'
+        '    long long N = (long long)Nx * Ny * Nz;\n'
         '    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n'
         '    if (idx >= N) return;\n'
         '\n'
@@ -505,30 +604,39 @@ class CumulantCollideKernelD3Q27:
     """Fused Cumulant collision kernel for D3Q27.
 
     Replaces macroscopic.compute() + cumulant.collide() with a single
-    CUDA kernel launch.
+    CUDA kernel launch. Per-instance SGS variant is fixed at construction.
 
     Usage:
-        >>> kernel = CumulantCollideKernelD3Q27()
-        >>> kernel.launch(f, f_post, rho, u, force, omega_1, omega_bulk, omega_high, N)
+        >>> kernel = CumulantCollideKernelD3Q27()                         # SGS off
+        >>> kernel = CumulantCollideKernelD3Q27(sgs_model="smagorinsky")  # SGS on
+        >>> kernel.launch(f, f_post, rho, u, force,
+        ...               omega_1, omega_bulk, omega_high, N, Cs=0.18)
     """
 
-    def __init__(self, block_size: int = 128) -> None:
+    def __init__(self, sgs_model: str = "off", block_size: int = 128) -> None:
         """Initialize kernel.
 
         Args:
+            sgs_model:  one of {"off", "smagorinsky"} (WALE pending stage B).
             block_size: CUDA threads per block. Lower than BGK (128 vs 256)
-                       due to higher register pressure (~90 registers).
+                        due to higher register pressure (~90 registers).
         """
+        if sgs_model not in ("off", "smagorinsky", "wale"):
+            raise ValueError(f"Unsupported sgs_model: {sgs_model!r}")
+        self._sgs_model = sgs_model
         self._block_size = block_size
         self._kernel = None
+        self._kernel_name: Optional[str] = None
+
+    @property
+    def sgs_model(self) -> str:
+        return self._sgs_model
 
     def _compile(self) -> None:
         import cupy as cp
-        self._kernel = cp.RawKernel(
-            _CUMULANT_D3Q27_KERNEL,
-            'cumulant_collide_d3q27',
-            options=('--use_fast_math',),
-        )
+        src, name = _build_kernel_d3q27(self._sgs_model)
+        self._kernel = cp.RawKernel(src, name, options=('--use_fast_math',))
+        self._kernel_name = name
 
     def launch(
         self,
@@ -541,19 +649,18 @@ class CumulantCollideKernelD3Q27:
         omega_bulk: float,
         omega_high: float,
         N: int,
+        Cs: float = 0.0,
+        nu_t_out: Optional['npt.NDArray'] = None,
+        nu_t_in: Optional['npt.NDArray'] = None,
     ) -> None:
         """Launch the fused cumulant collision kernel.
 
         Args:
-            f_in:       Input distribution (27, N)
-            f_post:     Post-collision output (27, N)
-            rho_out:    Density output (N,)
-            u_out:      Velocity output (3, N)
-            force:      Body force (3, N) or None
-            omega_1:    Shear relaxation rate 1/tau
-            omega_bulk: Bulk viscosity rate omega_2
-            omega_high: Higher-order rate omega_3-omega_1_0
-            N:          Total spatial nodes
+            Cs: Smagorinsky constant (only consumed when sgs_model == "smagorinsky").
+            nu_t_out: Optional eddy-viscosity output buffer (N,) [lu^2/lt].
+                      Smag and WALE paths; None -> skip writing.
+            nu_t_in: Pre-computed nu_t from WALE pre-pass (N,) [lu^2/lt].
+                     Required when sgs_model == "wale" (None -> nu_t treated as 0).
         """
         if self._kernel is None:
             self._compile()
@@ -563,15 +670,22 @@ class CumulantCollideKernelD3Q27:
         grid_size = (N + self._block_size - 1) // self._block_size
         force_arg = force if force is not None else cp.int32(0)
 
-        self._kernel(
-            (grid_size,),
-            (self._block_size,),
-            (
-                f_in, f_post, rho_out, u_out,
-                force_arg,
-                cp.float32(omega_1),
-                cp.float32(omega_bulk),
-                cp.float32(omega_high),
-                cp.int32(N),
-            ),
+        base_args = (
+            f_in, f_post, rho_out, u_out,
+            force_arg,
+            cp.float32(omega_1),
+            cp.float32(omega_bulk),
+            cp.float32(omega_high),
+            cp.int64(N),
         )
+        if self._sgs_model == "smagorinsky":
+            nu_t_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
+            args = base_args + (cp.float32(Cs), nu_t_arg)
+        elif self._sgs_model == "wale":
+            nu_t_in_arg  = nu_t_in  if nu_t_in  is not None else cp.int32(0)
+            nu_t_out_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
+            args = base_args + (nu_t_in_arg, nu_t_out_arg)
+        else:
+            args = base_args
+
+        self._kernel((grid_size,), (self._block_size,), args)

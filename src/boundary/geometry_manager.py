@@ -30,6 +30,10 @@ from src.boundary.geometry import (
     create_circle_mask,
     create_box_mask,
     create_airfoil_2d_mask,
+    create_airfoil_2d_mask_from_coords,
+    load_selig_dat,
+    transform_airfoil_coords_to_lu,
+    generate_naca_4digit_coordinates,
 )
 
 
@@ -164,38 +168,99 @@ def _create_2d_geometry(
     Nx, Ny = domain_shape
     
     if geom_type == 'airfoil':
-        # NACA Airfoil
-        naca = config.get('naca', '0012')
+        # Airfoil: NACA 4-digit (`naca` key) or arbitrary coords
+        # from a Selig .dat file (`selig_file` key) / inline coords
+        # (`x_coords`, `y_coords` keys).
         chord = config.get('chord', char_length)
         aoa = config.get('angle_of_attack', 0.0)
         center = config.get('center', (Nx//5, Ny//2))
-        num_points = config.get('num_points', 150)
-        
-        mask = create_airfoil_2d_mask(
-            xp, domain_shape,
-            naca=naca,
-            chord_length=chord,
-            center=center,
-            angle_of_attack=aoa,
-            num_points=num_points
-        )
-        
-        info = {
-            'type': 'airfoil',
-            'naca': naca,
-            'chord': chord,
-            'angle_of_attack': aoa,
-            'center': center,
-            'num_points': num_points,
-            'solid_nodes': int(xp.sum(mask))
-        }
-        
-        if verbose:
-            print(f"  Internal Obstacle (NACA Airfoil, 2D):")
-            print(f"    NACA {naca}, chord={chord} [lattice units]")
-            print(f"    center={center}, AoA={aoa}° [degrees]")
-            print(f"    num_points={num_points}")
-            print(f"    {info['solid_nodes']} solid nodes")
+
+        selig_file = config.get('selig_file')
+        x_coords = config.get('x_coords')
+        y_coords = config.get('y_coords')
+        naca = config.get('naca')
+
+        if selig_file is not None or (x_coords is not None and y_coords is not None):
+            # Arbitrary airfoil geometry from coordinates
+            if selig_file is not None:
+                x_norm, y_norm = load_selig_dat(selig_file)
+                source = f"selig:{selig_file}"
+            else:
+                import numpy as np_local
+                x_norm = np_local.asarray(x_coords, dtype=np_local.float64)
+                y_norm = np_local.asarray(y_coords, dtype=np_local.float64)
+                source = f"inline({len(x_norm)} pts)"
+
+            mask = create_airfoil_2d_mask_from_coords(
+                xp, domain_shape,
+                x_norm=x_norm,
+                y_norm=y_norm,
+                chord_length=chord,
+                center=center,
+                angle_of_attack=aoa,
+            )
+
+            x_poly_lu, y_poly_lu = transform_airfoil_coords_to_lu(
+                x_norm=x_norm, y_norm=y_norm,
+                chord_length=chord, center=center,
+                angle_of_attack=aoa,
+            )
+
+            info = {
+                'type': 'airfoil',
+                'source': source,
+                'num_points': int(len(x_norm)),
+                'chord': chord,
+                'angle_of_attack': aoa,
+                'center': center,
+                'solid_nodes': int(xp.sum(mask)),
+                'polygon_lu': (x_poly_lu, y_poly_lu),
+            }
+
+            if verbose:
+                print(f"  Internal Obstacle (Airfoil, 2D, arbitrary coords):")
+                print(f"    source={source}, pts={info['num_points']}")
+                print(f"    chord={chord} [lu], center={center}, AoA={aoa}°")
+                print(f"    {info['solid_nodes']} solid nodes")
+        else:
+            # NACA 4-digit fallback
+            naca = naca or '0012'
+            num_points = config.get('num_points', 150)
+
+            mask = create_airfoil_2d_mask(
+                xp, domain_shape,
+                naca=naca,
+                chord_length=chord,
+                center=center,
+                angle_of_attack=aoa,
+                num_points=num_points,
+            )
+
+            # Regenerate + transform polygon for IBB q-fraction use.
+            _xn, _yn = generate_naca_4digit_coordinates(naca, num_points)
+            x_poly_lu, y_poly_lu = transform_airfoil_coords_to_lu(
+                x_norm=_xn, y_norm=_yn,
+                chord_length=chord, center=center,
+                angle_of_attack=aoa,
+            )
+
+            info = {
+                'type': 'airfoil',
+                'naca': naca,
+                'chord': chord,
+                'angle_of_attack': aoa,
+                'center': center,
+                'num_points': num_points,
+                'solid_nodes': int(xp.sum(mask)),
+                'polygon_lu': (x_poly_lu, y_poly_lu),
+            }
+
+            if verbose:
+                print(f"  Internal Obstacle (NACA Airfoil, 2D):")
+                print(f"    NACA {naca}, chord={chord} [lattice units]")
+                print(f"    center={center}, AoA={aoa}° [degrees]")
+                print(f"    num_points={num_points}")
+                print(f"    {info['solid_nodes']} solid nodes")
     
     elif geom_type in ['circle', 'cylinder']:
         # Circle (or cylinder interpreted as circle in 2D)
@@ -462,9 +527,25 @@ def validate_geometry_config(
         if chord > min(domain_shape) * 0.8:
             return False, "Airfoil: chord too large (should be < 80% of domain)"
         
-        naca = config.get('naca', '')
-        if len(naca) != 4:
-            return False, f"Airfoil: NACA must be 4 digits, got '{naca}'"
+        # Accept either a Selig .dat file, inline (x,y) coords, or NACA 4-digit.
+        selig_file = config.get('selig_file')
+        x_coords = config.get('x_coords')
+        y_coords = config.get('y_coords')
+        naca = config.get('naca')
+
+        if selig_file is not None:
+            import os as _os
+            if not _os.path.exists(selig_file):
+                return False, f"Airfoil: selig_file not found: {selig_file}"
+        elif x_coords is not None and y_coords is not None:
+            if len(x_coords) != len(y_coords) or len(x_coords) < 3:
+                return False, "Airfoil: x_coords and y_coords must match length (≥ 3 points)"
+        elif naca is not None:
+            if len(naca) != 4:
+                return False, f"Airfoil: NACA must be 4 digits, got '{naca}'"
+        else:
+            return False, ("Airfoil: must specify 'selig_file', ('x_coords', 'y_coords'), "
+                           "or 'naca' (4-digit)")
     
     elif geom_type == 'box':
         corner_min = config.get('corner_min', None)
@@ -943,3 +1024,162 @@ def create_fine_level_geometry_config(
                   f"{new_max[2]:.1f}) [fine lu]")
 
     return new_config
+
+# =============================================================================
+# 2D Fine-Level Geometry Coordinate Transformation (for 2D MLG)
+# =============================================================================
+
+def create_fine_level_geometry_config_2d(
+    geometry_config: Dict[str, Any],
+    fine_origin_phys: Tuple[float, float],
+    fine_shape: Tuple[int, int],
+    dx_fine: float,
+    dx_coarse: float = 1.0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Transform L0 obstacle config to fine-level local coordinates (2D).
+
+    2D variant of create_fine_level_geometry_config. Supports:
+        - 'circle' / 'cylinder' (2D interpretation)
+        - 'box'
+        - 'airfoil' (NACA 4-digit, inline coords, or selig .dat)
+
+    Coordinate Mapping:
+        cx_local    = (cx_L0 - ox) / dx_fine
+        cy_local    = (cy_L0 - oy) / dx_fine
+        radius_local = radius_L0 / dx_fine
+        chord_local  = chord_L0 / dx_fine   (airfoil)
+
+    Args:
+        geometry_config: internal_geometry dict (2D coords).
+        fine_origin_phys: (ox, oy) fine domain origin in L0 lattice units.
+        fine_shape: (Nx_f, Ny_f) fine grid dimensions.
+        dx_fine: Fine grid spacing in L0 units (= 1 / 2^k).
+        dx_coarse: L0 spacing (= 1.0).
+        verbose: Print transformation details.
+
+    Returns:
+        New geometry config dict with fine local coords, or empty dict
+        if obstacle doesn't intersect fine domain / no obstacle configured.
+    """
+    # Find active 2D geometry type
+    geometry_types_2d = ['circle', 'cylinder', 'box', 'airfoil']
+    active_type = None
+    active_config = None
+
+    for gtype in geometry_types_2d:
+        if gtype in geometry_config:
+            gcfg = geometry_config[gtype]
+            if gcfg.get('enabled', False):
+                active_type = gtype
+                active_config = dict(gcfg)
+                break
+
+    if active_type is None:
+        return {}
+
+    ox, oy = fine_origin_phys
+    Nx_f, Ny_f = fine_shape
+
+    # ── Circle / Cylinder (2D) ──────────────────────────────────
+    if active_type in ('circle', 'cylinder'):
+        cx, cy = active_config['center']
+        radius = active_config['radius']
+
+        cx_local = (cx - ox) / dx_fine
+        cy_local = (cy - oy) / dx_fine
+        r_local = radius / dx_fine
+
+        # Intersection test
+        if (cx_local + r_local < 0 or cx_local - r_local > Nx_f - 1 or
+            cy_local + r_local < 0 or cy_local - r_local > Ny_f - 1):
+            if verbose:
+                print(f"    {active_type} does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            active_type: {
+                'enabled': True,
+                'center': (cx_local, cy_local),
+                'radius': r_local,
+            }
+        }
+        # Carry the wall-BC selector so each MLG fine level honors HWBB / IBB
+        # the user requested at L0.
+        if 'wall_bc' in active_config:
+            new_config[active_type]['wall_bc'] = active_config['wall_bc']
+        if verbose:
+            print(f"    Fine obstacle ({active_type}): "
+                  f"center=({cx_local:.1f}, {cy_local:.1f}), "
+                  f"R={r_local:.1f} [fine lu]")
+        return new_config
+
+    # ── Box (2D) ────────────────────────────────────────────────
+    elif active_type == 'box':
+        cmin = active_config['corner_min']
+        cmax = active_config['corner_max']
+        new_min = ((cmin[0] - ox) / dx_fine, (cmin[1] - oy) / dx_fine)
+        new_max = ((cmax[0] - ox) / dx_fine, (cmax[1] - oy) / dx_fine)
+
+        if (new_max[0] < 0 or new_min[0] > Nx_f - 1 or
+            new_max[1] < 0 or new_min[1] > Ny_f - 1):
+            if verbose:
+                print(f"    Box does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            'box': {
+                'enabled': True,
+                'corner_min': new_min,
+                'corner_max': new_max,
+            }
+        }
+        if verbose:
+            print(f"    Fine obstacle (box 2D): min={new_min}, max={new_max}")
+        return new_config
+
+    # ── Airfoil (2D) ────────────────────────────────────────────
+    elif active_type == 'airfoil':
+        # Airfoil center + chord are in L0 lattice units. Rescale.
+        cx, cy = active_config['center']
+        chord = active_config['chord']
+        aoa = active_config.get('angle_of_attack', 0.0)
+
+        cx_local = (cx - ox) / dx_fine
+        cy_local = (cy - oy) / dx_fine
+        chord_local = chord / dx_fine
+
+        # Bounding box check: airfoil is within ±chord/2 of center,
+        # plus small thickness margin (~10% chord).
+        half = 0.55 * chord_local
+        if (cx_local + half < 0 or cx_local - half > Nx_f - 1 or
+            cy_local + half < 0 or cy_local - half > Ny_f - 1):
+            if verbose:
+                print(f"    Airfoil does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            'airfoil': {
+                'enabled': True,
+                'center': (cx_local, cy_local),
+                'chord': chord_local,
+                'angle_of_attack': aoa,
+            }
+        }
+        # Preserve geometry-source keys (selig_file / naca / inline coords)
+        # plus the wall-BC selector so each MLG tier picks up HWBB / IBB
+        # the user requested at L0.
+        for key in (
+            'selig_file', 'naca', 'x_coords', 'y_coords', 'num_points',
+            'wall_bc',
+        ):
+            if key in active_config:
+                new_config['airfoil'][key] = active_config[key]
+
+        if verbose:
+            print(f"    Fine obstacle (airfoil 2D): "
+                  f"center=({cx_local:.1f}, {cy_local:.1f}), "
+                  f"chord={chord_local:.1f} [fine lu], AoA={aoa}°")
+        return new_config
+
+    return {}

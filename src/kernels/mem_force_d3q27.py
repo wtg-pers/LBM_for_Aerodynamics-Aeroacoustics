@@ -27,7 +27,7 @@ void mem_force_d3q27(
     const float* __restrict__ f_post,       // (27, N)
     const bool*  __restrict__ needs_bounce,  // (27, N)
     float*       __restrict__ force_xyz,     // (3,) output -- atomicAdd
-    const int N
+    const long long N
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -116,7 +116,7 @@ class MEMForceKernelD3Q27:
 
         self._kernel(
             (grid,), (self._block_size,),
-            (f_post, needs_bounce, force_xyz, cp.int32(N)),
+            (f_post, needs_bounce, force_xyz, cp.int64(N)),
         )
 
         fx, fy, fz = float(force_xyz[0]), float(force_xyz[1]), float(force_xyz[2])

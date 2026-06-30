@@ -67,12 +67,19 @@ class StreamingPull:
         self.Q = lattice.Q
 
         # Skip precomputing index arrays if CUDA streaming kernel is available
-        # (saves 4 × Q × N × 4B = 324 B/node of GPU memory)
+        # (saves 4 × Q × N × 4B of GPU memory)
         self._use_cuda = False
         if xp.__name__ == 'cupy' and self.dim == 3:
             try:
                 from src.kernels.streaming_d3q27 import StreamingKernelD3Q27
                 self._cuda_kernel = StreamingKernelD3Q27()
+                self._use_cuda = True
+            except Exception:
+                self._precompute_indices()
+        elif xp.__name__ == 'cupy' and self.dim == 2 and self.Q == 9:
+            try:
+                from src.kernels.streaming_d2q9 import StreamingKernelD2Q9
+                self._cuda_kernel = StreamingKernelD2Q9()
                 self._use_cuda = True
             except Exception:
                 self._precompute_indices()
@@ -160,8 +167,12 @@ class StreamingPull:
                    [dimensionless] - Modified in-place
         """
         if self._use_cuda:
-            Nx, Ny, Nz = self.shape
-            self._cuda_kernel.launch(f_post, f_next, Nx, Ny, Nz)
+            if self.dim == 3:
+                Nx, Ny, Nz = self.shape
+                self._cuda_kernel.launch(f_post, f_next, Nx, Ny, Nz)
+            else:
+                Nx, Ny = self.shape
+                self._cuda_kernel.launch(f_post, f_next, Nx, Ny)
         elif self.dim == 2:
             f_next[:] = f_post[self.q_idx, self.src_x, self.src_y]
         else:

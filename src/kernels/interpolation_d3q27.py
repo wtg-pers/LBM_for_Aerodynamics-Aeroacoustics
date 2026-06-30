@@ -34,7 +34,7 @@ void cubic_interp_3d(
     if (tid >= total) return;
 
     int NyNz = Ny * Nz;
-    int NxNyNz = Nx * NyNz;
+    long long NxNyNz = (long long)Nx * NyNz;   // 64-bit: q*NxNyNz overflows int32 at N>~79.5M
 
     int q  = tid / NxNyNz;
     int rem = tid - q * NxNyNz;
@@ -103,7 +103,7 @@ void cubic_interp_1d_x(
     int iy = rem / Nz;
     int iz = rem - iy * Nz;
 
-    int NxNyNz = Nx * NyNz;
+    long long NxNyNz = (long long)Nx * NyNz;   // 64-bit: q*NxNyNz overflows int32 at N>~79.5M
     #define FX(x) f[q * NxNyNz + (x) * NyNz + iy * Nz + iz]
 
     // Interior odd indices: 3, 5, ..., Nx-4
@@ -140,7 +140,7 @@ void cubic_interp_1d_y(
     if (tid >= total) return;
 
     int NyNz = Ny * Nz;
-    int NxNyNz = Nx * NyNz;
+    long long NxNyNz = (long long)Nx * NyNz;   // 64-bit: q*NxNyNz overflows int32 at N>~79.5M
 
     int q = tid / (Nx * Nz);
     int rem = tid - q * Nx * Nz;
@@ -180,7 +180,7 @@ void cubic_interp_1d_z(
     if (tid >= total) return;
 
     int NyNz = Ny * Nz;
-    int NxNyNz = Nx * NyNz;
+    long long NxNyNz = (long long)Nx * NyNz;   // 64-bit: q*NxNyNz overflows int32 at N>~79.5M
 
     int q = tid / (Nx * Ny);
     int rem = tid - q * Nx * Ny;

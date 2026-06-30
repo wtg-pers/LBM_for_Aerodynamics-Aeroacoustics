@@ -28,7 +28,7 @@ void hwbb_apply_d3q27(
     float*       __restrict__ f,           // (27, N) post-streaming, modified
     const float* __restrict__ f_post,      // (27, N) post-collision source
     const bool*  __restrict__ needs_bounce, // (27, N) boundary link mask
-    const int N
+    const long long N
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -54,7 +54,7 @@ extern "C" __global__
 void hwbb_apply_inplace_d3q27(
     float*       __restrict__ f,           // (27, N) post-collision, source AND target
     const bool*  __restrict__ needs_bounce, // (27, N) boundary link mask
-    const int N
+    const long long N
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -86,7 +86,7 @@ extern "C" __global__
 void hwbb_reset_solid_d3q27(
     float*       __restrict__ f,           // (27, N) modified
     const bool*  __restrict__ solid_mask,  // (N,) True=solid
-    const int N
+    const long long N
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -169,12 +169,12 @@ class HWBBKernelD3Q27:
         if f_post is not None:
             self._kernel_apply(
                 (grid,), (self._block_size,),
-                (f, f_post, needs_bounce, cp.int32(N)),
+                (f, f_post, needs_bounce, cp.int64(N)),
             )
         else:
             self._kernel_inplace(
                 (grid,), (self._block_size,),
-                (f, needs_bounce, cp.int32(N)),
+                (f, needs_bounce, cp.int64(N)),
             )
 
     def reset_solid(
@@ -198,5 +198,5 @@ class HWBBKernelD3Q27:
 
         self._kernel_reset(
             (grid,), (self._block_size,),
-            (f, solid_mask, cp.int32(N)),
+            (f, solid_mask, cp.int64(N)),
         )

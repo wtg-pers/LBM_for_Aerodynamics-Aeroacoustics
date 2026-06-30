@@ -104,26 +104,13 @@ class DomainBCManager:
                 continue
             
             if fc.bc_type == BCType.SPONGE:
-                # ── Sponge = Neumann face BC (base) + volume damping (overlay) ──
-                # Phase 1: Neumann fixes incoming populations at the boundary
-                #          face that were corrupted by periodic-wrap streaming.
-                # Phase 3: Sponge damps the entire buffer zone toward f_eq(ρ∞,U∞).
-                #
-                # Without the Neumann base layer, flat nodes on the sponge face
-                # retain wrap-around garbage after streaming. With σ_max < 1.0,
-                # (1 - σ_max) fraction of garbage survives → divergence.
-                neumann_config = FaceConfig(
-                    location=fc.location,
-                    bc_type=BCType.NEUMANN,
-                    method='neumann',
-                )
-                face_bc = create_face_bc(xp, lattice, neumann_config, self.node_map)
-                self.face_bcs.append(face_bc)
-                
-                sponge = SpongeLayerBC(xp, lattice, fc, domain_shape)
+                # SpongeLayerBC is self-contained: it composes its own NeumannBC
+                # internally for boundary-face wrap-around cleanup (Stage A) and
+                # then applies volume damping (Stage B). No separate face BC is
+                # registered here — see sponge.py for the rationale.
+                sponge = SpongeLayerBC(xp, lattice, fc, domain_shape, self.node_map)
                 self.sponge_layers.append(sponge)
                 if verbose:
-                    print(f"    {face_bc.get_info()} (base for sponge)")
                     print(f"    {sponge.get_info()}")
                 continue
             

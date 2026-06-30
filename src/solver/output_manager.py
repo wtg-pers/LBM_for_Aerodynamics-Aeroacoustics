@@ -76,12 +76,14 @@ class OutputManager:
         al_model: Optional[Any] = None,
         # ── Intervals ──
         output_interval: int = 500,
+        log_interval: int = 100,
         check_interval: int = 500,
         checkpoint_interval: int = 2000,
         # ── Misc ──
         tau: float = 0.6,
         solid_mask_np: Optional[Any] = None,
         perf_csv_path: Optional[str] = None,
+        blade_csv_dir: Optional[str] = None,
         domain_shape: Optional[tuple] = None,
         # ── References for finalize summary ──
         L_ref_lu: Optional[float] = None,
@@ -89,6 +91,8 @@ class OutputManager:
         config_path: Optional[str] = None,
         mlg_vtk_writer: Optional[object] = None,
         mlg_force_level: Optional[int] = None,
+        alm_marker_origin: Optional[tuple] = None,
+        alm_marker_spacing: Optional[float] = None,
     ) -> None:
         """Initialize OutputManager with all I/O components.
 
@@ -132,6 +136,8 @@ class OutputManager:
 
         # ── ALM ──
         self.al_model = al_model
+        self._alm_marker_origin = alm_marker_origin   # (ox, oy, oz) in L0 lu
+        self._alm_marker_spacing = alm_marker_spacing  # dx_fine in L0 lu
         self._is_multi_rotor: bool = False
         if al_model is not None:
             try:
@@ -142,6 +148,7 @@ class OutputManager:
 
         # ── Intervals ──
         self.output_interval = output_interval
+        self.log_interval = log_interval
         self.check_interval = check_interval
         self.checkpoint_interval = checkpoint_interval
 
@@ -149,6 +156,7 @@ class OutputManager:
         self.tau = tau
         self.solid_mask_np = solid_mask_np
         self.perf_csv_path = perf_csv_path
+        self.blade_csv_dir = blade_csv_dir
         self.domain_shape = domain_shape
         self.L_ref_lu = L_ref_lu
         self.u_ref_lu = u_ref_lu
@@ -162,6 +170,8 @@ class OutputManager:
         self._last_Cl: float = 0.0
         self._last_ct: float = 0.0
         self._last_cp: float = 0.0
+        self._last_thrust_lu: float = 0.0
+        self._last_power_lu: float = 0.0
         self._last_rev: float = 0.0
 
         # ── Time loop state (set by start()) ──
@@ -216,11 +226,23 @@ class OutputManager:
         """
         action = 'continue'
 
-        # ─── 1. Force Calculation (MEM) ───────────────────────────
-        self._process_force(step, sim)
-
-        # ─── 2. Progress bar ──────────────────────────────────────
+        # ─── 1. Progress bar ──────────────────────────────────────
         self._update_progress(step, sim)
+
+        # ─── 2. Logging (rotor perf + blade diag) ────────────────
+        if step % self.log_interval == 0 and step > self._start_step:
+            self._log_rotor_performance(step, sim)
+            self._log_blade_diagnostics(step, sim)
+
+        # ─── 2b. MEM force (independent gate at force_mgr.interval) ──
+        # Decoupled from log_interval so users can sample forces densely
+        # (e.g. every 10 steps) for Cp/Strouhal post-processing while
+        # keeping rotor/blade logging at a coarser cadence.
+        if (self.force_mgr is not None
+                and step > self._start_step
+                and step >= self.force_mgr.start_step
+                and step % self.force_mgr.interval == 0):
+            self._process_force(step, sim)
 
         # ─── 3. VTK output ───────────────────────────────────────
         self._write_vtk(step, sim)
@@ -228,10 +250,9 @@ class OutputManager:
         # ─── 4. Periodic checks ──────────────────────────────────
         if step % self.check_interval == 0 and step > self._start_step:
             self._check_conservation(step, sim)
-            self._log_rotor_performance(step, sim)
             action = self._check_convergence(step, sim)
 
-        # ─── 5. Checkpoint ────────────────────────────────────────
+        # ─── 6. Checkpoint ────────────────────────────────────────
         self._save_checkpoint(step, sim)
 
         return action
@@ -332,8 +353,36 @@ class OutputManager:
         if isinstance(sim, MultiLevelGrid):
             print(f"  (updates/coarse step: {updates_per_step:,})")
 
+        # ── Free WALE pre-pass buffers before heavy post-processing ──
+        # On 3-level MLG these hold ~1 GB; not freeing them can OOM the
+        # following macroscopic.compute() (cupy tensordot upcast intermediate).
+        def _free_wale_buffers(s):
+            for attr in ('_u_buf', '_rho_buf', '_nu_t_in'):
+                if hasattr(s, attr):
+                    setattr(s, attr, None)
+        try:
+            from src.grid.multi_level_grid import MultiLevelGrid
+            if isinstance(sim, MultiLevelGrid):
+                for _level in sim._levels:
+                    _free_wale_buffers(_level)
+            else:
+                _free_wale_buffers(sim)
+        except Exception:
+            pass
+        try:
+            import cupy as _cp
+            _cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
         # ── Final macroscopic recompute ──
-        rho_final, u_final = self.macroscopic.compute(sim.f)
+        # Fused kernel already updated sim.rho / sim.u during the last step;
+        # reuse those instead of running tensordot again (saves ~5 GB peak).
+        if (getattr(sim, 'rho', None) is not None
+                and getattr(sim, 'u', None) is not None):
+            rho_final, u_final = sim.rho, sim.u
+        else:
+            rho_final, u_final = self.macroscopic.compute(sim.f)
 
         # ── Final MLG VTK ──
         if self.mlg_vtk_writer is not None:
@@ -356,14 +405,11 @@ class OutputManager:
             )
             self.vtk_writer.write_pvd('simulation.pvd')
 
-            if (self.marker_vtk_writer is not None
-                    and self.al_model is not None):
-                self.marker_vtk_writer.write_from_al_model(
-                    step=final_step,
-                    al_model=self.al_model,
-                    time=float(final_step),
-                )
-                self.marker_vtk_writer.write_pvd()
+        # ── Final markers (both single grid and MLG) ──
+        if (self.marker_vtk_writer is not None
+                and self.al_model is not None):
+            self._write_markers(final_step)
+            self.marker_vtk_writer.write_pvd()
 
         # ── Final checkpoint ──
         if self.checkpoint_mgr is not None:
@@ -418,7 +464,10 @@ class OutputManager:
     # =====================================================================
 
     def _process_force(self, step: int, sim: 'Simulation') -> None:
-        """MEM force calculation (if enabled and at correct interval).
+        """MEM force calculation. Called at force_mgr.interval by process().
+
+        Caller is responsible for the step-modulo check; this function only
+        guards against (a) no force manager, (b) step below start_step.
 
         For MLG: uses the finest level's f_post where the obstacle exists,
         because L0's f_post is captured before F→C coupling and does not
@@ -426,43 +475,19 @@ class OutputManager:
         """
         if self.force_mgr is None:
             return
-        if not self.force_mgr.should_compute(step):
+        if step < self.force_mgr.start_step:
             return
 
-        # Esoteric mode: force computed inside kernel, read from accumulator
-        if hasattr(sim, '_use_esoteric') and sim._use_esoteric:
-            if sim._eso_force_out is not None:
-                forces = tuple(float(sim._eso_force_out[d]) for d in range(3))
-                coeffs = self.force_mgr.force_calc.get_coefficients(
-                    forces,
-                    rho_ref=self.force_mgr.rho_ref,
-                    u_ref=self.force_mgr.u_ref,
-                    char_length=self.force_mgr.char_length,
-                    span_length=self.force_mgr.span_length,
-                )
-                force_result = {
-                    'step': step,
-                    'Fx': forces[0], 'Fy': forces[1], 'Fz': forces[2],
-                    'Cd': coeffs['Cd'], 'Cl': coeffs['Cl'],
-                    'Cz': coeffs.get('Cz', 0.0),
-                }
-                self.force_mgr.history.append(force_result)
-                if self.force_mgr._csv_writer is not None:
-                    self.force_mgr._csv_writer.writerow(force_result)
-                    self.force_mgr._csv_file.flush()
-            else:
-                force_result = None
+        # Select f_post from the correct level
+        if (self._mlg_force_level is not None
+                and hasattr(sim, 'get_level')):
+            f_post = sim.get_level(self._mlg_force_level).f_post
         else:
-            # Standard mode: compute from f_post
-            if (self._mlg_force_level is not None
-                    and hasattr(sim, 'get_level')):
-                f_post = sim.get_level(self._mlg_force_level).f_post
-            else:
-                f_post = sim.f_post
+            f_post = sim.f_post
 
-            force_result = self.force_mgr.compute_and_log(
-                step, f_post, verbose=False,
-            )
+        force_result = self.force_mgr.compute_and_log(
+            step, f_post, verbose=False,
+        )
         if force_result:
             self._last_Cd = force_result['Cd']
             self._last_Cl = force_result['Cl']
@@ -486,15 +511,15 @@ class OutputManager:
                 perf = self.al_model.get_rotor_performance(rotor_idx=0)
                 self._pbar.set_postfix({
                     'rev': f"{perf.get('revolutions', 0):.2f}",
-                    'C_T': f"{perf.get('C_T', 0):.3f}",
+                    'T': f"{perf.get('thrust', 0):.4f}",
                     'rotors': f"{self.al_model.n_rotors}",
                     'drift': f"{self._last_drift:+.3f}%",
                 })
             else:
                 self._pbar.set_postfix({
                     'rev': f"{self.al_model.rotor.n_revolutions:.2f}",
-                    'C_T': f"{self._last_ct:.3f}",
-                    'C_P': f"{self._last_cp:.3f}",
+                    'T_lu': f"{self._last_thrust_lu:.4f}",
+                    'P_lu': f"{self._last_power_lu:.4f}",
                     'drift': f"{self._last_drift:+.3f}%",
                 })
         elif self.force_mgr is not None:
@@ -520,16 +545,25 @@ class OutputManager:
             from src.grid.multi_level_grid import MultiLevelGrid
             if isinstance(sim, MultiLevelGrid):
                 self.mlg_vtk_writer.write(step=step, mlg=sim, time=float(step))
-                # Skip redundant single-grid .vti (level0.vti already covers it)
+                # Write ALM markers (before returning)
+                if (self.marker_vtk_writer is not None
+                        and self.al_model is not None):
+                    self._write_markers(step)
                 return
 
         extra_vectors_vtk = {}
         if sim.body_force is not None:
             extra_vectors_vtk['body_force'] = sim.body_force
 
+        extra_scalars_vtk = {}
+        # Eddy viscosity (allocated only when SGS is enabled).
+        if getattr(sim, 'nu_t', None) is not None:
+            extra_scalars_vtk['nu_t'] = sim.nu_t
+
         self.vtk_writer.write(
             step=step, rho=sim.rho, u=sim.u,
             solid_mask=self.solid_mask_np,
+            extra_scalars=extra_scalars_vtk if extra_scalars_vtk else None,
             extra_vectors=extra_vectors_vtk if extra_vectors_vtk else None,
             time=float(step),
         )
@@ -539,6 +573,30 @@ class OutputManager:
             self.marker_vtk_writer.write_from_al_model(
                 step=step, al_model=self.al_model, time=float(step),
             )
+
+    def _write_markers(self, step: int) -> None:
+        """Write ALM marker VTP, transforming coords for MLG fine level."""
+        import numpy as np
+
+        # Transform marker positions from fine local to global coords
+        if self._alm_marker_origin is not None:
+            orig_positions = self.al_model._last_positions
+            if orig_positions is not None:
+                ox, oy, oz = self._alm_marker_origin
+                dx = self._alm_marker_spacing
+                transformed = orig_positions.copy()
+                transformed[:, 0] = ox + orig_positions[:, 0] * dx
+                transformed[:, 1] = oy + orig_positions[:, 1] * dx
+                transformed[:, 2] = oz + orig_positions[:, 2] * dx
+                self.al_model._last_positions = transformed
+
+        self.marker_vtk_writer.write_from_al_model(
+            step=step, al_model=self.al_model, time=float(step),
+        )
+
+        # Restore original positions (ALM needs local coords for next step)
+        if self._alm_marker_origin is not None and orig_positions is not None:
+            self.al_model._last_positions = orig_positions
 
     def _check_conservation(self, step: int, sim: 'Simulation') -> None:
         """Run mass conservation check."""
@@ -553,31 +611,128 @@ class OutputManager:
             self._last_drift = results['domain']['mass_drift_percent']
 
     def _log_rotor_performance(self, step: int, sim: 'Simulation') -> None:
-        """Log rotor performance to CSV (single or multi-rotor)."""
+        """Log rotor performance to CSV (single or multi-rotor).
+
+        Writes dimensional forces + normalization parameters so any
+        coefficient convention can be applied in post-processing:
+            C_T(prop)      = thrust_lu / (rho_ref * n_lu^2 * D_lu^4)
+            C_T(rotorcraft)= thrust_lu / (rho_ref * area_lu * tip_speed_lu^2)
+        """
+        import math
         if self.al_model is None or self.perf_csv_path is None:
             return
 
+        def _norm_params(model) -> str:
+            """Build normalization parameter string from a single ALM."""
+            rotor = model.rotor
+            rho_ref      = model.rho_ref
+            R_lu         = float(rotor.radius)
+            D_lu         = 2.0 * R_lu
+            omega_lu     = float(abs(rotor.omega))
+            tip_speed_lu = omega_lu * R_lu
+            area_lu      = math.pi * R_lu ** 2
+            n_lu         = omega_lu / (2.0 * math.pi)   # [rev/lt]
+            return (f"{rho_ref:.6f},{area_lu:.6f},{tip_speed_lu:.9f},"
+                    f"{omega_lu:.9f},{R_lu:.6f},{D_lu:.6f},{n_lu:.9f}")
+
+        def _time_phys(model, time_lt: float) -> float:
+            return time_lt * model.dt_phys
+
         if self._is_multi_rotor:
             for ri, rname in enumerate(self.al_model.names):
-                perf = self.al_model.get_rotor_performance(rotor_idx=ri)
-                self._last_ct = perf.get('C_T', 0)
-                self._last_cp = perf.get('C_P', 0)
+                model = self.al_model.models[ri]
+                perf  = model.get_rotor_performance()
+                self._last_ct  = perf.get('C_T', 0)
+                self._last_cp  = perf.get('C_P', 0)
+                self._last_thrust_lu = perf.get('thrust', 0)
+                self._last_power_lu  = perf.get('power', 0)
                 self._last_rev = perf.get('revolutions', 0)
+                time_lt  = float(perf.get('time', 0))
+                time_phys = _time_phys(model, time_lt)
+                norm = _norm_params(model)
                 with open(self.perf_csv_path, 'a') as fh:
                     fh.write(
-                        f"{step},{rname},{self._last_rev:.6f},"
-                        f"{self._last_ct:.6f},{self._last_cp:.6f}\n"
+                        f"{step},{time_lt:.6f},{time_phys:.9f},"
+                        f"{self._last_rev:.6f},"
+                        f"{self._last_thrust_lu:.9f},"
+                        f"{perf.get('torque', 0):.9f},"
+                        f"{self._last_power_lu:.9f},"
+                        f"{norm}\n"
                     )
         else:
             perf = self.al_model.get_rotor_performance()
-            self._last_ct = perf.get('C_T', 0)
-            self._last_cp = perf.get('C_P', 0)
+            self._last_ct  = perf.get('C_T', 0)
+            self._last_cp  = perf.get('C_P', 0)
+            self._last_thrust_lu = perf.get('thrust', 0)
+            self._last_power_lu  = perf.get('power', 0)
             self._last_rev = perf.get('revolutions', 0)
+            time_lt   = float(perf.get('time', 0))
+            time_phys = _time_phys(self.al_model, time_lt)
+            norm = _norm_params(self.al_model)
             with open(self.perf_csv_path, 'a') as fh:
                 fh.write(
-                    f"{step},{self._last_rev:.6f},"
-                    f"{self._last_ct:.6f},{self._last_cp:.6f}\n"
+                    f"{step},{time_lt:.6f},{time_phys:.9f},"
+                    f"{self._last_rev:.6f},"
+                    f"{self._last_thrust_lu:.9f},"
+                    f"{perf.get('torque', 0):.9f},"
+                    f"{self._last_power_lu:.9f},"
+                    f"{norm}\n"
                 )
+
+    def _log_blade_diagnostics(self, step: int, sim: 'Simulation') -> None:
+        """Log per-marker BEM diagnostics to individual CSV files.
+
+        File layout:
+            csv/blade_diagnostics/0.csv   — marker 0 (all blades, all steps)
+            csv/blade_diagnostics/1.csv   — marker 1
+            ...
+
+        Columns per file:
+            step, revolutions, blade, r_R, r_lu, chord_lu, twist,
+            u_n, u_theta, u_rel, phi, alpha, Re, CL, CD,
+            F_n, F_theta, F_L, F_D
+        """
+        import os
+        if self.al_model is None or self.blade_csv_dir is None:
+            return
+
+        models = (
+            [self.al_model.models[i] for i in range(self.al_model.n_rotors)]
+            if self._is_multi_rotor
+            else [self.al_model]
+        )
+
+        for model in models:
+            rev = model.rotor.n_revolutions
+            n_blades = model.rotor.n_blades
+            for bi in range(n_blades):
+                diag = model.get_blade_diagnostics(blade_idx=bi)
+                if 'error' in diag:
+                    continue
+                n_mk = len(diag['r'])
+                for j in range(n_mk):
+                    path = os.path.join(self.blade_csv_dir, f'{j}.csv')
+                    with open(path, 'a') as fh:
+                        fh.write(
+                            f"{step},{rev:.6f},{bi},"
+                            f"{diag['r_R'][j]:.4f},"
+                            f"{diag['r'][j]:.4f},"
+                            f"{diag['chord'][j]:.4f},"
+                            f"{diag['epsilon'][j]:.4f},"
+                            f"{diag['twist'][j]:.3f},"
+                            f"{diag['u_n'][j]:.6f},"
+                            f"{diag['u_theta'][j]:.6f},"
+                            f"{diag['u_rel'][j]:.6f},"
+                            f"{diag['phi'][j]:.3f},"
+                            f"{diag['alpha'][j]:.3f},"
+                            f"{diag['Re'][j]:.1f},"
+                            f"{diag['CL'][j]:.5f},"
+                            f"{diag['CD'][j]:.5f},"
+                            f"{diag['F_n'][j]:.6f},"
+                            f"{diag['F_theta'][j]:.6f},"
+                            f"{diag['F_L'][j]:.6f},"
+                            f"{diag['F_D'][j]:.6f}\n"
+                        )
 
     def _check_convergence(
         self, step: int, sim: 'Simulation',
@@ -619,18 +774,14 @@ class OutputManager:
         return 'continue'
     
     def _build_checkpoint_extra(self, sim) -> dict:
-        """Build extra_data dict for checkpoint."""
+        """Build extra_data dict for MLG checkpoint (fine level f arrays)."""
         extra = {}
-        # MLG: save fine level f arrays
         if self.mlg_vtk_writer is not None:
             from src.grid.multi_level_grid import MultiLevelGrid
             if isinstance(sim, MultiLevelGrid):
                 extra['num_levels'] = sim.num_levels
                 for k in range(1, sim.num_levels):
                     extra[f'f_level_{k}'] = sim.get_level(k).f
-        # Esoteric: save parity step for correct restart
-        if hasattr(sim, '_use_esoteric') and sim._use_esoteric:
-            extra['esoteric_step'] = sim._esoteric_step
         return extra if extra else None
 
     def _save_checkpoint(self, step: int, sim: 'Simulation') -> None:
@@ -651,24 +802,78 @@ class OutputManager:
 
     def _print_rotor_summary(self) -> None:
         """Print final rotor performance (single or multi)."""
+        import math
         if self.al_model is None:
             return
+
+        def _derived_coeffs(model, perf: dict) -> str:
+            """Compute both propeller and rotorcraft C_T/C_P from dimensional."""
+            rotor        = model.rotor
+            rho          = model.rho_ref
+            R            = float(rotor.radius)
+            omega        = float(abs(rotor.omega))
+            A            = math.pi * R ** 2
+            tip          = omega * R
+            n            = omega / (2.0 * math.pi)
+            D            = 2.0 * R
+            T            = perf.get('thrust', 0)
+            Q            = perf.get('torque', 0)
+            P            = perf.get('power', 0)
+            denom_rc     = rho * A * tip ** 2
+            denom_pr_T   = rho * n ** 2 * D ** 4
+            denom_pr_P   = rho * n ** 3 * D ** 5
+            CT_rc = T / denom_rc  if denom_rc   > 0 else float('nan')
+            CT_pr = T / denom_pr_T if denom_pr_T > 0 else float('nan')
+            CP_rc = P / (denom_rc * tip) if denom_rc * tip > 0 else float('nan')
+            CP_pr = P / denom_pr_P if denom_pr_P > 0 else float('nan')
+            return (
+                f"  T_lu={T:.6f}  Q_lu={Q:.6f}  P_lu={P:.6f}\n"
+                f"  C_T(rotorcraft)={CT_rc:.4f}  "
+                f"C_T(propeller)={CT_pr:.4f}\n"
+                f"  C_P(rotorcraft)={CP_rc:.4f}  "
+                f"C_P(propeller)={CP_pr:.4f}"
+            )
 
         if self._is_multi_rotor:
             print(f"\n[9] Multi-Rotor Performance "
                   f"({self.al_model.n_rotors} rotors)")
             for i, name in enumerate(self.al_model.names):
-                perf = self.al_model.get_rotor_performance(rotor_idx=i)
-                print(f"  [{i}] {name}:")
-                print(f"      Rev={perf.get('revolutions', 0):.2f}, "
-                      f"C_T={perf.get('C_T', 0):.4f}, "
-                      f"C_P={perf.get('C_P', 0):.4f}")
+                model = self.al_model.models[i]
+                perf  = model.get_rotor_performance()
+                print(f"  [{i}] {name}:  Rev={perf.get('revolutions', 0):.2f}")
+                print(_derived_coeffs(model, perf))
         else:
             perf = self.al_model.get_rotor_performance()
             print(f"\n[9] Rotor Performance")
             print(f"  Revolutions: {perf.get('revolutions', 0):.2f}")
-            print(f"  C_T = {perf.get('C_T', 0):.4f}")
-            print(f"  C_P = {perf.get('C_P', 0):.4f}")
+            print(_derived_coeffs(self.al_model, perf))
+
+    def _print_postrun_hints(self) -> None:
+        """Restart + post-processing hints. Called on success paths
+        (CONVERGED, normal completion) — skipped on DIVERGED / instability
+        because those produce data the user shouldn't trust by default."""
+        if not self.config_path:
+            return
+        print(f"\nTo continue: python main.py --config {self.config_path} "
+              f"--restart-latest --extend 10000")
+
+        if self.force_mgr is None:
+            return
+        csv_dir = getattr(self.force_mgr, 'csv_dir', None)
+        if csv_dir is None:
+            return
+        import os as _os
+        npz_path = _os.path.join(csv_dir, 'surface_link_forces.npz')
+        if not _os.path.exists(npz_path):
+            return
+        run_dir = _os.path.dirname(csv_dir.rstrip('/'))
+        print(
+            f"\nTo extract surface Cp (edit --window-start to a step "
+            f"past transient, see force_history.csv):\n"
+            f"  python -m src.utilities.surface_distribution "
+            f"{run_dir} {self.config_path} "
+            f"--window-start <STEP>"
+        )
 
     def _print_final_status(self, rho_final: Any) -> Optional[bool]:
         """Print final status and return success/failure.
@@ -689,6 +894,7 @@ class OutputManager:
             print(f" ✅ Simulation CONVERGED at step "
                   f"{self.conv_monitor.converged_step}!")
             print("=" * 70)
+            self._print_postrun_hints()
             return True
 
         if final_status == ConvergenceStatus.DIVERGED:
@@ -706,8 +912,5 @@ class OutputManager:
         print("\n" + "=" * 70)
         print(" ✓ Simulation completed.")
         print("=" * 70)
-        if self.config_path:
-            print(f"\nTo continue: python main.py --config {self.config_path} "
-                  f"--restart-latest --extend 10000")
-
+        self._print_postrun_hints()
         return True

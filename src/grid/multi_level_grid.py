@@ -149,8 +149,11 @@ class MultiLevelGrid:
         coarse = self._levels[0]
 
         # ── Save f_prev for level 0 (temporal interpolation) ─────
+        # Only needed for C->F temporal interp; single-level has no coupling
+        # (and _f_prev[0] is then never allocated -> None).
         xp = coarse.xp
-        xp.copyto(self._f_prev[0], coarse.f)
+        if self._num_levels > 1:
+            xp.copyto(self._f_prev[0], coarse.f)
 
         # ── Advance coarse level (full domain) ───────────────────
         coarse.advance()

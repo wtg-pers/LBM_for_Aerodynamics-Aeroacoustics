@@ -19,7 +19,11 @@ Available Face BCs:
     
     DomainBounceBackBC:  No-slip wall via half-way bounce-back (domain boundary)
         - f_i(bdy) = f_ī(bdy) from post-collision state
-    
+
+    DomainSlipBC:  Free-slip / symmetry wall via specular reflection
+        - f_i(bdy) = f_{σ(i)}(bdy) where σ flips only the face-normal c component
+        - Zero wall-normal velocity, preserved tangential velocity, no BL
+
     NeumannBC:  Zero-gradient extrapolation (open boundary)
         - f[:, boundary] = f[:, interior_neighbor]
 
@@ -106,17 +110,23 @@ class FaceBC:
         """Apply BC on flat nodes of a 2D face."""
         xp = self.xp
         loc = self.location
-        
+
         # Get flat slice (edge nodes excluded)
         face_sl = self.node_map.get_face_slice_2d(loc)
+
+        # Equilibrium with constant target: use cached f_eq
+        if not self.use_regularized and hasattr(self, '_cached_f_eq'):
+            f[:, face_sl[0], face_sl[1]] = self._cached_f_eq
+            return
+
         int_sl = self.node_map.get_interior_slice_2d(loc)
-        
+
         # Step 1: Interior neighbor distributions
         f_int = f[:, int_sl[0], int_sl[1]]  # shape (Q, N_flat)
-        
+
         # Step 2: Determine target ρ, u
         rho_t, u_t = self._get_target_rho_u(f_int)
-        
+
         # Step 3: Reconstruct
         if self.use_regularized:
             Pi_neq = compute_Pi_neq(xp, f_int, self.c, self.w, self.cs2)
@@ -125,10 +135,10 @@ class FaceBC:
             )
         else:
             f_new = compute_f_eq(xp, rho_t, u_t, self.c, self.w, self.cs2)
-        
+
         # Step 4: Write ONLY to flat nodes
         f[:, face_sl[0], face_sl[1]] = f_new
-    
+
     def _apply_3d(self, f: 'npt.NDArray') -> None:
         """Apply BC on flat nodes of a 3D face."""
         xp = self.xp
@@ -137,8 +147,8 @@ class FaceBC:
         face_sl = self.node_map.get_face_slice_3d(loc)
 
         # Equilibrium with constant target: use cached f_eq
-        if not self.use_regularized and hasattr(self, '_cached_f_eq_3d'):
-            f[:, face_sl[0], face_sl[1], face_sl[2]] = self._cached_f_eq_3d
+        if not self.use_regularized and hasattr(self, '_cached_f_eq'):
+            f[:, face_sl[0], face_sl[1], face_sl[2]] = self._cached_f_eq
             return
 
         int_sl = self.node_map.get_interior_slice_3d(loc)
@@ -227,10 +237,12 @@ class VelocityDirichletBC(FaceBC):
             for d in range(min(len(velocity), self.dim)):
                 self.u_target[d, ...] = float(velocity[d])
 
-        # Cache f_eq for equilibrium mode (constant target → same every step)
-        if not self.use_regularized and self.dim == 3:
+        # Cache f_eq for equilibrium mode (constant target → same every step).
+        # Applies to 2D and 3D alike — base FaceBC._apply_2d/3d both check
+        # hasattr(self, '_cached_f_eq') and short-circuit when present.
+        if not self.use_regularized:
             from src.boundary.regularized_utils import compute_f_eq
-            self._cached_f_eq_3d = compute_f_eq(
+            self._cached_f_eq = compute_f_eq(
                 xp, self.rho_target, self.u_target,
                 self.c, self.w, self.cs2,
             )
@@ -475,6 +487,121 @@ class DomainBounceBackBC(FaceBC):
 
 
 # =============================================================================
+# Domain Slip / Symmetry Wall (specular reflection)
+# =============================================================================
+
+class DomainSlipBC(FaceBC):
+    """Free-Slip Wall via Specular Reflection (Domain Boundary)
+
+    Physics:
+        u_n = 0                  (no penetration)
+        ∂u_t/∂n = 0              (no tangential shear)
+
+    Implementation:
+        For each incoming direction i, the source is σ(i), where σ flips only
+        the face-normal component of c. This keeps tangential momentum
+        unchanged at the wall and reverses the wall-normal component,
+        reproducing a frictionless wall located Δx/2 outside the boundary node.
+
+        f[i, face] = f_post[σ(i), face]
+
+    Contrast with DomainBounceBackBC:
+        Bounce-back uses σ = opp (full reversal)   → no-slip
+        Slip uses σ = axis-mirror (normal only)    → frictionless
+
+    Use case:
+        - Symmetry planes
+        - Wind-tunnel walls where BL growth is compensated (e.g., by physical
+          wall inclination in the experiment, ignored in the simulation)
+    """
+
+    def __init__(self, xp: 'ModuleType', lattice: 'object',
+                 config: FaceConfig, node_map: NodeMap) -> None:
+        super().__init__(xp, lattice, config, node_map)
+        self._setup_specular()
+
+    def _setup_specular(self) -> None:
+        """Build specular-reflection source indices for incoming directions."""
+        xp = self.xp
+        c = self.lattice.c
+        if hasattr(c, 'get'):
+            c_np = c.get()
+        else:
+            c_np = np.asarray(c)
+        axis = self.location.axis
+        is_min = self.location.is_min
+
+        # Specular map σ: flip c[axis, i], find matching direction
+        sigma = np.full(self.Q, -1, dtype=np.int64)
+        for i in range(self.Q):
+            target = c_np[:, i].copy()
+            target[axis] = -target[axis]
+            for j in range(self.Q):
+                if np.array_equal(c_np[:, j], target):
+                    sigma[i] = j
+                    break
+            if sigma[i] < 0:
+                raise RuntimeError(
+                    f"No specular-reflected match for direction {i} "
+                    f"(axis={axis}) on lattice with Q={self.Q}."
+                )
+
+        incoming = []
+        sources = []
+        for i in range(self.Q):
+            c_normal = int(c_np[axis, i])
+            if (is_min and c_normal > 0) or (not is_min and c_normal < 0):
+                incoming.append(i)
+                sources.append(int(sigma[i]))
+
+        self.incoming = xp.asarray(incoming, dtype=xp.int64)
+        self.sources = xp.asarray(sources, dtype=xp.int64)
+
+    def apply(self, f: 'npt.NDArray',
+              f_post: Optional['npt.NDArray'] = None) -> None:
+        """Apply specular reflection on flat nodes of this wall face."""
+        if self.dim == 2:
+            face_sl = self.node_map.get_face_slice_2d(self.location)
+            if f_post is not None:
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_src = int(self.sources[k])
+                    f[i_in, face_sl[0], face_sl[1]] = \
+                        f_post[i_src, face_sl[0], face_sl[1]]
+            else:
+                saved = {}
+                for k in range(len(self.incoming)):
+                    i_src = int(self.sources[k])
+                    saved[i_src] = f[i_src, face_sl[0], face_sl[1]].copy()
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_src = int(self.sources[k])
+                    f[i_in, face_sl[0], face_sl[1]] = saved[i_src]
+        else:
+            face_sl = self.node_map.get_face_slice_3d(self.location)
+            if f_post is not None:
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_src = int(self.sources[k])
+                    f[i_in, face_sl[0], face_sl[1], face_sl[2]] = \
+                        f_post[i_src, face_sl[0], face_sl[1], face_sl[2]]
+            else:
+                saved = {}
+                for k in range(len(self.incoming)):
+                    i_src = int(self.sources[k])
+                    saved[i_src] = f[i_src, face_sl[0], face_sl[1], face_sl[2]].copy()
+                for k in range(len(self.incoming)):
+                    i_in = int(self.incoming[k])
+                    i_src = int(self.sources[k])
+                    f[i_in, face_sl[0], face_sl[1], face_sl[2]] = saved[i_src]
+
+    def get_info(self) -> str:
+        n_inc = len(self.incoming)
+        return (f"DomainSlipBC at {self.location.value}: "
+                f"{n_inc} incoming directions, specular reflection")
+
+
+# =============================================================================
 # Neumann (Zero-Gradient Extrapolation) — INCOMING ONLY
 # =============================================================================
 
@@ -616,7 +743,10 @@ def create_face_bc(xp: 'ModuleType', lattice: 'object',
     
     if method in ('bounce_back', 'hwbb'):
         return DomainBounceBackBC(xp, lattice, config, node_map)
-    
+
+    if method in ('slip', 'symmetry', 'free_slip'):
+        return DomainSlipBC(xp, lattice, config, node_map)
+
     if bc_type == BCType.NEUMANN:
         return NeumannBC(xp, lattice, config, node_map)
     

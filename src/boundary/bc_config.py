@@ -65,7 +65,8 @@ class BCType(Enum):
         PERIODIC:   no explicit BC (handled by streaming periodicity)
     
     Edge/corner priority (highest → lowest):
-        WALL > VELOCITY > PRESSURE > NEUMANN > PERIODIC
+        WALL(no-slip) > SPONGE > VELOCITY > PRESSURE > NEUMANN > PERIODIC
+        (Slip WALL applied last: zeroes only face-normal component of u.)
     """
     VELOCITY   = "velocity"
     PRESSURE   = "pressure"
@@ -220,6 +221,11 @@ _METHOD_MAP: Dict[str, Tuple[BCType, bool]] = {
     'reg_wall':             (BCType.WALL, True),
     'bounce_back':          (BCType.WALL, False),       # f_i = f_ī (half-way BB)
     'hwbb':                 (BCType.WALL, False),
+
+    # ── Free-slip / symmetry walls (specular reflection) ──
+    'slip':                 (BCType.WALL, False),       # f_i = f_{σ(i)}, σ flips c_axis
+    'symmetry':             (BCType.WALL, False),
+    'free_slip':            (BCType.WALL, False),
     
     # ── Zero-gradient outlet ──
     'neumann':              (BCType.NEUMANN, False),    # f[bdy] = f[int]
@@ -269,25 +275,24 @@ def classify_method(method: str) -> Tuple[BCType, bool]:
 # Config Parsing
 # =============================================================================
 
-def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> Optional[FaceConfig]:
+def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> FaceConfig:
     """Parse a single boundary config dictionary into FaceConfig.
-    
-    Handles both new-style and legacy config formats:
-    
-    New style:
-        {'location': 'xmin', 'method': 'regularized_inlet', 'velocity': 0.1, 'rho': 1.0}
-    
-    Legacy style (any of these):
-        {'type': 'inlet', 'location': 0, 'velocity': 0.1}     ← numeric location → use bc_name
-        {'type': 'wall', 'method': 'bounce_back'}
-        {'type': 'outlet', 'pressure': 1.0}                    ← 'pressure' key → density
-    
+
+    Expected format:
+        {'location': 'xmin', 'method': 'equilibrium', 'velocity': [0.1, 0.0]}
+        {'location': 'xmax', 'method': 'sponge', 'velocity': [0.1, 0],
+         'density': 1.0, 'thickness': 20, 'strength': 0.5}
+
     Args:
         bc_name: User-defined name (e.g. 'inlet', 'west', 'ymin')
         bc_dict: Config dictionary
-        
+
     Returns:
-        FaceConfig, or None if location cannot be determined
+        FaceConfig — always valid
+
+    Raises:
+        ValueError: If location or method is missing or unrecognized
+                    (fail-fast: no silent drops).
     """
     # =====================================================================
     # Step 1: Determine location
@@ -304,35 +309,38 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> Optional[FaceCon
     except ValueError:
         try:
             location = FaceLocation.from_string(bc_name)
-        except ValueError:
-            print(f"  Warning: Cannot determine location for boundary '{bc_name}', skipping")
-            return None
+        except ValueError as e:
+            raise ValueError(
+                f"Boundary '{bc_name}': cannot determine location "
+                f"from 'location'={location_str!r} or bc_name. {e}"
+            ) from None
     
     # =====================================================================
     # Step 2: Determine method
     # =====================================================================
     method = bc_dict.get('method', '').lower().strip()
     bc_type_str = bc_dict.get('type', '').lower().strip()
-    
+
     if not method:
         method = _LEGACY_TYPE_MAP.get(bc_type_str, '')
     elif method not in _METHOD_MAP:
         fallback = _LEGACY_TYPE_MAP.get(bc_type_str, '')
         if fallback:
             method = fallback
-    
+
     if not method:
-        print(f"  Warning: No 'method'/'type' specified for boundary '{bc_name}', skipping")
-        return None
-    
+        raise ValueError(
+            f"Boundary '{bc_name}': no 'method' specified. "
+            f"Got bc_dict={bc_dict}"
+        )
+
     # =====================================================================
-    # Step 3: Classify method → (BCType, use_regularized)
+    # Step 3: Classify method → (BCType, use_regularized) — fail-fast
     # =====================================================================
     try:
         bc_type, use_regularized = classify_method(method)
     except ValueError as e:
-        print(f"  Warning: {e}")
-        return None
+        raise ValueError(f"Boundary '{bc_name}': {e}") from None
     
     # Periodic → return minimal FaceConfig
     if bc_type == BCType.PERIODIC:
@@ -401,11 +409,9 @@ def parse_all_boundaries(boundaries_config: Dict[str, Dict[str, Any]]) -> List[F
         [VELOCITY, PRESSURE, WALL, WALL]
     """
     face_configs: List[FaceConfig] = []
-    
+
     for bc_name, bc_dict in boundaries_config.items():
-        fc = parse_face_config(bc_name, bc_dict)
-        if fc is not None:
-            face_configs.append(fc)
+        face_configs.append(parse_face_config(bc_name, bc_dict))
     
     # Validate: no duplicate locations
     seen: set = set()

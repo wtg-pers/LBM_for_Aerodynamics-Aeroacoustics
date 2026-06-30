@@ -159,8 +159,14 @@ def make_polar_query(
         Returns:
             (CL, CD)  [dimensionless, dimensionless]
         """
+        alpha_in, re_in = float(alpha_deg), float(Re)
+        if not (np.isfinite(alpha_in) and np.isfinite(re_in)):
+            raise ValueError(
+                f"Non-finite polar query input: alpha={alpha_deg}, Re={Re}. "
+                f"Velocity field likely diverged - check TAU margin or startup transient."
+            )
         # Wrap α to [-180, 180]  [degrees]
-        a0 = (float(alpha_deg) + 180.0) % 360.0 - 180.0
+        a0 = (alpha_in + 180.0) % 360.0 - 180.0
 
         j1, j2, ta = _bounds(a, a0)
         k1, k2, tr = _bounds(R, float(Re))
@@ -1580,7 +1586,9 @@ class MultiAirfoilPolarManager:
             set_default: Use as fallback
         """
         db = AirfoilDatabase(name)
-        db.load_csv(
+        # Multi-Re BEMT-format CSV (columns: Re, AoA(deg), cl, cd).
+        # load_csv() is the single-Re loader and requires a separate Re arg.
+        db.load_bemt_csv(
             csv_path,
             alpha_col=alpha_col,
             Re_col=Re_col,
@@ -1588,6 +1596,32 @@ class MultiAirfoilPolarManager:
             CD_col=CD_col,
         )
         self.add_airfoil(name, db, set_default=set_default)
+
+    def add_airfoil_from_c81(
+        self,
+        name: str,
+        c81_path: str,
+        set_default: bool = False,
+    ) -> None:
+        """Add a Mach-indexed C81 airfoil (Mach-native query).
+
+        Registers a `polar_query(alpha, Re, mach)` closure that interpolates the
+        C81 deck on (alpha, Mach).  Used for tapered/variable-chord rotors where
+        the section Mach is passed directly (see c81_loader / ALM Mach-pass).
+
+        Args:
+            name: Airfoil identifier (must match blade-section airfoil names)
+            c81_path: Path to the Mach-indexed C81 deck
+            set_default: Use as fallback for unknown airfoils
+        """
+        from src.actuator.c81_loader import (
+            C81PolarSet, make_c81_polar_query_mach,
+        )
+        polar_set = C81PolarSet.from_file(c81_path)
+        # query carries .wants_mach = True → manager threads the section Mach.
+        self._queries[name] = make_c81_polar_query_mach(polar_set)
+        if set_default or self._default_airfoil is None:
+            self._default_airfoil = name
 
     def get_query(self, airfoil_name: str) -> Callable:
         """Get polar query function for specific airfoil
@@ -1618,7 +1652,8 @@ class MultiAirfoilPolarManager:
         self,
         airfoil_name: str,
         alpha: float,
-        Re: float
+        Re: float,
+        mach: Optional[float] = None,
     ) -> Tuple[float, float]:
         """Query CL, CD for specific airfoil
 
@@ -1626,36 +1661,46 @@ class MultiAirfoilPolarManager:
             airfoil_name: Airfoil identifier
             alpha: Angle of attack  [degrees]
             Re: Reynolds number     [dimensionless]
+            mach: Section Mach (only passed to Mach-native queries, e.g. C81
+                  decks added via add_airfoil_from_c81; ignored otherwise)
 
         Returns:
             (CL, CD)  [dimensionless, dimensionless]
         """
         query_func = self.get_query(airfoil_name)
+        # Pass Mach only to queries that declare they want it (Mach-native C81).
+        # Re-only queries (CSV/neuralfoil/flat_plate) keep the 2-arg call.
+        if mach is not None and getattr(query_func, 'wants_mach', False):
+            return query_func(alpha, Re, mach=mach)
         return query_func(alpha, Re)
 
     def to_unified_query(self) -> Callable:
-        """Create unified query function accepting airfoil name
+        """Create unified query function accepting airfoil name (+ optional Mach)
 
         Returns:
-            query(alpha_deg, Re, airfoil_name) → (CL, CD)
+            query(alpha_deg, Re, airfoil_name=None, mach=None) → (CL, CD)
 
         Note:
-            If airfoil_name is None or empty, uses default airfoil.
+            - If airfoil_name is None or empty, uses default airfoil.
+            - The `mach` parameter makes the ALM detect Mach-pass support and
+              supply the section Mach; it is only forwarded to Mach-native
+              per-airfoil queries (C81), so mixed Re-only/Mach decks are safe.
         """
         def unified_query(
             alpha_deg: float,
             Re: float,
-            airfoil_name: Optional[str] = None
+            airfoil_name: Optional[str] = None,
+            mach: Optional[float] = None,
         ) -> Tuple[float, float]:
             if airfoil_name is None or airfoil_name == "":
                 airfoil_name = self._default_airfoil
-            return self.query(airfoil_name, alpha_deg, Re)
+            return self.query(airfoil_name, alpha_deg, Re, mach=mach)
         return unified_query
 
     @property
     def airfoil_names(self) -> List[str]:
-        """List of registered airfoil names"""
-        return list(self._databases.keys())
+        """List of registered airfoil names (databases + Mach-native C81)"""
+        return list(self._queries.keys())
 
     @property
     def default_airfoil(self) -> Optional[str]:
@@ -1767,11 +1812,20 @@ def create_polar_from_config(
                     CD_col=af_cfg.get("CD_col", "cd"),
                     set_default=is_default,
                 )
-            
+
+            elif af_method == "c81":
+                # Mach-indexed C81 deck (Mach-native; for tapered rotors with
+                # the ALM Mach-pass). The section Mach is threaded by the manager.
+                manager.add_airfoil_from_c81(
+                    name=name,
+                    c81_path=af_cfg["path"],
+                    set_default=is_default,
+                )
+
             else:
                 raise ValueError(
                     f"Unknown airfoil method '{af_method}' for '{name}'. "
-                    f"Available: 'neuralfoil', 'flat_plate', 'csv'"
+                    f"Available: 'neuralfoil', 'flat_plate', 'csv', 'c81'"
                 )
 
         # Return unified query (3-arg) and manager
@@ -1808,7 +1862,10 @@ def create_polar_from_config(
     elif method == "flat_plate":
         Re_target = config.get("Re_target", 1e5)
         polar = create_flat_plate_polar(Re=Re_target)
-        return polar.get_coefficients, None
+        _inner = polar.get_coefficients
+        def _flat_plate_query(alpha_deg: float, Re: float = 0.0):
+            return _inner(alpha_deg)
+        return _flat_plate_query, None
 
     elif method == "database":
         preset = config.get("preset", "nrel_s826")
@@ -1831,6 +1888,24 @@ def create_polar_from_config(
             CD_col=config.get("CD_col", "cd"),
         )
         return make_polar_query(*packs[0]), None
+
+    elif method == "c81":
+        # Mach-indexed C81 deck (e.g. NACA23012.C81 for HART-II).
+        # The ALM's polar_query is Reynolds-indexed; for a CONSTANT-chord
+        # blade the closure recovers the local Mach from Re
+        # (M = nu/(chord*a) * Re) and interpolates the C81 table on (alpha, M).
+        # See src/actuator/c81_loader.py for the equivalence proof.
+        from src.actuator.c81_loader import (
+            C81PolarSet, make_c81_polar_query,
+        )
+        polar_set = C81PolarSet.from_file(config["path"])
+        query = make_c81_polar_query(
+            polar_set,
+            chord=float(config["chord"]),         # [m] constant chord
+            nu=float(config["nu"]),               # [m^2/s] kinematic viscosity
+            sound_speed=float(config["sound_speed"]),  # [m/s] free-stream a
+        )
+        return query, None
 
     # ─────────────────────────────────────────────────────────────────
     # [TEMPORARY / TEST-ONLY] Prescribed fixed CL/CD
@@ -1895,5 +1970,5 @@ def create_polar_from_config(
         raise ValueError(
             f"Unknown polar method: '{method}'. "
             f"Available: 'neuralfoil', 'flat_plate', 'database', "
-            f"'csv', 'multi', 'prescribed'"
+            f"'csv', 'c81', 'multi', 'prescribed'"
         )

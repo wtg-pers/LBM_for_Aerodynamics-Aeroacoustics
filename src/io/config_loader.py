@@ -22,10 +22,3 @@ class ConfigLoader:
             raise AttributeError("Config file must have a 'config' dictionary.")
             
         return config_module.config
-    
-    def get_simulation_params(self):
-        return self.config.get('simulation', {})
-    
-    def get_boundary_config(self, location):
-        boundaries = self.config.get('boundaries', {})
-        return boundaries.get(location, None)

@@ -66,11 +66,6 @@ class SolverInitializer:
 
         # ── Step 3: Wire f into Simulation ───────────────────────
         if not is_mlg:
-            # On restart with Esoteric, f is already in Esoteric layout
-            if should_restart and hasattr(self, '_last_checkpoint_state'):
-                eso_step = self._last_checkpoint_state.get('esoteric_step', None)
-                if eso_step is not None:
-                    sim._esoteric_f_already_set = True
             sim.set_distribution(f)
             sim.step_count = start_step
 
@@ -111,17 +106,67 @@ class SolverInitializer:
                     f.write(header)
                 print(f"  Rotor CSV: {path}")
 
-        # ── Step 4c: Esoteric parity restore on restart ─────────
-        if (start_step > 0
-                and hasattr(sim, '_use_esoteric') and sim._use_esoteric):
-            # Restore esoteric_step from checkpoint extra_data
-            # The checkpoint f is already in Esoteric memory layout
-            if hasattr(self, '_last_checkpoint_state'):
-                eso_step = self._last_checkpoint_state.get('esoteric_step', start_step)
-                sim._esoteric_step = eso_step
-                print(f"  Esoteric parity restored: step {eso_step}")
+        # Blade diagnostics CSV (per-marker files)
+        if self._setup.blade_csv_dir is not None:
+            blade_dir = self._setup.blade_csv_dir
+            header = self._setup._blade_csv_header
+            os.makedirs(blade_dir, exist_ok=True)
+
+            # Determine n_markers from ALM
+            al = self._setup.al_model
+            if hasattr(al, 'rotor'):
+                n_markers = al.rotor.markers_per_blade
+            elif hasattr(al, 'models'):
+                n_markers = al.models[0].rotor.markers_per_blade
             else:
-                sim._esoteric_step = start_step
+                n_markers = 0
+
+            for j in range(n_markers):
+                path = os.path.join(blade_dir, f'{j}.csv')
+                if start_step > 0 and os.path.exists(path):
+                    kept = []
+                    with open(path, 'r') as f:
+                        _ = f.readline()
+                        for line in f:
+                            if line.strip():
+                                step_val = int(line.split(',')[0])
+                                if step_val < start_step:
+                                    kept.append(line)
+                    with open(path, 'w') as f:
+                        f.write(header)
+                        f.writelines(kept)
+                else:
+                    with open(path, 'w') as f:
+                        f.write(header)
+            print(f"  Blade CSV: {blade_dir}/ ({n_markers} marker files)")
+
+        # Blade geometry snapshot (actual interpolated values, written once)
+        if self._setup.al_model is not None and self._setup.blade_csv_dir is not None:
+            al = self._setup.al_model
+            models = (
+                [al.models[i] for i in range(al.n_rotors)]
+                if hasattr(al, 'models')
+                else [al]
+            )
+            for model in models:
+                rotor = model.rotor
+                blade = rotor.blades[0]
+                geo_path = os.path.join(
+                    self._setup.blade_csv_dir, 'blade_geometry.csv',
+                )
+                with open(geo_path, 'w') as f:
+                    f.write('marker,r_R,r_lu,chord_lu,twist_deg,epsilon_lu,active\n')
+                    for j in range(blade.n_markers):
+                        f.write(
+                            f"{j},"
+                            f"{blade.marker_r[j] / rotor.radius:.4f},"
+                            f"{blade.marker_r[j]:.4f},"
+                            f"{blade.marker_chord[j]:.4f},"
+                            f"{blade.marker_twist[j]:.3f},"
+                            f"{blade.marker_epsilon[j]:.4f},"
+                            f"{blade.marker_active[j]}\n"
+                        )
+                print(f"  Blade geometry: {geo_path}")
 
         # ── Step 5: Info ─────────────────────────────────────────
         if hasattr(sim, 'print_info'):
@@ -151,7 +196,6 @@ class SolverInitializer:
         f = xp.asarray(state['f'])
         completed_step = state['step']
         start_step = completed_step + 1
-        self._last_checkpoint_state = state  # store for esoteric parity
         print(f"  Loaded step {completed_step}, resuming from step {start_step}")
         return f, start_step
 
@@ -170,7 +214,9 @@ class SolverInitializer:
 
     def _fresh_start(self, xp, setup) -> Tuple[Any, int]:
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")
-        physics_config = setup.sim_params.get('physics', {})
+        # `initial_flow_velocity` is injected by setup._extract_physics
+        # from `physics.U_inf` * `physics.flow_direction`.
+        physics_config = setup._physics_config
         flow_vel = physics_config.get('initial_flow_velocity', 0.0)
         dtype = setup.compute_dtype
 
@@ -201,7 +247,7 @@ class SolverInitializer:
         """Fresh start: all levels get f = f_eq(ρ₀, u₀)."""
         setup = self._setup
         xp = self.xp
-        physics_config = setup.sim_params.get('physics', {})
+        physics_config = setup._physics_config
         flow_vel = physics_config.get('initial_flow_velocity', [0.0, 0.0, 0.0])
         dim = setup.lattice.dim
 
@@ -225,7 +271,7 @@ class SolverInitializer:
             level_sim.set_distribution(f_k)
 
             mem_mb = f_k.nbytes / (1024 * 1024)
-            print(f"  Level {k}: shape={shape}, τ={level_sim.tau:.4f}, "
+            print(f"  Level {k}: shape={shape}, τ={level_sim.tau:.6f}, "
                   f"f size={mem_mb:.1f} MB")
 
         total_nodes = sum(
@@ -293,7 +339,7 @@ class SolverInitializer:
                 rho_0 = xp.ones(shape, dtype=dtype)
                 u_0 = xp.zeros((dim,) + shape, dtype=dtype)
 
-                physics_config = setup.sim_params.get('physics', {})
+                physics_config = setup._physics_config
                 flow_vel = physics_config.get('initial_flow_velocity',
                                               [0.0, 0.0, 0.0])
                 if isinstance(flow_vel, (list, tuple)):

@@ -572,6 +572,176 @@ def _point_in_polygon_mask(
     return mask
 
 
+def transform_airfoil_coords_to_lu(
+    x_norm: 'npt.NDArray',
+    y_norm: 'npt.NDArray',
+    chord_length: float,
+    center: Tuple[float, float],
+    angle_of_attack: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Scale + rotate (about mid-chord) + translate to lattice-unit polygon.
+
+    Mirrors the transform used inside `create_airfoil_2d_mask_from_coords`,
+    exposed so callers (e.g. q-fraction computation for IBB) can obtain
+    the same polygon the mask was built from.
+
+    Args:
+        x_norm, y_norm:  Normalized airfoil contour  [dimensionless, 0..1 chord].
+        chord_length:    Chord length  [lattice units].
+        center:          Mid-chord position (cx, cy)  [lattice units].
+        angle_of_attack: Nose-up AoA  [degrees].
+
+    Returns:
+        (x_lu, y_lu): Closed polygon (first point repeated) in lattice units.
+    """
+    import numpy as np_local
+
+    x = np_local.asarray(x_norm, dtype=np_local.float64) * chord_length
+    y = np_local.asarray(y_norm, dtype=np_local.float64) * chord_length
+
+    if angle_of_attack != 0.0:
+        alpha = np_local.deg2rad(angle_of_attack)
+        cos_a = np_local.cos(alpha)
+        sin_a = np_local.sin(alpha)
+        x_mid = 0.5 * chord_length
+        x_rot = (x - x_mid) * cos_a - y * sin_a + x_mid
+        y_rot = (x - x_mid) * sin_a + y * cos_a
+        x, y = x_rot, y_rot
+
+    cx, cy = center
+    x = x - 0.5 * chord_length + cx
+    y = y + cy
+
+    if not (np_local.isclose(x[0], x[-1]) and np_local.isclose(y[0], y[-1])):
+        x = np_local.concatenate([x, x[:1]])
+        y = np_local.concatenate([y, y[:1]])
+
+    return x, y
+
+
+def load_selig_dat(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load airfoil coordinates from a Selig-format .dat file.
+
+    Selig format: one (x, y) pair per line, starting from trailing edge,
+    along the upper surface to leading edge, then along the lower surface
+    back to trailing edge. Coordinates are normalized to unit chord
+    (x in [0, 1]).
+
+    The file must contain only numeric data — any header must be stripped
+    beforehand.
+
+    Args:
+        path: Absolute path to the .dat file.
+
+    Returns:
+        (x_norm, y_norm): Two 1D arrays of normalized airfoil coordinates.
+                          Open contour (not closed at the TE).
+    """
+    data = np.loadtxt(path, dtype=np.float64)
+    if data.ndim != 2 or data.shape[1] != 2:
+        raise ValueError(
+            f"Expected (N, 2) Selig coordinates from '{path}', "
+            f"got shape {data.shape}."
+        )
+    return data[:, 0], data[:, 1]
+
+
+def create_airfoil_2d_mask_from_coords(
+    xp: 'ModuleType',
+    shape: Tuple[int, int],
+    x_norm: 'npt.NDArray',
+    y_norm: 'npt.NDArray',
+    chord_length: float,
+    center: Tuple[float, float],
+    angle_of_attack: float = 0.0,
+) -> 'npt.NDArray':
+    """Create a 2D airfoil solid mask from arbitrary (x, y) coordinates.
+
+    Uses point-in-polygon testing on the provided contour. Intended for
+    Selig .dat or similar tabulated airfoil profiles.
+
+    Pipeline:
+        1. Scale normalized coords by chord_length  [lattice units]
+        2. Rotate by angle_of_attack around mid-chord  [radians]
+        3. Translate so the mid-chord is at `center`  [lattice units]
+        4. Point-in-polygon mask over the grid
+
+    Args:
+        xp: Array module (numpy or cupy).
+        shape: (Nx, Ny) domain shape  [lattice units].
+        x_norm, y_norm: Normalized airfoil contour (open contour;
+                        function closes it automatically).  [dimensionless]
+        chord_length: Chord length in lattice units.
+        center: (cx, cy) mid-chord position  [lattice units].
+        angle_of_attack: Nose-up AoA  [degrees].
+
+    Returns:
+        Boolean mask, shape (Nx, Ny), True = solid.
+    """
+    import numpy as np_local
+
+    x_airfoil = np_local.asarray(x_norm, dtype=np_local.float64) * chord_length
+    y_airfoil = np_local.asarray(y_norm, dtype=np_local.float64) * chord_length
+
+    if angle_of_attack != 0.0:
+        alpha_rad = np_local.deg2rad(angle_of_attack)
+        cos_a = np_local.cos(alpha_rad)
+        sin_a = np_local.sin(alpha_rad)
+        x_mid = 0.5 * chord_length
+        x_rot = (x_airfoil - x_mid) * cos_a - y_airfoil * sin_a + x_mid
+        y_rot = (x_airfoil - x_mid) * sin_a + y_airfoil * cos_a
+        x_airfoil = x_rot
+        y_airfoil = y_rot
+
+    cx, cy = center
+    x_airfoil = x_airfoil - 0.5 * chord_length + cx
+    y_airfoil = y_airfoil + cy
+
+    # Close the contour if not already closed (within floating tolerance)
+    if not (np_local.isclose(x_airfoil[0], x_airfoil[-1]) and
+            np_local.isclose(y_airfoil[0], y_airfoil[-1])):
+        x_airfoil = np_local.concatenate([x_airfoil, x_airfoil[:1]])
+        y_airfoil = np_local.concatenate([y_airfoil, y_airfoil[:1]])
+
+    Nx, Ny = shape
+
+    # Cell-center point-in-polygon: a cell is solid iff its center
+    # (i, j) lies inside the polygon. This is the only mask that keeps
+    # the IBB invariant intact — for every fluid→solid lattice link the
+    # polygon edge passes between the two cell centers, so the per-link
+    # q-fraction (compute_q_fraction_polyline) finds a valid intersection
+    # and does NOT fall back to the q=0.5 HWBB sentinel.
+    #
+    # Sub-grid VOF (frac ≥ 0.5) was tried earlier to retain sub-pixel
+    # tail-edge cells, but it admitted cells whose centers sit *outside*
+    # the polygon. The fluid→solid links into those cells then missed
+    # the polygon entirely, sending ~40 % of L3 links to the q=0.5
+    # fallback — IBB collapsed to HWBB along the airfoil surface.
+    #
+    # An outward-polyline-dilation prototype was also tried (per-edge
+    # offset + arc-rounded corners) to thicken sub-pixel tail edges into
+    # a connected mask. The dilated polygon altered airfoil geometry
+    # (especially LE rounding and TE arc) and over-predicted Cl by ~30 %
+    # versus the cell-center-PIP baseline at α=0 — i.e. the "fix" was
+    # worse than the symptom. Removed; do not reintroduce.
+    #
+    # No connected-component filter is applied: isolated 1-cell
+    # fragments past the main body (e.g. cambered TE camber-line
+    # cells where polygon thickness < Δx) are *real* sub-pixel features
+    # of the airfoil, not numerical noise. Each such cell still has its
+    # center inside the polygon, so its inbound links resolve a valid q
+    # and IBB represents the sub-pixel taper correctly.
+    x = np_local.arange(Nx, dtype=np_local.float64)
+    y = np_local.arange(Ny, dtype=np_local.float64)
+    X, Y = np_local.meshgrid(x, y, indexing='ij')
+    mask_np = _point_in_polygon_mask(X, Y, x_airfoil, y_airfoil)
+
+    if xp.__name__ == 'cupy':
+        import cupy as cp
+        return cp.asarray(mask_np)
+    return mask_np
+
+
 def create_airfoil_2d_mask(
     xp: 'ModuleType',
     shape: Tuple[int, int],
@@ -579,7 +749,7 @@ def create_airfoil_2d_mask(
     chord_length: float,
     center: Tuple[float, float],
     angle_of_attack: float = 0.0,
-    num_points: int = 100
+    num_points: int = 100,
 ) -> 'npt.NDArray':
     """Create 2D NACA airfoil solid mask
     
@@ -642,23 +812,31 @@ def create_airfoil_2d_mask(
     x_mid = 0.5 * chord_length  # Mid-chord position
     x_airfoil = x_airfoil - x_mid + cx
     y_airfoil = y_airfoil + cy
-    
-    # Step 5: Create grid for mask [lattice units]
+
+    # Close the contour
+    if not (np_local.isclose(x_airfoil[0], x_airfoil[-1]) and
+            np_local.isclose(y_airfoil[0], y_airfoil[-1])):
+        x_airfoil = np_local.concatenate([x_airfoil, x_airfoil[:1]])
+        y_airfoil = np_local.concatenate([y_airfoil, y_airfoil[:1]])
+
+    # Step 5: cell-center point-in-polygon (see notes in
+    # create_airfoil_2d_mask_from_coords for why VOF is NOT used: it
+    # produces solid cells whose centers lie outside the polygon, which
+    # breaks compute_q_fraction_polyline and forces ~40 % of links to
+    # the q=0.5 HWBB sentinel).
     Nx, Ny = shape
     x = np_local.arange(Nx, dtype=np_local.float64)
     y = np_local.arange(Ny, dtype=np_local.float64)
     X, Y = np_local.meshgrid(x, y, indexing='ij')
-    
-    # Step 6: Point-in-polygon test for each grid point
     mask_np = _point_in_polygon_mask(X, Y, x_airfoil, y_airfoil)
-    
+
     # Step 7: Transfer to target array module (numpy → cupy if needed)
     if xp.__name__ == 'cupy':
         import cupy as cp
         mask = cp.asarray(mask_np)
     else:
         mask = mask_np
-    
+
     return mask
 
 

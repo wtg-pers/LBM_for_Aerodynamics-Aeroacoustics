@@ -108,8 +108,12 @@ class NodeMap:
         self.dim = dim
         
         # Build lookup: FaceLocation → FaceConfig
+        # PERIODIC faces are excluded — they are not real domain boundaries
+        # (streaming handles wrap-around), so they should not generate edges
+        # nor trim flat masks of adjacent walls.
         self._face_map: Dict[FaceLocation, FaceConfig] = {
             fc.location: fc for fc in face_configs
+            if fc.bc_type != BCType.PERIODIC
         }
         
         # Results

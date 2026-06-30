@@ -16,19 +16,41 @@ This is the Palabos approach (Malaspinas et al., 2011):
 
 Target (ρ, u) Resolution Rules:
     When 2 or 3 faces meet, their prescribed values may conflict.
-    Resolution follows physical priority:
-    
-    | Combination           | ρ               | u                |
-    |----------------------|-----------------|------------------|
-    | Wall ∩ Wall          | extrapolate     | 0                |
-    | Wall ∩ Velocity      | extrapolate     | 0  (wall wins)   |
-    | Wall ∩ Pressure      | ρ_target        | 0  (wall wins)   |
-    | Wall ∩ Freestream    | ρ_target        | 0  (wall wins)   |
-    | Velocity ∩ Pressure  | ρ_target        | u_inlet          |
-    | Velocity ∩ Freestream| ρ_freestream    | u_inlet          |
-    | Pressure ∩ Pressure  | avg(ρ_target)   | extrapolate      |
-    | Sponge ∩ any         | ρ∞              | U∞               |
-    | Freestream ∩ any     | ρ∞              | U∞               |
+    "Wall" below means the no-slip kind (hwbb, bounce_back). A slip /
+    symmetry face is treated as transparent to tangential flow — only
+    its face-normal velocity component is zeroed, after the non-wall
+    targets are resolved.
+
+    Priority (highest → lowest):
+        1. No-slip WALL → u = 0; ρ from PRESSURE > SPONGE > extrapolate
+        2. SPONGE       → (ρ∞, U∞)  [far-field reference wins over Dirichlet,
+                          consistent with Phase 3 sponge volume damping]
+        3. VELOCITY ∩ PRESSURE → ρ from PRESSURE, u from VELOCITY
+        4. VELOCITY     → (ρ_inlet, u_inlet)
+        5. PRESSURE     → (avg ρ_p, u_extrap)
+        6. Fallback     → (ρ_extrap, u_extrap)   [Neumann or pure extrapolation]
+        + Slip WALL applied last: zero face-normal component of resolved u.
+
+    Examples (after priority resolution):
+
+    | Combination              | ρ               | u                  |
+    |-------------------------|-----------------|--------------------|
+    | Wall ∩ Wall              | extrapolate     | 0                  |
+    | Wall ∩ Velocity          | extrapolate     | 0  (wall wins)     |
+    | Wall ∩ Pressure          | ρ_p_target      | 0  (wall wins)     |
+    | Wall ∩ Sponge            | ρ∞              | 0  (wall wins)     |
+    | Sponge ∩ Velocity        | ρ∞              | U∞ (sponge wins)   |
+    | Sponge ∩ Pressure        | ρ∞              | U∞ (sponge wins)   |
+    | Sponge ∩ Neumann         | ρ∞              | U∞                 |
+    | Velocity ∩ Pressure      | ρ_p_target      | u_inlet            |
+    | Velocity ∩ Velocity      | ρ_inlet         | u_inlet            |
+    | Pressure ∩ Pressure      | avg(ρ_p)        | extrapolate        |
+    | Slip ∩ Velocity          | ρ_inlet         | u_inlet, u[s]=0    |
+    | Slip ∩ Sponge            | ρ∞              | U∞,     u[s]=0     |
+    | Slip ∩ Neumann           | extrapolate     | u_ext,  u[s]=0     |
+    | Slip ∩ Slip (3D)         | extrapolate     | u_ext,  normals 0  |
+    | Slip ∩ Slip (2D corner)  | extrapolate     | (0, 0) effective   |
+    | Neumann + Neumann/etc.   | extrapolate     | extrapolate        |
 
 References:
     - Malaspinas, Chopard, Latt, Comp. Fluids 49, 2011
@@ -103,11 +125,24 @@ class CornerBC:
                 faces.append(edge.face_c)
             types = set(fc.bc_type for fc in faces)
 
-            # Check if target is constant (no extrapolation needed)
-            needs_extrap = (BCType.NEUMANN in types
-                           or (BCType.WALL in types and BCType.PRESSURE not in types
-                               and BCType.VELOCITY not in types
-                               and BCType.SPONGE not in types))
+            # Check if target is constant (no extrapolation needed).
+            # Cases that DO need runtime extrapolation:
+            #   - NEUMANN present                       (Branch 6, both extrap)
+            #   - PRESSURE alone (no V/W/S)             (Branch 5, u extrap)
+            #   - No-slip WALL without PRESSURE/SPONGE  (Branch 1, ρ extrap;
+            #     WALL+VELOCITY also lands here — wall pins u=0, but ρ has no
+            #     constant reference)
+            # SPONGE always pins (ρ∞, U∞) → constant. VELOCITY+PRESSURE constant.
+            needs_extrap = (
+                BCType.NEUMANN in types
+                or (BCType.PRESSURE in types
+                    and BCType.VELOCITY not in types
+                    and BCType.SPONGE not in types
+                    and BCType.WALL not in types)
+                or (BCType.WALL in types
+                    and BCType.PRESSURE not in types
+                    and BCType.SPONGE not in types)
+            )
 
             if not needs_extrap and self.dim == 3:
                 # Constant target: compute f_eq once
@@ -136,10 +171,17 @@ class CornerBC:
             faces = [corner.face_a, corner.face_b, corner.face_c]
             types = set(fc.bc_type for fc in faces)
 
-            needs_extrap = (BCType.NEUMANN in types
-                           or (BCType.WALL in types and BCType.PRESSURE not in types
-                               and BCType.VELOCITY not in types
-                               and BCType.SPONGE not in types))
+            # Same extrapolation rules as edges (see comment above).
+            needs_extrap = (
+                BCType.NEUMANN in types
+                or (BCType.PRESSURE in types
+                    and BCType.VELOCITY not in types
+                    and BCType.SPONGE not in types
+                    and BCType.WALL not in types)
+                or (BCType.WALL in types
+                    and BCType.PRESSURE not in types
+                    and BCType.SPONGE not in types)
+            )
 
             if not needs_extrap:
                 rho_dummy = xp.ones(1, dtype=xp.float64)
@@ -290,136 +332,153 @@ class CornerBC:
     # Target Resolution
     # =========================================================================
     
+    # Methods that represent a free-slip / symmetry wall (WALL-typed).
+    # These zero only the face-normal velocity component at corners,
+    # leaving tangential components to be set by other faces.
+    _SLIP_METHODS = frozenset({'slip', 'symmetry', 'free_slip'})
+
+    @classmethod
+    def _is_slip(cls, fc) -> bool:
+        return (fc.bc_type == BCType.WALL
+                and fc.method.lower() in cls._SLIP_METHODS)
+
+    @classmethod
+    def _is_noslip_wall(cls, fc) -> bool:
+        return (fc.bc_type == BCType.WALL
+                and fc.method.lower() not in cls._SLIP_METHODS)
+
+    def _apply_slip_walls(self, u_t, slip_walls):
+        """Zero the face-normal velocity component for each slip wall face.
+
+        Returns u_t unchanged if no slip walls are present. Otherwise copies
+        first so callers' extrapolation arrays are not mutated in place.
+
+        Works for both scalar-node (u_t shape (dim,)) and line/edge
+        (u_t shape (dim, N)) u_t arrays.
+        """
+        if not slip_walls:
+            return u_t
+        u_t = u_t.copy() if hasattr(u_t, 'copy') else self.xp.array(u_t)
+        for fc in slip_walls:
+            u_t[fc.location.axis] = 0
+        return u_t
+
     def _resolve_target(self, faces, rho_ext, u_ext):
         """Resolve target (ρ, u) when multiple faces meet.
-        
+
         Priority rules (physical basis):
-            1. WALL present → u = 0 (no-slip dominates velocity)
-            2. VELOCITY provides u; PRESSURE provides ρ
-            3. SPONGE provides (ρ∞, U∞) from its freestream target
-            4. NEUMANN prescribes nothing → pure extrapolation
-            5. Fallback: extrapolate from diagonal interior
-        
+            1. No-slip WALL → u = 0; ρ from PRESSURE > SPONGE > extrapolate
+               (no-slip is a hard physical constraint; pressure target wins
+               for ρ if available, else sponge ρ∞, else interior extrapolation)
+            2. SPONGE → (ρ∞, U∞) from its freestream target
+               (placed above VELOCITY/PRESSURE so corners shared with a sponge
+               buffer track far-field truth, consistent with Phase 3 volume
+               damping — avoids Phase 2/Phase 3 disagreement)
+            3. VELOCITY ∩ PRESSURE → ρ from PRESSURE, u from VELOCITY
+            4. VELOCITY → (ρ_inlet, u_inlet)
+            5. PRESSURE → (avg ρ_p, u_extrap)
+            6. Fallback (Neumann/etc.) → (ρ_extrap, u_extrap)
+            + Slip WALL applied last: zero only the face-normal component of
+              the resolved u, leaving tangential flow untouched.
+
         Args:
             faces: List of FaceConfig objects meeting at this node
             rho_ext: Extrapolated density from diagonal interior  [dimensionless]
             u_ext: Extrapolated velocity from diagonal interior  [Δx/Δt]
-            
+
         Returns:
             (rho_target, u_target)
         """
         xp = self.xp
-        
+
         types = set(fc.bc_type for fc in faces)
-        
-        # --- Wall present → u = 0 always ---
-        has_wall = BCType.WALL in types
-        
-        if has_wall:
-            if isinstance(rho_ext, (int, float)) or rho_ext.ndim == 0:
-                u_t = xp.zeros(self.dim, dtype=xp.float64)
-            else:
-                u_t = xp.zeros((self.dim,) + rho_ext.shape, dtype=xp.float64)
-            
-            # Density from pressure face if available, else extrapolate
+
+        # Classify wall faces: no-slip (hwbb/bounce_back) vs slip (specular).
+        # No-slip walls force u=0 entirely; slip walls only zero the
+        # wall-normal component and are applied last.
+        slip_walls = [fc for fc in faces if self._is_slip(fc)]
+        has_noslip_wall = any(self._is_noslip_wall(fc) for fc in faces)
+
+        is_array = (
+            isinstance(rho_ext, np.ndarray)
+            or (hasattr(rho_ext, 'ndim') and rho_ext.ndim > 0)
+        )
+
+        def _broadcast_rho(value: float):
+            if is_array:
+                return xp.full_like(rho_ext, float(value))
+            return xp.asarray(value, dtype=xp.float64)
+
+        def _zero_u():
+            if is_array:
+                return xp.zeros((self.dim,) + rho_ext.shape, dtype=xp.float64)
+            return xp.zeros(self.dim, dtype=xp.float64)
+
+        def _build_u_from_velocity(vel):
+            u_t = _zero_u()
+            if isinstance(vel, (int, float)):
+                u_t[0] = float(vel)
+            elif isinstance(vel, (list, tuple)):
+                for d in range(min(len(vel), self.dim)):
+                    u_t[d] = float(vel[d])
+            return u_t
+
+        # --- 1) No-slip wall present → u = 0 always ---
+        # ρ priority: PRESSURE target > SPONGE ρ∞ > interior extrapolation.
+        # No-slip pins u; ρ falls back to the most authoritative far-field
+        # reference adjacent to this corner.
+        if has_noslip_wall:
+            u_t = _zero_u()
+
             if BCType.PRESSURE in types:
                 pf = next(fc for fc in faces if fc.bc_type == BCType.PRESSURE)
-                rho_t = xp.asarray(pf.density, dtype=xp.float64)
-                if isinstance(rho_ext, np.ndarray) or (hasattr(rho_ext, 'ndim') and rho_ext.ndim > 0):
-                    rho_t = xp.full_like(rho_ext, float(pf.density))
+                rho_t = _broadcast_rho(pf.density)
+            elif BCType.SPONGE in types:
+                sf = next(fc for fc in faces if fc.bc_type == BCType.SPONGE)
+                rho_t = _broadcast_rho(sf.density)
             else:
                 rho_t = rho_ext
-            
+
             return rho_t, u_t
-        
-        # --- Velocity ∩ Pressure ---
+
+        # --- 2) SPONGE present → freestream target (ρ∞, U∞) ---
+        # Placed above VELOCITY/PRESSURE so corners shared with a sponge buffer
+        # track the far-field reference. This keeps Phase 2 (corner BC) and
+        # Phase 3 (sponge volume damping) writing the same target — eliminating
+        # the σ-dependent fight that would otherwise occur at those nodes.
+        if BCType.SPONGE in types:
+            sf = next(fc for fc in faces if fc.bc_type == BCType.SPONGE)
+            rho_t = _broadcast_rho(sf.density)
+            u_t = _build_u_from_velocity(sf.velocity)
+            return rho_t, self._apply_slip_walls(u_t, slip_walls)
+
+        # --- 3) VELOCITY ∩ PRESSURE ---
         if BCType.VELOCITY in types and BCType.PRESSURE in types:
             vf = next(fc for fc in faces if fc.bc_type == BCType.VELOCITY)
             pf = next(fc for fc in faces if fc.bc_type == BCType.PRESSURE)
-            
-            rho_t = xp.asarray(pf.density, dtype=xp.float64)
-            if isinstance(rho_ext, np.ndarray) or (hasattr(rho_ext, 'ndim') and rho_ext.ndim > 0):
-                rho_t = xp.full_like(rho_ext, float(pf.density))
-            
-            if isinstance(rho_ext, (int, float)) or rho_ext.ndim == 0:
-                u_t = xp.zeros(self.dim, dtype=xp.float64)
-            else:
-                u_t = xp.zeros((self.dim,) + rho_ext.shape, dtype=xp.float64)
-            
-            vel = vf.velocity
-            if isinstance(vel, (int, float)):
-                u_t[0] = float(vel)
-            elif isinstance(vel, (list, tuple)):
-                for d in range(min(len(vel), self.dim)):
-                    u_t[d] = float(vel[d])
-            
-            return rho_t, u_t
-        
-        # --- Velocity ∩ Velocity ---
+            rho_t = _broadcast_rho(pf.density)
+            u_t = _build_u_from_velocity(vf.velocity)
+            return rho_t, self._apply_slip_walls(u_t, slip_walls)
+
+        # --- 4) VELOCITY only ---
         if BCType.VELOCITY in types:
             vf = next(fc for fc in faces if fc.bc_type == BCType.VELOCITY)
-            rho_t = xp.asarray(vf.density, dtype=xp.float64)
-            if isinstance(rho_ext, np.ndarray) or (hasattr(rho_ext, 'ndim') and rho_ext.ndim > 0):
-                rho_t = xp.full_like(rho_ext, float(vf.density))
-            
-            if isinstance(rho_ext, (int, float)) or rho_ext.ndim == 0:
-                u_t = xp.zeros(self.dim, dtype=xp.float64)
-            else:
-                u_t = xp.zeros((self.dim,) + rho_ext.shape, dtype=xp.float64)
-            
-            vel = vf.velocity
-            if isinstance(vel, (int, float)):
-                u_t[0] = float(vel)
-            elif isinstance(vel, (list, tuple)):
-                for d in range(min(len(vel), self.dim)):
-                    u_t[d] = float(vel[d])
-            
-            return rho_t, u_t
-        
-        # --- Pressure ∩ Pressure ---
+            rho_t = _broadcast_rho(vf.density)
+            u_t = _build_u_from_velocity(vf.velocity)
+            return rho_t, self._apply_slip_walls(u_t, slip_walls)
+
+        # --- 5) PRESSURE only (avg density from all pressure faces) ---
         if BCType.PRESSURE in types:
             pressure_faces = [fc for fc in faces if fc.bc_type == BCType.PRESSURE]
             avg_rho = sum(fc.density for fc in pressure_faces) / len(pressure_faces)
-            
-            rho_t = xp.asarray(avg_rho, dtype=xp.float64)
-            if isinstance(rho_ext, np.ndarray) or (hasattr(rho_ext, 'ndim') and rho_ext.ndim > 0):
-                rho_t = xp.full_like(rho_ext, avg_rho)
-            
-            return rho_t, u_ext
-        
-        # --- Sponge present → use freestream target (ρ∞, U∞) ---
-        # Sponge faces have well-defined freestream targets stored in
-        # FaceConfig.density and FaceConfig.velocity.  At edge/corner nodes
-        # where sponge meets sponge (or sponge meets neumann), using the
-        # sponge target is consistent with the volume damping in the buffer
-        # zone. This prevents corner nodes from extrapolating interior
-        # values that may contain strong wake structures.
-        if BCType.SPONGE in types:
-            sf = next(fc for fc in faces if fc.bc_type == BCType.SPONGE)
-            
-            rho_t = xp.asarray(sf.density, dtype=xp.float64)
-            if isinstance(rho_ext, np.ndarray) or (hasattr(rho_ext, 'ndim') and rho_ext.ndim > 0):
-                rho_t = xp.full_like(rho_ext, float(sf.density))
-            
-            if isinstance(rho_ext, (int, float)) or rho_ext.ndim == 0:
-                u_t = xp.zeros(self.dim, dtype=xp.float64)
-            else:
-                u_t = xp.zeros((self.dim,) + rho_ext.shape, dtype=xp.float64)
-            
-            vel = sf.velocity
-            if isinstance(vel, (int, float)):
-                u_t[0] = float(vel)
-            elif isinstance(vel, (list, tuple)):
-                for d in range(min(len(vel), self.dim)):
-                    u_t[d] = float(vel[d])
-            
-            return rho_t, u_t
-        
-        # --- Neumann / Fallback: pure extrapolation ---
+            rho_t = _broadcast_rho(avg_rho)
+            return rho_t, self._apply_slip_walls(u_ext, slip_walls)
+
+        # --- 6) Neumann / Fallback: pure extrapolation ---
         # NEUMANN faces prescribe nothing (∂f/∂n = 0 is handled by face BC).
-        # At edge/corner nodes, we simply use the extrapolated values from
-        # the diagonal interior neighbor. This also serves as the general fallback.
-        return rho_ext, u_ext
+        # At edge/corner nodes, use the extrapolated values from the diagonal
+        # interior neighbor. Also serves as the general fallback.
+        return rho_ext, self._apply_slip_walls(u_ext, slip_walls)
     
     # =========================================================================
     # Info

@@ -175,6 +175,11 @@ class MLGVTKWriter:
                     and hasattr(level_sim.obstacle_bc, 'solid_mask')):
                 solid_mask = level_sim.obstacle_bc.solid_mask
 
+            # SGS eddy viscosity (allocated only when SGS enabled).
+            extras = {}
+            if getattr(level_sim, 'nu_t', None) is not None:
+                extras['nu_t'] = level_sim.nu_t
+
             # File in level subdirectory
             vti_filename = f"{prefix}_{step:08d}_level{k}.vti"
             vti_filepath = os.path.join(self._level_dirs[k], vti_filename)
@@ -187,6 +192,7 @@ class MLGVTKWriter:
                 rho=rho,
                 u=u,
                 solid_mask=solid_mask,
+                extras=extras,
             )
 
             # Relative path from .vth location (vtk/vth/) to .vti (vtk/level{k}/)
@@ -219,6 +225,7 @@ class MLGVTKWriter:
         rho: np.ndarray,
         u: np.ndarray,
         solid_mask: Optional[np.ndarray] = None,
+        extras: Optional[dict] = None,
     ) -> None:
         """Write a single level's data as VTK ImageData (.vti).
 
@@ -269,6 +276,17 @@ class MLGVTKWriter:
                 mask_np.astype(np.int8).transpose(2, 1, 0)
             ).tobytes()
             data_arrays.append(('solid_mask', 'Int8', 1, mask_flat))
+
+        if extras:
+            for name, field in extras.items():
+                if hasattr(field, 'get'):
+                    field_np = field.get()
+                else:
+                    field_np = np.asarray(field)
+                field_flat = np.ascontiguousarray(
+                    field_np.transpose(2, 1, 0)
+                ).astype(dtype).tobytes()
+                data_arrays.append((name, vtk_type, 1, field_flat))
 
         xml_lines = [
             '<?xml version="1.0"?>',
