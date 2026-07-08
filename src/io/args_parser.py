@@ -100,19 +100,26 @@ Examples:
     dir_group = parser.add_argument_group('Directory Overrides (CLI > config)')
     
     dir_group.add_argument(
-        '--output-dir', type=str, default=None,
+        '--results-dir', type=str, default=None,
         metavar='PATH',
-        help='Override VTK output directory'
+        help='Override the WHOLE result folder root: writes vtk/, csv/, and '
+             'checkpoints/ under PATH (one flag renames the run folder). The '
+             'per-subdir flags below take precedence if also given.'
+    )
+    dir_group.add_argument(
+        '--vtk-dir', type=str, default=None,
+        metavar='PATH',
+        help='Override VTK output subdirectory (formerly --output-dir)'
     )
     dir_group.add_argument(
         '--checkpoint-dir', type=str, default=None,
         metavar='PATH',
-        help='Override checkpoint directory'
+        help='Override checkpoint subdirectory'
     )
     dir_group.add_argument(
         '--csv-dir', type=str, default=None,
         metavar='PATH',
-        help='Override CSV output directory'
+        help='Override CSV output subdirectory'
     )
     
     # ==========================================================================

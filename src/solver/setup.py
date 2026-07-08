@@ -308,6 +308,15 @@ class SimulationSetup:
         self._time_config = self.config.get('time', {})
         self._grid_cfg = self.config.get('grid', {})
         self._numerics_cfg = self.config.get('numerics', {})
+        # NaN trap (debug) — DEFAULT OFF. The per-step bool(xp.any(~isfinite)) check
+        # forces a GPU→CPU sync that serialises the async kernel pipeline and lowers
+        # GPU utilisation, and it only adds value when a run actually diverges. Keep
+        # it off for healthy production runs; enable ONLY on a re-run to locate a
+        # blow-up. numerics.nan_trap (bool); numerics.nan_check_every (int; 1 = every
+        # step, most precise; N = every N steps, cheaper). Set on the Simulation
+        # class so every level (single-grid + MLG) shares the setting.
+        Simulation.nan_trap_enabled = bool(self._numerics_cfg.get('nan_trap', False))
+        Simulation.nan_check_every = max(1, int(self._numerics_cfg.get('nan_check_every', 1)))
 
         self._output_config = self.config.get('output', {})
         self._vtk_config = self._output_config.get('vtk', {})
@@ -493,11 +502,18 @@ class SimulationSetup:
         if self.Nz is not None:
             grid_cfg['Nz'] = self.Nz
 
+        # Pass the rotor config to the UnitConverter whenever a rotor is defined —
+        # the tip_speed sets the velocity scale (dx/dt) and is a PHYSICAL property
+        # independent of whether the ALM actually runs. Gating this on `al_enabled`
+        # broke pure-LBM diagnostics (ALM disabled → tip_speed=0 → "U_max_phys ~ 0").
+        # The ALM *running* is still gated by al_enabled elsewhere (al_model=None).
+        _uc_al = self._al_cfg if (isinstance(self._al_cfg, dict)
+                                  and self._al_cfg.get('rotor')) else None
         uc = UnitConverter(
             physics=pc,
             grid=grid_cfg,
             numerics=self._numerics_cfg,
-            actuator_line=self._al_cfg if self.al_enabled else None,
+            actuator_line=_uc_al,
         )
         self._unit_converter = uc
 
@@ -683,11 +699,24 @@ class SimulationSetup:
         args = self._args
         oc = self._output_config
 
-        output_dir = args.output_dir or oc.get('output_dir', './results/vtk')
-        self.checkpoint_dir = (
-            args.checkpoint_dir or oc.get('checkpoint_dir', './checkpoints')
-        )
-        self._csv_dir = args.csv_dir or oc.get('csv_dir', './results/csv')
+        # Directory resolution precedence (most specific wins):
+        #   --vtk-dir / --csv-dir / --checkpoint-dir   (per-subdir override)
+        #   > --results-dir PATH                       (root → PATH/{vtk,csv,checkpoints})
+        #   > config `output` block.
+        _root = getattr(args, 'results_dir', None)
+
+        def _resolve(sub_flag, sub_name, cfg_key, cfg_default):
+            if sub_flag:
+                return sub_flag
+            if _root:
+                return os.path.join(_root, sub_name)
+            return oc.get(cfg_key, cfg_default)
+
+        output_dir = _resolve(getattr(args, 'vtk_dir', None), 'vtk',
+                              'output_dir', './results/vtk')
+        self.checkpoint_dir = _resolve(args.checkpoint_dir, 'checkpoints',
+                                       'checkpoint_dir', './checkpoints')
+        self._csv_dir = _resolve(args.csv_dir, 'csv', 'csv_dir', './results/csv')
 
         is_restart = args.restart_latest or args.restart is not None
         clear_previous = args.clear or oc.get('clear_previous', False)

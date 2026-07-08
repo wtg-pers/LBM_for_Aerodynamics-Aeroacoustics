@@ -6,11 +6,13 @@ linearizes the lifting line around the previous time step's solution. The
 sensitivity coefficients (Kleine Eq. A5/A6, 5.14) require the **lift-curve slope**
 ∂C_l/∂α at the linearization point.
 
-We obtain the slope by **central finite difference** on the existing polar query
-(C81 / csv / flat_plate alike), so no change to the polar loaders is needed.
-`delta_deg` (default 1°) smooths over local kinks of a bilinearly-interpolated
-C81 deck — Kleine §6.1 recommends a smooth (PCHIP-like) slope; a 1° central
-difference averages across the local bilinear segments to that end.
+We obtain the slope from a local **third-order (cubic) polynomial fit** of C_l(α)
+on the existing polar query (C81 / csv / flat_plate alike), matching Kleine §6.1
+("a third-order polynomial interpolation of C_l is used to avoid discontinuities
+in the lift coefficient slope" of a bilinearly-interpolated deck). Four C_l
+samples spanning ±1.5·`delta_deg` about α are fit with a cubic and its analytic
+derivative is evaluated at α. (Pre-2026-07 this was a 2-point central difference;
+the cubic is the paper's choice.)
 
 Slope is returned in **per-radian** units (Kleine's α is in radians).
 
@@ -61,7 +63,12 @@ def lift_curve_slope(
     mach: Optional[float] = None,
     delta_deg: float = 1.0,
 ) -> float:
-    """Central-difference ∂C_l/∂α  [per radian]  at one (α, Re[, name][, mach]).
+    """Third-order-polynomial ∂C_l/∂α  [per radian] at one (α, Re[, name][, mach]).
+
+    Kleine §6.1: a cubic interpolation of C_l avoids the slope discontinuities of
+    a bilinearly-interpolated deck. Four C_l samples at α + δ·{−1.5,−0.5,0.5,1.5}
+    (δ = `delta_deg`) are fit with a cubic p(x), x = (α′−α) in radians; the slope
+    is p′(0) = the linear coefficient.
 
     Args:
         polar_query: Callable returning (C_l, C_d).
@@ -69,14 +76,43 @@ def lift_curve_slope(
         Re: Reynolds number.
         name: Airfoil name (multi-airfoil polars) or None.
         mach: Section Mach (Mach-indexed polars) or None.
-        delta_deg: Central-difference half-step  [deg].
+        delta_deg: Fit-stencil spacing  [deg].
 
     Returns:
         dC_l/dα  [1/rad].
     """
-    cl_p = _cl_at(polar_query, alpha_deg + delta_deg, Re, name, mach)
-    cl_m = _cl_at(polar_query, alpha_deg - delta_deg, Re, name, mach)
-    return (cl_p - cl_m) / (2.0 * delta_deg * _DEG2RAD)   # [1/rad]
+    offs = delta_deg * np.array([-1.5, -0.5, 0.5, 1.5])       # [deg], centred at α
+    cls = np.array([_cl_at(polar_query, alpha_deg + o, Re, name, mach)
+                    for o in offs])
+    xs = offs * _DEG2RAD                                       # [rad], x=0 at α
+    coeffs = np.polyfit(xs, cls, 3)         # [a,b,c,d]: a x³ + b x² + c x + d
+    return float(coeffs[2])                 # p′(0) = c  [1/rad]
+
+
+def cubic_slope_4pt(cls, delta_deg: float = 1.0, xp=np):
+    """∂C_l/∂α [1/rad] from 4 C_l samples at α + δ·{−1.5,−0.5,0.5,1.5} [deg].
+
+    Closed-form derivative of the SAME cubic that lift_curve_slope fits with
+    np.polyfit (Kleine §6.1) — the exact 4-point centred Fornberg weights for
+    p′(0) on the equally-spaced stencil (spacing δ):
+
+        p′(0) = (c₋₃ − 27·c₋₁ + 27·c₊₁ − c₊₃) / (24·δ_rad)
+
+    Since 4 points determine the cubic uniquely, this is identical to
+    np.polyfit(xs, cls, 3)[2] up to FP round-off (verified <1e-12). Needed
+    because cupy has no polyfit → the GPU-resident BEM path uses this.
+
+    Args:
+        cls: (4, ...) samples in the order [−1.5δ, −0.5δ, +0.5δ, +1.5δ].
+        delta_deg: stencil spacing δ [deg].
+        xp: numpy or cupy (array module of `cls`).
+
+    Returns:
+        dC_l/dα [1/rad], shape cls.shape[1:].
+    """
+    d_rad = delta_deg * _DEG2RAD
+    c = cls
+    return (c[0] - 27.0 * c[1] + 27.0 * c[2] - c[3]) / (24.0 * d_rad)
 
 
 def lift_curve_slope_batch(

@@ -56,6 +56,38 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# §0. Marker radial-distribution helpers
+# =============================================================================
+def _cosine_map(xi: np.ndarray, side: str) -> np.ndarray:
+    """Map ξ∈[0,1] → [0,1], monotonic, clustering points toward an edge.
+
+    side="both": dense at both ends, "tip": dense at ξ=1, "root": dense at ξ=0.
+    All three satisfy f(0)=0, f(1)=1 (so the span endpoints are preserved).
+    """
+    if side == "both":
+        return 0.5 * (1.0 - np.cos(np.pi * xi))
+    if side == "tip":
+        return np.sin(0.5 * np.pi * xi)              # dense near ξ=1
+    if side == "root":
+        return 1.0 - np.cos(0.5 * np.pi * xi)        # dense near ξ=0
+    raise ValueError(f"unknown cosine_side {side!r} (expected 'both','tip','root')")
+
+
+def _trapezoid_widths(r: np.ndarray) -> np.ndarray:
+    """Trapezoidal control-volume widths for nodes r (endpoints get half-cells).
+
+    Δr_0 = (r_1-r_0)/2,  Δr_{N-1} = (r_{N-1}-r_{N-2})/2,
+    Δr_j = (r_{j+1}-r_{j-1})/2 (interior).  Σ Δr = r_{N-1} - r_0 (= span).
+    """
+    r = np.asarray(r, dtype=np.float64)
+    dr = np.empty_like(r)
+    dr[1:-1] = 0.5 * (r[2:] - r[:-2])
+    dr[0] = 0.5 * (r[1] - r[0])
+    dr[-1] = 0.5 * (r[-1] - r[-2])
+    return dr
+
+
+# =============================================================================
 # §1. Blade Section Data Structure
 # =============================================================================
 
@@ -186,10 +218,26 @@ class Blade:
         self.marker_chord: np.ndarray = np.array([])    # [m]
         self.marker_twist: np.ndarray = np.array([])    # [degrees]
         self.marker_sweep: np.ndarray = np.array([])    # [degrees] LE sweep Λ
+        # Geometric tip sweep: cumulative LE tangential displacement Δs(r) [m]
+        # (Step 1, patch_notes/alm_tip_sweep_refine). When `sweep_geometric` is
+        # True, markers are physically offset by (sweep_sign·Δs)·ê_θ each step so
+        # sampling/spreading act at the swept-back location. Default OFF →
+        # positions are bit-identical to the straight-line marker line.
+        self.marker_sweep_offset: np.ndarray = np.array([])   # [m] Δs along ê_θ
+        self.sweep_geometric: bool = False              # apply geometric offset?
+        self._sweep_sign: float = -1.0                  # -sign(ω): swept-back = -motion
+        # Sharp tip sweep (method 2): straight swept LE beyond a break r/R at a
+        # CONSTANT angle. When sweep_break_rR is set, Λ(r) is a STEP (not the
+        # section-interpolated ramp) and Δs(r) is exactly linear → matches the TM
+        # tip back-set. None → legacy section-interpolated sweep.
+        self.sweep_break_rR: Optional[float] = None     # r/R where sweep starts
+        self.sweep_tip_deg: float = 0.0                 # constant Λ beyond break [deg]
         self.marker_airfoil: List[str] = []
         self.marker_dr: float = 0.0                     # [m]
         self.marker_epsilon: np.ndarray = np.array([])  # [m]
         self.marker_active: np.ndarray = np.array([], dtype=bool)
+        self._marker_distribution: str = "uniform"      # set by generate_markers
+        self._cosine_side: str = "both"
 
         # Gaussian projection-width (ε) taper controls.
         # "default" reproduces ε = max(chord/4, 2·Δx) exactly; "tip_taper"
@@ -260,6 +308,8 @@ class Blade:
             self,
             n_radial: int,
             skip_inactive_root: bool = True,
+            distribution: str = "uniform",
+            cosine_side: str = "both",
         ) -> None:
         """Generate evenly-spaced marker particles along the blade span
 
@@ -310,19 +360,70 @@ class Blade:
             )
 
         n = n_radial
-        dr = effective_span / n           # [m]
-
-        self.marker_dr = dr  # [m]
         self.n_markers = n
+        r_tip = self.r_tip
+        # Remember the distribution so unit conversions (to_lattice_units) that
+        # regenerate markers preserve it instead of silently reverting to uniform.
+        self._marker_distribution = distribution
+        self._cosine_side = cosine_side
 
-        # Radial positions (cell-centered), starting from r_start  [m]
-        #   r_j = r_start + (j + 0.5) · Δr
-        self.marker_r = r_start + (np.arange(n) + 0.5) * dr  # [m]
+        # --- Radial marker placement (3 distributions; Σ marker_dr = span) ---
+        if distribution == "uniform":
+            # Cell-centred, equal spacing.  marker_dr stays a SCALAR so the
+            # downstream correction path is byte-identical to all prior runs.
+            dr = effective_span / n                          # [m]
+            self.marker_dr = dr
+            self.marker_r = r_start + (np.arange(n) + 0.5) * dr   # [m]
+        elif distribution == "cosine":
+            # Cell-centred clustering toward root/tip/both.  Cells are defined by
+            # edges mapped through the cosine, so Σ(cell width) = span exactly;
+            # markers sit at cell centres.  Reduces to "uniform" for a linear map.
+            xi_e = np.arange(n + 1) / n                      # N+1 edges in [0,1]
+            r_edges = r_start + effective_span * _cosine_map(xi_e, cosine_side)
+            self.marker_r = 0.5 * (r_edges[:-1] + r_edges[1:])    # cell centres [m]
+            self.marker_dr = np.diff(r_edges)                # (n,) per-cell Δr [m]
+        elif distribution == "endpoint":
+            # Nodes placed AT the endpoints (root-cut and tip) with trapezoidal
+            # control volumes (half-width at the ends) → Σ Δr = span.
+            self.marker_r = np.linspace(r_start, r_tip, n)   # [m] endpoints incl.
+            self.marker_dr = _trapezoid_widths(self.marker_r)    # (n,) Δr [m]
+        elif distribution == "cosine_endpoint":
+            # HYBRID of cosine ⊕ endpoint: cosine-CLUSTERED NODES that still land
+            # exactly on the endpoints (root-cut & tip, since _cosine_map(0)=0,
+            # (1)=1), with trapezoidal control volumes.  → tip/root clustering AND
+            # closure markers at r/R=root-cut & 1.0.  cosine_side picks the side(s).
+            xi = np.arange(n) / (n - 1)                      # N nodes in [0,1] incl. ends
+            self.marker_r = r_start + effective_span * _cosine_map(xi, cosine_side)
+            self.marker_dr = _trapezoid_widths(self.marker_r)    # (n,) Δr [m]
+        else:
+            raise ValueError(
+                f"unknown marker distribution {distribution!r} (expected "
+                "'uniform', 'cosine', 'endpoint', or 'cosine_endpoint')")
 
         # Interpolate properties at each marker
         self.marker_chord = self._chord_interp(self.marker_r)    # [m]
         self.marker_twist = self._twist_interp(self.marker_r)    # [degrees]
-        self.marker_sweep = self._sweep_interp(self.marker_r)    # [degrees] Λ
+        # LE sweep Λ(r) and the geometric back-set Δs(r) of the swept quarter-
+        # chord line from the straight pitch axis (0 inboard; used by the aero
+        # cosΛ and, when sweep_geometric is on, by the marker offset).
+        if self.sweep_break_rR is not None:
+            # Sharp sweep (method 2): straight swept LE at CONSTANT Λ beyond the
+            # break → Λ is a STEP and Δs is EXACTLY linear (tan Λ·(r − r_break)),
+            # independent of marker/section spacing. Matches the TM tip back-set.
+            rR = self.marker_r / self.r_tip
+            self.marker_sweep = np.where(
+                rR > self.sweep_break_rR, self.sweep_tip_deg, 0.0)   # [deg] step
+            r_break = self.sweep_break_rR * self.r_tip               # [m]
+            self.marker_sweep_offset = (
+                np.tan(np.radians(self.sweep_tip_deg))
+                * np.maximum(self.marker_r - r_break, 0.0))          # [m] exact
+        else:
+            # Legacy: section-interpolated Λ + discretised Δs = Σ tan(Λ)·dr.
+            self.marker_sweep = self._sweep_interp(self.marker_r)    # [deg] Λ
+            dr_arr = (self.marker_dr if np.ndim(self.marker_dr) > 0
+                      else np.full(n, self.marker_dr))       # (n,) per-marker Δr [m]
+            self.marker_sweep_offset = np.cumsum(
+                np.tan(np.radians(self.marker_sweep)) * dr_arr)   # [m]
 
         # Airfoil and active flag (nearest-neighbor lookup)
         self.marker_airfoil = [self._get_airfoil_at_r(r) for r in self.marker_r]
@@ -445,7 +546,15 @@ class Blade:
                 "Blade.coord_system is not set. "
                 "Use Rotor to create blades with a coordinate system."
             )
-        return self._coord_system.marker_position(self.marker_r, theta)
+        pos = self._coord_system.marker_position(self.marker_r, theta)  # (n,3)
+        # Geometric tip sweep (Step 1): shift each marker back along the blade
+        # motion direction by Δs·ê_θ (swept-back = -sign(ω)·ê_θ). ê_θ co-rotates
+        # with θ so the offset tracks the blade. Disabled (default) → unchanged.
+        if self.sweep_geometric and self.marker_sweep_offset.size:
+            e_theta = self._coord_system.tangent_vector(theta)          # (3,)
+            pos = pos + (self._sweep_sign
+                         * self.marker_sweep_offset)[:, None] * e_theta[None, :]
+        return pos
 
     def get_marker_unit_vectors(
         self,
@@ -541,7 +650,8 @@ class Blade:
         ]
         if self.n_markers > 0:
             lines += [
-                f"  Marker spacing (Δr): {self.marker_dr:.5f} m",
+                f"  Marker spacing (Δr): {np.mean(self.marker_dr):.5f} m"
+                + ("" if np.ndim(self.marker_dr) == 0 else " (mean)"),
                 f"  Chord range:    [{self.marker_chord.min():.4f}, "
                 f"{self.marker_chord.max():.4f}] m",
                 f"  Twist range:    [{self.marker_twist.min():.2f}, "
@@ -766,7 +876,13 @@ class Blade:
                 is_active=sec_dict.get('active', True),
                 sweep=float(sec_dict.get('sweep', 0.0)),
             ))
-        return cls(sections)
+        blade = cls(sections)
+        # Sharp tip sweep (method 2): constant Λ beyond a break r/R, overriding
+        # the section-interpolated ramp. Set before markers are generated.
+        if config.get('sweep_break_rR') is not None:
+            blade.sweep_break_rR = float(config['sweep_break_rR'])
+            blade.sweep_tip_deg = float(config.get('sweep_tip_deg', 0.0))
+        return blade
 
     # =================================================================
     # §4. Unit Conversion Support
@@ -812,10 +928,19 @@ class Blade:
         new_blade.epsilon_mode = self.epsilon_mode
         new_blade.epsilon_tip_factor = self.epsilon_tip_factor
         new_blade.epsilon_taper_start = self.epsilon_taper_start
+        # Sharp-sweep params are r/R- and degree-based (unit-independent) — carry
+        # them so the LU generate_markers below rebuilds the step Λ and exact Δs.
+        new_blade.sweep_break_rR = self.sweep_break_rR
+        new_blade.sweep_tip_deg = self.sweep_tip_deg
 
-        # Copy marker generation state if markers were generated
+        # Copy marker generation state if markers were generated.
+        # Preserve the radial distribution (uniform/cosine/endpoint) — otherwise
+        # the lattice-unit blade silently reverts to uniform (bug: fine-level ALM
+        # goes through here, so non-uniform distributions were being lost).
         if self.n_markers > 0:
-            new_blade.generate_markers(n_radial=self.n_markers)
+            new_blade.generate_markers(n_radial=self.n_markers,
+                                       distribution=self._marker_distribution,
+                                       cosine_side=self._cosine_side)
             if self.marker_epsilon.any():
                 # Recalculate epsilon in new units
                 new_blade.marker_epsilon = self.marker_epsilon / length_scale

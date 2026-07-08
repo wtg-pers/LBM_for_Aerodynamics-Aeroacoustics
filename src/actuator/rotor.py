@@ -433,11 +433,12 @@ class Rotor:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Compute relative velocity components for BEM calculation
 
-        From Watanabe et al. Eq. 5-8:
-            u_n, u_θ = decompose(u_global)         [Eq. 5]
-            u_rel = √(u_n² + (ω·r - u_θ)²)       [Eq. 6]
-            φ = atan2(u_n, ω·r - u_θ)             [Eq. 7]
-            α = φ - γ                              [Eq. 8]
+        Velocity triangle — Watanabe et al. Eq. 8-12 geometry, but the
+        ROTORCRAFT α sign (twist - φ, not Watanabe's turbine φ - γ):
+            u_n, u_θ = decompose(u_global)         [Eq. 8-9]
+            u_rel = √(u_n² + (ω·r - u_θ)²)       [Eq. 10]
+            φ = atan2(u_n, ω·r - u_θ)             [Eq. 11]
+            α = γ - φ   (twist - flow angle; propeller/rotor convention)
 
         Args:
             blade_idx: Blade index
@@ -576,6 +577,34 @@ class Rotor:
             radii: shape (N_b * n_markers,)  [m or lu]
         """
         return np.tile(self.blades[0].marker_r, self.n_blades)  # [m or lu]
+
+    def get_all_marker_aero_frame(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per-marker blade-local orthonormal frame at the current azimuth.
+
+        For the anisotropic Gaussian force projection (Natelson 2026 Eq. 7). With
+        the orthonormal blade frame {ê_θ(θ), ê_n, ê_r(θ)} and geometric pitch
+        (marker_twist γ):
+            ê_c =  cos γ · ê_θ + sin γ · ê_n     (chord direction)
+            ê_t = -sin γ · ê_θ + cos γ · ê_n     (thickness, ⊥ chord in section)
+            ê_r =  radial_vector(θ)               (span, shared per blade)
+        {ê_c, ê_t, ê_r} is orthonormal. Sweep rotation of the frame is not yet
+        included (outer ~5% only).
+
+        Returns:
+            (ec, et, er): each shape (N_total, 3)  [dimensionless]
+        """
+        n = self.total_markers
+        ec = np.zeros((n, 3)); et = np.zeros((n, 3)); er = np.zeros((n, 3))
+        for k in range(self.n_blades):
+            i0 = k * self.markers_per_blade
+            i1 = i0 + self.markers_per_blade
+            e_n, e_theta, e_r = self.get_blade_unit_vectors(k)   # (3,) each
+            g = np.radians(self.blades[k].marker_twist)           # (npb,) [rad]
+            c = np.cos(g)[:, None]; s = np.sin(g)[:, None]        # (npb, 1)
+            ec[i0:i1] = c * e_theta[None, :] + s * e_n[None, :]
+            et[i0:i1] = -s * e_theta[None, :] + c * e_n[None, :]
+            er[i0:i1] = e_r[None, :]
+        return ec, et, er
 
     # -----------------------------------------------------------------
     # §1.6 Aerodynamic Output Computation
@@ -789,7 +818,7 @@ class Rotor:
         lines.append("")
         lines.append("  --- Blade Geometry (shared) ---")
         lines.append(f"  Span:             {self.blades[0].span:.4f}")
-        lines.append(f"  Marker spacing:   {self.blades[0].marker_dr:.5f}")
+        lines.append(f"  Marker spacing:   {np.mean(self.blades[0].marker_dr):.5f}")
         lines.append(
             f"  Chord range:      [{self.blades[0].marker_chord.min():.4f}, "
             f"{self.blades[0].marker_chord.max():.4f}]"
@@ -1058,7 +1087,11 @@ class Rotor:
                 "along the radial direction."
             )
 
-        blade.generate_markers(n_radial=int(n_radial))
+        blade.generate_markers(
+            n_radial=int(n_radial),
+            distribution=grid_cfg.get('marker_distribution', 'uniform'),
+            cosine_side=grid_cfg.get('cosine_side', 'both'),
+        )
         blade.set_lattice_spacing(dx=dx)
 
         # Hub center

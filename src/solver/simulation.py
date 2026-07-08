@@ -360,10 +360,21 @@ class Simulation:
     def _check_nan(self, where: str) -> None:
         """Detect non-finite values in rho/u and abort with location info.
 
-        Runs every step when enabled; lightweight single reductions on GPU.
-        Set Simulation.nan_trap_enabled = False on class to disable.
+        DEFAULT OFF. The check does a per-step GPU→CPU sync (bool(xp.any(...)))
+        that serialises the async kernel pipeline and drops GPU utilisation, yet it
+        adds value ONLY when a run actually diverges. So keep it off for healthy
+        production runs and enable it ONLY to locate a blow-up on re-run:
+
+            numerics: {nan_trap: true, nan_check_every: 1}    # 1 = every step (precise)
+
+        `nan_check_every` > 1 checks every N steps — cheaper, catches the blow-up
+        within N steps (slightly less precise on the first-bad location). Wired in
+        src/solver/setup.py from the `numerics` config onto the Simulation class.
         """
-        if not getattr(self, 'nan_trap_enabled', True):
+        if not getattr(self, 'nan_trap_enabled', False):
+            return
+        every = int(getattr(self, 'nan_check_every', 1))
+        if every > 1 and (self.step_count % every) != 0:
             return
         xp = self.xp
         if self.rho is None or self.u is None:

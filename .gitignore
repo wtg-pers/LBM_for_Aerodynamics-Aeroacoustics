@@ -24,3 +24,14 @@
 **/__pycache__/
 **/.DS_Store
 **/**Zone.Identifier
+
+# 5. patch_notes 아래 대용량 런 산출물은 커밋 제외 (CSV/log/md/py는 유지).
+#    !patch_notes/** 가 재포함하므로 여기서 다시 무시해야 함.
+#    bit-gate 체크포인트는 patch note의 sha256으로 대체 → 844MB npz 커밋 불요.
+patch_notes/**/*.npz
+patch_notes/**/*.vti
+patch_notes/**/*.vtp
+patch_notes/**/*.vth
+patch_notes/**/*.vtu
+patch_notes/**/*.vtm
+patch_notes/**/*.pvd

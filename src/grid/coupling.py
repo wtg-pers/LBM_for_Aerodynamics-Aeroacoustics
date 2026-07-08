@@ -37,7 +37,17 @@ Date: 2026-04
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
+
+# Phase 1a Stage A: boundary-only C→F upsamples just a thin coarse slab per fine
+# face instead of the whole fine volume. Bit-identical on the written strips
+# (verified CPU), but measured NEUTRAL on GPU (C2F.L4 unchanged: the upsample
+# was not the C→F bottleneck — the macro/f_eq decomposition on the full coarse
+# sub, or launch/sync, dominates). So DEFAULT is the proven full-volume path;
+# boundary-only is opt-in (MLG_C2F_BOUNDARY=1) until steps 1-4 are also
+# boundary-scoped and GPU bit-identity is confirmed. See 02_phase1a_stageA.
+_C2F_BOUNDARY_ONLY = os.environ.get("MLG_C2F_BOUNDARY", "0") == "1"
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -153,6 +163,39 @@ class GridCoupling:
             slice(oz, oz + ex_nz),       # z
         )
 
+        # ── Phase 1a Stage A: boundary-only C→F face specs ───────
+        # Each of the 6 fine faces needs only a thin coarse slab: `cw` coarse
+        # nodes deep on the face-normal axis, full on the two tangential axes.
+        # cw = ow_f/2 + 2 covers the cubic stencil (radius 3 fine = 1.5 coarse),
+        # so the written strip is bit-identical to the full-volume upsample.
+        # Each spec = (coarse-slab slice, fine-write slice, slab-read slice), 4D.
+        R = region.REFINE_RATIO
+        ow_f_b = region.overlap_width * R
+        Cx, Cy, Cz = region.fine_domain_coarse.shape
+        Nx_fb, Ny_fb, Nz_fb = region.fine_shape
+        cw = ow_f_b // 2 + 2
+
+        def _face(axis: int, side: str, C: int, Nf: int):
+            cwx = min(cw, C)              # coarse nodes on the normal axis
+            wl = min(ow_f_b, Nf)         # fine strip thickness written
+            sl = 2 * cwx - 1             # upsampled slab length (normal axis)
+            if side == 'min':
+                c, w, r = slice(0, cwx), slice(0, wl), slice(0, wl)
+            else:
+                c, w, r = slice(C - cwx, C), slice(Nf - wl, Nf), slice(sl - wl, sl)
+            a = slice(None)
+            if axis == 1:
+                return ((a, c, a, a), (a, w, a, a), (a, r, a, a))
+            if axis == 2:
+                return ((a, a, c, a), (a, a, w, a), (a, a, r, a))
+            return ((a, a, a, c), (a, a, a, w), (a, a, a, r))
+
+        self._bnd_face_specs = [
+            _face(1, 'min', Cx, Nx_fb), _face(1, 'max', Cx, Nx_fb),
+            _face(2, 'min', Cy, Ny_fb), _face(2, 'max', Cy, Ny_fb),
+            _face(3, 'min', Cz, Nz_fb), _face(3, 'max', Cz, Nz_fb),
+        ]
+
     # =================================================================
     # Public: Coarse → Fine
     # =================================================================
@@ -196,12 +239,17 @@ class GridCoupling:
         # ── 4. Rescale f^neq for fine level ──────────────────────
         f_neq_fine = self._factor_c2f * f_neq
 
-        # ── 5. Upsample to fine resolution ───────────────────────
-        f_fine_full = self._upsample_to_fine(f_eq, f_neq_fine)
-
-        # ── 6. Write boundary strips to f_fine ───────────────────
-        for face_name, (sx, sy, sz) in self._fine_bnd_slices.items():
-            f_fine[:, sx, sy, sz] = f_fine_full[:, sx, sy, sz]
+        # ── 5+6. Upsample & write the 6 fine boundary strips ─────
+        # Boundary-only (Phase 1a Stage A): upsample a thin coarse slab per
+        # face rather than the full fine volume. Bit-identical on the written
+        # strips; MLG_C2F_FULL=1 restores the full-volume path.
+        coarse_nodes = f_eq + f_neq_fine
+        if _C2F_BOUNDARY_ONLY:
+            self._upsample_boundary_into(coarse_nodes, f_fine)
+        else:
+            f_fine_full = self._upsample_block(coarse_nodes)
+            for (sx, sy, sz) in self._fine_bnd_slices.values():
+                f_fine[:, sx, sy, sz] = f_fine_full[:, sx, sy, sz]
 
     # =================================================================
     # Public: Fine → Coarse
@@ -279,35 +327,46 @@ class GridCoupling:
     # Private: Upsample coarse → fine resolution
     # =================================================================
 
-    def _upsample_to_fine(
-        self, f_eq: 'npt.NDArray', f_neq_fine: 'npt.NDArray',
-    ) -> 'npt.NDArray':
-        """Create fine-resolution f from coarse (f_eq, f_neq).
-
-        Array layout: (Q, Nx_f, Ny_f, Nz_f).
-        Interpolation: axis 1=x, axis 2=y, axis 3=z.
+    def _upsample_block(self, coarse_nodes: 'npt.NDArray') -> 'npt.NDArray':
+        """Upsample a coarse block (Q, bx, by, bz) → fine (Q, 2bx-1, 2by-1,
+        2bz-1): place coarse at even fine indices, cubic-interpolate the rest
+        (axis 1=x, 2=y, 3=z). Block edges are treated as domain boundaries by
+        the interp stencil, so a written value is bit-identical to the
+        full-volume result wherever the block covers that value's stencil.
         """
         xp = self._xp
-        Nx_f, Ny_f, Nz_f = self._region.fine_shape
+        _, bx, by, bz = coarse_nodes.shape
+        nx, ny, nz = 2 * bx - 1, 2 * by - 1, 2 * bz - 1
 
-        f_coarse_nodes = f_eq + f_neq_fine
+        f_fine = xp.zeros((self._Q, nx, ny, nz), dtype=coarse_nodes.dtype)
+        f_fine[:, 0::2, 0::2, 0::2] = coarse_nodes
 
-        # Allocate: (Q, Nx_f, Ny_f, Nz_f)
-        f_fine = xp.zeros((self._Q, Nx_f, Ny_f, Nz_f), dtype=f_eq.dtype)
-
-        # Place at even indices
-        f_fine[:, 0::2, 0::2, 0::2] = f_coarse_nodes
-
-        # Interpolate odd indices: axis 1=x, 2=y, 3=z
         if self._cuda_interp is not None:
-            self._cuda_interp.interpolate(
-                f_fine, self._Q, Nx_f, Ny_f, Nz_f)
+            self._cuda_interp.interpolate(f_fine, self._Q, nx, ny, nz)
         else:
             f_fine = self._interp.interpolate_1d(xp, f_fine, axis=1)
             f_fine = self._interp.interpolate_1d(xp, f_fine, axis=2)
             f_fine = self._interp.interpolate_1d(xp, f_fine, axis=3)
 
         return f_fine
+
+    def _upsample_boundary_into(
+        self, coarse_nodes: 'npt.NDArray', f_fine: 'npt.NDArray',
+    ) -> None:
+        """Boundary-only C→F (Phase 1a Stage A): upsample one thin coarse slab
+        per fine face and write the 6 boundary strips of `f_fine` in place.
+
+        Bit-identical to `_upsample_block` over the full volume on the written
+        strips — each face slab is full on its two tangential axes and `cw`
+        coarse nodes deep on the normal axis, where `cw = ow_f/2 + 2` guarantees
+        the cubic stencil of every written fine node is inside the slab (and the
+        slab's outer edge coincides with the true domain boundary, so the
+        boundary stencil matches). The fine interior, which C→F never writes, is
+        skipped. Verified: scratchpad/phase1a_stageA_ab.py.
+        """
+        for c_sl, w_sl, r_sl in self._bnd_face_specs:
+            slab = self._upsample_block(coarse_nodes[c_sl])
+            f_fine[w_sl] = slab[r_sl]
 
     # =================================================================
     # Private: F→C Low-pass Filter

@@ -51,6 +51,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+from src.utilities.step_profiler import timed as _prof, step_done as _prof_step
+
 if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
@@ -117,6 +119,13 @@ class MultiLevelGrid:
         ]
         self._f_prev_initialized: bool = False
 
+        # ── Precomputed profiler section names (Phase 0; see step_profiler) ─
+        # Built once so the disabled hot path never formats a string.
+        self._pn_adv = tuple(f"L{k}.advance" for k in range(self._num_levels))
+        self._pn_c2f = tuple(f"C2F.L{k}" for k in range(self._num_levels))
+        self._pn_f2c = tuple(f"F2C.L{k}" for k in range(self._num_levels))
+        self._pn_fprev = tuple(f"fprev.L{k}" for k in range(self._num_levels))
+
     # =================================================================
     # Simulation-compatible interface
     # =================================================================
@@ -153,16 +162,19 @@ class MultiLevelGrid:
         # (and _f_prev[0] is then never allocated -> None).
         xp = coarse.xp
         if self._num_levels > 1:
-            xp.copyto(self._f_prev[0], coarse.f)
+            with _prof(self._pn_fprev[0]):
+                xp.copyto(self._f_prev[0], coarse.f)
 
         # ── Advance coarse level (full domain) ───────────────────
-        coarse.advance()
+        with _prof(self._pn_adv[0]):
+            coarse.advance()
 
         # ── Recursively advance all finer levels ─────────────────
         if self._num_levels > 1:
             self._advance_fine(level_k=1)
 
         self._step_count += 1
+        _prof_step()
 
     def _advance_fine(self, level_k: int) -> None:
         """Recursively advance level_k (two fine steps per coarse step).
@@ -200,17 +212,20 @@ class MultiLevelGrid:
         # Save f_prev for this level (if even finer levels exist)
         if has_finer:
             xp = sim_fine.xp
-            xp.copyto(self._f_prev[level_k], sim_fine.f)
+            with _prof(self._pn_fprev[level_k]):
+                xp.copyto(self._f_prev[level_k], sim_fine.f)
 
         # Advance fine level (collide + stream)
-        sim_fine.advance()
+        with _prof(self._pn_adv[level_k]):
+            sim_fine.advance()
 
         # C→F AFTER advance: fix boundary at t+δt_f (half-step interp)
-        coupling.coarse_to_fine(
-            sim_coarse.f, sim_fine.f,
-            is_half_step=True,
-            f_coarse_prev=self._f_prev[level_k - 1],
-        )
+        with _prof(self._pn_c2f[level_k]):
+            coupling.coarse_to_fine(
+                sim_coarse.f, sim_fine.f,
+                is_half_step=True,
+                f_coarse_prev=self._f_prev[level_k - 1],
+            )
 
         # Recurse into finer levels
         if has_finer:
@@ -223,16 +238,19 @@ class MultiLevelGrid:
         # Save f_prev for this level (if even finer levels exist)
         if has_finer:
             xp = sim_fine.xp
-            xp.copyto(self._f_prev[level_k], sim_fine.f)
+            with _prof(self._pn_fprev[level_k]):
+                xp.copyto(self._f_prev[level_k], sim_fine.f)
 
         # Advance fine level (collide + stream)
-        sim_fine.advance()
+        with _prof(self._pn_adv[level_k]):
+            sim_fine.advance()
 
         # C→F AFTER advance: fix boundary at t+δt_c (full-step)
-        coupling.coarse_to_fine(
-            sim_coarse.f, sim_fine.f,
-            is_half_step=False,
-        )
+        with _prof(self._pn_c2f[level_k]):
+            coupling.coarse_to_fine(
+                sim_coarse.f, sim_fine.f,
+                is_half_step=False,
+            )
 
         # Recurse into finer levels
         if has_finer:
@@ -241,7 +259,8 @@ class MultiLevelGrid:
         # ═════════════════════════════════════════════════════════
         # F→C feedback: overwrite coarse excised region with fine data
         # ═════════════════════════════════════════════════════════
-        coupling.fine_to_coarse(sim_fine.f, sim_coarse.f)
+        with _prof(self._pn_f2c[level_k]):
+            coupling.fine_to_coarse(sim_fine.f, sim_coarse.f)
 
     # =================================================================
     # Properties (delegate to Level 0 for Simulation compatibility)

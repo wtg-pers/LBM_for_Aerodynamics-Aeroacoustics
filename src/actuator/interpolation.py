@@ -833,11 +833,15 @@ def sample_velocity_alt(
     axis: 'npt.NDArray' = None,
     radius: float = None,
     eps_r_factor: float = 0.5,
+    ec: 'npt.NDArray' = None,
+    et: 'npt.NDArray' = None,
+    ring_n: int = 20,
+    ring_r_factor: float = 1.0,
 ) -> 'npt.NDArray':
-    """Dispatch to an alternative velocity sampler (B-i / B-ii / B-iii).
+    """Dispatch to an alternative velocity sampler (B-i / B-ii / B-iii / ring).
 
     Args:
-        mode: "point" | "aniso" | "mask_disk"  (NOT "gaussian" — use §6).
+        mode: "point" | "aniso" | "mask_disk" | "ring"  (NOT "gaussian" — use §6).
         u_field: (3, Nx, Ny, Nz)  [Δx/Δt]  (numpy or cupy)
         marker_positions: (N_markers, 3)  [lu]
         marker_epsilon: (N_markers,)  [lu]
@@ -853,6 +857,9 @@ def sample_velocity_alt(
     """
     if mode == "point":
         u = _sample_trilinear(u_field, marker_positions, xp)
+    elif mode == "ring":
+        u = _sample_ring(u_field, marker_positions, ec, et, marker_epsilon,
+                         xp, ring_n, ring_r_factor)
     elif mode == "aniso":
         u = _sample_aniso(u_field, marker_positions, marker_epsilon, xp,
                           n_cut, hub, axis, eps_r_factor)
@@ -862,7 +869,7 @@ def sample_velocity_alt(
     else:
         raise ValueError(
             f"Unknown sampling mode {mode!r} "
-            "(expected 'point', 'aniso', or 'mask_disk')"
+            "(expected 'point', 'ring', 'aniso', or 'mask_disk')"
         )
     if xp.__name__ != 'numpy':
         u = xp.asnumpy(u)
@@ -947,6 +954,40 @@ def _sample_trilinear(u_field, marker_positions, xp):
                 for d in range(3):
                     out[:, d] += w * u_field[d, ix, iy, iz]
     return out  # (N,3) [Δx/Δt]
+
+
+def _sample_ring(u_field, marker_positions, ec, et, marker_epsilon, xp,
+                 n_sensors=20, r_factor=1.0):
+    """Ring inflow sampling (Natelson 2026 / ROAM): average the trilinear velocity
+    over ``n_sensors`` points on a circle in the airfoil SECTION plane (spanned by
+    the chord ec and thickness et unit vectors) at radius ``r_factor·ε`` around
+    each marker. This averages out the marker's own smeared body-force deficit at
+    the centre, giving a cleaner estimate of the inflow the blade section sees.
+
+    Args:
+        u_field: (3, Nx, Ny, Nz)  [Δx/Δt]
+        marker_positions: (N, 3)  [lu]
+        ec, et: (N, 3) chord / thickness unit vectors (section plane basis)
+        marker_epsilon: (N,)  [lu]
+        n_sensors: number of ring points (Natelson: 20)
+        r_factor: ring radius = r_factor · ε
+
+    Returns:
+        u_markers: (N, 3)  [Δx/Δt]  (xp array; caller moves to host)
+    """
+    n = marker_positions.shape[0]
+    mp = np.asarray(marker_positions, dtype=np.float64)              # (N,3)
+    ec = np.asarray(ec, dtype=np.float64)
+    et = np.asarray(et, dtype=np.float64)
+    R = (r_factor * np.asarray(marker_epsilon, dtype=np.float64))[:, None]  # (N,1)
+    acc = xp.zeros((n, 3), dtype=xp.float64)
+    for i in range(n_sensors):
+        phi = 2.0 * np.pi * i / n_sensors
+        # sensor offset lies in the section plane -> zero component along span
+        offset = np.cos(phi) * ec + np.sin(phi) * et                # (N,3) unit
+        sensor_pos = mp + R * offset                                # (N,3) [lu]
+        acc = acc + _sample_trilinear(u_field, sensor_pos, xp)
+    return acc / float(n_sensors)                                   # (N,3) [Δx/Δt]
 
 
 def _sample_aniso(u_field, marker_positions, marker_epsilon, xp,

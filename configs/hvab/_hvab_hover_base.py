@@ -163,6 +163,38 @@ GRID_PRESETS = {
     # DEBUG: 단일레벨(extents 없음) D76 → 8·5·5·D^3 = 87.78M 셀 > 79.5M int32 임계.
     #   레벨당 셀수 천장(q*N+idx overflow) before/after 검증용. SGS off로 24GB 적합.
     "ovf87": (76, []),
+    # ★slab5 (2026-07-05): 도메인을 기존 L1 크기로 축소(3.25D×2.5D², hub 상류 0.75D)
+    #   + L1을 도메인 거의 전체로 + 로터 디스크 슬랩 L4(dx=L0/16) 추가.
+    #   L4 슬랩: lat ±17lu=1.0625R(≈사용자 1.05R 의도), x [hub−1, hub+2]lu = 48 fine
+    #   cells 두께 — 하한 근거: ALM Gaussian force/sampling 지지폭 ±3ε(등현부
+    #   ε=0.25c=5.7 L4셀 → ±17셀) + overlap. 10셀 두께는 커널이 잘려 불가.
+    #   nesting: 전 interface lat_sep≥0.15D(5lu), L3→L4 axial 3lu=0.094D(tip 가이드
+    #   0.08D 충족). L1은 outlet sponge(L=20lu, x∈[84,104]) 침범 않게 x_max=83.
+    #   ε/Δx: 팁 3.4(2Δx floor 해제·0.25c 지배), 팁 chord 13.6셀 = light_tip5급
+    #   해상을 45.3M셀/~18.6GB로 (137M/56GB 대비). 24GB GPU 적합.
+    #   ⚠주의: (a)도메인 축소+L4 동시 변경이라 기존 light 결과와 절대 CT/FM 직접
+    #   비교 불가(상류 0.75D·측면 1.25D는 호버 재순환/블로케이지 민감 — 재기준선
+    #   필요), (b)wall clock ~3.3×(updates/coarse 131M→435M).
+    #   셀: L0 0.67M + L1 4.17M + L2 9.37M + L3 13.68M + L4 17.43M = 45.3M.
+    "light_slab5": (32,
+                    [(0.65625, 1.84375, 1.15625),   # L1 max: x[3,83] y,z[3,77]
+                     (0.4,     1.0,     0.84375),   # L2: x[12,56] lat ±27
+                     (0.125,   0.25,    0.6875),    # L3: x[20,32] lat ±22
+                     (0.03125, 0.0625,  0.53125)],  # L4 slab: x[23,26] lat ±17
+                    {"nx_D": 3.25, "ny_D": 2.5, "nz_D": 2.5, "hub_x_D": 0.75}),
+    # ★bench5 (2026-07-05): HPC 업그레이드용 초고속 baseline — light_slab5의
+    #   5-level 토폴로지(로터 슬랩 L4 포함)를 D=16으로 축소, nesting 여백은
+    #   절대 lu 기준 재배치(L0→L1 3lu, 레벨간 sep 3~4lu, 슬랩 두께 3lu=48
+    #   fine cells로 ±3ε 지지 유지, lat ±9lu=±1.125R). 물리 정확도 목적이
+    #   아니라 커널/MLG/ALM/sponge 전 경로의 회귀·성능 앵커(bit-identical +
+    #   CT@2rev + MLUPS). 셀: L0 0.13M + L1 0.41M + L2 1.57M + L3 2.95M +
+    #   L4 3.98M ≈ 9.05M / ~3.7GB. 503 steps/rev, 2rev ≈ 수 분(1×4090).
+    "bench5": (16,
+               [(0.8125, 1.1875, 1.25),     # L1: x[3,35]  lat ±20 (sponge x[36,56] 앞)
+                (0.5625, 0.9375, 1.0),      # L2: x[7,31]  lat ±16
+                (0.3125, 0.3125, 0.75),     # L3: x[11,21] lat ±12
+                (0.0625, 0.125,  0.5625)],  # L4 slab: x[15,18] lat ±9
+               {"nx_D": 3.5, "ny_D": 3.0, "nz_D": 3.0, "hub_x_D": 1.0}),
 }
 DEFAULT_PRESET = "light"   # 24GB GPU 안전. tip ε floor 제한(6.3 cell). 16-cell은 fine(DGX).
 BYTES_PER_CELL = 410.0     # 실측(LBM/MLG; dyn_smag 포함 ~동일), CT 메모리모델 기준
@@ -175,7 +207,9 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
                  smoke_sgs=False, preset=None, use_sgs=True,
                  eps_correction=None, prandtl_loss=True, run_tag="",
                  tip_sweep=False, sampling=None, smoke_levels=2,
-                 n_rev=18, polar_source="neuralfoil"):
+                 n_rev=18, polar_source="neuralfoil",
+                 marker_distribution="uniform", cosine_side="both",
+                 radial_truncation=False, anisotropic=None):
     """HVAB hover config (주어진 collective, tip Mach).
 
     eps_correction : None|bool|dict  — viscous-core smearing 보정 (기본 off).
@@ -209,9 +243,17 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
         _nf = max(1, smoke_levels - 1)
         D, EXTENTS, DEVICE, N_REV = 16, _SMOKE_EXT[:_nf], "cpu", 1
         USE_SGS = smoke_sgs
+        _DOM = None
     else:
         preset_name = preset or DEFAULT_PRESET
-        D, EXTENTS = GRID_PRESETS[preset_name]
+        _pv = GRID_PRESETS[preset_name]
+        # len-3 preset = (D, EXTENTS, DOMAIN): DOMAIN overrides the default
+        # 8D×5D×5D box (nx/ny/nz in units of D, hub_x_D from the inlet).
+        if len(_pv) == 3:
+            D, EXTENTS, _DOM = _pv
+        else:
+            D, EXTENTS = _pv
+            _DOM = None
         DEVICE, N_REV, USE_SGS = "gpu", n_rev, use_sgs
     NUM_LEVELS = len(EXTENTS) + 1
 
@@ -219,8 +261,14 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
     STEPS_REV = int(round(np.pi * D / U_MAX_LU))
     RHO_LU    = 1.0
 
-    Nx, Ny, Nz = 8 * D, 5 * D, 5 * D
-    HUB_X, HUB_Y, HUB_Z = 3 * D, Ny // 2, Nz // 2
+    if not smoke and _DOM is not None:
+        Nx = int(round(_DOM["nx_D"] * D))
+        Ny = int(round(_DOM["ny_D"] * D))
+        Nz = int(round(_DOM["nz_D"] * D))
+        HUB_X, HUB_Y, HUB_Z = int(round(_DOM["hub_x_D"] * D)), Ny // 2, Nz // 2
+    else:
+        Nx, Ny, Nz = 8 * D, 5 * D, 5 * D
+        HUB_X, HUB_Y, HUB_Z = 3 * D, Ny // 2, Nz // 2
 
     def _box(up, down, lat):
         return {"x_min": HUB_X - int(up * D),  "x_max": HUB_X + int(down * D),
@@ -257,6 +305,20 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
         },
     }
 
+    # Tip-sweep options (patch_notes/alm_tip_sweep_refine). Accepts:
+    #   bool True  = FULL 3-element sweep (aero cosΛ + 기하 후퇴 + LE-법선 α)
+    #   bool False = off
+    #   dict {"aero","geometric","alpha_normal"} = 개별 A/B 토글
+    # aero cosΛ는 sweep이 활성이면 항상 적용(기하/α는 그 위 추가). marker_sweep(Λ)은
+    # sweep 활성 시에만 세팅.
+    if isinstance(tip_sweep, dict):
+        _sw_geom = bool(tip_sweep.get("geometric", False))
+        _sw_alpha = bool(tip_sweep.get("alpha_normal", False))
+        _sw_active = bool(tip_sweep.get("aero", True)) or _sw_geom or _sw_alpha
+    else:
+        _sw_active = bool(tip_sweep)
+        _sw_geom = _sw_alpha = bool(tip_sweep)     # bare True → full 3-element
+
     actuator_line = {
         "enabled": True,
         "rotor": {
@@ -266,17 +328,47 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
             "blade": {"sections": [
                 {"r": float(r), "chord": float(c), "twist": float(tw),
                  "airfoil": af, "active": act,
-                 "sweep": float(sw) if tip_sweep else 0.0}
-                for r, c, tw, af, act, sw in _blade_sections(collective_deg)]},
-            "grid": {"n_radial": N_RADIAL},
+                 "sweep": float(sw) if _sw_active else 0.0}
+                for r, c, tw, af, act, sw in _blade_sections(collective_deg)],
+                # Sharp sweep (method 2): constant 30° straight LE from the break
+                # to the tip → Λ step + exact linear back-set (TM 1.911in), not the
+                # section-interpolated ramp. Only when sweep active.
+                **({"sweep_break_rR": TAPER_START, "sweep_tip_deg": TIP_SWEEP_DEG}
+                   if _sw_active else {})},
+            "grid": {"n_radial": N_RADIAL,
+                     "marker_distribution": marker_distribution,
+                     "cosine_side": cosine_side},
         },
         "gaussian_cutoff": 3.0, "rho_ref": 1.0, "coeff_mode": "rotorcraft",
         "ramp_steps": STEPS_REV, "prandtl_loss": prandtl_loss,
+        "sweep_geometric": _sw_geom, "sweep_alpha_normal": _sw_alpha,
     }
     if eps_correction is not None:
         actuator_line["eps_correction"] = eps_correction
     if sampling is not None:
         actuator_line["sampling"] = sampling
+    _spreading = {}
+    if radial_truncation:
+        # Merabet 2021 tip/root radial truncation + renormalisation of the
+        # Gaussian source (default off → bit-identical).
+        _spreading["radial_truncation"] = True
+    if anisotropic is not None:
+        # Natelson 2026 Eq.7 / Churchfield 2017 anisotropic Gaussian force
+        # projection. Per-axis width factors × the isotropic ε (c=chord,
+        # t=thickness, r=radial); c=t=r=1 reduces exactly to isotropic.
+        # anisotropic=True → recommended physical default (chord-optimal ε_c=ε_iso
+        # ≈0.25c; thinnest-resolvable ε_t≈0.5ε_iso≈2Δx at the tip since physical
+        # 0.25·thickness is sub-grid; span ε_r=ε_iso).
+        if isinstance(anisotropic, dict):
+            _spreading["anisotropic"] = {
+                "enabled": True, "c": float(anisotropic.get("c", 1.0)),
+                "t": float(anisotropic.get("t", 1.0)),
+                "r": float(anisotropic.get("r", 1.0))}
+        elif anisotropic:
+            _spreading["anisotropic"] = {"enabled": True,
+                                         "c": 1.0, "t": 0.5, "r": 1.0}
+    if _spreading:
+        actuator_line["spreading"] = _spreading
 
     mlg = {"enabled": True, "num_levels": NUM_LEVELS, "overlap_width": 2,
            "interpolation": "cubic", "filter_level": 1, "levels": levels}

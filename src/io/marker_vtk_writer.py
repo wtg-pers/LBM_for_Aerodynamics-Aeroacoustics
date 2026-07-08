@@ -300,6 +300,8 @@ class MarkerVTPWriter:
             scalars['F_D'] = bem.F_D
             scalars['F_n'] = bem.F_n
             scalars['F_theta'] = bem.F_theta
+            if getattr(bem, 'w_corr', None) is not None:
+                scalars['w_corr'] = bem.w_corr   # smearing correction (>0 = added downwash)
 
         vectors: Dict[str, np.ndarray] = {}
         if al_model._last_forces_global is not None:

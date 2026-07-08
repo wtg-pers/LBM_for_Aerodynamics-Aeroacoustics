@@ -54,6 +54,18 @@ import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
 try:
+    import cupy as _cp                     # optional GPU backend
+except Exception:                          # pragma: no cover — CPU-only env
+    _cp = None
+
+
+def _array_module(x):
+    """Return cupy for a cupy array, else numpy (BEM GPU-resident dispatch)."""
+    if _cp is not None and isinstance(x, _cp.ndarray):
+        return _cp
+    return np
+
+try:
     import numpy.typing as npt
     _Arr = "npt.NDArray"
 except Exception:  # pragma: no cover
@@ -180,8 +192,49 @@ class _C81Table:
             (aoa, mach), data, method="linear",
             bounds_error=False, fill_value=None,  # None+clamp ⇒ no real extrap
         )
+        self._gpu = None                  # lazy (aoa,mach,data) cupy mirror
+
+    def _bilinear(self, alpha_deg, mach, xp):
+        """Clamped bilinear on the rectilinear (α,M) grid — xp∈{numpy,cupy}.
+
+        searchsorted + explicit weights; mathematically identical to
+        RegularGridInterpolator(method='linear') on this grid (verified
+        <1e-12), so the GPU-resident BEM path (cupy inputs) matches the CPU
+        reference. Non-uniform α/M grids handled via searchsorted (no index
+        arithmetic). See patch_notes/hpc_upgrade/05_p2_bem_gpu_resident_design.md.
+        """
+        if xp is _cp:
+            if self._gpu is None:         # upload grid once (static)
+                self._gpu = (_cp.asarray(self.aoa), _cp.asarray(self.mach),
+                             _cp.asarray(self.data))
+            aoa, mach_g, data = self._gpu
+        else:
+            aoa, mach_g, data = self.aoa, self.mach, self.data
+        a = xp.clip(alpha_deg, aoa[0], aoa[-1])
+        M = xp.clip(mach, mach_g[0], mach_g[-1])
+        na = aoa.shape[0]; nm = mach_g.shape[0]
+        ia = xp.clip(xp.searchsorted(aoa, a) - 1, 0, na - 2)
+        im = xp.clip(xp.searchsorted(mach_g, M) - 1, 0, nm - 2)
+        a0 = aoa[ia]; a1 = aoa[ia + 1]
+        m0 = mach_g[im]; m1 = mach_g[im + 1]
+        ta = (a - a0) / (a1 - a0)
+        tm = (M - m0) / (m1 - m0)
+        c00 = data[ia, im]; c10 = data[ia + 1, im]
+        c01 = data[ia, im + 1]; c11 = data[ia + 1, im + 1]
+        return (c00 * (1 - ta) * (1 - tm) + c10 * ta * (1 - tm)
+                + c01 * (1 - ta) * tm + c11 * ta * tm)
 
     def __call__(self, alpha_deg: Scalar, mach: Scalar) -> Scalar:
+        xp = _array_module(alpha_deg) if _array_module(alpha_deg) is _cp \
+            else _array_module(mach)
+        if xp is _cp:
+            # GPU-resident path: explicit bilinear (RegularGridInterpolator is
+            # CPU/scipy-only). Bit-close to the numpy reference below.
+            a = _cp.asarray(alpha_deg, dtype=_cp.float64)
+            M = _cp.asarray(mach, dtype=_cp.float64)
+            a_b, M_b = _cp.broadcast_arrays(a, M)
+            return self._bilinear(a_b, M_b, _cp)
+        # CPU reference path (unchanged — bit-identical to prior behavior).
         a = np.clip(np.asarray(alpha_deg, dtype=np.float64),
                     self.aoa[0], self.aoa[-1])
         M = np.clip(np.asarray(mach, dtype=np.float64),
@@ -290,6 +343,9 @@ def make_c81_polar_query(
 
     polar_query.mach_per_Re = k           # type: ignore[attr-defined]
     polar_query.polar_set = polar         # type: ignore[attr-defined]
+    # _C81Table broadcasts (α, M) arrays through one RegularGridInterpolator
+    # call, so whole-blade batched lookups are exact (same interpolant/clamp).
+    polar_query.supports_batch = True     # type: ignore[attr-defined]
     return polar_query
 
 
@@ -324,6 +380,7 @@ def make_c81_polar_query_mach(
 
     polar_query.polar_set = polar         # type: ignore[attr-defined]
     polar_query.wants_mach = True         # type: ignore[attr-defined]
+    polar_query.supports_batch = True     # type: ignore[attr-defined] (see above)
     return polar_query
 
 

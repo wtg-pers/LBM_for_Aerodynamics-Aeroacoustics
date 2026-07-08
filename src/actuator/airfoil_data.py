@@ -1632,10 +1632,20 @@ class MultiAirfoilPolarManager:
         Returns:
             query(alpha_deg, Re) → (CL, CD)
         """
+        # Resolution cache: the ALM asks for the same few names every sub-step,
+        # so resolve (case-insensitive scan + fallback warning) once per name.
+        cache = getattr(self, '_query_cache', None)
+        if cache is None:
+            cache = self._query_cache = {}
+        hit = cache.get(airfoil_name)
+        if hit is not None:
+            return hit
+
         # Normalize name (case-insensitive)
         name_lower = airfoil_name.lower()
         for key in self._queries:
             if key.lower() == name_lower:
+                cache[airfoil_name] = self._queries[key]
                 return self._queries[key]
 
         # Fallback to default
@@ -1644,6 +1654,7 @@ class MultiAirfoilPolarManager:
                 f"Unknown airfoil '{airfoil_name}', using default "
                 f"'{self._default_airfoil}'"
             )
+            cache[airfoil_name] = self._queries[self._default_airfoil]
             return self._queries[self._default_airfoil]
 
         raise KeyError(f"Airfoil '{airfoil_name}' not found and no default set")
@@ -1695,6 +1706,9 @@ class MultiAirfoilPolarManager:
             if airfoil_name is None or airfoil_name == "":
                 airfoil_name = self._default_airfoil
             return self.query(airfoil_name, alpha_deg, Re, mach=mach)
+        # Expose the manager so callers can resolve per-airfoil query functions
+        # once and issue batched (whole-blade) lookups — see ALM _lookup_cl_cd.
+        unified_query.manager = self          # type: ignore[attr-defined]
         return unified_query
 
     @property

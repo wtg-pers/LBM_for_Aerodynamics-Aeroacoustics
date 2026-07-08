@@ -30,6 +30,10 @@ import numpy as np
 _INV4PI = 1.0 / (4.0 * np.pi)
 _DEG = 180.0 / np.pi
 
+import os as _os  # noqa: E402
+_FWI_DUMP = 'ALM_PROFILE_BEM' in _os.environ   # P1: periodic array-size dump
+_fwi_calls = 0   # ns_kept grows as the wake fills → sample it a few times
+
 # =============================================================================
 # Phase 2 — exact smeared finite-segment kernel (Kleine Eq. 3.20-3.24)
 # =============================================================================
@@ -38,7 +42,29 @@ _DEG = 180.0 / np.pi
 # Eq. 3.24. NOTE: the Korean summary (docs/papers_kr/...) transcribed Eq. 3.20
 # with a spurious (Z/ε) factor in the 2nd term (which diverges); the form below
 # is the PDF's correct one.
-from scipy.special import erf as _erf  # noqa: E402
+from scipy.special import erf as _erf_cpu  # noqa: E402
+
+# --- optional GPU backend: BEM-resident free-wake (P2/S2). The whole Biot-
+# Savart influence build (freewake_influence → _seg_vz_batch → segment_missing_
+# theta) is xp-agnostic; cupy inputs run on the GPU, numpy inputs stay on the
+# CPU reference path (bit-identical). erf dispatches to cupyx on the GPU. ---
+try:
+    import cupy as _cp
+    from cupyx.scipy.special import erf as _erf_gpu
+except Exception:                          # pragma: no cover — CPU-only env
+    _cp = None
+    _erf_gpu = None
+
+
+def _am(x):
+    """Array module (cupy for a cupy array, else numpy)."""
+    if _cp is not None and isinstance(x, _cp.ndarray):
+        return _cp
+    return np
+
+
+def _erf(x, xp):
+    return _erf_gpu(x) if xp is _cp else _erf_cpu(x)
 
 
 def phi_smeared(r, Z, eps):
@@ -46,14 +72,16 @@ def phi_smeared(r, Z, eps):
 
         Φ = (1/r)[ -Z/√(r²+Z²)·erf(√(r²+Z²)/ε) + exp(-r²/ε²)·erf(Z/ε) ]
     """
-    s = np.sqrt(r * r + Z * Z)
-    return (1.0 / r) * (-Z / s * _erf(s / eps)
-                        + np.exp(-(r * r) / (eps * eps)) * _erf(Z / eps))
+    xp = _am(r)
+    s = xp.sqrt(r * r + Z * Z)
+    return (1.0 / r) * (-Z / s * _erf(s / eps, xp)
+                        + xp.exp(-(r * r) / (eps * eps)) * _erf(Z / eps, xp))
 
 
 def phi_ideal(r, Z):
     """Φⁱ(r,Z), Kleine Eq. 3.21 — singular (ε→0) limit: (1/r)(-Z/√(r²+Z²))."""
-    s = np.sqrt(r * r + Z * Z)
+    xp = _am(r)
+    s = xp.sqrt(r * r + Z * Z)
     return (1.0 / r) * (-Z / s)
 
 
@@ -177,73 +205,108 @@ def _build_segments(rings, eps, tail_len):
     Returns P1,P2 (ns,3), seg_eps (ns,), seg_edge (ns,). Segments = consecutive
     rings per edge + one semi-infinite tail per edge (oldest segment direction).
     """
-    R = np.asarray(rings, dtype=np.float64)          # (L, ne, 3)
+    xp = _am(rings[0])
+    R = xp.asarray(rings, dtype=xp.float64)          # (L, ne, 3)
     L, ne, _ = R.shape
     P1s, P2s, edges = [], [], []
     if L >= 2:
         P1s.append(R[:-1].reshape(-1, 3))
         P2s.append(R[1:].reshape(-1, 3))
-        edges.append(np.tile(np.arange(ne), L - 1))
+        edges.append(xp.tile(xp.arange(ne), L - 1))
         d = R[-1] - R[-2]
-        dn = np.sqrt((d * d).sum(1))
-        dn = np.where(dn > 1e-12, dn, 1.0)
+        dn = xp.sqrt((d * d).sum(1))
+        dn = xp.where(dn > 1e-12, dn, 1.0)
         tail = R[-1] + (tail_len / dn)[:, None] * d
-        P1s.append(R[-1]); P2s.append(tail); edges.append(np.arange(ne))
+        P1s.append(R[-1]); P2s.append(tail); edges.append(xp.arange(ne))
     else:                                            # single ring → tail only undefined
-        return (np.zeros((0, 3)), np.zeros((0, 3)),
-                np.zeros(0), np.zeros(0, dtype=int))
-    P1 = np.concatenate(P1s); P2 = np.concatenate(P2s)
-    seg_edge = np.concatenate(edges)
-    seg_eps = np.asarray(eps, dtype=np.float64)[seg_edge]
+        return (xp.zeros((0, 3)), xp.zeros((0, 3)),
+                xp.zeros(0), xp.zeros(0, dtype=int))
+    P1 = xp.concatenate(P1s); P2 = xp.concatenate(P2s)
+    seg_edge = xp.concatenate(edges)
+    seg_eps = xp.asarray(eps, dtype=xp.float64)[seg_edge]
     return P1, P2, seg_eps, seg_edge
 
 
 def _seg_vz_batch(X, P1, P2, seg_eps, axial, r_min=1e-9):
     """Axial-dir induced velocity at each control X (nc,3) from each unit-Γ
     segment P1→P2 (ns,3). Vectorized → Vz (nc, ns)."""
+    xp = _am(X)
     Lv = P2 - P1
-    Llen = np.sqrt((Lv * Lv).sum(1))
+    Llen = xp.sqrt((Lv * Lv).sum(1))
     safe = Llen > 1e-12
-    Lhat = Lv / np.where(safe, Llen, 1.0)[:, None]              # (ns,3)
+    Lhat = Lv / xp.where(safe, Llen, 1.0)[:, None]              # (ns,3)
     Xc = X[:, None, :]; P1c = P1[None, :, :]; Lc = Lhat[None, :, :]
     t = ((Xc - P1c) * Lc).sum(2)                                # (nc,ns)
     foot = P1c + t[:, :, None] * Lc
     dvec = Xc - foot
-    r = np.sqrt((dvec * dvec).sum(2))                           # (nc,ns)
-    rhat = dvec / np.where(r > r_min, r, 1.0)[:, :, None]
+    r = xp.sqrt((dvec * dvec).sum(2))                           # (nc,ns)
+    rhat = dvec / xp.where(r > r_min, r, 1.0)[:, :, None]
     Z1 = -t; Z2 = Llen[None, :] - t
-    um = segment_missing_theta(np.where(r > r_min, r, 1.0),
+    um = segment_missing_theta(xp.where(r > r_min, r, 1.0),
                                -Z2, -Z1, 1.0, seg_eps[None, :])
-    cross = np.cross(np.broadcast_to(Lc, dvec.shape), rhat)     # (nc,ns,3)
+    cross = xp.cross(xp.broadcast_to(Lc, dvec.shape), rhat)     # (nc,ns,3)
     V = um[:, :, None] * cross
     bad = (r < r_min) | (~safe[None, :])
-    V = np.where(bad[:, :, None], 0.0, V)
+    V = xp.where(bad[:, :, None], 0.0, V)
     return (V * axial[None, None, :]).sum(2)                    # (nc,ns)
 
 
-def freewake_influence(control_pos, rings, eps, axial_dir, tail_len=1.0e6):
+def freewake_influence(control_pos, rings, eps, axial_dir, tail_len=1.0e6,
+                       prune_factor=6.0):
     """Vectorized B[i,m] = (induced velocity at control i from unit-Γ trailed
     filament m) · axial_dir.  Caller forms A = Δr · (B @ G); straight semi-
     infinite limit == Phase 1 `influence_matrix`. (Cross-checked vs
-    `_freewake_influence_loop`.)"""
+    `_freewake_influence_loop`.)
+
+    `prune_factor` (default 6): the DEFICIT kernel `segment_missing_theta` decays
+    ~exp(−(d/ε)²) (d/ε=5 → 2e-13, d/ε=6 → 2e-18), so a trailed segment whose nearest
+    approach to the blade exceeds prune_factor·ε contributes nothing. A rotor helix
+    spirals away, so the vast majority of the 2-rev wake is beyond that — pruning
+    them (O(ns) bounding check on the segment's clamped nearest point to the blade
+    centroid) is NUMERICALLY IDENTICAL to the full sum but far cheaper. Set
+    prune_factor=None/inf to disable (exact reference)."""
+    xp = _am(control_pos)
     ne = rings[0].shape[0]
-    ax = np.asarray(axial_dir, dtype=np.float64)
-    ax = ax / np.sqrt(ax @ ax)
+    ax = xp.asarray(axial_dir, dtype=xp.float64)
+    ax = ax / xp.sqrt(ax @ ax)
     P1, P2, seg_eps, seg_edge = _build_segments(rings, eps, tail_len)
     if P1.shape[0] == 0:
-        return np.zeros((control_pos.shape[0], ne))
-    Vz = _seg_vz_batch(np.asarray(control_pos, dtype=np.float64),
-                       P1, P2, seg_eps, ax)                     # (nc, ns)
-    S = np.zeros((Vz.shape[1], ne))                             # edge reduction
-    S[np.arange(Vz.shape[1]), seg_edge] = 1.0
-    return Vz @ S                                               # (nc, ne)
+        return xp.zeros((control_pos.shape[0], ne))
+    X = xp.asarray(control_pos, dtype=xp.float64)
+    if prune_factor is not None and np.isfinite(prune_factor):
+        ctr = X.mean(0)                                         # blade centroid
+        brad = xp.sqrt(((X - ctr) ** 2).sum(1)).max()          # blade radius (0-d)
+        Lv = P2 - P1
+        Llen = xp.sqrt((Lv * Lv).sum(1))
+        Lhat = Lv / xp.where(Llen > 1e-12, Llen, 1.0)[:, None]
+        t = xp.clip(((ctr[None, :] - P1) * Lhat).sum(1), 0.0, Llen)  # nearest pt param
+        foot = P1 + t[:, None] * Lhat                          # clamped nearest pt
+        d_ctr = xp.sqrt(((foot - ctr[None, :]) ** 2).sum(1))   # (ns,) → blade centroid
+        keep = d_ctr < (brad + prune_factor * seg_eps)         # within cutoff of blade
+        if not bool(keep.all()):
+            P1, P2, seg_eps, seg_edge = P1[keep], P2[keep], seg_eps[keep], seg_edge[keep]
+            if P1.shape[0] == 0:
+                return xp.zeros((X.shape[0], ne))
+    global _fwi_calls
+    if _FWI_DUMP:
+        if _fwi_calls % 8000 == 0:
+            print(f"[freewake] call={_fwi_calls} nc={X.shape[0]} ne={ne} "
+                  f"ns_kept={P1.shape[0]} (after prune) → "
+                  f"Biot-Savart nc*ns_kept*3 = {X.shape[0] * P1.shape[0] * 3}")
+        _fwi_calls += 1
+    Vz = _seg_vz_batch(X, P1, P2, seg_eps, ax)                 # (nc, ns_kept)
+    S = xp.zeros((Vz.shape[1], ne))                            # edge reduction
+    S[xp.arange(Vz.shape[1]), seg_edge] = 1.0
+    return Vz @ S                                              # (nc, ne)
 
 
 def _gradient_matrix(r: np.ndarray) -> np.ndarray:
     """G such that (G @ Γ) == np.gradient(Γ, r), for non-uniform r.
 
-    Built by applying np.gradient to the unit columns so the discrete operator
-    matches the Dağ correction exactly (one-sided at the ends).
+    DEPRECATED trailed-vorticity operator (marker dΓ/dr). Kept only for
+    reference/back-compat — it DROPS the tip & root trailed vortices (Σ γ ≠ 0),
+    which made the correction ~10-30× too weak; use `edge_operator` instead.
+    See patch_notes/alm_dag_edge_fix/.
     """
     n = len(r)
     G = np.zeros((n, n), dtype=np.float64)
@@ -255,28 +318,64 @@ def _gradient_matrix(r: np.ndarray) -> np.ndarray:
     return G
 
 
-def influence_matrix(r: np.ndarray, eps: np.ndarray, dr: float) -> np.ndarray:
-    """A_ik = ∂w_i/∂Γ_k  for the semi-infinite straight trailed wake.
+def edge_operator(r: np.ndarray, eps: np.ndarray, dr):
+    """Panel-edge trailed-vortex system (Dağ & Sørensen 2020 Eq. 17-18).
 
-    w = A @ Γ reproduces the Dağ deficit downwash linearly in Γ:
-        A = -(1/4π)·Δr · (Kmat @ G),
-        Kmat_im = exp(-((r_i-r_m)/ε_m)²)/(r_i-r_m)   (signed, 0 on diagonal),
-        G = gradient matrix (dΓ/dr).
+    N markers bound N+1 panel EDGES. Returns (E, r_edge, eps_edge):
+      E       (N+1, N)  edge-difference operator, Γw = E @ Γ with
+                        Γw(j)=Γ(j)−Γ(j−1) and Γ padded 0 outside the blade →
+                        the outermost edge sheds the TIP vortex (Γw=−Γ_tip) and
+                        the innermost the root vortex, so Σ Γw = 0 (conserved).
+      r_edge  (N+1,)    edge radial positions: root, interior midpoints, tip.
+      eps_edge(N+1,)    ε on the edges (neighbour-averaged; ends = nearest marker).
+
+    The old `_gradient_matrix` (dΓ/dr at markers) silently dropped the tip/root
+    edge vortices → weak correction. dr only places the two closure edges.
     """
     n = len(r)
-    d = r[:, None] - r[None, :]                 # (i,m) signed distance  [lu]
+    drv = np.full(n, float(dr)) if np.ndim(dr) == 0 else np.asarray(dr, float)
+    r_edge = np.empty(n + 1)
+    r_edge[1:-1] = 0.5 * (r[:-1] + r[1:])            # interior midpoints
+    r_edge[0] = r[0] - 0.5 * drv[0]                  # root closure edge
+    r_edge[-1] = r[-1] + 0.5 * drv[-1]              # tip  closure edge
+    E = np.zeros((n + 1, n), dtype=np.float64)
+    E[0, 0] = 1.0                                    # Γw[0] = Γ[0] − 0 (root)
+    j = np.arange(1, n)
+    E[j, j] = 1.0; E[j, j - 1] = -1.0               # Γw[j] = Γ[j] − Γ[j−1]
+    E[n, n - 1] = -1.0                               # Γw[N] = 0 − Γ[N−1] (tip)
+    eps_edge = np.empty(n + 1)
+    eps_edge[1:-1] = 0.5 * (eps[:-1] + eps[1:])
+    eps_edge[0] = eps[0]; eps_edge[-1] = eps[-1]
+    return E, r_edge, eps_edge
+
+
+def influence_matrix(r: np.ndarray, eps: np.ndarray, dr) -> np.ndarray:
+    """A_ik = ∂w_i/∂Γ_k  for the semi-infinite straight trailed wake (edge-based,
+    Dağ & Sørensen 2020 Eq. 17-18 — matches `_viscous_core_correction`):
+
+        w = A @ Γ = +(1/4π) · Kmat_edge @ (E @ Γ),
+        Kmat_edge[i,j] = exp(-((r_i-r_edge_j)/ε_edge_j)²)/(r_i-r_edge_j),
+        E = edge-difference operator (Γw = Γ(j)−Γ(j−1), incl. tip/root closure).
+
+    The trailed vortices live on the N+1 panel EDGES so the tip vortex (−Γ_tip)
+    and root vortex are represented and Σ Γw = 0.  The pre-2026-07 form used
+    dΓ/dr at the markers × −(1/4π), dropping the two end vortices → the tip
+    correction came out ~10-30× too weak.  dr only positions the closure edges.
+    See patch_notes/alm_dag_edge_fix/.
+    """
+    E, r_edge, eps_edge = edge_operator(r, eps, dr)
+    d = r[:, None] - r_edge[None, :]                # (N, N+1) signed distance
     far = np.abs(d) > 1e-9
-    safe_d = np.where(far, d, 1.0)
-    eps_m = eps[None, :]                          # core at trailed vortex m
-    Kmat = np.where(far, np.exp(-(d / eps_m) ** 2) / safe_d, 0.0)
-    G = _gradient_matrix(r)
-    return (-_INV4PI * dr) * (Kmat @ G)          # (n,n)
+    Kmat = np.where(far, np.exp(-(d / eps_edge[None, :]) ** 2)
+                    / np.where(far, d, 1.0), 0.0)   # (N, N+1)
+    return _INV4PI * (Kmat @ E)                      # +1/(4π), (N, N)
 
 
 def _triangle(u_n: np.ndarray, u_tan: np.ndarray, twist_deg: np.ndarray):
     """(u_rel, phi_deg, alpha_deg) from axial u_n and tangential u_tan."""
-    u_rel = np.sqrt(u_n * u_n + u_tan * u_tan)
-    phi = np.arctan2(u_n, u_tan)                  # [rad]
+    xp = _am(u_n)
+    u_rel = xp.sqrt(u_n * u_n + u_tan * u_tan)
+    phi = xp.arctan2(u_n, u_tan)                  # [rad]
     alpha_deg = twist_deg - phi * _DEG
     return u_rel, phi, alpha_deg
 
@@ -311,6 +410,9 @@ def correct_noniterative(
     Returns:
         (u_n_corrected, alpha_deg_corrected, Gamma_new, w_corr).
     """
+    # xp-agnostic (P2/S3): cupy inputs → GPU-resident correction (A stays on
+    # device, no B/A D2H). xp from A (passed on the GPU path) else r.
+    xp = _am(A) if A is not None else _am(r)
     if A is None:
         A = influence_matrix(r, eps, dr)
     n = len(r)
@@ -319,26 +421,26 @@ def correct_noniterative(
     w_prev = A @ Gamma_prev                                   # missing downwash
     u_n_d = u_n + w_prev
     u_rel_d, _, alpha_d = _triangle(u_n_d, u_tan, twist_deg)
-    CL_d = np.asarray(cl_eval(alpha_d), dtype=np.float64)
-    dCL_d = np.asarray(dcl_dalpha_eval(alpha_d), dtype=np.float64)   # [1/rad]
+    CL_d = xp.asarray(cl_eval(alpha_d), dtype=xp.float64)
+    dCL_d = xp.asarray(dcl_dalpha_eval(alpha_d), dtype=xp.float64)   # [1/rad]
     Gamma_dag = 0.5 * chord * u_rel_d * CL_d                  # Γ†
 
     # ── Sensitivity b† = ∂Γ/∂u_n  at † (Kleine Eq. A5/A6 analogue) ──
     #   Γ = ½ c u_rel C_l(α);  ∂u_rel/∂u_n = u_n/u_rel;
     #   ∂α/∂u_n = -u_tan/u_rel²  →  b = ½ c (u_n C_l - u_tan dC_l/dα)/u_rel
-    safe_url = np.where(u_rel_d > 1e-12, u_rel_d, 1.0)
+    safe_url = xp.where(u_rel_d > 1e-12, u_rel_d, 1.0)
     b = 0.5 * chord * (u_n_d * CL_d - u_tan * dCL_d) / safe_url
 
     # Inactive markers (root / u_rel→0): zero feedback so their rows are identity
     # (ΔΓ=0) and they don't destabilize the solve.
     if active is not None:
-        b = np.where(active, b, 0.0)
-        Gamma_dag = np.where(active, Gamma_dag, 0.0)
+        b = xp.where(active, b, 0.0)
+        Gamma_dag = xp.where(active, Gamma_dag, 0.0)
 
     # ── Non-iterative linear solve (Kleine Eq. 5.15) ──
-    M = np.eye(n) - (b[:, None] * A)                         # I - diag(b) A
+    M = xp.eye(n) - (b[:, None] * A)                         # I - diag(b) A
     rhs = Gamma_dag - Gamma_prev
-    dGamma = np.linalg.solve(M, rhs)
+    dGamma = xp.linalg.solve(M, rhs)
     Gamma_new = Gamma_prev + dGamma
 
     # ── Apply: corrected downwash → triangle → forces (caller) ──

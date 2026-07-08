@@ -507,19 +507,26 @@ class OutputManager:
             return
 
         if self.al_model is not None:
+            # NOTE: thrust/power are shown as the dimensionless, grid-invariant
+            # C_T and C_P — NOT the raw lattice force/power. thrust_lu/power_lu are
+            # in FINEST-level lattice units and scale as (resolution)ⁿ, so they
+            # jump between a 4-level and 5-level grid for identical physics —
+            # misleading to watch. C_T=T/(ρ·A·(ωR)²), C_P=P/(ρ·A·(ωR)³) cancel that
+            # scale exactly. (Lattice values are still logged to the CSVs.)
             if self._is_multi_rotor:
                 perf = self.al_model.get_rotor_performance(rotor_idx=0)
                 self._pbar.set_postfix({
                     'rev': f"{perf.get('revolutions', 0):.2f}",
-                    'T': f"{perf.get('thrust', 0):.4f}",
+                    'C_T': f"{perf.get('C_T', 0):.5f}",
+                    'C_P': f"{perf.get('C_P', 0):.5f}",
                     'rotors': f"{self.al_model.n_rotors}",
                     'drift': f"{self._last_drift:+.3f}%",
                 })
             else:
                 self._pbar.set_postfix({
                     'rev': f"{self.al_model.rotor.n_revolutions:.2f}",
-                    'T_lu': f"{self._last_thrust_lu:.4f}",
-                    'P_lu': f"{self._last_power_lu:.4f}",
+                    'C_T': f"{self._last_ct:.5f}",
+                    'C_P': f"{self._last_cp:.5f}",
                     'drift': f"{self._last_drift:+.3f}%",
                 })
         elif self.force_mgr is not None:
@@ -597,6 +604,21 @@ class OutputManager:
         # Restore original positions (ALM needs local coords for next step)
         if self._alm_marker_origin is not None and orig_positions is not None:
             self.al_model._last_positions = orig_positions
+
+        # Correction wake filaments (Kleine free / Dağ prescribed helix) → ParaView.
+        # No-op for the straight kernel (no stored wake). Uses the same fine→global
+        # transform as the markers so the wake overlays the flow field.
+        try:
+            from src.io.wake_vtk_writer import write_wake_vtp
+            wdir = os.path.join(
+                getattr(self.marker_vtk_writer, 'output_dir', '.'), 'wake')
+            write_wake_vtp(
+                self.al_model, step, wdir,
+                origin=self._alm_marker_origin,
+                spacing=(self._alm_marker_spacing
+                         if self._alm_marker_origin is not None else 1.0))
+        except Exception:
+            pass
 
     def _check_conservation(self, step: int, sim: 'Simulation') -> None:
         """Run mass conservation check."""
