@@ -49,6 +49,7 @@ Date: 2026-04
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from src.utilities.step_profiler import timed as _prof, step_done as _prof_step
@@ -126,6 +127,24 @@ class MultiLevelGrid:
         self._pn_f2c = tuple(f"F2C.L{k}" for k in range(self._num_levels))
         self._pn_fprev = tuple(f"fprev.L{k}" for k in range(self._num_levels))
 
+        # ── Phase 1c — CUDA Graphs (S1: pure-LBM whole coarse-step) ──────
+        # advance() = ~2^M-1 sim.advance() + coupling → 150-300 kernel launches
+        # per coarse step. Phase 0 verdict = launch-bound (3620 ms ≫ 25-50 ms
+        # bandwidth floor). Capturing the entire recursion into one CUDA graph
+        # and replaying it removes per-launch/driver overhead (08 design; PoC
+        # 2.6×). ONLY valid for pure-LBM: ALM keeps a CPU-BEM in the L4 loop
+        # (uncapturable) and reallocates rho/u; see _graph_precheck().
+        self._graph_enabled = os.environ.get("MLG_CUDA_GRAPH", "0") == "1"
+        self._graph = None                 # captured cp.cuda.Graph (None until captured)
+        self._graph_stream = None          # non-blocking capture/replay stream
+        self._graph_warmup = 0             # eager steps done before capture
+        self._graph_failed = False         # permanent eager fallback after a failure
+        self._graph_ok: Optional[bool] = None   # precheck result (lazy, cached)
+        # Eager warmup before capture: allocate lazy buffers (rho/u, f_prev),
+        # JIT-compile every RawKernel, and stabilise memory-pool pointers so the
+        # captured graph binds fixed device addresses.
+        self._GRAPH_WARMUP = int(os.environ.get("MLG_CUDA_GRAPH_WARMUP", "3"))
+
     # =================================================================
     # Simulation-compatible interface
     # =================================================================
@@ -141,7 +160,37 @@ class MultiLevelGrid:
 
         Physical time advanced: δt_0 (one coarsest-level timestep).
         Total sub-steps performed: 2^(M-1) + 2^(M-2) + ... + 1 = 2^M - 1.
+
+        Execution path (Phase 1c S1):
+            - MLG_CUDA_GRAPH=1 + pure-LBM eligible → after a few eager warmup
+              steps, the whole coarse-step kernel sequence is captured into one
+              CUDA graph and every subsequent call is a single graph.launch().
+              Algorithmically identical (same kernels, same order), so the
+              per-step result is bit-identical to the eager path.
+            - otherwise → the eager recursion (_advance_eager).
         """
+        if not self._graph_should_use():
+            self._advance_eager()
+            return
+
+        # ── Fast path: replay the captured whole-step graph ──────
+        if self._graph is not None:
+            self._graph.launch(stream=self._graph_stream)
+            self._graph_stream.synchronize()
+            self._graph_replay_bookkeeping()
+            return
+
+        # ── Warmup (eager) to allocate lazy buffers & JIT kernels ─
+        if self._graph_warmup < self._GRAPH_WARMUP:
+            self._advance_eager()
+            self._graph_warmup += 1
+            return
+
+        # ── Capture the whole coarse-step on this call, then run it ─
+        self._graph_capture_and_launch()
+
+    def _advance_eager(self) -> None:
+        """Eager (non-graph) coarse timestep: the nested-stepping recursion."""
         # ── Lazy initialization of f_prev buffers ────────────────
         # Deferred from __init__ because f is set by Initializer (Layer 2)
         if not self._f_prev_initialized:
@@ -173,6 +222,103 @@ class MultiLevelGrid:
         if self._num_levels > 1:
             self._advance_fine(level_k=1)
 
+        self._step_count += 1
+        _prof_step()
+
+    # =================================================================
+    # Phase 1c — CUDA Graph capture / replay (S1: pure-LBM whole-step)
+    # =================================================================
+
+    def _graph_should_use(self) -> bool:
+        """Whether this advance() should take the CUDA-graph path.
+
+        Runs the (dynamic) precheck once and caches it. Returns False for any
+        ineligible run so advance() transparently uses the eager recursion.
+        """
+        if not self._graph_enabled or self._graph_failed:
+            return False
+        if self._graph_ok is None:
+            ok, reason = self._graph_precheck()
+            self._graph_ok = ok
+            if ok:
+                print("[MLG] CUDA graph mode ON (pure-LBM whole coarse-step); "
+                      f"capture after {self._GRAPH_WARMUP} eager warmup step(s).")
+            else:
+                print(f"[MLG] CUDA graph mode requested but ineligible: {reason}"
+                      " — using eager path.")
+        return self._graph_ok
+
+    def _graph_precheck(self) -> Tuple[bool, str]:
+        """Static eligibility of this MLG for whole-step graph capture (S1).
+
+        All must hold or capture is unsafe:
+          - cupy backend (graphs are a CUDA feature);
+          - no host↔device sync inside the captured region — MLG_PROFILE/NVTX
+            (per-section deviceSynchronize) and nan_trap (bool(xp.any(...)) .get)
+            both break capture, so both must be off;
+          - pure-LBM only: any level with an ALM model routes L4 through a
+            CPU-in-loop BEM and reallocates rho/u each step (08 §1) → the whole
+            coarse step is not a fixed pure-GPU sequence.
+        """
+        if self._levels[0].xp.__name__ != "cupy":
+            return False, "numpy backend (CPU)"
+        if "MLG_PROFILE" in os.environ or os.environ.get("MLG_NVTX") == "1":
+            return False, "MLG_PROFILE/MLG_NVTX active (per-section sync)"
+        for k, lev in enumerate(self._levels):
+            if getattr(lev, "al_model", None) is not None:
+                return False, f"L{k} has ALM (S1 is pure-LBM only; see S2)"
+            if getattr(lev, "nan_trap_enabled", False):
+                return False, f"L{k} nan_trap enabled (host sync per step)"
+        return True, "ok"
+
+    def _graph_capture_and_launch(self) -> None:
+        """Capture one whole coarse-step into a CUDA graph, then execute it.
+
+        Capture records the kernel sequence onto a non-blocking stream WITHOUT
+        executing it; the counters bumped by the record run are therefore
+        correct for exactly one step, and graph.launch() then applies the GPU
+        work. Any failure permanently disables the graph path (eager fallback)
+        after restoring counters and running one clean eager step.
+        """
+        import cupy as cp
+        snap = (self._step_count, [lev.step_count for lev in self._levels])
+        try:
+            stream = cp.cuda.Stream(non_blocking=True)
+            with stream:
+                stream.begin_capture()
+                self._advance_eager()          # records ops; not yet executed
+                graph = stream.end_capture()
+            graph.launch(stream=stream)         # apply the recorded coarse step
+            stream.synchronize()
+            self._graph = graph
+            self._graph_stream = stream
+            print("[MLG] CUDA graph captured — replaying whole coarse-step "
+                  f"(warmup done at step {self._step_count}).")
+        except Exception as e:                  # pragma: no cover (hardware path)
+            # Record run bumped counters but did NOT advance GPU state (ops were
+            # only recorded). Restore counters, then run one real eager step.
+            self._step_count, level_counts = snap
+            for lev, c in zip(self._levels, level_counts):
+                lev.step_count = c
+            try:
+                stream.end_capture()            # best-effort: close aborted capture
+            except Exception:
+                pass
+            self._graph = None
+            self._graph_failed = True
+            print(f"[MLG] CUDA graph capture FAILED ({type(e).__name__}: {e}); "
+                  "falling back to eager for the rest of the run.")
+            self._advance_eager()
+
+    def _graph_replay_bookkeeping(self) -> None:
+        """Advance Python-side counters after a graph replay.
+
+        graph.launch() re-executes only the recorded GPU ops; the host-side
+        step counters (incremented inside the record run, not the replay) must
+        be advanced manually. Level k performs 2^k sub-steps per coarse step.
+        """
+        for k, lev in enumerate(self._levels):
+            lev.step_count += (1 << k)
         self._step_count += 1
         _prof_step()
 

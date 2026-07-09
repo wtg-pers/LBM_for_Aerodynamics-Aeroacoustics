@@ -112,6 +112,26 @@ class GridCoupling:
         self._factor_c2f = scaler.rescaling_factor_c2f(lc)
         self._factor_f2c = scaler.rescaling_factor_f2c(lc)
 
+        # ── Phase 1c Target 2: fused C→F rescale kernel ──────────
+        # Replaces the unfused _compute_macroscopic + _compute_f_eq + f_neq/
+        # reconstruct elementwise chain (nsys ~39.5% of pure-LBM; the "macro/
+        # f_eq decomposition on the full coarse sub" this file already flags as
+        # the C→F bottleneck) with ONE per-node kernel. env
+        # COUPLING_FUSED_RESCALE (default 1). CV-band equivalent (fp32 last-bit);
+        # Python path (below) is the exact fallback. D3Q27 fp32 + cupy only.
+        self._fused_rescale = None
+        if (xp.__name__ == 'cupy'
+                and os.environ.get("COUPLING_FUSED_RESCALE", "1") == "1"
+                and self._Q == 27 and self._dim == 3
+                and self._c.dtype == xp.float32):
+            try:
+                from src.kernels.coupling_rescale_d3q27 import (
+                    CouplingRescaleKernelD3Q27)
+                self._fused_rescale = CouplingRescaleKernelD3Q27(
+                    self._c, self._w, self._cs2)
+            except Exception:
+                self._fused_rescale = None
+
         # ── Fine domain slices on coarse grid ────────────────────
         # Solver array: f.shape = (Q, Nx, Ny, Nz)
         # axis 1 = x, axis 2 = y, axis 3 = z
@@ -220,30 +240,35 @@ class GridCoupling:
 
         # ── 1. Extract coarse sub-volume ─────────────────────────
         f_sub = f_coarse[self._coarse_sub_slices].copy()
+        if is_half_step and f_coarse_prev is None:
+            raise ValueError(
+                "f_coarse_prev is required for half-step temporal "
+                "interpolation."
+            )
 
-        # ── 2. Temporal interpolation (half-step) ────────────────
-        if is_half_step:
-            if f_coarse_prev is None:
-                raise ValueError(
-                    "f_coarse_prev is required for half-step temporal "
-                    "interpolation."
-                )
-            f_sub_prev = f_coarse_prev[self._coarse_sub_slices]
-            f_sub = 0.5 * (f_sub_prev + f_sub)
-
-        # ── 3. Decompose: f^eq + f^neq ──────────────────────────
-        rho, u = self._compute_macroscopic(f_sub)
-        f_eq = self._compute_f_eq(rho, u)
-        f_neq = f_sub - f_eq
-
-        # ── 4. Rescale f^neq for fine level ──────────────────────
-        f_neq_fine = self._factor_c2f * f_neq
+        # ── 2-4. Temporal interp + decompose (f^eq + rescaled f^neq) ─
+        if self._fused_rescale is not None:
+            # Fused: temporal interp + macroscopic + f_eq + reconstruct in one
+            # per-node kernel (read f once, write coarse_nodes once).
+            f_prev_sub = (f_coarse_prev[self._coarse_sub_slices].copy()
+                          if is_half_step else None)
+            coarse_nodes = self._fused_rescale.c2f(
+                f_sub, f_prev_sub, is_half_step, self._factor_c2f)
+        else:
+            # Python fallback (exact prior behaviour).
+            if is_half_step:
+                f_sub_prev = f_coarse_prev[self._coarse_sub_slices]
+                f_sub = 0.5 * (f_sub_prev + f_sub)
+            rho, u = self._compute_macroscopic(f_sub)
+            f_eq = self._compute_f_eq(rho, u)
+            f_neq = f_sub - f_eq
+            f_neq_fine = self._factor_c2f * f_neq
+            coarse_nodes = f_eq + f_neq_fine
 
         # ── 5+6. Upsample & write the 6 fine boundary strips ─────
         # Boundary-only (Phase 1a Stage A): upsample a thin coarse slab per
         # face rather than the full fine volume. Bit-identical on the written
         # strips; MLG_C2F_FULL=1 restores the full-volume path.
-        coarse_nodes = f_eq + f_neq_fine
         if _C2F_BOUNDARY_ONLY:
             self._upsample_boundary_into(coarse_nodes, f_fine)
         else:

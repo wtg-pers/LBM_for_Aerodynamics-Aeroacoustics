@@ -175,37 +175,39 @@ void cubic_interp_1d_z(
     float* __restrict__ f,
     const int Q, const int Nx, const int Ny, const int Nz
 ) {
-    int total = Q * Nx * Ny;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // Thread per (q, ix, iy, iz) with iz FASTEST across threads. z is the
+    // contiguous axis, so a warp of consecutive iz touches a contiguous span
+    // -> COALESCED global access. The previous fiber-per-thread mapping
+    // (thread per (q,ix,iy), internal iz loop) put consecutive threads on iy
+    // (stride Nz) -> uncoalesced, which made this kernel ~5.7x its x/y peers
+    // for the SAME array (nsys 2026-07-08: z 876M vs x 152M ns). Arithmetic
+    // per node is identical -> bit-identical result, only the mapping changed.
+    long long total = (long long)Q * Nx * Ny * Nz;
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= total) return;
+
+    int iz = (int)(tid % Nz);
+    if ((iz & 1) == 0) return;                 // even node: coarse value, keep
+
+    long long t2 = tid / Nz;
+    int iy = (int)(t2 % Ny);
+    long long t3 = t2 / Ny;
+    int ix = (int)(t3 % Nx);
+    int q  = (int)(t3 / Nx);
 
     int NyNz = Ny * Nz;
     long long NxNyNz = (long long)Nx * NyNz;   // 64-bit: q*NxNyNz overflows int32 at N>~79.5M
-
-    int q = tid / (Nx * Ny);
-    int rem = tid - q * Nx * Ny;
-    int ix = rem / Ny;
-    int iy = rem - ix * Ny;
-
     #define FZ(z) f[q * NxNyNz + ix * NyNz + iy * Nz + (z)]
 
-    for (int iz = 3; iz <= Nz - 4; iz += 2) {
+    if (iz == 1) {                             // left boundary
+        if (Nz >= 5) FZ(1) = 0.375f * FZ(0) + 0.75f * FZ(2) - 0.125f * FZ(4);
+        else if (Nz >= 3) FZ(1) = 0.5f * (FZ(0) + FZ(2));
+    } else if (iz == Nz - 2) {                 // right boundary (Nz odd -> odd)
+        if (Nz >= 5) FZ(Nz-2) = 0.375f * FZ(Nz-1) + 0.75f * FZ(Nz-3) - 0.125f * FZ(Nz-5);
+        else if (Nz >= 3) FZ(Nz-2) = 0.5f * (FZ(Nz-3) + FZ(Nz-1));
+    } else if (iz >= 3 && iz <= Nz - 4) {      // interior
         FZ(iz) = 0.5625f * (FZ(iz-1) + FZ(iz+1))
                - 0.0625f * (FZ(iz-3) + FZ(iz+3));
-    }
-
-    if (Nz >= 5) {
-        FZ(1) = 0.375f * FZ(0) + 0.75f * FZ(2) - 0.125f * FZ(4);
-    } else if (Nz >= 3) {
-        FZ(1) = 0.5f * (FZ(0) + FZ(2));
-    }
-
-    if ((Nz - 2) % 2 == 1) {
-        if (Nz >= 5) {
-            FZ(Nz-2) = 0.375f * FZ(Nz-1) + 0.75f * FZ(Nz-3) - 0.125f * FZ(Nz-5);
-        } else if (Nz >= 3) {
-            FZ(Nz-2) = 0.5f * (FZ(Nz-3) + FZ(Nz-1));
-        }
     }
     #undef FZ
 }
@@ -264,6 +266,7 @@ class CubicInterpolationKernel3D:
         n = Q * Nx * Nz
         self._ky(((n + bs - 1) // bs,), (bs,), args)
 
-        # Z-axis: threads = Q * Nx * Ny
-        n = Q * Nx * Ny
+        # Z-axis: thread per (q, ix, iy, iz), iz fastest -> coalesced.
+        # threads = Q * Nx * Ny * Nz (even-iz lanes early-return).
+        n = Q * Nx * Ny * Nz
         self._kz(((n + bs - 1) // bs,), (bs,), args)

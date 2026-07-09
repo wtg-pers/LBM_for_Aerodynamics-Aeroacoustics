@@ -121,8 +121,14 @@ coupling. 단 util 제거는 규모 무관 유효(Amdahl 직렬구간 소멸).
   프루닝 0.0. 속도 블레이드당 24.8→4.05ms(6.1×, RTX3090).
 - **클러스터 게이트 대기**: freewake 87.5→~20-40ms, bem 102.6→~40-55, C_T=0.00915 무회귀.
 
-### 다음 — Stage 3 (correction on-device) → Stage 4 (완전 상주)
-- S3: `correct_noniterative`(solve) + velocity-triangle(`rotor.py`) xp化 → A를 CPU로 안 내림.
-  cl_eval/dcl는 S1서 GPU-ready. 전블레이드 배치는 kinematics/polar에 적용(freewake는 per-blade 유지).
-- S4: FreeWake.rings GPU 상주(shed/convect) → per-call H2D 제거, F_global cupy→spread,
-  substep sync 0 → util 최대화. 게이트: `[ALM prof]` util↑ + slab5-smoke.
+### Stage 3 — correction on-device ✅구현/❌기각 (2026-07-08) — 06/07 참조
+- S3a(correct xp)·S3b(_lookup_cl_cd xp + 배선) 구현·로컬 검증(GPU==CPU 4e-16) 완료.
+- **★클러스터 결과 = 성능 실패**: correction=n≈48 작은 배열 → GPU 런치 오버헤드 지배,
+  solve **10→148ms**(14.5×), bem 44.6→187, 완주 21→60분. 물리는 CV-band 무해.
+- **조치**: `ALM_CORR_GPU` 기본 OFF로 되돌림(S2 복귀). xp 코드 보존(opt-in, negative result).
+
+### ★최종 결론 — GPU 상주는 S2에서 종료 (Stage 4 폐기)
+- **freewake(360K)만 GPU 이득**; correction·velocity-triangle(작은 배열)은 CPU 우세.
+  S3c/S4는 같은 tiny-array 문제 반복 → 미진행. 스케일 caveat(207M선 ALM 소수)로도 ROI 없음.
+- **채택: 패치04 + S1(polar LUT) + S2(freewake GPU) = bench5 61→21분(2.9×), 물리 CV-band.**
+- (열린 대안, 비추천: correction 전체 단일 fused CUDA 커널로 tiny-launch 회피 — 대공사·저ROI.)
