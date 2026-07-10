@@ -104,18 +104,20 @@ void esoteric_bgk_d3q27(
     const int Nx, const int Ny, const int Nz,
     const int t_step                       // time step (parity: t_step & 1)
 ) {
-    int N = Nx * Ny * Nz;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // 64-bit indexing: q*N+idx overflows int32 above ~79.5M nodes/level
+    // (see project int32 kernel ceiling; cumulant esoteric already 64-bit).
+    long long N = (long long)Nx * (long long)Ny * (long long)Nz;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
     int type = node_type[idx];
     if (type == 1) return;  // SOLID: skip (implicit bounce-back)
 
     // 3D index (C-contiguous: x varies slowest)
-    int ix = idx / (Ny * Nz);
-    int rem = idx - ix * Ny * Nz;
-    int iy = rem / Nz;
-    int iz = rem - iy * Nz;
+    long long ix = idx / ((long long)Ny * Nz);
+    long long rem = idx - ix * (long long)Ny * Nz;
+    long long iy = rem / Nz;
+    long long iz = rem - iy * Nz;
 
     // Esoteric D3Q27 lattice constants (paired ordering)
     const int cx[27] = {''' + _fmt_array(CX_ESO) + r'''};
@@ -135,10 +137,10 @@ void esoteric_bgk_d3q27(
         int i = 2 * p + 1;  // odd index: 1, 3, 5, ..., 25
 
         // Neighbor in direction i
-        int nx = (ix + cx[i] + Nx) % Nx;
-        int ny = (iy + cy[i] + Ny) % Ny;
-        int nz = (iz + cz[i] + Nz) % Nz;
-        int j_i = nx * Ny * Nz + ny * Nz + nz;
+        long long nx = (ix + cx[i] + Nx) % Nx;
+        long long ny = (iy + cy[i] + Ny) % Ny;
+        long long nz = (iz + cz[i] + Nz) % Nz;
+        long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
 
         if (is_odd) {
             fhn[i]   = f[i     * N + idx];   // dir i from slot i at self
@@ -245,10 +247,10 @@ void esoteric_bgk_d3q27(
     for (int p = 0; p < 13; p++) {
         int i = 2 * p + 1;
 
-        int nx = (ix + cx[i] + Nx) % Nx;
-        int ny = (iy + cy[i] + Ny) % Ny;
-        int nz = (iz + cz[i] + Nz) % Nz;
-        int j_i = nx * Ny * Nz + ny * Nz + nz;
+        long long nx = (ix + cx[i] + Nx) % Nx;
+        long long ny = (iy + cy[i] + Ny) % Ny;
+        long long nz = (iz + cz[i] + Nz) % Nz;
+        long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
 
         if (is_odd) {
             f[(i+1) * N + j_i] = fhn[i];     // dir i -> slot i+1 at neighbor
@@ -401,3 +403,141 @@ def convert_f_esoteric_to_std(xp, f_eso: 'npt.NDArray') -> 'npt.NDArray':
         std_q = _STD_TO_ESO[eso_q]
         f_std[std_q] = f_eso[eso_q]
     return f_std
+
+
+# ============================================================
+# Gather / Scatter: Esoteric memory <-> physical distribution
+# (bridge for MLG coupling, checkpointing; pure permutation+roll
+#  = bit-exact roundtrip)
+# ============================================================
+
+def esoteric_gather_physical(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
+    """Reconstruct the physical distribution (Esoteric direction ordering)
+    from Esoteric memory, as the kernel LOAD at step `t_step` would read it.
+
+        even LOAD: f[i]@x = mem[i+1]@x ; f[i+1]@x = mem[i]@(x+c_i)
+        odd  LOAD: f[i]@x = mem[i]@x   ; f[i+1]@x = mem[i+1]@(x+c_i)
+
+    "value at x comes from array at x+c_i" == xp.roll(arr, shift=-c_i).
+    Exact inverse of init_f_esoteric / esoteric_scatter_physical.
+    """
+    f_phys = xp.empty_like(f_mem)
+    f_phys[0] = f_mem[0]
+    even = (t_step % 2 == 0)
+    ndim = f_mem.ndim - 1
+    ax = tuple(range(ndim))
+    for p in range(13):
+        i = 2 * p + 1
+        neg = tuple(-c for c in (CX_ESO[i], CY_ESO[i], CZ_ESO[i])[:ndim])
+        if even:
+            f_phys[i] = f_mem[i + 1]
+            f_phys[i + 1] = xp.roll(f_mem[i], shift=neg, axis=ax)
+        else:
+            f_phys[i] = f_mem[i]
+            f_phys[i + 1] = xp.roll(f_mem[i + 1], shift=neg, axis=ax)
+    return f_phys
+
+
+def esoteric_scatter_physical(xp, f_phys: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
+    """Place a physical distribution (Esoteric ordering) into Esoteric memory
+    so the kernel LOAD at step `t_step` reads exactly f_phys. Same mapping as
+    init_f_esoteric (kept as the single implementation)."""
+    return init_f_esoteric(xp, f_phys, t_start=t_step)
+
+
+def esoteric_gather_std(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
+    """Esoteric memory -> physical f in STANDARD D3Q27 ordering."""
+    return convert_f_esoteric_to_std(
+        xp, esoteric_gather_physical(xp, f_mem, t_step))
+
+
+def esoteric_scatter_std(xp, f_std: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
+    """Physical f in STANDARD ordering -> Esoteric memory layout."""
+    return init_f_esoteric(
+        xp, convert_f_std_to_esoteric(xp, f_std), t_start=t_step)
+
+
+# ============================================================
+# Esoteric macro pre-pass kernel: LOAD + (rho, u), no collide/store.
+# Used by the WALE/dyn_smag pre-pass and the ALM 2-pass, which need
+# the current-step macroscopic fields BEFORE the collision launch.
+# NOTE: computes on every node incl. solids (garbage there) -- same
+# as the standard MacroKernel pre-pass; ALM/rotor cases have no solids.
+# ============================================================
+
+_ESOTERIC_MACRO_KERNEL = r'''
+extern "C" __global__
+void esoteric_macro_d3q27(
+    const float* __restrict__ f,        // (27, N) Esoteric memory
+    float*       __restrict__ rho_out,  // (N,)
+    float*       __restrict__ u_out,    // (3, N)
+    const int Nx, const int Ny, const int Nz,
+    const int t_step
+) {
+    long long N = (long long)Nx * (long long)Ny * (long long)Nz;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    long long ix = idx / ((long long)Ny * Nz);
+    long long rem = idx - ix * (long long)Ny * Nz;
+    long long iy = rem / Nz;
+    long long iz = rem - iy * Nz;
+
+    const int cx[27] = {''' + _fmt_array(CX_ESO) + r'''};
+    const int cy[27] = {''' + _fmt_array(CY_ESO) + r'''};
+    const int cz[27] = {''' + _fmt_array(CZ_ESO) + r'''};
+
+    int is_odd = t_step & 1;
+
+    float fhn[27];
+    fhn[0] = f[0 * N + idx];
+    for (int p = 0; p < 13; p++) {
+        int i = 2 * p + 1;
+        long long nx = (ix + cx[i] + Nx) % Nx;
+        long long ny = (iy + cy[i] + Ny) % Ny;
+        long long nz = (iz + cz[i] + Nz) % Nz;
+        long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
+        if (is_odd) {
+            fhn[i]   = f[i     * N + idx];
+            fhn[i+1] = f[(i+1) * N + j_i];
+        } else {
+            fhn[i]   = f[(i+1) * N + idx];
+            fhn[i+1] = f[i     * N + j_i];
+        }
+    }
+
+    float rho = 0.0f, mx = 0.0f, my = 0.0f, mz = 0.0f;
+    for (int q = 0; q < 27; q++) {
+        float fq = fhn[q];
+        rho += fq; mx += cx[q]*fq; my += cy[q]*fq; mz += cz[q]*fq;
+    }
+    float inv_rho = 1.0f / rho;
+    rho_out[idx] = rho;
+    u_out[0 * N + idx] = mx * inv_rho;
+    u_out[1 * N + idx] = my * inv_rho;
+    u_out[2 * N + idx] = mz * inv_rho;
+}
+'''
+
+
+class EsotericMacroKernelD3Q27:
+    """Macro-only pre-pass on Esoteric memory (rho, u; no collide/store)."""
+
+    def __init__(self, block_size: int = 256) -> None:
+        self._block_size = block_size
+        self._kernel = None
+
+    def launch(self, f: 'npt.NDArray', rho_out: 'npt.NDArray',
+               u_out: 'npt.NDArray', Nx: int, Ny: int, Nz: int,
+               t_step: int) -> None:
+        import cupy as cp
+        if self._kernel is None:
+            self._kernel = cp.RawKernel(
+                _ESOTERIC_MACRO_KERNEL, "esoteric_macro_d3q27",
+                options=('--use_fast_math',))
+        N = Nx * Ny * Nz
+        grid = (N + self._block_size - 1) // self._block_size
+        self._kernel((grid,), (self._block_size,),
+                     (f, rho_out, u_out,
+                      cp.int32(Nx), cp.int32(Ny), cp.int32(Nz),
+                      cp.int32(t_step)))

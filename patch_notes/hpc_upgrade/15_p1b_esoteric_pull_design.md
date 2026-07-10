@@ -99,7 +99,30 @@ fused cumulant(float32) · cubic-z 코얼레싱 · C2F rescale 융합 · canonic
     max|Δrho|=7.2e-7, max|Δu|=1.3e-7(float32 last-bit), step-0부터 정확, 질량drift -3.5e-7. **전사 오류 0.**
   - `eso_sim_integration_gate.py`(BGK+cumulant, 실 Simulation): 둘 다 **PASS**(`is_cumulant` 정합, f_post None).
   - 회귀(cumulant MLG, off): 317 B/node 동일 → **무회귀**.
-- 상태: **uncommitted**(44f2f56 위). 다음 → Phase (c): MLG gather/scatter + ALM 2-pass + f_prev + checkpoint reconcile.
+- 커밋 **3b462ba**. 다음 → Phase (c).
+
+### ✅ Phase (c) reconcile — 완료·검증 (2026-07-10, 로컬 3090) — 검토시점 한계 5종 전부 해소
+- **c1 BGK 커널 64-bit**: `esoteric_d3q27.py` 커널 인덱싱 int→long long(idx/N/j_i; cumulant와 동일 컨벤션).
+- **c2 gather/scatter**(MLG 브릿지, 재구현): `esoteric_gather/scatter_{physical,std}` — LOAD 슬롯매핑의 역
+  (`roll(-c_i)`), scatter=`init_f_esoteric`(단일구현). + `EsotericMacroKernelD3Q27`(LOAD+macro만; SGS pre-pass/ALM용).
+- **c3 SGS**: esoteric cumulant 커널 템플릿화 — 표준 커널의 `_SGS_BLOCK_{OFF,SMAG,WALE}` **단일소스 재사용**.
+  smagorinsky=inline(K국소), wale/dyn_smag=2-pass(esoteric macro→기존 WALE/DynSmag 커널→nu_t_in). BGK+SGS는 명시적 거부.
+  버그 1건: `{{SGS_PARAM}}`을 라인주석 뒤에 삽입→콤마가 주석에 먹혀 nvrtc 실패. 주석 제거로 수정.
+- **c4 ALM 2-pass**: `_advance_esoteric_with_alm` — esoteric macro pre-pass(비보정 u)→`_compute_body_force`
+  (canonical-axis 파이프라인 무변경)→커널(force; Guo 보정+source 내부). `_advance_fused_with_alm` 미러.
+- **c5 MLG**: `multi_level_grid.py` `_phys_f`/`_write_phys_f` — coupling·f_prev가 항상 **물리 f(표준순서)** 를 봄
+  (비-esoteric은 identity=무회귀). coupling.py **무변경**(cubic-z/C2F 융합 80a64c9 그대로 사용). graph precheck에
+  esoteric 거부 추가(parity가 스텝마다 바뀌어 whole-step 캡처 불가).
+- **c6 checkpoint/sponge**: checkpoint는 **physical layout으로 저장**(`physical_f` 프로퍼티, output_manager 5개 사이트)
+  → restart는 기존 fresh-convert 경로 그대로(디스크 포맷 parity-free·하위호환). sponge 6면 확장(y/z 추가;
+  bc_uz=sigma 재사용이라 sponge 목표 w=0 가정 — hover엔 무해, 문서화).
+- **게이트 결과**(전부 PASS): `eso_gather_scatter`(roundtrip **bit-exact** 4-parity + 동역학 참조 4.8e-7) ·
+  `eso_sgs_alm`(A smag 커널 7.2e-7/nu_t 4e-8, B dyn_smag Simulation e2e 7.2e-7, C ALM 상수력 7.2e-7+가속확인) ·
+  `eso_mlg`(**bench5 5-level HVAB-mini topology**: 5레벨 전부 esoteric, L0-L4 max|Δ|≤8.3e-7, mass drift 표준과 동일
+  −1.49e-7) · 기존 3종(a/b/통합) 재실행 PASS.
+- 남은 정직한 한계: MLG **동역학**(ALM 강제) 검증은 (d)의 bench5_baseline smoke에서; esoteric MLG gather/scatter는
+  full-field(성능 미최적화, boundary-only는 추후); sponge 목표 w=0 가정.
+- 상태: uncommitted(3b462ba 위). 다음 → Phase (d): bench5_baseline ALM smoke(std vs eso CT) + 메모리 실측 + D40 config.
 
 ## 5. 게이트 목록 (`patch_notes/hpc_upgrade/gates/`)
 `eso_bgk_conservation_gate.py`(a) · `eso_cumulant_equiv_gate.py`(b, ★) · `eso_mlg_alm_gate.py`(c) ·

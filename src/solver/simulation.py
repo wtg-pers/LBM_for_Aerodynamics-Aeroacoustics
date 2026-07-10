@@ -389,6 +389,19 @@ class Simulation:
             return None
         return self._f_post
 
+    @property
+    def physical_f(self) -> Optional['npt.NDArray']:
+        """f in standard ordering + physical layout (checkpoint/IO safe).
+
+        Esoteric mode: gathers the single-buffer memory into a physical
+        copy (parity-free on disk -> restart uses the normal fresh-convert
+        path in set_distribution). Otherwise returns f itself.
+        """
+        if self._use_esoteric and self.f is not None:
+            from src.kernels.esoteric_d3q27 import esoteric_gather_std
+            return esoteric_gather_std(self.xp, self.f, self._esoteric_step)
+        return self.f
+
     # =====================================================================
     # Diagnostic: NaN/Inf trap
     # =====================================================================
@@ -473,8 +486,10 @@ class Simulation:
                 "Simulation not ready: call set_distribution() first"
             )
 
-        if self._use_esoteric:
+        if self._use_esoteric and self.al_model is None:
             self._advance_esoteric()
+        elif self._use_esoteric:
+            self._advance_esoteric_with_alm()
         elif self._use_fused and self.al_model is None:
             self._advance_fused()
         elif self._use_fused and self.al_model is not None:
@@ -496,6 +511,7 @@ class Simulation:
         """
         from src.kernels.esoteric_d3q27 import (
             EsotericBGKKernelD3Q27,
+            EsotericMacroKernelD3Q27,
             convert_f_std_to_esoteric,
             init_f_esoteric,
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE,
@@ -549,14 +565,38 @@ class Simulation:
 
         # Collision-model-specific kernel: cumulant (HVAB) or BGK.
         from src.collision.cumulant import CumulantCollision
+        sgs_model = self._sgs_cfg["model"]
         if isinstance(self.collision, CumulantCollision):
             from src.kernels.esoteric_cumulant_d3q27 import (
                 EsotericCumulantKernelD3Q27)
-            self._esoteric_kernel = EsotericCumulantKernelD3Q27()
+            # dyn_smag reuses the WALE kernel branch (same as standard path).
+            sgs_kernel = "wale" if sgs_model == "dyn_smag" else sgs_model
+            if sgs_kernel not in ("off", "smagorinsky", "wale"):
+                raise ValueError(
+                    f"esoteric cumulant: unsupported SGS '{sgs_model}'")
+            self._esoteric_kernel = EsotericCumulantKernelD3Q27(
+                sgs_model=sgs_kernel)
             self._esoteric_is_cumulant = True
             self._eso_omega_bulk = float(self.collision.omega_bulk)
             self._eso_omega_high = float(self.collision.omega_3)
+            # SGS buffers (mirrors the standard fused path, f32/esoteric).
+            if sgs_model in ("smagorinsky", "wale", "dyn_smag"):
+                self.nu_t = xp.zeros(self.domain_shape, dtype=xp.float32)
+            if sgs_model in ("wale", "dyn_smag"):
+                self._rho_buf = xp.empty(N, dtype=xp.float32)
+                self._u_buf = xp.empty((3, N), dtype=xp.float32)
+                self._nu_t_in = xp.empty(N, dtype=xp.float32)
+                self._eso_macro_kernel = EsotericMacroKernelD3Q27()
+                if sgs_model == "wale":
+                    from src.kernels.wale_d3q27 import WALEKernelD3Q27
+                    self._wale_kernel = WALEKernelD3Q27()
+                else:
+                    from src.kernels.dyn_smag_d3q27 import DynSmagKernelD3Q27
+                    self._wale_kernel = DynSmagKernelD3Q27()
         else:
+            if sgs_model not in ("off", "none"):
+                raise ValueError(
+                    "esoteric BGK does not support SGS (cumulant only)")
             self._esoteric_kernel = EsotericBGKKernelD3Q27()
             self._esoteric_is_cumulant = False
         self._use_esoteric = True
@@ -613,22 +653,74 @@ class Simulation:
             u_inf = getattr(sb, 'u_inf', [0.0, 0.0, 0.0])
             u_inf = u_inf.get() if hasattr(u_inf, 'get') else u_inf
             for layer_i in range(L):
-                if loc in ('xmax', 'east'):   sl = (Nx-1-layer_i, slice(None), slice(None))
-                elif loc in ('xmin', 'west'): sl = (layer_i, slice(None), slice(None))
+                if loc in ('xmax', 'east'):     sl = (Nx-1-layer_i, slice(None), slice(None))
+                elif loc in ('xmin', 'west'):   sl = (layer_i, slice(None), slice(None))
+                elif loc in ('ymax', 'north'):  sl = (slice(None), Ny-1-layer_i, slice(None))
+                elif loc in ('ymin', 'south'):  sl = (slice(None), layer_i, slice(None))
+                elif loc in ('zmax', 'top'):    sl = (slice(None), slice(None), Nz-1-layer_i)
+                elif loc in ('zmin', 'bottom'): sl = (slice(None), slice(None), layer_i)
                 else:
-                    continue  # y/z sponge: Phase 1c
+                    continue
+                # NOTE: bc_uz is reused as sigma -> sponge target w is
+                # implicitly 0 (fine for hover; documented in patch 15).
                 node_type[sl] = NODE_SPONGE
                 bc_rho[sl] = rho_inf
                 bc_ux[sl] = float(u_inf[0])
                 bc_uy[sl] = float(u_inf[1]) if len(u_inf) > 1 else 0.0
                 bc_uz[sl] = float(sigma_np[layer_i])  # reuse bc_uz as sigma
 
+    def _eso_sgs_pre_pass(self) -> None:
+        """WALE/dyn_smag pre-pass on Esoteric memory: LOAD-macro -> nu_t.
+
+        Mirrors _wale_pre_pass (3D branch), but the macro comes from the
+        Esoteric LOAD replica (the pre-collision state of THIS step)."""
+        Nx, Ny, Nz = self.domain_shape
+        self._eso_macro_kernel.launch(
+            self.f, self._rho_buf, self._u_buf, Nx, Ny, Nz,
+            self._esoteric_step)
+        if self._sgs_cfg["model"] == "wale":
+            self._wale_kernel.launch(
+                self._u_buf[0], self._u_buf[1], self._u_buf[2],
+                self._nu_t_in, Nx, Ny, Nz,
+                Cw=float(self._sgs_cfg["Cw"]), dx=1.0)
+        else:  # dyn_smag
+            self._wale_kernel.launch(
+                self._u_buf[0], self._u_buf[1], self._u_buf[2],
+                self._nu_t_in, Nx, Ny, Nz,
+                dx=1.0,
+                Cs_max=float(self._sgs_cfg["Cs_max"]),
+                alpha_sq=float(self._sgs_cfg["alpha_sq"]))
+
+    def _advance_esoteric_with_alm(self) -> None:
+        """Esoteric ALM 2-pass (mirrors _advance_fused_with_alm):
+        Pass 1 = macro from Esoteric memory (pre-collision, uncorrected u)
+        -> ALM body force -> Pass 2 = collision kernel with force (Guo
+        velocity correction + source term inside the kernel)."""
+        if not self._esoteric_is_cumulant:
+            raise RuntimeError("Esoteric ALM requires the cumulant kernel")
+        xp = self.xp
+        Nx, Ny, Nz = self.domain_shape
+        if getattr(self, '_eso_macro_kernel', None) is None:
+            from src.kernels.esoteric_d3q27 import EsotericMacroKernelD3Q27
+            self._eso_macro_kernel = EsotericMacroKernelD3Q27()
+        # Pass 1: rho/u views share memory with the 3D-shaped arrays.
+        self._eso_macro_kernel.launch(
+            self.f, self.rho.ravel(), self.u.reshape(3, -1),
+            Nx, Ny, Nz, self._esoteric_step)
+        self._check_nan("esoteric+alm:post-macro")
+        body_force = self._compute_body_force(self.u, self.rho)
+        if body_force is not None and body_force.dtype != xp.float32:
+            body_force = body_force.astype(xp.float32)
+        self.body_force = body_force
+        self._advance_esoteric()   # consumes self.body_force, then clears it
+
     def _advance_esoteric(self) -> None:
         """Esoteric Pull advance: 1 kernel launch (load+macro+BC+collide+store)."""
         Nx, Ny, Nz = self.domain_shape
         omega = 1.0 / self.tau
         if self._esoteric_is_cumulant:
-            # Cumulant. force = ALM body_force (None until ALM 2-pass, Phase 1c).
+            if self._sgs_cfg["model"] in ("wale", "dyn_smag"):
+                self._eso_sgs_pre_pass()
             self._esoteric_kernel.launch(
                 self.f, self.rho, self.u,
                 self._eso_node_type,
@@ -638,6 +730,9 @@ class Simulation:
                 Nx, Ny, Nz,
                 t_step=self._esoteric_step,
                 force=self.body_force,
+                Cs=float(self._sgs_cfg["Cs"]),
+                nu_t_out=(self.nu_t.ravel() if self.nu_t is not None else None),
+                nu_t_in=getattr(self, '_nu_t_in', None),
             )
         else:
             force_out = None

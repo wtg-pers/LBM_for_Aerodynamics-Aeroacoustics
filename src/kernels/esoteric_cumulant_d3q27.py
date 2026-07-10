@@ -30,9 +30,14 @@ from src.kernels.esoteric_d3q27 import (
     CX_ESO, CY_ESO, CZ_ESO, W_ESO, _fmt_array,
     NODE_FLUID, NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE,
 )
+# SGS branch templates: SINGLE SOURCE shared with the standard fused cumulant
+# kernel (identical blocks -> identical SGS physics in both layouts).
+from src.kernels.cumulant_d3q27 import (
+    _SGS_BLOCK_OFF, _SGS_BLOCK_WALE, _SGS_BLOCK_SMAG,
+)
 
 
-_ESOTERIC_CUMULANT_KERNEL = r'''
+_ESOTERIC_CUMULANT_TEMPLATE = r'''
 extern "C" __global__
 void esoteric_cumulant_d3q27(
     float*        __restrict__ f,          // (27, N) single buffer, in-place (Esoteric layout)
@@ -48,7 +53,7 @@ void esoteric_cumulant_d3q27(
     const float omega_bulk,                // bulk viscosity rate
     const float omega_high,                // higher-order rate (omega_3-10)
     const int Nx, const int Ny, const int Nz,
-    const int t_step                       // parity: t_step & 1
+    const int t_step{{SGS_PARAM}}
 ) {
     long long N = (long long)Nx * (long long)Ny * (long long)Nz;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -185,6 +190,7 @@ void esoteric_cumulant_d3q27(
         float w3 = omega_high, w4 = omega_high, w5 = omega_high;
         float w6 = omega_high, w7 = omega_high, w8 = omega_high;
         float w9 = omega_high, w10 = omega_high;
+{{SGS_BLOCK}}
         float C200 = K[2][0][0], C020 = K[0][2][0], C002 = K[0][0][2];
         float Dxu = -w1*0.5f*inv_rho*(2.0f*C200 - C020 - C002)
                     -w2*0.5f*inv_rho*(C200 + C020 + C002 - rho);
@@ -355,17 +361,44 @@ void esoteric_cumulant_d3q27(
 '''
 
 
+def _build_eso_cumulant_kernel(sgs_model: str) -> str:
+    """Substitute the SGS variant into the template (mirrors cumulant_d3q27).
+
+    sgs_model: "off" | "smagorinsky" (inline, local) | "wale" (nu_t from a
+    pre-pass buffer; also serves dyn_smag, which reuses the WALE branch).
+    """
+    if sgs_model == "off":
+        sgs_param = ""
+        sgs_block = _SGS_BLOCK_OFF
+    elif sgs_model == "smagorinsky":
+        sgs_param = ",\n    const float Cs,\n    float* __restrict__ nu_t_out"
+        sgs_block = _SGS_BLOCK_SMAG
+    elif sgs_model == "wale":
+        sgs_param = (",\n    const float* __restrict__ nu_t_in_buf"
+                     ",\n    float* __restrict__ nu_t_out")
+        sgs_block = _SGS_BLOCK_WALE
+    else:
+        raise ValueError(f"Unsupported sgs_model: {sgs_model!r}")
+    return (_ESOTERIC_CUMULANT_TEMPLATE
+            .replace("{{SGS_PARAM}}", sgs_param)
+            .replace("{{SGS_BLOCK}}", sgs_block))
+
+
 class EsotericCumulantKernelD3Q27:
     """Esoteric Pull + cumulant collision + BC, single launch, in-place."""
 
-    def __init__(self, block_size: int = 256) -> None:
+    def __init__(self, sgs_model: str = "off", block_size: int = 256) -> None:
+        if sgs_model not in ("off", "smagorinsky", "wale"):
+            raise ValueError(f"Unsupported sgs_model: {sgs_model!r}")
+        self._sgs_model = sgs_model
         self._block_size = block_size
         self._kernel = None
 
     def _compile(self) -> None:
         import cupy as cp
         self._kernel = cp.RawKernel(
-            _ESOTERIC_CUMULANT_KERNEL, "esoteric_cumulant_d3q27",
+            _build_eso_cumulant_kernel(self._sgs_model),
+            "esoteric_cumulant_d3q27",
             options=('--use_fast_math',))
 
     def launch(
@@ -384,6 +417,9 @@ class EsotericCumulantKernelD3Q27:
         Nx: int, Ny: int, Nz: int,
         t_step: int,
         force: Optional['npt.NDArray'] = None,
+        Cs: float = 0.0,
+        nu_t_out: Optional['npt.NDArray'] = None,
+        nu_t_in: Optional['npt.NDArray'] = None,
     ) -> None:
         if self._kernel is None:
             self._compile()
@@ -391,10 +427,19 @@ class EsotericCumulantKernelD3Q27:
         N = Nx * Ny * Nz
         grid = (N + self._block_size - 1) // self._block_size
         force_arg = force if force is not None else cp.int32(0)
-        self._kernel(
-            (grid,), (self._block_size,),
-            (f, rho_out, u_out, node_type,
-             bc_rho, bc_ux, bc_uy, bc_uz, force_arg,
-             cp.float32(omega_1), cp.float32(omega_bulk), cp.float32(omega_high),
-             cp.int32(Nx), cp.int32(Ny), cp.int32(Nz), cp.int32(t_step)),
+        base_args = (
+            f, rho_out, u_out, node_type,
+            bc_rho, bc_ux, bc_uy, bc_uz, force_arg,
+            cp.float32(omega_1), cp.float32(omega_bulk), cp.float32(omega_high),
+            cp.int32(Nx), cp.int32(Ny), cp.int32(Nz), cp.int32(t_step),
         )
+        if self._sgs_model == "smagorinsky":
+            nu_t_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
+            args = base_args + (cp.float32(Cs), nu_t_arg)
+        elif self._sgs_model == "wale":
+            nu_t_in_arg = nu_t_in if nu_t_in is not None else cp.int32(0)
+            nu_t_out_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
+            args = base_args + (nu_t_in_arg, nu_t_out_arg)
+        else:
+            args = base_args
+        self._kernel((grid,), (self._block_size,), args)

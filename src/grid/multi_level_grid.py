@@ -189,6 +189,27 @@ class MultiLevelGrid:
         # ── Capture the whole coarse-step on this call, then run it ─
         self._graph_capture_and_launch()
 
+    # ── Esoteric bridge: coupling / f_prev always see PHYSICAL f ──
+    # (standard ordering). For esoteric levels this gathers/scatters the
+    # single-buffer memory (parity = _esoteric_step, the next LOAD's view);
+    # for standard levels these are identity (zero overhead / regression).
+    # Coupling code itself is unchanged (patch 15 Phase c).
+
+    def _phys_f(self, sim) -> 'npt.NDArray':
+        """Physical (standard-ordered) f of a level; gather when esoteric."""
+        if getattr(sim, '_use_esoteric', False):
+            from src.kernels.esoteric_d3q27 import esoteric_gather_std
+            return esoteric_gather_std(sim.xp, sim.f, sim._esoteric_step)
+        return sim.f
+
+    def _write_phys_f(self, sim, f_std: 'npt.NDArray') -> None:
+        """Write physical f back into a level; scatter when esoteric."""
+        if getattr(sim, '_use_esoteric', False):
+            from src.kernels.esoteric_d3q27 import esoteric_scatter_std
+            sim.f[...] = esoteric_scatter_std(sim.xp, f_std, sim._esoteric_step)
+        elif f_std is not sim.f:
+            sim.xp.copyto(sim.f, f_std)
+
     def _advance_eager(self) -> None:
         """Eager (non-graph) coarse timestep: the nested-stepping recursion."""
         # ── Lazy initialization of f_prev buffers ────────────────
@@ -201,7 +222,7 @@ class MultiLevelGrid:
                         f"Call set_distribution() on all levels first."
                     )
                 if i < self._num_levels - 1:
-                    self._f_prev[i] = lev.xp.copy(lev.f)
+                    self._f_prev[i] = lev.xp.copy(self._phys_f(lev))
             self._f_prev_initialized = True
 
         coarse = self._levels[0]
@@ -212,7 +233,7 @@ class MultiLevelGrid:
         xp = coarse.xp
         if self._num_levels > 1:
             with _prof(self._pn_fprev[0]):
-                xp.copyto(self._f_prev[0], coarse.f)
+                xp.copyto(self._f_prev[0], self._phys_f(coarse))
 
         # ── Advance coarse level (full domain) ───────────────────
         with _prof(self._pn_adv[0]):
@@ -269,6 +290,9 @@ class MultiLevelGrid:
                 return False, f"L{k} has ALM (S1 is pure-LBM only; see S2)"
             if getattr(lev, "nan_trap_enabled", False):
                 return False, f"L{k} nan_trap enabled (host sync per step)"
+            if getattr(lev, "_use_esoteric", False):
+                return False, (f"L{k} esoteric (parity alternates per step; "
+                               "whole-step capture unsupported)")
         return True, "ok"
 
     def _graph_capture_and_launch(self) -> None:
@@ -359,7 +383,7 @@ class MultiLevelGrid:
         if has_finer:
             xp = sim_fine.xp
             with _prof(self._pn_fprev[level_k]):
-                xp.copyto(self._f_prev[level_k], sim_fine.f)
+                xp.copyto(self._f_prev[level_k], self._phys_f(sim_fine))
 
         # Advance fine level (collide + stream)
         with _prof(self._pn_adv[level_k]):
@@ -367,11 +391,13 @@ class MultiLevelGrid:
 
         # C→F AFTER advance: fix boundary at t+δt_f (half-step interp)
         with _prof(self._pn_c2f[level_k]):
+            f_fine_phys = self._phys_f(sim_fine)
             coupling.coarse_to_fine(
-                sim_coarse.f, sim_fine.f,
+                self._phys_f(sim_coarse), f_fine_phys,
                 is_half_step=True,
                 f_coarse_prev=self._f_prev[level_k - 1],
             )
+            self._write_phys_f(sim_fine, f_fine_phys)
 
         # Recurse into finer levels
         if has_finer:
@@ -385,7 +411,7 @@ class MultiLevelGrid:
         if has_finer:
             xp = sim_fine.xp
             with _prof(self._pn_fprev[level_k]):
-                xp.copyto(self._f_prev[level_k], sim_fine.f)
+                xp.copyto(self._f_prev[level_k], self._phys_f(sim_fine))
 
         # Advance fine level (collide + stream)
         with _prof(self._pn_adv[level_k]):
@@ -393,10 +419,12 @@ class MultiLevelGrid:
 
         # C→F AFTER advance: fix boundary at t+δt_c (full-step)
         with _prof(self._pn_c2f[level_k]):
+            f_fine_phys = self._phys_f(sim_fine)
             coupling.coarse_to_fine(
-                sim_coarse.f, sim_fine.f,
+                self._phys_f(sim_coarse), f_fine_phys,
                 is_half_step=False,
             )
+            self._write_phys_f(sim_fine, f_fine_phys)
 
         # Recurse into finer levels
         if has_finer:
@@ -406,7 +434,9 @@ class MultiLevelGrid:
         # F→C feedback: overwrite coarse excised region with fine data
         # ═════════════════════════════════════════════════════════
         with _prof(self._pn_f2c[level_k]):
-            coupling.fine_to_coarse(sim_fine.f, sim_coarse.f)
+            f_coarse_phys = self._phys_f(sim_coarse)
+            coupling.fine_to_coarse(self._phys_f(sim_fine), f_coarse_phys)
+            self._write_phys_f(sim_coarse, f_coarse_phys)
 
     # =================================================================
     # Properties (delegate to Level 0 for Simulation compatibility)
@@ -451,6 +481,11 @@ class MultiLevelGrid:
     def is_ready(self) -> bool:
         """Whether all levels have distributions set."""
         return all(lev.is_ready for lev in self._levels)
+
+    @property
+    def physical_f(self) -> Optional['npt.NDArray']:
+        """Level-0 f in standard ordering/layout (checkpoint/IO safe)."""
+        return self._levels[0].physical_f
 
     @property
     def tau(self) -> float:

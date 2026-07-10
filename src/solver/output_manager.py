@@ -414,7 +414,7 @@ class OutputManager:
         # ── Final checkpoint ──
         if self.checkpoint_mgr is not None:
             self.checkpoint_mgr.save(
-                step=final_step, f=sim.f, rho=rho_final,
+                step=final_step, f=sim.physical_f, rho=rho_final,
                 u=u_final, tau=self.tau, config=self.sim_params,
                 extra_data=self._build_checkpoint_extra(sim),
             )
@@ -773,7 +773,7 @@ class OutputManager:
             if self.conv_monitor.on_diverged == 'stop_with_checkpoint':
                 if self.checkpoint_mgr is not None:
                     self.checkpoint_mgr.save(
-                        step=step, f=sim.f,
+                        step=step, f=sim.physical_f,
                         rho=sim.rho, u=sim.u,
                         tau=self.tau, config=self.sim_params,
                         extra_data=self._build_checkpoint_extra(sim),
@@ -786,7 +786,7 @@ class OutputManager:
             if self.conv_monitor.on_converged == 'checkpoint_and_stop':
                 if self.checkpoint_mgr is not None:
                     self.checkpoint_mgr.save(
-                        step=step, f=sim.f,
+                        step=step, f=sim.physical_f,
                         rho=sim.rho, u=sim.u,
                         tau=self.tau, config=self.sim_params,
                     )
@@ -803,7 +803,7 @@ class OutputManager:
             if isinstance(sim, MultiLevelGrid):
                 extra['num_levels'] = sim.num_levels
                 for k in range(1, sim.num_levels):
-                    extra[f'f_level_{k}'] = sim.get_level(k).f
+                    extra[f'f_level_{k}'] = sim.get_level(k).physical_f
         return extra if extra else None
 
     def _save_checkpoint(self, step: int, sim: 'Simulation') -> None:
@@ -813,7 +813,7 @@ class OutputManager:
             return
 
         self.checkpoint_mgr.save(
-            step=step, f=sim.f, rho=sim.rho, u=sim.u,
+            step=step, f=sim.physical_f, rho=sim.rho, u=sim.u,
             tau=self.tau, config=self.sim_params,
             extra_data=self._build_checkpoint_extra(sim),
         )
