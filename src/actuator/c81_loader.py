@@ -94,6 +94,14 @@ def _read_data_floats(path: str) -> Tuple[str, list]:
         toks = ln.split()
         if not toks:
             continue
+        # psu-flavor decks label each coefficient block's Mach row with a
+        # leading "cl"/"cd"/"cm" token — skip exactly that token (the rest of
+        # the row is the Mach grid). Any other non-float leading token keeps
+        # the original meaning: start of the trailing comment block.
+        if toks[0].lower() in ("cl", "cd", "cm"):
+            toks = toks[1:]
+            if not toks:
+                continue
         try:
             float(toks[0])
         except ValueError:
@@ -104,19 +112,28 @@ def _read_data_floats(path: str) -> Tuple[str, list]:
 
 
 def _parse_header_counts(header: str) -> Tuple[str, Dict[str, int]]:
-    """Parse the packed 6×I2 dimension specifier at the end of the header.
+    """Parse the packed dimension specifier at the end of the header.
 
+    Flavors (3 × (NLM, NAL) pairs, per coefficient CL/CD/CM):
+        12 digits: (I2, I2) x 3 — classic 6xI2 (legacy + NASA OVERFLOW decks)
+        15 digits: (I2, I3) x 3 — psu decks (361 alphas: -180..180 by 1 deg)
+        18 digits: (I3, I3) x 3
     Returns (airfoil_name, {NLMC, NALC, NLMD, NALD, NLMM, NALM}).
     """
-    m = re.search(r"(\d{12})\s*$", header)
-    if not m:
+    m = re.search(r"(\d{12,18})\s*$", header)
+    if not m or len(m.group(1)) not in (12, 15, 18):
         raise ValueError(
-            f"Cannot find 12-digit C81 dimension specifier in header: "
-            f"{header!r}"
+            f"Cannot find a 12/15/18-digit C81 dimension specifier in "
+            f"header: {header!r}"
         )
     d = m.group(1)
+    wm, wa = {12: (2, 2), 15: (2, 3), 18: (3, 3)}[len(d)]
     keys = ["NLMC", "NALC", "NLMD", "NALD", "NLMM", "NALM"]
-    counts = {k: int(d[i:i + 2]) for k, i in zip(keys, range(0, 12, 2))}
+    counts: Dict[str, int] = {}
+    pos = 0
+    for i in range(3):
+        counts[keys[2 * i]] = int(d[pos:pos + wm]); pos += wm
+        counts[keys[2 * i + 1]] = int(d[pos:pos + wa]); pos += wa
     name = header[: m.start()].strip().rstrip(",").strip()
     return name, counts
 
@@ -336,7 +353,8 @@ def make_c81_polar_query(
     k = nu / (chord * sound_speed)        # [s/m · ... ] → Mach per unit Re
 
     def polar_query(alpha_deg: Scalar, Re: Scalar) -> Tuple[Scalar, Scalar]:
-        mach = k * np.asarray(Re, dtype=np.float64)
+        xp = _array_module(alpha_deg)     # GPU-resident BEM: cupy α → cupy path
+        mach = k * xp.asarray(Re, dtype=xp.float64)
         cl = polar.get_CL(alpha_deg, mach)
         cd = polar.get_CD(alpha_deg, mach)
         return cl, cd
@@ -373,7 +391,8 @@ def make_c81_polar_query_mach(
     def polar_query(
         alpha_deg: Scalar, Re: Scalar, mach: Scalar = 0.0,
     ) -> Tuple[Scalar, Scalar]:
-        m = np.asarray(mach, dtype=np.float64)
+        xp = _array_module(alpha_deg)     # GPU-resident BEM: cupy α → cupy path
+        m = xp.asarray(mach, dtype=xp.float64)
         cl = polar.get_CL(alpha_deg, m)
         cd = polar.get_CD(alpha_deg, m)
         return cl, cd

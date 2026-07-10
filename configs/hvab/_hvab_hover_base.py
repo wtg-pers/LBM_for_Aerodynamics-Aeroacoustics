@@ -73,6 +73,13 @@ def _c81(name, source="neuralfoil"):
     if source == "nasa_overflow":
         return os.path.join(_REPO, "data", "airfoils", "hvab_nasa_overflow",
                             name + "_OVERFLOW_SA.c81")
+    if source == "ksas_psu":
+        # KSAS 대조용 psu 덱 (handoff §4 배선, 2026-07-10): RC{412,410,68}_psu.c81.
+        # psu에는 RC6-08T가 없음 → RC68_psu로 fallback(RC6-08T는 RC6-08의 tab
+        # 변형; 덱을 KSAS 내부 일관으로 유지). 팁 익형 차이는 대조 해석 시 유의.
+        psu = {"RC4-12": "RC412_psu.c81", "RC4-10": "RC410_psu.c81",
+               "RC6-08": "RC68_psu.c81",  "RC6-08T": "RC68_psu.c81"}
+        return os.path.join(_REPO, "data", "airfoils", psu[name])
     return os.path.join(_REPO, "data", "airfoils", name + ".C81")
 
 N_RADIAL    = 48                                     # markers/blade (테이퍼·다익형 해상)
@@ -461,7 +468,7 @@ if __name__ == "__main__":
     om = 0.65 * C_S_PHYS / R_PHYS
     print("  M_tip=0.65 → RPM=%.1f, V_tip=%.1f m/s, twist=%.2f deg/R @ %.2fR"
           % (om * 60 / (2 * np.pi), om * R_PHYS, TWIST_RATE, TWIST_REF))
-    for src in ("neuralfoil", "nasa_overflow"):
+    for src in ("neuralfoil", "nasa_overflow", "ksas_psu"):
         print("  RC decks [%s]: " % src + ", ".join(
             "%s=%s" % (n, os.path.exists(_c81(n, src)))
             for n in ("RC4-12", "RC4-10", "RC6-08", "RC6-08T")))
