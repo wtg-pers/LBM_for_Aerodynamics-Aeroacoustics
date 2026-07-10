@@ -150,6 +150,7 @@ class Simulation:
         # Resurrected from commit 8036317. See patch_notes/hpc_upgrade/15.
         self._use_esoteric: bool = False
         self._esoteric_kernel = None
+        self._esoteric_is_cumulant: bool = False
         self._esoteric_step: int = 0
         self._esoteric_f_already_set: bool = False
 
@@ -201,7 +202,8 @@ class Simulation:
                 and self.xp.__name__ == 'cupy'
                 and len(self.domain_shape) == 3):
             from src.collision.bgk import BGKCollision
-            if isinstance(self.collision, BGKCollision):
+            from src.collision.cumulant import CumulantCollision
+            if isinstance(self.collision, (BGKCollision, CumulantCollision)):
                 try:
                     self._init_esoteric(f)
                 except Exception as e:
@@ -545,7 +547,18 @@ class Simulation:
             self._eso_needs_bounce = nb_eso.reshape(27, N)
             self._eso_force_out = xp.zeros(3, dtype=xp.float32)
 
-        self._esoteric_kernel = EsotericBGKKernelD3Q27()
+        # Collision-model-specific kernel: cumulant (HVAB) or BGK.
+        from src.collision.cumulant import CumulantCollision
+        if isinstance(self.collision, CumulantCollision):
+            from src.kernels.esoteric_cumulant_d3q27 import (
+                EsotericCumulantKernelD3Q27)
+            self._esoteric_kernel = EsotericCumulantKernelD3Q27()
+            self._esoteric_is_cumulant = True
+            self._eso_omega_bulk = float(self.collision.omega_bulk)
+            self._eso_omega_high = float(self.collision.omega_3)
+        else:
+            self._esoteric_kernel = EsotericBGKKernelD3Q27()
+            self._esoteric_is_cumulant = False
         self._use_esoteric = True
 
     def _build_esoteric_domain_bc(self, node_type, bc_rho, bc_ux, bc_uy, bc_uz,
@@ -614,19 +627,33 @@ class Simulation:
         """Esoteric Pull advance: 1 kernel launch (load+macro+BC+collide+store)."""
         Nx, Ny, Nz = self.domain_shape
         omega = 1.0 / self.tau
-        force_out = None
-        if self._eso_force_out is not None:
-            self._eso_force_out.fill(0)
-            force_out = self._eso_force_out
-        self._esoteric_kernel.launch(
-            self.f, self.rho, self.u,
-            self._eso_node_type,
-            self._eso_bc_rho, self._eso_bc_ux, self._eso_bc_uy, self._eso_bc_uz,
-            omega, Nx, Ny, Nz,
-            t_step=self._esoteric_step,
-            needs_bounce=self._eso_needs_bounce,
-            force_out=force_out,
-        )
+        if self._esoteric_is_cumulant:
+            # Cumulant. force = ALM body_force (None until ALM 2-pass, Phase 1c).
+            self._esoteric_kernel.launch(
+                self.f, self.rho, self.u,
+                self._eso_node_type,
+                self._eso_bc_rho, self._eso_bc_ux,
+                self._eso_bc_uy, self._eso_bc_uz,
+                omega, self._eso_omega_bulk, self._eso_omega_high,
+                Nx, Ny, Nz,
+                t_step=self._esoteric_step,
+                force=self.body_force,
+            )
+        else:
+            force_out = None
+            if self._eso_force_out is not None:
+                self._eso_force_out.fill(0)
+                force_out = self._eso_force_out
+            self._esoteric_kernel.launch(
+                self.f, self.rho, self.u,
+                self._eso_node_type,
+                self._eso_bc_rho, self._eso_bc_ux,
+                self._eso_bc_uy, self._eso_bc_uz,
+                omega, Nx, Ny, Nz,
+                t_step=self._esoteric_step,
+                needs_bounce=self._eso_needs_bounce,
+                force_out=force_out,
+            )
         self.body_force = None
         self._esoteric_step += 1
         self.step_count += 1

@@ -84,7 +84,22 @@ fused cumulant(float32) · cubic-z 코얼레싱 · C2F rescale 융합 · canonic
   - `eso_sim_integration_gate.py`(실 Simulation, LBM_ESOTERIC=1): `_use_esoteric=True`, `f_post=None`,
     30스텝 질량drift 7e-8, NaN無 → **PASS**.
   - 회귀(precision_dtype_probe, cumulant MLG, esoteric off): 317 B/node 동일 → **무회귀**.
-- 상태: **uncommitted**(80a64c9 위). 다음 → Phase (b).
+- 커밋 **44f2f56**. 다음 → Phase (b).
+
+### ✅ Phase (b) cumulant Esoteric Pull 재구현 — 완료·검증 (2026-07-10, 로컬 3090)
+- 신규 `src/kernels/esoteric_cumulant_d3q27.py`(`EsotericCumulantKernelD3Q27`): BGK Pull LOAD/STORE/BC 스캐폴딩에
+  현 fused cumulant collision **steps 4-8 verbatim 이식**(K[3][3][3]는 cx 무참조라 순서 무관 → 그대로 복사),
+  macro/K-binning/scatter/Guo-source만 CX_ESO로. **64-bit 인덱싱**(현 컨벤션; BGK 커널은 아직 int32=phase(c) 정리).
+  CX_ESO/W_ESO/_fmt_array는 `esoteric_d3q27`에서 import(단일소스).
+- `simulation.py` 배선 확장: `set_distribution` esoteric 분기에 CumulantCollision 추가, `_init_esoteric`가
+  cumulant 시 `EsotericCumulantKernelD3Q27`+`omega_bulk`/`omega_3` 저장, `_advance_esoteric` cumulant 분기(force 인자).
+  force=None(ALM 2-pass는 phase(c)).
+- **게이트 결과**:
+  - ★`eso_cumulant_equiv_gate.py`(esoteric cumulant vs 표준 fused cumulant, TGV 40스텝): **첫 실행 PASS** —
+    max|Δrho|=7.2e-7, max|Δu|=1.3e-7(float32 last-bit), step-0부터 정확, 질량drift -3.5e-7. **전사 오류 0.**
+  - `eso_sim_integration_gate.py`(BGK+cumulant, 실 Simulation): 둘 다 **PASS**(`is_cumulant` 정합, f_post None).
+  - 회귀(cumulant MLG, off): 317 B/node 동일 → **무회귀**.
+- 상태: **uncommitted**(44f2f56 위). 다음 → Phase (c): MLG gather/scatter + ALM 2-pass + f_prev + checkpoint reconcile.
 
 ## 5. 게이트 목록 (`patch_notes/hpc_upgrade/gates/`)
 `eso_bgk_conservation_gate.py`(a) · `eso_cumulant_equiv_gate.py`(b, ★) · `eso_mlg_alm_gate.py`(c) ·
