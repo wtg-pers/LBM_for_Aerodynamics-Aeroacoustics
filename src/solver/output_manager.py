@@ -414,7 +414,7 @@ class OutputManager:
         # ── Final checkpoint ──
         if self.checkpoint_mgr is not None:
             self.checkpoint_mgr.save(
-                step=final_step, f=sim.physical_f, rho=rho_final,
+                step=final_step, f=self._f_checkpoint_cpu(sim), rho=rho_final,
                 u=u_final, tau=self.tau, config=self.sim_params,
                 extra_data=self._build_checkpoint_extra(sim),
             )
@@ -773,7 +773,7 @@ class OutputManager:
             if self.conv_monitor.on_diverged == 'stop_with_checkpoint':
                 if self.checkpoint_mgr is not None:
                     self.checkpoint_mgr.save(
-                        step=step, f=sim.physical_f,
+                        step=step, f=self._f_checkpoint_cpu(sim),
                         rho=sim.rho, u=sim.u,
                         tau=self.tau, config=self.sim_params,
                         extra_data=self._build_checkpoint_extra(sim),
@@ -786,7 +786,7 @@ class OutputManager:
             if self.conv_monitor.on_converged == 'checkpoint_and_stop':
                 if self.checkpoint_mgr is not None:
                     self.checkpoint_mgr.save(
-                        step=step, f=sim.physical_f,
+                        step=step, f=self._f_checkpoint_cpu(sim),
                         rho=sim.rho, u=sim.u,
                         tau=self.tau, config=self.sim_params,
                     )
@@ -795,6 +795,45 @@ class OutputManager:
 
         return 'continue'
     
+    @staticmethod
+    def _f_checkpoint_cpu(sim_like):
+        """Level f for checkpointing, moved to host IMMEDIATELY.
+
+        Esoteric levels gather a full physical copy on the GPU; converting
+        to host per level (freeing the GPU copy before the next level) keeps
+        the checkpoint's GPU footprint at ~one level's f. Passing the GPU
+        arrays through to save() retained all levels simultaneously (~10 GB
+        at D40) and OOM'd the first checkpoint (2026-07-10 cluster run).
+        Non-GPU arrays pass through unchanged.
+        """
+        import numpy as _np
+        sim = (sim_like.get_level(0) if hasattr(sim_like, 'get_level')
+               else sim_like)
+        if getattr(sim, '_use_esoteric', False):
+            # SLAB-STREAMED gather -> host: a full-field GPU gather is one
+            # f-sized block (1.9-2.9 GB/level at D40) that the fragmented
+            # pool cannot reuse across levels -- the first D40 checkpoint
+            # OOM'd exactly here (2026-07-10 cluster). Gathering x-slabs via
+            # the bit-exact region gather caps the GPU transient at ~0.5 GB.
+            from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
+            xp = sim.xp
+            Nx, Ny, Nz = sim.domain_shape
+            out = _np.empty((sim.f.shape[0], Nx, Ny, Nz), dtype=sim.f.dtype)
+            step = max(1, 3_000_000 // max(Ny * Nz, 1))
+            full = (slice(None), slice(None))
+            for x0 in range(0, Nx, step):
+                sl = slice(x0, min(x0 + step, Nx))
+                g = esoteric_gather_std_region(
+                    xp, sim.f, sim._esoteric_step, (sl,) + full)
+                out[:, sl] = g.get() if hasattr(g, 'get') else g
+                del g
+            if xp.__name__ == 'cupy':
+                import cupy
+                cupy.get_default_memory_pool().free_all_blocks()
+            return out
+        f = sim.physical_f
+        return f.get() if hasattr(f, 'get') else f
+
     def _build_checkpoint_extra(self, sim) -> dict:
         """Build extra_data dict for MLG checkpoint (fine level f arrays)."""
         extra = {}
@@ -803,7 +842,10 @@ class OutputManager:
             if isinstance(sim, MultiLevelGrid):
                 extra['num_levels'] = sim.num_levels
                 for k in range(1, sim.num_levels):
-                    extra[f'f_level_{k}'] = sim.get_level(k).physical_f
+                    # Host-immediate per level: keeps the GPU transient bounded to ONE
+                    # level's gather instead of retaining every level's physical copy
+                    # until save() (OOM'd the D40 checkpoint on a 24GB card).
+                    extra[f'f_level_{k}'] = self._f_checkpoint_cpu(sim.get_level(k))
         return extra if extra else None
 
     def _save_checkpoint(self, step: int, sim: 'Simulation') -> None:
@@ -811,9 +853,14 @@ class OutputManager:
             return
         if step <= 0 or step % self.checkpoint_interval != 0:
             return
+        try:
+            import cupy
+            cupy.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
 
         self.checkpoint_mgr.save(
-            step=step, f=sim.physical_f, rho=sim.rho, u=sim.u,
+            step=step, f=self._f_checkpoint_cpu(sim), rho=sim.rho, u=sim.u,
             tau=self.tau, config=self.sim_params,
             extra_data=self._build_checkpoint_extra(sim),
         )

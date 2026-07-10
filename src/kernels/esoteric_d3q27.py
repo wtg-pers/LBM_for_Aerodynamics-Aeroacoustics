@@ -446,9 +446,29 @@ def esoteric_scatter_physical(xp, f_phys: 'npt.NDArray', t_step: int) -> 'npt.ND
 
 
 def esoteric_gather_std(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
-    """Esoteric memory -> physical f in STANDARD D3Q27 ordering."""
-    return convert_f_esoteric_to_std(
-        xp, esoteric_gather_physical(xp, f_mem, t_step))
+    """Esoteric memory -> physical f in STANDARD D3Q27 ordering.
+
+    FUSED single-allocation version (gather + reorder in one pass, writing
+    each slot directly into its standard index). The previous two-step
+    gather_physical -> convert transiently held TWO f-sized arrays, which
+    OOM'd the D40 checkpoint gather on a 24GB card (2026-07-10 cluster run).
+    Values are identical to the two-step path (pure permutation + roll).
+    """
+    out = xp.empty_like(f_mem)
+    even = (t_step % 2 == 0)
+    ndim = f_mem.ndim - 1
+    ax = tuple(range(ndim))
+    out[_STD_TO_ESO[0]] = f_mem[0]
+    for p in range(13):
+        i = 2 * p + 1
+        neg = tuple(-c for c in (CX_ESO[i], CY_ESO[i], CZ_ESO[i])[:ndim])
+        if even:
+            out[_STD_TO_ESO[i]] = f_mem[i + 1]
+            out[_STD_TO_ESO[i + 1]] = xp.roll(f_mem[i], shift=neg, axis=ax)
+        else:
+            out[_STD_TO_ESO[i]] = f_mem[i]
+            out[_STD_TO_ESO[i + 1]] = xp.roll(f_mem[i + 1], shift=neg, axis=ax)
+    return out
 
 
 def esoteric_scatter_std(xp, f_std: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
