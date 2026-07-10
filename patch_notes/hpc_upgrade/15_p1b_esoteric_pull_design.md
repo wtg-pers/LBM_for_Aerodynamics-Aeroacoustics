@@ -122,7 +122,28 @@ fused cumulant(float32) · cubic-z 코얼레싱 · C2F rescale 융합 · canonic
   −1.49e-7) · 기존 3종(a/b/통합) 재실행 PASS.
 - 남은 정직한 한계: MLG **동역학**(ALM 강제) 검증은 (d)의 bench5_baseline smoke에서; esoteric MLG gather/scatter는
   full-field(성능 미최적화, boundary-only는 추후); sponge 목표 w=0 가정.
-- 상태: uncommitted(3b462ba 위). 다음 → Phase (d): bench5_baseline ALM smoke(std vs eso CT) + 메모리 실측 + D40 config.
+- 커밋 **c7a1cd1**. 다음 → Phase (d).
+
+### ✅ Phase (d) HVAB-mini ALM smoke + 메모리 실측 — 완료 (2026-07-10, 로컬 3090)
+- f32 가드 추가(esoteric은 f32 전용, f64 유입 시 명시 거부).
+- **`eso_bench5_alm_smoke.py` PASS** — bench5_baseline(HVAB D16, 5-level MLG+cumulant+dyn_smag+eq/sponge+회전 ALM),
+  20 coarse steps std vs eso: 추력 |F| 추적 **median tail rel 7.7e-5**(계통 편향 無) / max 1.1e-2(간헐 스파이크
+  = free-wake fp-카오스, repo 확립 CV-band ±3% 내; 게이트=median<1e-3 AND max<3e-2 카오스-인지형). NaN 無.
+- **메모리 실측**: pure-LBM eso **2.556GB vs std 3.584GB = −1.03GB**(f_post 제거 예측치 정확 일치, L4 f_post=None);
+  ALM eso **2.676 vs std 3.765 = −1.09GB**. leak 無(스텝 1→12 used 평탄). 측정 교훈: 동일 프로세스 연속 빌드는
+  gc.collect() 필수(잔존 참조 ~1.4GB이 다음 측정 오염).
+- ★★**D40 정직한 재산정 — 현 상태로는 24GB 불가**:
+  - live(used) 성분합 @D40(91.6M): f 9.9 + rho/u 1.5 + bc 1.6 + **f_prev 7.0**(비-finest 65.2M×108B, full-level 복사)
+    + dyn_smag 2.2 + ALM F_grid(f64) 0.6 + misc ≈ **~23GB**.
+  - **transient**(MLG 브릿지 full-field gather/scatter): D16 실측 pool/used = 6.28/2.68(≈2.3×). D40 L4 gather 1회
+    ≈2.85GB, C2F 중 동시 temp ~7GB → **peak ~30GB. OOM.**
+  - ⇒ **Phase (e) 필요(2건, 구조적으로도 정당)**:
+    (e1) **f_prev sub-volume화**: coupling은 `f_coarse_prev[coarse_sub_slices]`만 읽음 → full-level 복사(7.0GB)를
+    child sub-volume(~0.5GB)로. **std 경로에도 동일 이득**(값 동일 → std bit-identical 기대). −6.5GB.
+    (e2) **boundary-scoped gather/scatter**: coupling이 읽는 코스 서브볼륨/쓰는 스트립만 gather/scatter(+roll 할로 1셀)
+    → transient ~7GB→~1GB. esoteric 전용.
+  - (e1)+(e2) 후 D40 ≈ live ~16.4GB + transient ~1-2GB = **~18GB ✓ 여유 포함 적합**.
+- 산출물: 게이트 7종(전부 PASS), HVAB-mini ALM 동역학 검증 완료. **D40 ready-to-run config는 (e) 완료 후**가 정직한 순서.
 
 ## 5. 게이트 목록 (`patch_notes/hpc_upgrade/gates/`)
 `eso_bgk_conservation_gate.py`(a) · `eso_cumulant_equiv_gate.py`(b, ★) · `eso_mlg_alm_gate.py`(c) ·

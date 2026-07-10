@@ -521,6 +521,11 @@ class Simulation:
         Nx, Ny, Nz = self.domain_shape
         N = Nx * Ny * Nz
 
+        if f.dtype != xp.float32:
+            raise ValueError(
+                f"esoteric kernels are float32-only (got {f.dtype}); "
+                "use precision: float32 or disable LBM_ESOTERIC")
+
         if not self._esoteric_f_already_set:
             f_eso = convert_f_std_to_esoteric(xp, f)
             self.f = init_f_esoteric(xp, f_eso, t_start=0)
