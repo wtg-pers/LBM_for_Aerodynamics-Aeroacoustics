@@ -220,26 +220,59 @@ class GridCoupling:
     # Public: Coarse → Fine
     # =================================================================
 
+    # ── Scoped-access geometry (Phase e2: esoteric region bridge) ──
+
+    @property
+    def coarse_sub_spatial_slices(self) -> tuple:
+        """Spatial (x, y, z) slices of the coarse sub-volume C2F reads."""
+        return self._coarse_sub_slices[1:]
+
+    @property
+    def excised_spatial_slices(self) -> tuple:
+        """Spatial (x, y, z) slices of the coarse region F2C writes."""
+        return self._excised_coarse_slices[1:]
+
+    @property
+    def fine_at_coarse_spatial_slices(self) -> tuple:
+        """Spatial slices of the coarse-coincident fine nodes F2C reads."""
+        R = self._region.REFINE_RATIO
+        return (slice(0, None, R),) * 3
+
     def coarse_to_fine(
         self,
         f_coarse: 'npt.NDArray',
-        f_fine: 'npt.NDArray',
+        f_fine: Optional['npt.NDArray'],
         *,
         is_half_step: bool = False,
         f_coarse_prev: Optional['npt.NDArray'] = None,
+        f_coarse_is_sub: bool = False,
+        f_coarse_prev_is_sub: bool = False,
+        strips_out: Optional[list] = None,
     ) -> None:
         """Inject coarse data into the fine grid boundary strip.
 
         Args:
-            f_coarse: shape (Q, Nx_c, Ny_c, Nz_c).
+            f_coarse: shape (Q, Nx_c, Ny_c, Nz_c) — or, when
+                f_coarse_is_sub, the pre-extracted sub-volume
+                f_coarse[coarse_sub] (Phase e2 esoteric bridge).
             f_fine: shape (Q, Nx_f, Ny_f, Nz_f). Modified IN-PLACE.
+                May be None when strips_out is given.
             is_half_step: True for temporal interpolation.
-            f_coarse_prev: Previous coarse f (required if is_half_step).
+            f_coarse_prev: Previous coarse f (required if is_half_step) —
+                full-shaped, or the sub-volume when f_coarse_prev_is_sub
+                (Phase e1: MLG stores f_prev as the sub-volume only; the
+                values read are identical, so this is bit-preserving).
+            strips_out: when provided (esoteric bridge), the 6 boundary
+                strips are APPENDED as (spatial_write_slices, values)
+                instead of being written into f_fine — avoids any
+                full-fine-field temporary. Uses the boundary-only
+                upsample (bit-identical on the strips).
         """
         xp = self._xp
 
         # ── 1. Extract coarse sub-volume ─────────────────────────
-        f_sub = f_coarse[self._coarse_sub_slices].copy()
+        f_sub = (f_coarse if f_coarse_is_sub
+                 else f_coarse[self._coarse_sub_slices].copy())
         if is_half_step and f_coarse_prev is None:
             raise ValueError(
                 "f_coarse_prev is required for half-step temporal "
@@ -250,14 +283,18 @@ class GridCoupling:
         if self._fused_rescale is not None:
             # Fused: temporal interp + macroscopic + f_eq + reconstruct in one
             # per-node kernel (read f once, write coarse_nodes once).
-            f_prev_sub = (f_coarse_prev[self._coarse_sub_slices].copy()
-                          if is_half_step else None)
+            if is_half_step:
+                f_prev_sub = (f_coarse_prev if f_coarse_prev_is_sub
+                              else f_coarse_prev[self._coarse_sub_slices].copy())
+            else:
+                f_prev_sub = None
             coarse_nodes = self._fused_rescale.c2f(
                 f_sub, f_prev_sub, is_half_step, self._factor_c2f)
         else:
             # Python fallback (exact prior behaviour).
             if is_half_step:
-                f_sub_prev = f_coarse_prev[self._coarse_sub_slices]
+                f_sub_prev = (f_coarse_prev if f_coarse_prev_is_sub
+                              else f_coarse_prev[self._coarse_sub_slices])
                 f_sub = 0.5 * (f_sub_prev + f_sub)
             rho, u = self._compute_macroscopic(f_sub)
             f_eq = self._compute_f_eq(rho, u)
@@ -269,7 +306,11 @@ class GridCoupling:
         # Boundary-only (Phase 1a Stage A): upsample a thin coarse slab per
         # face rather than the full fine volume. Bit-identical on the written
         # strips; MLG_C2F_FULL=1 restores the full-volume path.
-        if _C2F_BOUNDARY_ONLY:
+        if strips_out is not None:
+            for c_sl, w_sl, r_sl in self._bnd_face_specs:
+                slab = self._upsample_block(coarse_nodes[c_sl])
+                strips_out.append((w_sl[1:], slab[r_sl]))
+        elif _C2F_BOUNDARY_ONLY:
             self._upsample_boundary_into(coarse_nodes, f_fine)
         else:
             f_fine_full = self._upsample_block(coarse_nodes)
@@ -283,8 +324,11 @@ class GridCoupling:
     def fine_to_coarse(
         self,
         f_fine: 'npt.NDArray',
-        f_coarse: 'npt.NDArray',
-    ) -> None:
+        f_coarse: Optional['npt.NDArray'],
+        *,
+        f_fine_is_at_coarse: bool = False,
+        return_excised: bool = False,
+    ) -> Optional['npt.NDArray']:
         """Overwrite EXCISED coarse nodes with fine-grid data.
 
         Only the excised region (interior of fine_region) is overwritten.
@@ -299,13 +343,19 @@ class GridCoupling:
             5. Write ONLY to excised coarse nodes (not overlap strip)
 
         Args:
-            f_fine: shape (Q, Nx_f, Ny_f, Nz_f). Read only.
+            f_fine: shape (Q, Nx_f, Ny_f, Nz_f). Read only. When
+                f_fine_is_at_coarse, the pre-strided coarse-coincident
+                nodes f_fine[:, 0::R, 0::R, 0::R] (Phase e2 bridge).
             f_coarse: shape (Q, Nx_c, Ny_c, Nz_c). Modified IN-PLACE.
+                May be None when return_excised is True.
+            return_excised: return the excised block (Q, *excised_shape)
+                instead of writing it (caller scatters it; Phase e2).
         """
         R = self._region.REFINE_RATIO
 
         # ── Extract coarse-coincident fine nodes ─────────────────
-        f_fine_at_coarse = f_fine[:, 0::R, 0::R, 0::R]
+        f_fine_at_coarse = (f_fine if f_fine_is_at_coarse
+                            else f_fine[:, 0::R, 0::R, 0::R])
 
         # ── Compute macroscopic (unfiltered) ─────────────────────
         rho_f, u_f = self._compute_macroscopic(f_fine_at_coarse)
@@ -323,8 +373,11 @@ class GridCoupling:
 
         # ── Write ONLY excised region to coarse ──────────────────
         # Overlap strip keeps native coarse values → smooth interface
+        if return_excised:
+            return f_reconstructed[self._excised_local_slices]
         f_coarse[self._excised_coarse_slices] = \
             f_reconstructed[self._excised_local_slices]
+        return None
 
     # =================================================================
     # Private: Equilibrium & Macroscopic

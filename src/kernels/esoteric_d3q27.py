@@ -458,6 +458,81 @@ def esoteric_scatter_std(xp, f_std: 'npt.NDArray', t_step: int) -> 'npt.NDArray'
 
 
 # ============================================================
+# REGION-scoped gather/scatter (Phase e2, patch 15)
+# Same slot/parity mapping as the full versions, restricted to a
+# spatial region (supports strided slices, e.g. the F2C 0::R read).
+# Wrap semantics for the +-c_i shifted access match the kernel's
+# periodic index arithmetic exactly ((i + c + N) % N).
+# ============================================================
+
+def _region_axis_indices(xp, sl: slice, n: int):
+    """Integer indices selected by `sl` on an axis of length n."""
+    return xp.arange(*sl.indices(n), dtype=xp.int64)
+
+
+def _region_ix(xp, mem_shape, region, shift=(0, 0, 0)):
+    """Open-mesh advanced indices for region (+shift, wrapped) per axis."""
+    Nx, Ny, Nz = mem_shape
+    ix = (_region_axis_indices(xp, region[0], Nx) + shift[0]) % Nx
+    iy = (_region_axis_indices(xp, region[1], Ny) + shift[1]) % Ny
+    iz = (_region_axis_indices(xp, region[2], Nz) + shift[2]) % Nz
+    return ix[:, None, None], iy[None, :, None], iz[None, None, :]
+
+
+def esoteric_gather_std_region(xp, f_mem: 'npt.NDArray', t_step: int,
+                               region) -> 'npt.NDArray':
+    """Gather the physical f (STANDARD ordering) on a spatial region only.
+
+    region: 3-tuple of slices into the (Nx, Ny, Nz) grid (strided OK).
+    Returns (27, *region_shape). Equals esoteric_gather_std(...)[:, region].
+    """
+    shape = f_mem.shape[1:]
+    ix0, iy0, iz0 = _region_ix(xp, shape, region)
+    rs = (len(ix0.ravel()), len(iy0.ravel()), len(iz0.ravel()))
+    out = xp.empty((27,) + rs, dtype=f_mem.dtype)
+    even = (t_step % 2 == 0)
+    out[_STD_TO_ESO[0]] = f_mem[0][ix0, iy0, iz0]
+    for p in range(13):
+        i = 2 * p + 1
+        ci = (CX_ESO[i], CY_ESO[i], CZ_ESO[i])
+        ixs, iys, izs = _region_ix(xp, shape, region, shift=ci)
+        std_i, std_ip1 = _STD_TO_ESO[i], _STD_TO_ESO[i + 1]
+        if even:
+            out[std_i] = f_mem[i + 1][ix0, iy0, iz0]
+            out[std_ip1] = f_mem[i][ixs, iys, izs]
+        else:
+            out[std_i] = f_mem[i][ix0, iy0, iz0]
+            out[std_ip1] = f_mem[i + 1][ixs, iys, izs]
+    return out
+
+
+def esoteric_scatter_std_region(xp, f_mem: 'npt.NDArray',
+                                values: 'npt.NDArray', t_step: int,
+                                region) -> None:
+    """Scatter physical values (STANDARD ordering, region-shaped) into the
+    Esoteric memory IN PLACE, so the next LOAD at `t_step` reads them.
+
+    Inverse of esoteric_gather_std_region on the same region: writes the
+    local slot at region and the paired slot at region+c_i (wrapped).
+    """
+    shape = f_mem.shape[1:]
+    ix0, iy0, iz0 = _region_ix(xp, shape, region)
+    even = (t_step % 2 == 0)
+    f_mem[0][ix0, iy0, iz0] = values[_STD_TO_ESO[0]]
+    for p in range(13):
+        i = 2 * p + 1
+        ci = (CX_ESO[i], CY_ESO[i], CZ_ESO[i])
+        ixs, iys, izs = _region_ix(xp, shape, region, shift=ci)
+        std_i, std_ip1 = _STD_TO_ESO[i], _STD_TO_ESO[i + 1]
+        if even:
+            f_mem[i + 1][ix0, iy0, iz0] = values[std_i]
+            f_mem[i][ixs, iys, izs] = values[std_ip1]
+        else:
+            f_mem[i][ix0, iy0, iz0] = values[std_i]
+            f_mem[i + 1][ixs, iys, izs] = values[std_ip1]
+
+
+# ============================================================
 # Esoteric macro pre-pass kernel: LOAD + (rho, u), no collide/store.
 # Used by the WALE/dyn_smag pre-pass and the ALM 2-pass, which need
 # the current-step macroscopic fields BEFORE the collision launch.

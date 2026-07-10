@@ -195,6 +195,47 @@ GRID_PRESETS = {
                 (0.3125, 0.3125, 0.75),     # L3: x[11,21] lat ±12
                 (0.0625, 0.125,  0.5625)],  # L4 slab: x[15,18] lat ±9
                {"nx_D": 3.5, "ny_D": 3.0, "nz_D": 3.0, "hub_x_D": 1.0}),
+    # ★farfield (2026-07-09): 문헌 앵커 far-field = 신뢰할 수 있는 절대 CT용.
+    #   도메인 KSAS/Gwon(IJASS) 기반: 반경 6R(±3D)·상류 3R(1.5D)·하류 10R(5D)
+    #   → blockage πR²/(6R)² = 2.7% (slab5 cramped 12.6% 대비). 로터 nest =
+    #   slab5의 검증된 4-fine telescope(cells/R 256, tip chord 13.6, ε/Δx 3.4) 이식;
+    #   far-field 확대분은 전부 L0(R/16)라 값쌈. Phase-A 검증판(등방 baseline).
+    #   셀: L0 7.67M + L1 4.17M + L2 9.37M + L3 13.68M + L4 17.43M = 52.3M / ~21GB.
+    #   단일 24GB OK; 4×4090 = 13M/GPU. **n_radial=64** 권장(δr≤ε_c,tip 겹침, blob 방지).
+    #   nesting: L1 x[27,107]·lat±37 ⊇ L2 ⊇ L3 ⊇ L4(디스크). sponge(L=20 @ x[188,208])는
+    #   L1(x_max=107)과 여유 큼. Nx=208, Ny=Nz=192, hub(48,96,96).
+    "farfield": (32,
+                 [(0.65625, 1.84375, 1.15625),
+                  (0.4,     1.0,     0.84375),
+                  (0.125,   0.25,    0.6875),
+                  (0.03125, 0.0625,  0.53125)],
+                 {"nx_D": 6.5, "ny_D": 6.0, "nz_D": 6.0, "hub_x_D": 1.5}),
+    # ★farfield40 (2026-07-10): farfield와 IDENTICAL한 D-상대 기하를 D0=40으로.
+    #   4-케이스 목표 해상 cells/R 320 (tip chord 17.0셀, dx_fine ↓×0.8). extents가
+    #   D-비율이라 nesting은 farfield와 동일 상대구조, lu 마진은 ×1.25 (더 안전).
+    #   ~102M셀 — 표준(410B/cell)이면 ~42GB로 24GB 불가, **esoteric(LBM_ESOTERIC=1,
+    #   f_post 제거+f_prev sub-volume, patch_notes/hpc_upgrade/15) 전제 ~19GB로
+    #   단일 24GB 4090 적합**. 로컬 3090 build+step 검증은 15 §11 Phase(e) 로그.
+    "farfield40": (40,
+                   [(0.65625, 1.84375, 1.15625),
+                    (0.4,     1.0,     0.84375),
+                    (0.125,   0.25,    0.6875),
+                    (0.03125, 0.0625,  0.53125)],
+                   {"nx_D": 6.5, "ny_D": 6.0, "nz_D": 6.0, "hub_x_D": 1.5}),
+    # ★unif D-sweep (2026-07-08): UNIFORM grid (MLG OFF, 단일레벨) 격자수렴 격리.
+    #   빈 extents [] → NUM_LEVELS=1 = uniform (ovf87 선례). 동일 물리 도메인
+    #   5D×4D×4D(상류 1.5D/하류 3.5D/측면 2D each), hub 1.5D from inlet.
+    #   목적: "LBM 격자가 CT/팁하중에 유의한가"를 MLG 아티팩트 없이 D만 스윕해 검토.
+    #   D가 로터 지름 격자수(uniform이라 로터=최종해상). 셀=80·D³, float32 ~410B/cell:
+    #     D20 0.64M(~0.3GB) · D32 2.62M(~1.1GB) · D40 5.12M(~2.1GB)
+    #     D60 17.3M(~7.1GB) · D80 40.96M(~16.8GB) — 전부 24GB OK, 79.5M int32 천장 아래.
+    #   ⚠ 절대 CT/FM은 MLG(slab5/light) 결과와 도메인이 달라 직접비교 불가;
+    #     판정은 '이 스윕 내부의 수렴 추세'(D↑ 시 CT·팁 M²cₙ이 평평해지나)로.
+    "unif20": (20, [], {"nx_D": 5, "ny_D": 4, "nz_D": 4, "hub_x_D": 1.5}),
+    "unif32": (32, [], {"nx_D": 5, "ny_D": 4, "nz_D": 4, "hub_x_D": 1.5}),
+    "unif40": (40, [], {"nx_D": 5, "ny_D": 4, "nz_D": 4, "hub_x_D": 1.5}),
+    "unif60": (60, [], {"nx_D": 5, "ny_D": 4, "nz_D": 4, "hub_x_D": 1.5}),
+    "unif80": (80, [], {"nx_D": 5, "ny_D": 4, "nz_D": 4, "hub_x_D": 1.5}),
 }
 DEFAULT_PRESET = "light"   # 24GB GPU 안전. tip ε floor 제한(6.3 cell). 16-cell은 fine(DGX).
 BYTES_PER_CELL = 410.0     # 실측(LBM/MLG; dyn_smag 포함 ~동일), CT 메모리모델 기준
@@ -209,13 +250,17 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
                  tip_sweep=False, sampling=None, smoke_levels=2,
                  n_rev=18, polar_source="neuralfoil",
                  marker_distribution="uniform", cosine_side="both",
-                 radial_truncation=False, anisotropic=None):
+                 radial_truncation=False, anisotropic=None, n_radial=None):
     """HVAB hover config (주어진 collective, tip Mach).
 
     eps_correction : None|bool|dict  — viscous-core smearing 보정 (기본 off).
         production A/B 권장: eps_correction={"enabled":True,"target":"inviscid"}
         + prandtl_loss=False (보정이 물리적 팁 de-loading을 직접 해상하므로
         경험적 Prandtl과 중복; 둘 다 켜면 팁 이중 차감).
+    n_radial       : None|int — markers/blade override (기본 None → N_RADIAL=48).
+        마커 개수만 바꿔 lattice-unit 마커 간격 g_LU∝D/N을 격리(격자수렴 crossover:
+        D40+N24 ≡ D80 baseline, D80+N96 ≡ D40 baseline). ε=max(chord/4,2Δx)는
+        chord·dx에만 의존해 N과 무관하므로(대부분 2Δx floor) 순수 마커해상 효과.
     prandtl_loss   : bool — 경험적 Prandtl tip/root loss (기본 True).
     tip_sweep      : bool — 팁 sweep(30°, 외측 5%) simple-sweep 보정 (기본 False).
         True면 swept 마커가 LE-법선 속도 u_rel·cosΛ로 폴라 Mach·Re·동압 계산
@@ -335,7 +380,7 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
                 # section-interpolated ramp. Only when sweep active.
                 **({"sweep_break_rR": TAPER_START, "sweep_tip_deg": TIP_SWEEP_DEG}
                    if _sw_active else {})},
-            "grid": {"n_radial": N_RADIAL,
+            "grid": {"n_radial": N_RADIAL if n_radial is None else int(n_radial),
                      "marker_distribution": marker_distribution,
                      "cosine_side": cosine_side},
         },
@@ -358,15 +403,19 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
         # t=thickness, r=radial); c=t=r=1 reduces exactly to isotropic.
         # anisotropic=True → recommended physical default (chord-optimal ε_c=ε_iso
         # ≈0.25c; thinnest-resolvable ε_t≈0.5ε_iso≈2Δx at the tip since physical
-        # 0.25·thickness is sub-grid; span ε_r=ε_iso).
+        # 0.25·thickness is sub-grid). r_ref="spacing" (default) ties the span
+        # width to the marker spacing (ε_r=a_r·δr, Churchfield 2017 §II.A.2) so
+        # adjacent markers overlap into a continuous line; "chord" = legacy ε_r=ε_iso.
         if isinstance(anisotropic, dict):
             _spreading["anisotropic"] = {
                 "enabled": True, "c": float(anisotropic.get("c", 1.0)),
                 "t": float(anisotropic.get("t", 1.0)),
-                "r": float(anisotropic.get("r", 1.0))}
+                "r": float(anisotropic.get("r", 1.0)),
+                "r_ref": str(anisotropic.get("r_ref", "spacing"))}
         elif anisotropic:
             _spreading["anisotropic"] = {"enabled": True,
-                                         "c": 1.0, "t": 0.5, "r": 1.0}
+                                         "c": 1.0, "t": 0.5, "r": 1.0,
+                                         "r_ref": "spacing"}
     if _spreading:
         actuator_line["spreading"] = _spreading
 

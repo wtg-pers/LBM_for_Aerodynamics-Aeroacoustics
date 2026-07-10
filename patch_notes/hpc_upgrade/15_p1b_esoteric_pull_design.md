@@ -144,6 +144,33 @@ fused cumulant(float32) · cubic-z 코얼레싱 · C2F rescale 융합 · canonic
     → transient ~7GB→~1GB. esoteric 전용.
   - (e1)+(e2) 후 D40 ≈ live ~16.4GB + transient ~1-2GB = **~18GB ✓ 여유 포함 적합**.
 - 산출물: 게이트 7종(전부 PASS), HVAB-mini ALM 동역학 검증 완료. **D40 ready-to-run config는 (e) 완료 후**가 정직한 순서.
+- 커밋 **133bbe2**. 다음 → Phase (e).
+
+### ✅ Phase (e) D40-fit 최적화 — 완료 (2026-07-10, 로컬 3090) — **D40 단일 24GB 실증**
+- **(e1) f_prev sub-volume화**: coupling이 실제 읽는 `coarse_sub`만 저장(`_f_prev_sub_src`; coupling에
+  `f_coarse_prev_is_sub` kwarg). bench5 f_prev 레벨당 8~70MB(was 수백MB). **std 경로에도 동일 적용 —
+  ALM smoke std 추력 trace가 (d)와 전 자릿수 일치 = bit-보존 실증.**
+- **(e2) region-scoped esoteric 브릿지**: full-field `_phys_f`/`_write_phys_f` 제거 →
+  `esoteric_{gather,scatter}_std_region`(wrap-정확 advanced indexing, strided 지원; 커널과 동일 `%` 규약).
+  C2F=[코스 서브볼륨 gather + `strips_out`(경계 슬랩 업샘플)로 스트립만 scatter], F2C=[`0::R` strided gather
+  (`f_fine_is_at_coarse`) + `return_excised`로 excised 블록만 scatter]. coupling에 opt-in kwargs(기본=기존 동작).
+  **2D coupling 가드**(`_scoped`): 2D MLG는 legacy 경로 그대로(회귀 0).
+- **(e3, 예정외 발견·수정) init 메모리 피크**: D40 첫 빌드에서 **pool 고수위 52.6GB**(WSL2 oversubscription이
+  은폐; 네이티브 Linux 4090이면 init OOM). 범인=레벨별 monolithic `compute_equilibrium`의 (Q,N) 브로드캐스트
+  임시(~4×f, L4 11GB)+레벨 간 pool 미회수. 수정: **x-슬랩 청킹 equilibrium**(`_equilibrium_lowmem`, pointwise라
+  **bit-identical** — |F_grid| 합/ALM trace로 실증) + 레벨 간 `free_all_blocks()`. → **pool 52.6→20.6GB**.
+  부수: D40 coarse step 21.4s→**3.1s**(스왑 제거).
+- **게이트**: G1 region gather/scatter(**bit-exact** 4-parity×4-region 조합) · G2 scoped coupling
+  (`eso_coupling_scoped_gate`: e1/e2/F2C 전부 **bit-exact** vs 원본, boundary-slab vs full-volume 포함) ·
+  eso_mlg 재PASS(수치 (c)와 동일) · ALM smoke 재PASS(**std trace 전 자릿수 보존**, eso도 동일).
+- **메모리 최종 실측**: bench5 pure eso 2.556→**2.032GB**(std 3.584→3.242); pool: eso 6.28→**2.84GB**.
+- ★★**D40 로컬 실증(3090)**: `farfield40` preset(farfield의 D-상대 기하 그대로 D0=40) = **정확히 91.6M**
+  (L0 15.0/L1 7.7/L2 17.4/L3 25.1/L4 26.4M — handoff §4 명세 재현). LBM_ESOTERIC=1 빌드+2 coarse step:
+  **used 17.1GB, pool 고수위 20.6GB, NaN 無, ALM 정상** → **단일 24GB 4090 적합(여유 ~3.4GB)** ✓.
+  (std는 f_post 포함 ~27GB live → esoteric이 enabler.)
+- **전달물**: `configs/hvab/hvab_hover_c10_farfield40_eso.py`(4-case CASE 1: 순수 ALM 등방 gaussian+N64+보정off,
+  NASA 덱, n_rev=25). 실행: `LBM_ESOTERIC=1 python main.py --config configs/hvab/hvab_hover_c10_farfield40_eso.py`.
+  ⚠MLG_CUDA_GRAPH 금지(자동 거부됨). 나머지 3케이스(archB/KSAS)는 덱 배선(handoff §4) 후.
 
 ## 5. 게이트 목록 (`patch_notes/hpc_upgrade/gates/`)
 `eso_bgk_conservation_gate.py`(a) · `eso_cumulant_equiv_gate.py`(b, ★) · `eso_mlg_alm_gate.py`(c) ·

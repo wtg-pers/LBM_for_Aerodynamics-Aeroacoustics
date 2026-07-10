@@ -189,26 +189,95 @@ class MultiLevelGrid:
         # ── Capture the whole coarse-step on this call, then run it ─
         self._graph_capture_and_launch()
 
-    # ── Esoteric bridge: coupling / f_prev always see PHYSICAL f ──
-    # (standard ordering). For esoteric levels this gathers/scatters the
-    # single-buffer memory (parity = _esoteric_step, the next LOAD's view);
-    # for standard levels these are identity (zero overhead / regression).
-    # Coupling code itself is unchanged (patch 15 Phase c).
+    # ── Esoteric bridge (Phase e2: REGION-scoped) ────────────────
+    # Coupling only reads the coarse sub-volume / strided fine nodes and
+    # only writes the 6 fine strips / the coarse excised block — so for
+    # esoteric levels we gather/scatter exactly those regions (parity =
+    # _esoteric_step, the next LOAD's view). No full-field temporaries.
+    # Standard levels take the exact pre-existing coupling path.
+    # Phase e1: f_prev stores ONLY the coarse sub-volume C2F actually
+    # reads (identical values -> bit-preserving; ~14x smaller).
 
-    def _phys_f(self, sim) -> 'npt.NDArray':
-        """Physical (standard-ordered) f of a level; gather when esoteric."""
-        if getattr(sim, '_use_esoteric', False):
-            from src.kernels.esoteric_d3q27 import esoteric_gather_std
-            return esoteric_gather_std(sim.xp, sim.f, sim._esoteric_step)
-        return sim.f
+    @staticmethod
+    def _scoped(coupling) -> bool:
+        """3D coupling with the region-scoped API (2D coupling = legacy)."""
+        return hasattr(coupling, 'coarse_sub_spatial_slices')
 
-    def _write_phys_f(self, sim, f_std: 'npt.NDArray') -> None:
-        """Write physical f back into a level; scatter when esoteric."""
-        if getattr(sim, '_use_esoteric', False):
-            from src.kernels.esoteric_d3q27 import esoteric_scatter_std
-            sim.f[...] = esoteric_scatter_std(sim.xp, f_std, sim._esoteric_step)
-        elif f_std is not sim.f:
-            sim.xp.copyto(sim.f, f_std)
+    def _f_prev_sub_src(self, k: int) -> 'npt.NDArray':
+        """Sub-volume of level k's physical f read by C2F(k -> k+1).
+
+        2D (legacy) couplings lack the scoped API -> full-field f_prev
+        exactly as before (esoteric is 3D-only, so no gather needed).
+        """
+        lev = self._levels[k]
+        cpl = self._couplings[k]
+        if not self._scoped(cpl):
+            return lev.f
+        sp = cpl.coarse_sub_spatial_slices
+        if getattr(lev, '_use_esoteric', False):
+            from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
+            return esoteric_gather_std_region(
+                lev.xp, lev.f, lev._esoteric_step, sp)
+        return lev.f[(slice(None),) + sp]
+
+    def _coupling_c2f(self, coupling, sim_coarse, sim_fine, *,
+                      is_half_step: bool, f_prev) -> None:
+        """C2F with per-level esoteric scoping (see class comment)."""
+        if not self._scoped(coupling):     # 2D legacy path, unchanged
+            coupling.coarse_to_fine(
+                sim_coarse.f, sim_fine.f, is_half_step=is_half_step,
+                f_coarse_prev=f_prev)
+            return
+        if getattr(sim_coarse, '_use_esoteric', False):
+            from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
+            f_c = esoteric_gather_std_region(
+                sim_coarse.xp, sim_coarse.f, sim_coarse._esoteric_step,
+                coupling.coarse_sub_spatial_slices)
+            c_is_sub = True
+        else:
+            f_c = sim_coarse.f
+            c_is_sub = False
+        if getattr(sim_fine, '_use_esoteric', False):
+            from src.kernels.esoteric_d3q27 import esoteric_scatter_std_region
+            strips: list = []
+            coupling.coarse_to_fine(
+                f_c, None, is_half_step=is_half_step, f_coarse_prev=f_prev,
+                f_coarse_is_sub=c_is_sub, f_coarse_prev_is_sub=True,
+                strips_out=strips)
+            for sp_sl, vals in strips:
+                esoteric_scatter_std_region(
+                    sim_fine.xp, sim_fine.f, vals,
+                    sim_fine._esoteric_step, sp_sl)
+        else:
+            coupling.coarse_to_fine(
+                f_c, sim_fine.f, is_half_step=is_half_step,
+                f_coarse_prev=f_prev,
+                f_coarse_is_sub=c_is_sub, f_coarse_prev_is_sub=True)
+
+    def _coupling_f2c(self, coupling, sim_fine, sim_coarse) -> None:
+        """F2C with per-level esoteric scoping (see class comment)."""
+        if not self._scoped(coupling):     # 2D legacy path, unchanged
+            coupling.fine_to_coarse(sim_fine.f, sim_coarse.f)
+            return
+        if getattr(sim_fine, '_use_esoteric', False):
+            from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
+            f_f = esoteric_gather_std_region(
+                sim_fine.xp, sim_fine.f, sim_fine._esoteric_step,
+                coupling.fine_at_coarse_spatial_slices)
+            f_is_at = True
+        else:
+            f_f = sim_fine.f
+            f_is_at = False
+        if getattr(sim_coarse, '_use_esoteric', False):
+            from src.kernels.esoteric_d3q27 import esoteric_scatter_std_region
+            block = coupling.fine_to_coarse(
+                f_f, None, f_fine_is_at_coarse=f_is_at, return_excised=True)
+            esoteric_scatter_std_region(
+                sim_coarse.xp, sim_coarse.f, block,
+                sim_coarse._esoteric_step, coupling.excised_spatial_slices)
+        else:
+            coupling.fine_to_coarse(
+                f_f, sim_coarse.f, f_fine_is_at_coarse=f_is_at)
 
     def _advance_eager(self) -> None:
         """Eager (non-graph) coarse timestep: the nested-stepping recursion."""
@@ -222,7 +291,8 @@ class MultiLevelGrid:
                         f"Call set_distribution() on all levels first."
                     )
                 if i < self._num_levels - 1:
-                    self._f_prev[i] = lev.xp.copy(self._phys_f(lev))
+                    self._f_prev[i] = lev.xp.ascontiguousarray(
+                        self._f_prev_sub_src(i))
             self._f_prev_initialized = True
 
         coarse = self._levels[0]
@@ -233,7 +303,7 @@ class MultiLevelGrid:
         xp = coarse.xp
         if self._num_levels > 1:
             with _prof(self._pn_fprev[0]):
-                xp.copyto(self._f_prev[0], self._phys_f(coarse))
+                xp.copyto(self._f_prev[0], self._f_prev_sub_src(0))
 
         # ── Advance coarse level (full domain) ───────────────────
         with _prof(self._pn_adv[0]):
@@ -383,7 +453,8 @@ class MultiLevelGrid:
         if has_finer:
             xp = sim_fine.xp
             with _prof(self._pn_fprev[level_k]):
-                xp.copyto(self._f_prev[level_k], self._phys_f(sim_fine))
+                xp.copyto(self._f_prev[level_k],
+                          self._f_prev_sub_src(level_k))
 
         # Advance fine level (collide + stream)
         with _prof(self._pn_adv[level_k]):
@@ -391,13 +462,9 @@ class MultiLevelGrid:
 
         # C→F AFTER advance: fix boundary at t+δt_f (half-step interp)
         with _prof(self._pn_c2f[level_k]):
-            f_fine_phys = self._phys_f(sim_fine)
-            coupling.coarse_to_fine(
-                self._phys_f(sim_coarse), f_fine_phys,
-                is_half_step=True,
-                f_coarse_prev=self._f_prev[level_k - 1],
-            )
-            self._write_phys_f(sim_fine, f_fine_phys)
+            self._coupling_c2f(coupling, sim_coarse, sim_fine,
+                               is_half_step=True,
+                               f_prev=self._f_prev[level_k - 1])
 
         # Recurse into finer levels
         if has_finer:
@@ -411,7 +478,8 @@ class MultiLevelGrid:
         if has_finer:
             xp = sim_fine.xp
             with _prof(self._pn_fprev[level_k]):
-                xp.copyto(self._f_prev[level_k], self._phys_f(sim_fine))
+                xp.copyto(self._f_prev[level_k],
+                          self._f_prev_sub_src(level_k))
 
         # Advance fine level (collide + stream)
         with _prof(self._pn_adv[level_k]):
@@ -419,12 +487,8 @@ class MultiLevelGrid:
 
         # C→F AFTER advance: fix boundary at t+δt_c (full-step)
         with _prof(self._pn_c2f[level_k]):
-            f_fine_phys = self._phys_f(sim_fine)
-            coupling.coarse_to_fine(
-                self._phys_f(sim_coarse), f_fine_phys,
-                is_half_step=False,
-            )
-            self._write_phys_f(sim_fine, f_fine_phys)
+            self._coupling_c2f(coupling, sim_coarse, sim_fine,
+                               is_half_step=False, f_prev=None)
 
         # Recurse into finer levels
         if has_finer:
@@ -434,9 +498,7 @@ class MultiLevelGrid:
         # F→C feedback: overwrite coarse excised region with fine data
         # ═════════════════════════════════════════════════════════
         with _prof(self._pn_f2c[level_k]):
-            f_coarse_phys = self._phys_f(sim_coarse)
-            coupling.fine_to_coarse(self._phys_f(sim_fine), f_coarse_phys)
-            self._write_phys_f(sim_coarse, f_coarse_phys)
+            self._coupling_f2c(coupling, sim_fine, sim_coarse)
 
     # =================================================================
     # Properties (delegate to Level 0 for Simulation compatibility)

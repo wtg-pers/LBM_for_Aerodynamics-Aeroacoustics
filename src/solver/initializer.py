@@ -267,10 +267,19 @@ class SolverInitializer:
             else:
                 u_0[0] = flow_vel
 
-            f_k = level_sim.collision.compute_equilibrium(rho_0, u_0)
+            f_k = self._equilibrium_lowmem(level_sim, rho_0, u_0, dtype)
+            del rho_0, u_0
             level_sim.set_distribution(f_k)
-
             mem_mb = f_k.nbytes / (1024 * 1024)
+            del f_k
+            # Return this level's init transients to the driver so the pool
+            # high-water stays ~(live + one level's temps). Without this, a
+            # 91.6M-cell 5-level build peaked at 52.6 GB pool (would OOM on
+            # a native-Linux 24GB card; WSL2 oversubscription masked it).
+            if xp.__name__ == 'cupy':
+                import cupy as _cp
+                _cp.get_default_memory_pool().free_all_blocks()
+
             print(f"  Level {k}: shape={shape}, τ={level_sim.tau:.6f}, "
                   f"f size={mem_mb:.1f} MB")
 
@@ -280,6 +289,37 @@ class SolverInitializer:
         )
         print(f"  Total nodes across all levels: {total_nodes:,}")
         return 0
+
+    @staticmethod
+    def _equilibrium_lowmem(level_sim, rho_0, u_0, dtype,
+                            max_chunk_nodes: int = 4_000_000):
+        """f_eq via compute_equilibrium in x-slabs (BIT-IDENTICAL).
+
+        compute_equilibrium is pointwise, so slab-chunking along x changes
+        nothing numerically while capping the (Q, N)-sized broadcasting
+        temporaries at (Q, chunk). A monolithic call on a 26M-node level
+        transiently needs ~4x f-size (>11 GB at D40-L4); chunked it is
+        ~4 x (Q x chunk x 4B) ~= 1.7 GB. Small levels take one slab.
+        """
+        xp = level_sim.xp
+        shape = rho_0.shape                       # (Nx, Ny, Nz) or (Nx, Ny)
+        n_per_x = 1
+        for d in shape[1:]:
+            n_per_x *= int(d)
+        step = max(1, max_chunk_nodes // max(n_per_x, 1))
+        if step >= shape[0]:
+            return level_sim.collision.compute_equilibrium(rho_0, u_0)
+        # First slab also tells us Q (no reliance on collision internals).
+        first = level_sim.collision.compute_equilibrium(
+            rho_0[:step], u_0[:, :step])
+        f = xp.empty((first.shape[0],) + tuple(shape), dtype=dtype)
+        f[:, :step] = first
+        del first
+        for x0 in range(step, shape[0], step):
+            sl = slice(x0, min(x0 + step, shape[0]))
+            f[:, sl] = level_sim.collision.compute_equilibrium(
+                rho_0[sl], u_0[:, sl])
+        return f
 
     def _restart_mlg(self, mlg: 'MultiLevelGrid', args: Any) -> int:
         """Restart MLG from checkpoint.
