@@ -137,6 +137,91 @@ def compute_radial_scales(
     return scales
 
 
+def compute_radial_scales_batch(
+    xp, domain_shape, marker_positions, marker_epsilon, marker_active,
+    axis, hub, r_root, r_tip, n_cut: float = 3.0
+) -> 'npt.NDArray':
+    """Vectorised (xp-agnostic) compute_radial_scales — same node selection.
+
+    The reference implementation loops the near-limit markers on the HOST with
+    a numpy meshgrid stencil sum per marker; at D40 (~30+ near-limit markers,
+    root boxes ~41^3) this cost ~30 ms per ALM sub-step and made the archB
+    (radial-truncation) runs ~1.4x slower per coarse step (profiled: spread
+    5.1 -> 37.4 ms/call). Here all selected markers are batched into ONE padded
+    (M, K, K, K) broadcast on `xp` (cupy -> GPU, where the scales are consumed
+    anyway; returns a device array). Box floor/ceil + domain clip + sphere cut
+    are identical to the reference; only the summation ORDER differs, so
+    results agree to fp64 round-off (gate: alm_radial_scales_gate.py).
+    """
+    Nx, Ny, Nz = domain_shape
+    axis_np = np.asarray(axis, dtype=np.float64)
+    axis_np = axis_np / (np.linalg.norm(axis_np) + 1e-30)
+    hub_np = np.asarray(hub, dtype=np.float64)
+    pos_np = np.asarray(marker_positions, dtype=np.float64)
+    eps_np = np.asarray(marker_epsilon, dtype=np.float64)
+    n = pos_np.shape[0]
+    if marker_active is None:
+        marker_active = np.ones(n, dtype=bool)
+
+    # near-limit selection: identical to the reference implementation.
+    r_m = _cylindrical_radius(
+        pos_np[:, 0], pos_np[:, 1], pos_np[:, 2], axis_np, hub_np)
+    reach = n_cut * eps_np
+    sel = np.where(np.asarray(marker_active, dtype=bool)
+                   & ((r_m + reach > r_tip) | (r_m - reach < r_root)))[0]
+    out = xp.ones(n, dtype=xp.float64)
+    if sel.size == 0:
+        return out
+
+    p = pos_np[sel]                                   # (M, 3)
+    eps = eps_np[sel]                                 # (M,)
+    rc = n_cut * eps                                  # (M,)
+    # Per-marker inclusive box [floor(p-rc), ceil(p+rc)] clipped to the domain
+    # (same as the reference); padded to the largest box K.
+    lo = np.floor(p - rc[:, None])
+    hi = np.ceil(p + rc[:, None])
+    for d, N in enumerate((Nx, Ny, Nz)):
+        lo[:, d] = np.clip(lo[:, d], 0, N - 1)
+        hi[:, d] = np.clip(hi[:, d], 0, N - 1)
+    K = int((hi - lo).max()) + 1
+
+    lo_x = xp.asarray(lo); hi_x = xp.asarray(hi)
+    p_x = xp.asarray(p); eps_x = xp.asarray(eps); rc_x = xp.asarray(rc)
+    ar = xp.arange(K, dtype=xp.float64)               # (K,)
+
+    gx = lo_x[:, 0, None] + ar[None, :]               # (M, K)
+    gy = lo_x[:, 1, None] + ar[None, :]
+    gz = lo_x[:, 2, None] + ar[None, :]
+    mx = (gx <= hi_x[:, 0, None])[:, :, None, None]   # inside per-marker box
+    my = (gy <= hi_x[:, 1, None])[:, None, :, None]
+    mz = (gz <= hi_x[:, 2, None])[:, None, None, :]
+
+    dx = (gx - p_x[:, 0, None])[:, :, None, None]     # (M, K, 1, 1)
+    dy = (gy - p_x[:, 1, None])[:, None, :, None]
+    dz = (gz - p_x[:, 2, None])[:, None, None, :]
+    d_sq = dx * dx + dy * dy + dz * dz                # (M, K, K, K)
+    sph = (mx & my & mz) & (d_sq <= (rc_x ** 2)[:, None, None, None])
+
+    norm = 1.0 / (np.pi ** 1.5) / (eps_x ** 3)        # (M,)
+    eta = xp.where(
+        sph, norm[:, None, None, None]
+        * xp.exp(-d_sq / (eps_x ** 2)[:, None, None, None]), 0.0)
+    S_all = eta.sum(axis=(1, 2, 3))                   # (M,)
+
+    ax_x = xp.asarray(axis_np); hub_x = xp.asarray(hub_np)
+    hx = (gx - hub_x[0])[:, :, None, None]
+    hy = (gy - hub_x[1])[:, None, :, None]
+    hz = (gz - hub_x[2])[:, None, None, :]
+    dot = hx * ax_x[0] + hy * ax_x[1] + hz * ax_x[2]
+    rn = xp.sqrt(xp.maximum(hx * hx + hy * hy + hz * hz - dot * dot, 0.0))
+    S_kept = xp.where((rn >= r_root) & (rn <= r_tip), eta, 0.0).sum(axis=(1, 2, 3))
+
+    sc_sel = xp.where((S_kept > 1e-30) & (S_all > 0.0),
+                      S_all / xp.maximum(S_kept, 1e-300), 1.0)
+    out[xp.asarray(sel)] = sc_sel
+    return out
+
+
 def spread_force_single_marker(
     F_grid: 'npt.NDArray',
     marker_pos: 'npt.NDArray',
@@ -945,18 +1030,21 @@ def spread_forces_to_grid_gpu(
             F_grid += xp.asarray(F_host)
         return F_grid
 
-    # Radial truncation: per-marker renorm scales computed on the host with the
-    # SAME routine as the CPU path (identical results), then handed to the kernel.
+    # Radial truncation: per-marker renorm scales. Batched on the GPU (they are
+    # consumed by the GPU kernel anyway) — the host per-marker loop cost ~30 ms
+    # per ALM sub-step at D40 and dominated the archB slowdown. Node selection
+    # identical to the CPU reference; fp64 sum order differs (round-off only,
+    # gate: alm_radial_scales_gate.py).
     radial_gpu = None
     if radial_trunc is not None:
-        scales_full = compute_radial_scales(
-            domain_shape, marker_positions, marker_epsilon, active_mask,
+        scales_full = compute_radial_scales_batch(
+            xp, domain_shape, marker_positions, marker_epsilon, active_mask,
             radial_trunc['axis'], radial_trunc['hub'],
             radial_trunc['r_root'], radial_trunc['r_tip'], n_cut=n_cut)
         _ax = np.asarray(radial_trunc['axis'], dtype=np.float64)
         _ax = _ax / (np.linalg.norm(_ax) + 1e-30)
         radial_gpu = {
-            'scales': scales_full[active_mask],
+            'scales': scales_full[xp.asarray(active_mask)],
             'axis': _ax,
             'hub': np.asarray(radial_trunc['hub'], dtype=np.float64),
             'r_root': float(radial_trunc['r_root']),
