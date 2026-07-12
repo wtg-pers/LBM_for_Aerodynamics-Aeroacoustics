@@ -76,12 +76,25 @@ class DistributedMLGRunner:
             self.parts.append(Partition1D.from_range(
                 shapes[k], n_ranks, rank, self.axis, f0_, fc_, ghost=ghost))
 
-        # local slabs (extract level-by-level, free the full copy at once)
+        # local slabs: extract views level-by-level and RELEASE each source
+        # level's device arrays right after its slab is built — keeps the
+        # transient peak at (t=0 build state + one slab), shrinking per level
+        # (the f copies of the first version OOMed 24GB at D40).
         self.lv: List[LocalLevel] = []
         for k in range(NL):
-            ld = extract_level(mlg.get_level(k))
+            lev = mlg.get_level(k)
+            ld = extract_level(lev)
             self.lv.append(LocalLevel(ld, self.parts[k]))
             del ld
+            for a in ("f", "f_post", "f_prev", "rho", "u",
+                      "_eso_node_type", "_eso_bc_rho", "_eso_bc_ux",
+                      "_eso_bc_uy", "_eso_bc_uz"):
+                if hasattr(lev, a):
+                    try:
+                        setattr(lev, a, None)
+                    except AttributeError:
+                        pass                     # read-only property
+            cp.get_default_memory_pool().free_all_blocks()
         self.ex = [HaloBandExchangerV1(self.parts[k], transport, cp,
                                        tag_base=16 * k)
                    for k in range(NL)]
@@ -108,6 +121,7 @@ class DistributedMLGRunner:
             m._velocity_sampler = make_distributed_sampler(
                 allreduce, rank, p, cp)
             self.model = m
+            cp.get_default_memory_pool().free_all_blocks()   # old global F_grid
         self.alm_lev = alm_lev
 
     # ── plumbing ─────────────────────────────────────────────────────

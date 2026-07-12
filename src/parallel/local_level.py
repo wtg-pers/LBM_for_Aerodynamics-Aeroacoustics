@@ -22,7 +22,14 @@ from src.kernels.dyn_smag_d3q27 import DynSmagKernelD3Q27
 
 
 def extract_level(lev) -> dict:
-    """Copy everything the distributed driver needs from a built level."""
+    """Reference (NOT copy) everything the driver needs from a built level.
+
+    Views only — at D40 the per-level f copy alone is up to 2.9GB and stacked
+    copies OOM a 24GB card during runner construction (M5 field finding).
+    LocalLevel wrap-slices its slab out of these views; the caller then
+    releases the source arrays (see DistributedMLGRunner) so the transient
+    peak stays at (t=0 build state + one slab) and shrinks level by level.
+    """
     shape = lev.domain_shape
     return dict(
         shape=shape,
@@ -30,12 +37,12 @@ def extract_level(lev) -> dict:
         omega_bulk=lev._eso_omega_bulk,
         omega_high=lev._eso_omega_high,
         sgs=dict(lev._sgs_cfg),
-        f0=lev.physical_f.copy(),                      # standard phys, t=0
-        node_type=lev._eso_node_type.reshape(shape).copy(),
-        bc_rho=lev._eso_bc_rho.reshape(shape).copy(),
-        bc_ux=lev._eso_bc_ux.reshape(shape).copy(),
-        bc_uy=lev._eso_bc_uy.reshape(shape).copy(),
-        bc_uz=lev._eso_bc_uz.reshape(shape).copy(),
+        f0=lev.physical_f,                             # standard phys, t=0
+        node_type=lev._eso_node_type.reshape(shape),
+        bc_rho=lev._eso_bc_rho.reshape(shape),
+        bc_ux=lev._eso_bc_ux.reshape(shape),
+        bc_uy=lev._eso_bc_uy.reshape(shape),
+        bc_uz=lev._eso_bc_uz.reshape(shape),
     )
 
 

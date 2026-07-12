@@ -48,7 +48,8 @@ $MPIRUN -n 4 python main_mpi.py \
 ## 2. 실 케이스 (farfield40 D40 case1, 4-rank)
 드라이 체크 결과(로컬 검증): axis=y 자동선택, L0 bounds=[0,108,121,133,240],
 L4 owns=[148,208,192,133], worst-rank share 0.266 (이상 0.250, 밸런스 효율 94%).
-빌드 피크 ~20.6GB/GPU(초기화 일시), 정착 후 슬랩 ~7-8GB/GPU.
+빌드 피크 ~19.2GB/GPU(초기화 일시), 러너 구축은 피크 미증가(뷰 추출+레벨별 원본
+해제 — 최초 버전의 레벨별 f 복사 OOM은 수정됨), 정착 3.7~5.0GB/rank(로컬 D40 프로브).
 
 ```bash
 # 1-rev 스모크 (1257 coarse steps ≈ 단일GPU 대비 ~3.5× 빠를 것으로 기대)

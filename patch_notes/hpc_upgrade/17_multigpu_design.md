@@ -164,3 +164,11 @@
 - 검토용 보고서: `docs/MULTIGPU_DESIGN_PHILOSOPHY_kr.md` — 설계 철학(§1 bit-parity 사다리/축일반성/
   no-fork 훅/프리미티브 재사용/복제빌드/게이트 사다리/실측후 최적화), 분해·halo·ALM·러너 상세,
   1-ulp 사건 사례연구, 한계·로드맵, 검토 요청 포인트 5건.
+
+### M5 §2 첫 시도 OOM → 수정 (2026-07-12)
+- 클러스터 ff40 4-rank 실런이 러너 구축 중 OOM(23.2GB에서 L2 f 복사 1.875GB 실패).
+  원인=extract_level의 `physical_f.copy()` — 레벨별 전체 복사 누적(bench5에선 무해, D40 치명).
+- 수정: **뷰 추출(복사 전무) + 슬랩 구축 직후 원본 레벨 배열 해제**(f/rho/u/_eso_* → None,
+  free_all_blocks) — 과도 피크가 (t=0 상태 + 슬랩 1개)로 상한, 레벨 진행마다 단조 감소.
+- 검증: bench5 2-rank mpirun bit 유지. **D40 로컬 프로브**: 빌드 피크 19.2GB → 러너 구축 피크
+  미증가 → 정착 rank0 5.0GB/rank1 3.7GB. 게이트는 자체 extract 사본이라 무영향.
