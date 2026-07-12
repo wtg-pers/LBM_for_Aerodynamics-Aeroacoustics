@@ -59,12 +59,16 @@ $MPIRUN -n 4 python main_mpi.py \
   --steps 1257 --log-every 16 --cuda-aware 1 \
   --csv mpi4_case1_rev1.csv
 
-# 좋으면 풀런 (25 rev)
+# 좋으면 풀런 (25 rev) — VTK/checkpoint는 production 포맷으로 rank0 조립
 $MPIRUN -n 4 python main_mpi.py \
   --config configs/hvab/hvab_hover_c10_farfield40_eso_mpi4.py \
   --steps 31425 --log-every 64 --cuda-aware 1 \
+  --vtk-every 1257 --ckpt-every 6285 \
   --csv mpi4_case1_full.csv
 ```
+(성능 4-pass 후 실측 0.671 s/step → 25 rev ≈ 5.9h. VTK ~1.7GB/스냅샷·rev당 1회,
+checkpoint ~10GB/개·6285步마다 — 디스크 ~60GB 확보. 출력 시점에 rank0로 host-staged
+gather가 돌므로 해당 step은 수 초 느려짐.)
 비교: 단일GPU case1 CSV의 같은 rev 구간과 thrust 곡선 겹쳐보기
 (ramp 구간이라 초기 일치 뚜렷해야 함; CV-band ±3% 이내).
 
@@ -80,7 +84,9 @@ $MPIRUN -n 4 python main_mpi.py \
 3. 이상 시: 전체 traceback (`comm.Abort` fail-fast가 걸려 있어 행 없이 죽음)
 
 ## 4. 현재 한계 (M5 스코프)
-- MPI 러너는 **thrust CSV만** 출력 (VTK/checkpoint 미배선 — 검증 후 후속)
+- ~~thrust CSV만~~ → **VTK(.vti/.vth)·checkpoint(npz) rank0 조립 지원**(--vtk-every/
+  --ckpt-every; production 포맷 동일 = 기존 분석스크립트·단일GPU restart 그대로 사용 가능).
+  잔여: MPI 러너 자체의 --restart 재개 배선, ALM 마커 VTP
 - kleine free-wake·비gaussian 샘플러 분산 미지원(fail-fast) — production은 straight
 - 케이스가 단일 GPU 메모리를 초과하면 분산 초기화 필요(후속; D40은 해당 없음)
 - v2 slot halo(M4)는 게이트 검증만, production 미결합 — 강스케일링 실측 후 결정

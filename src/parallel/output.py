@@ -1,0 +1,114 @@
+"""Rank-0 assembled field output for the MPI runner (patch 17 M5b).
+
+VTK and checkpoints reuse the PRODUCTION writers byte-for-byte: rank 0 keeps
+the setup's MLGVTKWriter and CheckpointManager (built during its own full
+build), every rank sends its owned slabs (host-staged numpy), and rank 0
+assembles the global per-level arrays and calls the same write()/save() the
+single-GPU loop calls. Checkpoints are therefore restartable by BOTH the
+single-GPU path and the MPI runner (each rank restores the global state
+through the normal initializer, then slab-extracts as always).
+
+All entry points are COLLECTIVE — every rank must call them at the same
+coarse step (non-root ranks only send).
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import numpy as np
+import cupy as cp
+
+
+def _gather_level(comm, rank: int, nr: int, runner, arr_local,
+                  k: int, tag0: int, pre_sliced: bool = False):
+    """Assemble owned slabs of a (C, x, y, z) LOCAL array on rank 0.
+
+    pre_sliced=True when the caller already passes OWNED-only data
+    (e.g. runner.owned_f_std) — slicing twice drops 2*ghost rows per
+    rank (caught by the bench5 npz shape check)."""
+    part = runner.parts[k]
+    own = (arr_local if pre_sliced
+           else arr_local[(slice(None),) + part.owned_local()])
+    own = cp.asnumpy(own) if hasattr(own, "get") else np.asarray(own)
+    if rank != 0:
+        comm.send((own.shape, own.dtype.str), dest=0, tag=tag0)
+        comm.Send(np.ascontiguousarray(own), dest=0, tag=tag0 + 1)
+        return None
+    pieces = [own]
+    for r in range(1, nr):
+        shape, dt = comm.recv(source=r, tag=tag0)
+        buf = np.empty(shape, dtype=np.dtype(dt))
+        comm.Recv(buf, source=r, tag=tag0 + 1)
+        pieces.append(buf)
+    return np.concatenate(pieces, axis=1 + runner.axis)
+
+
+class _LevelView:
+    """Duck-typed level for MLGVTKWriter (needs .rho/.u/.obstacle_bc)."""
+
+    def __init__(self, rho, u):
+        self.rho = rho
+        self.u = u
+        self.obstacle_bc = None
+
+
+class _MLGView:
+    def __init__(self, levels):
+        self._levels = levels
+
+    def get_level(self, k):
+        return self._levels[k]
+
+
+class Rank0OutputBridge:
+    """Collective VTK / checkpoint output through the production writers."""
+
+    def __init__(self, comm, rank: int, nr: int,
+                 mlg_vtk_writer=None, checkpoint_mgr=None,
+                 sim_params: Optional[dict] = None,
+                 tau: float = 0.5) -> None:
+        self._comm, self._rank, self._nr = comm, rank, nr
+        self._vtk = mlg_vtk_writer
+        self._ckpt = checkpoint_mgr
+        self._sim_params = sim_params or {}
+        self._tau = tau
+
+    # ── VTK: assembled rho/u per level -> MLGVTKWriter.write ─────────
+    def write_vtk(self, step: int, runner) -> None:
+        comm, rank, nr = self._comm, self._rank, self._nr
+        views = []
+        for k in range(runner.NL):
+            L = runner.lv[k]
+            rho = _gather_level(comm, rank, nr, runner,
+                                L.rho[None], k, tag0=300 + 4 * k)
+            u = _gather_level(comm, rank, nr, runner,
+                              L.u, k, tag0=302 + 4 * k)
+            if rank == 0:
+                views.append(_LevelView(rho[0], u))
+        if rank == 0 and self._vtk is not None:
+            self._vtk.write(step, _MLGView(views), time=float(step))
+        comm.Barrier()
+
+    # ── Checkpoint: assembled std f -> CheckpointManager.save ────────
+    def save_checkpoint(self, step: int, runner) -> None:
+        comm, rank, nr = self._comm, self._rank, self._nr
+        f_levels = []
+        for k in range(runner.NL):
+            fk = _gather_level(comm, rank, nr, runner,
+                               runner.owned_f_std(k), k, tag0=400 + 2 * k,
+                               pre_sliced=True)
+            f_levels.append(fk)                      # None on non-root
+            cp.get_default_memory_pool().free_all_blocks()
+        rho0 = _gather_level(comm, rank, nr, runner,
+                             runner.lv[0].rho[None], 0, tag0=460)
+        u0 = _gather_level(comm, rank, nr, runner,
+                           runner.lv[0].u, 0, tag0=462)
+        if rank == 0 and self._ckpt is not None:
+            extra = {"num_levels": runner.NL}
+            for k in range(1, runner.NL):
+                extra[f"f_level_{k}"] = f_levels[k]
+            self._ckpt.save(step=step, f=f_levels[0], rho=rho0[0], u=u0,
+                            tau=self._tau, config=self._sim_params,
+                            extra_data=extra)
+        comm.Barrier()

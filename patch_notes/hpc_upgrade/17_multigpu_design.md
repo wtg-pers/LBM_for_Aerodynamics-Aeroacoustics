@@ -219,3 +219,13 @@
   증가는 로컬 열스로틀 — 연속실행 클럭저하; 상대 개선이 신호).
 - 게이트: eso_gather_scatter(왕복 bit)/coupling_scoped/M2a/M2b(5레벨 bit)/mpirun 2-rank verify
   전부 PASS.
+
+### ✅ M5 성능 수렴 + M5b 필드출력 (2026-07-13)
+- **클러스터 재측정: 0.671 s/step** (2.96→0.67, 4-pass 누적 4.4×). 내역: alm 0.275(복제·Amdahl)/
+  halo_complete 0.18(스큐대기)/kernel 0.103/coupling 0.096. **밸런스 이상치(3.76×) 대비 병렬효율
+  ~100%** — region 커널이 단일GPU에도 이득이라 3.1s 기준은 낡음(단일 재기준 ~2.5s 추정→실질 ~3.7×).
+  25-rev 풀런 ≈ 5.9h. 성능 라운드 종료(잔여 후보: ALM 로컬화·스큐·v2는 필요시).
+- **M5b**: `src/parallel/output.py` Rank0OutputBridge — production MLGVTKWriter/CheckpointManager
+  재사용(rank0가 writers 포함 빌드 유지), owned 슬랩 host-staged gather→글로벌 조립→동일 write/save.
+  main_mpi --vtk-every/--ckpt-every. bench5 검증: 5레벨 .vti+.vth, checkpoint npz 키/전레벨 global
+  shape 일치(더블슬라이스 버그 1건 shape 체크로 즉검출·수정). 잔여: MPI --restart 배선, 마커 VTP.

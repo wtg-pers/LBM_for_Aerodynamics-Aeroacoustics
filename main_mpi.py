@@ -46,15 +46,20 @@ def parse_cli(argv):
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--profile", action="store_true",
                     help="per-section wall-time attribution (adds sync overhead)")
+    ap.add_argument("--vtk-every", type=int, default=0,
+                    help="coarse steps between assembled VTK writes (0=off)")
+    ap.add_argument("--ckpt-every", type=int, default=0,
+                    help="coarse steps between assembled checkpoints (0=off)")
     ap.add_argument("--strict-bit", action="store_true",
                     help="verify passes ONLY on bit-identity (pure-LBM cases; "
                          "reviewer F-4)")
     return ap.parse_args(argv)
 
 
-def build(config, dev: int):
-    sys.argv = ["mpi", "--config", config, "--gpu", str(dev),
-                "--no-vtk", "--no-force"]
+def build(config, dev: int, with_writers: bool = False):
+    sys.argv = ["mpi", "--config", config, "--gpu", str(dev), "--no-force"]
+    if not with_writers:
+        sys.argv.append("--no-vtk")      # writers only needed on rank 0
     from src.io.args_parser import parse_args
     from src.solver.setup import SimulationSetup
     from src.solver.initializer import SolverInitializer
@@ -65,7 +70,7 @@ def build(config, dev: int):
     SolverInitializer(s).initialize(mlg, a)
     s.stop_log_capture()
     mlg._graph_enabled = False
-    return mlg
+    return mlg, s
 
 
 def main():
@@ -87,9 +92,11 @@ def main():
         dev = local % ndev
     cp.cuda.Device(dev).use()
 
+    want_out = bool(args.vtk_every or args.ckpt_every)
     if rank != 0:                                 # quiet non-root builds
         sys.stdout = open(os.devnull, "w")
-    mlg = build(args.config, dev)
+    mlg, setup = build(args.config, dev,
+                       with_writers=(rank == 0 and want_out))
     sys.stdout = sys.__stdout__
 
     from src.parallel import MPITransport
@@ -102,9 +109,23 @@ def main():
         mlg, transport, rank, nr, allreduce=MPIAllreduce(comm),
         axis=axis, ghost=args.ghost)
 
+    # output bridge (production writers) BEFORE freeing the build
+    from src.parallel.output import Rank0OutputBridge
+    bridge = None
+    if want_out:
+        bridge = Rank0OutputBridge(
+            comm, rank, nr,
+            mlg_vtk_writer=(getattr(setup, "_mlg_vtk_writer", None)
+                            if rank == 0 else None),
+            checkpoint_mgr=(getattr(setup, "checkpoint_mgr", None)
+                            if rank == 0 else None),
+            sim_params=(getattr(setup, "sim_params", None)
+                        if rank == 0 else None),
+            tau=float(mlg.get_level(0).tau))
+
     # free the full build (runner kept slabs + the ALM model)
     import gc
-    del mlg
+    del mlg, setup
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
 
@@ -138,7 +159,32 @@ def main():
 
     if args.profile:
         runner.profile = {}
-    stats = runner.run(args.steps, log_every=args.log_every, on_log=on_log)
+
+    # main loop (collective output cadences need every rank in lockstep)
+    import time as _time
+    t0 = _time.perf_counter()
+    t_last = t0
+    runner.last_interval = None
+    for s_ in range(1, args.steps + 1):
+        runner.step_coarse()
+        if args.log_every and s_ % args.log_every == 0:
+            cp.cuda.runtime.deviceSynchronize()
+            now = _time.perf_counter()
+            runner.last_interval = {
+                "s_per_step": (now - t_last) / args.log_every,
+                "elapsed_s": now - t0}
+            t_last = now
+            on_log(s_, runner)
+        if bridge is not None and args.vtk_every and \
+                s_ % args.vtk_every == 0:
+            bridge.write_vtk(s_, runner)
+        if bridge is not None and args.ckpt_every and \
+                s_ % args.ckpt_every == 0:
+            bridge.save_checkpoint(s_, runner)
+    cp.cuda.runtime.deviceSynchronize()
+    dt_all = _time.perf_counter() - t0
+    stats = {"steps": args.steps, "wall_s": dt_all,
+             "s_per_step": dt_all / max(args.steps, 1)}
     comm.Barrier()
     if args.profile:
         prof = comm.gather(runner.profile, root=0)
