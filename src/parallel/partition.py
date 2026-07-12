@@ -23,18 +23,60 @@ AXIS_NAME = {v: k for k, v in AXIS_INDEX.items()}
 _AUTO_ORDER = (0, 1, 2)
 
 
-def choose_axis(level_shapes: Sequence[Tuple[int, int, int]]) -> int:
-    """Auto axis rule: maximize the MINIMUM per-level extent along the axis.
+def choose_axis(level_shapes: Sequence[Tuple[int, int, int]],
+                pair_boxes: Optional[Sequence] = None,
+                n_ranks: int = 2) -> int:
+    """Auto axis rule.
 
-    This guarantees the dominant (finest) level splits evenly — e.g. the
-    farfield40 L4 rotor slab is only 57 cells thick in x, so x would starve
-    all but one rank; y/z (681) split cleanly.
+    With `pair_boxes` (per level pair: the fine_domain_coarse (lo, hi)
+    INCLUSIVE bounds per axis, in the coarse level's coords): SIMULATE the
+    derived cut chain per axis and pick the axis minimizing the worst-rank
+    share of total updates (level cells x 2^k). Raw extents are NOT enough:
+    bench5's x extents look splittable (56 >= 48) but the nested boxes
+    collapse the x chain — L3/L4 land entirely on one rank (G-M2b finding).
+
+    Without boxes: fall back to maximizing the minimum per-level extent.
+    Ties fall to _AUTO_ORDER (halo-contiguity descending x, y, z).
     """
-    best_ax, best_val = _AUTO_ORDER[0], -1
+    if pair_boxes is None:
+        best_ax, best_val = _AUTO_ORDER[0], -1
+        for ax in _AUTO_ORDER:
+            val = min(int(s[ax]) for s in level_shapes)
+            if val > best_val:
+                best_ax, best_val = ax, val
+        return best_ax
+
+    from src.parallel.mlg_coupling import fine_range_from_coarse
+    nl = len(level_shapes)
+    weights = []                       # per-level updates: cells * 2^k
+    for k, s in enumerate(level_shapes):
+        weights.append(float(s[0] * s[1] * s[2]) * (2.0 ** k))
+    total = sum(weights)
+
+    best_ax, best_worst = _AUTO_ORDER[0], float("inf")
     for ax in _AUTO_ORDER:
-        val = min(int(s[ax]) for s in level_shapes)
-        if val > best_val:
-            best_ax, best_val = ax, val
+        loads = [0.0] * n_ranks
+        ok = True
+        try:
+            parts = [Partition1D(level_shapes[0], n_ranks, r, ax)
+                     for r in range(n_ranks)]
+        except ValueError:
+            continue
+        for r in range(n_ranks):
+            loads[r] += weights[0] * parts[r].own_count / level_shapes[0][ax]
+        for k in range(1, nl):
+            lo, hi = pair_boxes[k - 1][ax]
+            nf = level_shapes[k][ax]
+            nxt = []
+            for r in range(n_ranks):
+                f0, fc = fine_range_from_coarse(parts[r], lo, hi, nf)
+                loads[r] += weights[k] * fc / nf
+                nxt.append(Partition1D.from_range(
+                    level_shapes[k], n_ranks, r, ax, f0, fc))
+            parts = nxt
+        worst = max(loads) / total
+        if ok and worst < best_worst - 1e-12:
+            best_ax, best_worst = ax, worst
     return best_ax
 
 

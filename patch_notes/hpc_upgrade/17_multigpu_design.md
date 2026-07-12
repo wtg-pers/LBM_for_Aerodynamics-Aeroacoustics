@@ -83,3 +83,17 @@
   3-rank 비대칭 분할도 3축 bit ✓.
 - 남은 M2b: bench5 5-레벨 연쇄(레벨쌍 4개 체인) + 솔버 통합(setup/MultiLevelGrid의 분산 구동, BC/sponge
   끝랭크 슬라이스, checkpoint rank0 조립). fprev는 로컬 블록 영역으로 자연 확장(코드 동일).
+
+### ✅ M2b — 실제 bench5 5-레벨 체인 (2026-07-12, 로컬 3090)
+- **G-M2b PASS**: bench5_pure_lbm을 1-rank로 빌드해 **production `MultiLevelGrid.advance()` 자체를 레퍼런스**로,
+  동일 초기상태에서 분산판(레벨별 wrap-슬라이스된 f/node_type/bc, production advance 복제=dyn_smag pre-pass→
+  WALE-branch cumulant, 레벨쌍 4개 RankLocalCoupling 체인, production 재귀 스케줄 미러) 2-rank 구동 —
+  **y/z 양축, 5레벨 전부 bit-identical**.
+- ★발견 1 — **SGS는 ghost=3 필요**: dyn_smag u-구배 stencil이 ghost2의 오염된 u를 읽으면 ghost1 nu_t→owned로
+  전파. ghost=3이면 u 유효층이 한 겹 깊어져 owned 보호(게이트 실증). SGS-off 경로는 ghost=2로 충분(M1/M2a).
+- ★발견 2 — **auto-axis 지표 격상(체인 시뮬레이션)**: bench5 x-체인은 pair2 box(x[18,62])가 rank0의 유도된
+  L2 범위에 포함돼 **L3/L4가 rank0 독점**(rank1 own=0) — 원시 extent 지표(x=56>y=48)로는 x를 뽑는 함정.
+  `choose_axis(shapes, pair_boxes, n_ranks)`가 축별 cut 체인을 시뮬레이션해 worst-rank 업데이트 점유율을
+  최소화 → bench5에서 x 기각·y 선택(게이트에 회귀 포함). box 없으면 legacy min-extent 폴백.
+- 잔여(M2c→M5로 이관): mpirun runner/per-rank setup 배선(모든 수학 경로는 이미 게이트됨 → 배선 리스크 낮음),
+  own_count=0 랭크 허용(현재 fail-fast assert), checkpoint rank0 조립.
