@@ -194,3 +194,14 @@
   인라인 재기술(연산자 미공유 → kernel-vs-elementwise 라운딩 분기) → `_feq_fneq` 공유로 교정.
   회귀: scoped/M2b/mpirun 2-rank 전부 bit 복원. 교훈 추가: **분해 코드는 프리미티브의 '수식'이
   아니라 '연산자 객체'를 공유해야 한다**.
+
+### 3차 수리: rank-로컬 c2f full-volume upsample 제거 (2026-07-13)
+- 2차 재측정(사용자): 2.97s/step — feq 커널화 이득 ~0.07s뿐. **coupling 지배항의 진범 =
+  rank-로컬 c2f의 full-volume upsample**("v1; slab-scoped is M4" 이연 항목): L3→L4 호출당
+  fine 블록 전체(~6GB 쓰기) 생성 후 6개 스트립만 사용 — 스트립 필요량의 ~30×.
+- 수정: production strips_out 패리티의 **boundary-only 슬랩 upsample** 이식 — face별 얇은
+  coarse 슬랩(cw=4)만 로컬 블록에서 잘라 upsample. 분할축-수직 face는 소유 스트립 있는
+  rank만(블록 포함성 assert — own≥ghost로 보장), 횡방향 face는 M2 여백논증 그대로(블록
+  ±2행 → owned 스트립 노드는 centered 스텐실 = bit).
+- 회귀: **M2a/M2b/mpirun 2-rank 전부 bit**. 기대: coupling ~1.0 → ~0.1-0.2 s/step + 블록
+  fine 배열(~GB급) 할당 churn 소멸. 클러스터 재측정 대기.

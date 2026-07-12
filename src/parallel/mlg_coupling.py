@@ -124,27 +124,53 @@ class RankLocalCouplingV1:
             f_eq = gc._compute_f_eq(rho, u)
             coarse_nodes = f_eq + gc._factor_c2f * (f_sub - f_eq)
 
-        # local full-volume upsample of the block (v1; slab-scoped is M4)
-        fine_block = gc._upsample_block(coarse_nodes)
+        # Boundary-only upsample (production strips_out parity, patch 17
+        # M5 pass 3): the v1 full-volume block upsample wrote ~30x more
+        # fine volume than the 6 written strips need (D40 profile: coupling
+        # ~1.0 s/step of 3.0). Per face, upsample only the thin coarse slab
+        # from the LOCAL block; the M2 margin argument carries over
+        # unchanged (the block extends 2 coarse rows past owned, so every
+        # owned strip node sees the same centered/one-sided stencils as the
+        # full-volume result -> bit).
         blk_f0 = 2 * (rng[0] - self._box_lo)      # block origin, global fine
-
+        B = coarse_nodes.shape[1 + a]
         own0 = self._pf.own_start
         own1 = own0 + self._pf.own_count
-        for (sx, sy, sz) in gc._fine_bnd_slices.values():
-            strip = [sx, sy, sz]                   # global fine, spatial
+        for c_sl, w_sl, r_sl in gc._bnd_face_specs:
+            strip = list(w_sl[1:])                 # global fine, spatial
+            fa = next(i for i, sl_ in enumerate(strip)
+                      if not (sl_.start is None and sl_.stop is None))
             s_ax = strip[a]
             lo = 0 if s_ax.start is None else s_ax.start
             hi = self._nf_ax if s_ax.stop is None else s_ax.stop
             lo, hi = max(lo, own0), min(hi, own1)  # ∩ owned fine rows
             if hi <= lo:
                 continue
+            c_spatial = list(c_sl[1:])             # box coords, thin on fa
+            r_spatial = [slice(None)] * 3
+            if fa == a:
+                # face normal to the split axis: translate the slab rows to
+                # local block indices (containment guaranteed: owning strip
+                # rows implies own>=ghost coarse rows reach past the slab)
+                cb = c_spatial[a]
+                lo_c = cb.start + self._box_lo - rng[0]
+                hi_c = cb.stop + self._box_lo - rng[0]
+                if lo_c < 0 or hi_c > B:
+                    raise AssertionError(
+                        f"c2f face slab [{lo_c},{hi_c}) outside local block "
+                        f"B={B} (own_count too small?)")
+                c_spatial[a] = slice(lo_c, hi_c)
+                off = lo - (0 if s_ax.start is None else s_ax.start)
+                r0 = r_sl[1 + fa].start or 0
+                r_spatial[fa] = slice(r0 + off, r0 + off + (hi - lo))
+            else:
+                c_spatial[a] = slice(None)         # full local block rows
+                r_spatial[fa] = r_sl[1 + fa]
+                r_spatial[a] = slice(lo - blk_f0, hi - blk_f0)
+            slab = gc._upsample_block(
+                coarse_nodes[(slice(None),) + tuple(c_spatial)])
+            vals = slab[(slice(None),) + tuple(r_spatial)]
             strip[a] = slice(lo, hi)
-            # values from the local upsampled block
-            blk = [slice(s.start, s.stop) if s.start is not None or
-                   s.stop is not None else slice(None) for s in strip]
-            blk[a] = slice(lo - blk_f0, hi - blk_f0)
-            vals = fine_block[(slice(None),) + tuple(blk)]
-            # destination in LOCAL fine coords
             dst = list(strip)
             dst[a] = slice(self._l_f(lo), self._l_f(hi))
             esoteric_scatter_std_region(xp, mem_f, vals, t_f, tuple(dst))
