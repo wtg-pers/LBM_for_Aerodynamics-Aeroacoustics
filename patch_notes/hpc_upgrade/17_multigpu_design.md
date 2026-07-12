@@ -69,3 +69,17 @@
   비균등(5,5,5,5,4)도 3축 bit ✓. v1 물리-밴드 halo의 "구성적 정확성" 실증(ghost-2 중복계산 + 프리미티브
   재사용 전략 그대로 적중).
 - 다음 → M2: MLG 레벨별 분할(코스-정렬 cut 규칙, coupling 랭크-로컬화, 홀수 extent 처리).
+
+### ✅ M2a — MLG rank-local 커플링 핵심 수학 (2026-07-12, 로컬 3090)
+- `Partition1D.from_range`(명시 범위 — fine 분할은 coarse cut에서 **유도**: fine=2·(coarse−box_lo), 마지막
+  랭크가 co-located +1 노드 흡수) + `src/parallel/mlg_coupling.py`(`RankLocalCouplingV1`):
+  **global GridCoupling의 수학 프리미티브(fused rescale·cubic upsample·filter·macro/f_eq)를 그대로 재사용**,
+  슬라이스 오케스트레이션만 로컬화. margin 논증: C2F=코스 블록 ±2행 확장→owned 파인 스트립은 centered
+  stencil(=global bit); F2C=strided 읽기 ±1 코스행→filter centered(=global bit).
+- 스케줄: 커플링 읽기 직전 해당 레벨 re-sync(advance가 ghost layer2를 오염시키므로). 파인 레벨도 periodic
+  ring 교환 = 1-rank 커널의 global wrap 의미론을 정확 재현(스트립 밖 오염 행이 동일하게 생성·덮임).
+- **게이트 G-M2a PASS**: 합성 2-레벨(코스 36×32×32 주기 + 파인 47³ 중첩, 실제 GridCoupling+fused rescale,
+  production 스케줄 5 coarse step) — 2-rank vs 1-rank **x/y/z 3축 coarse·fine 전부 bit-identical**;
+  3-rank 비대칭 분할도 3축 bit ✓.
+- 남은 M2b: bench5 5-레벨 연쇄(레벨쌍 4개 체인) + 솔버 통합(setup/MultiLevelGrid의 분산 구동, BC/sponge
+  끝랭크 슬라이스, checkpoint rank0 조립). fprev는 로컬 블록 영역으로 자연 확장(코드 동일).

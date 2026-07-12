@@ -114,6 +114,24 @@ class Partition1D:
             return r % self.n_ranks
         return r if 0 <= r < self.n_ranks else None
 
+    @classmethod
+    def from_range(cls, global_shape: Tuple[int, int, int], n_ranks: int,
+                   rank: int, axis: int, own_start: int, own_count: int,
+                   ghost: int = 2, periodic: bool = True) -> "Partition1D":
+        """Partition with an EXPLICIT owned range (MLG coarse-aligned cuts).
+
+        Fine-level partitions are DERIVED from the coarse cuts (fine index =
+        2*(coarse - box_lo)), not split independently — this keeps coupling
+        regions rank-local (patch 17 M2)."""
+        p = cls(global_shape, n_ranks, rank, axis, ghost=ghost,
+                periodic=periodic)
+        p.own_start = int(own_start)
+        p.own_count = int(own_count)
+        ls = list(p.global_shape)
+        ls[axis] = p.own_count + 2 * p.ghost
+        p.local_shape = tuple(ls)
+        return p
+
     def __repr__(self) -> str:
         return (f"Partition1D(axis={AXIS_NAME[self.axis]}, rank={self.rank}/"
                 f"{self.n_ranks}, own=[{self.own_start},"
