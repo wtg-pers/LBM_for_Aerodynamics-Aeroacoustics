@@ -169,10 +169,25 @@ def verify(comm, rank, nr, runner, args):
     ok = True
     for k in range(NL):
         rf = cp.asnumpy(ref.get_level(k).physical_f)
-        df = np.max(np.abs(getattr(runner, f"_asm{k}") - rf))
+        d = np.abs(getattr(runner, f"_asm{k}") - rf)
+        df = float(d.max())
         bit = bool(df == 0.0)
         ok = ok and (df < 1e-4)
         print(f"[verify] L{k}: max|df|={df:.3e}  bit={bit}", flush=True)
+        if not bit:
+            # localize: owning rank per diff y tells devices apart; x range
+            # tells sponge (high x) from bulk; count tells isolated vs band
+            nz = np.argwhere(d > 0)
+            gb = getattr(runner, "bounds", None)
+            ys = np.unique(nz[:, 1 + runner.axis])
+            own = [int(np.searchsorted(gb, y, side="right") - 1)
+                   if gb is not None else -1 for y in ys[:12]]
+            print(f"[verify]   diff cells={len(nz)}  "
+                  f"axis-coords={ys[:12].tolist()} -> owner rank {own}",
+                  flush=True)
+            for row in nz[:5]:
+                print(f"[verify]   (q,x,y,z)={tuple(int(v) for v in row)}  "
+                      f"dist={d[tuple(row)]:.3e}", flush=True)
     print(f"[verify] RESULT: {'PASS' if ok else 'FAIL'} "
           "(gate: max|df|<1e-4; bit expected at 2 ranks)", flush=True)
 
