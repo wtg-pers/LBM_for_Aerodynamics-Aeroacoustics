@@ -143,3 +143,17 @@
   타당성은 드라이 체인체크로 확정.
 - 남음(사용자 클러스터, runbook 18): OpenMPI+UCX cuda-aware 실검증, 4-rank verify, farfield40
   1-rev 스모크+스케일링. 이후 검토용 철학 보고서 작성 예정.
+
+### M5 클러스터 검증 §1 + 1-ulp 원인 규명·수정 (2026-07-12, anode1)
+- **§1(a) 2-rank ALM cuda_aware=1: 전 레벨 bit** — CUDA-aware UCX device-direct 경로 클러스터 첫 검증.
+- §1(b)(c) 4-rank: L1~L4 bit, **L0만 7.451e-09(=2⁻²⁷, f≈0.074의 f32 1-ulp)**. 진단 체인:
+  ①로컬 3090 loopback 동일조건(동일 bounds) 재현 → bit(프로토콜 무죄) ②GPU 4장 동일모델 확인
+  ③`--devices 0,0,0,0`(전부 GPU0)에서도 동일 재현(디바이스 이질성 기각) ④verify 위치출력:
+  **diff가 최소 슬랩 rank1(own=6)·rank2(own=5) 소유행 전체에만** — shape 의존 확정.
+- **원인**: coupling.py `_compute_macroscopic/_compute_f_eq`의 `xp.sum`/`einsum` — CuPy reduction/
+  cuBLAS가 배열 shape·SM 수로 누적전략 선택 → 작은 rank-로컬 F2C 블록에서만 결합순서 변화.
+  L0만인 이유=L0 F2C가 유일한 소형(48² transverse) 블록(C2F는 fused 커널이라 무관), 3090 재현불가
+  이유=SM 82 vs 128의 전략 경계 차이.
+- **수정**: 고정순서 ±누적으로 교체(c∈{−1,0,+1}이라 곱셈 불요; q승순·d승순 serial) — 어떤 shape/
+  디바이스에서도 결합순서 동일 → 분산-vs-단일 bit 보장이 구조적으로 회복. 회귀: eso_coupling_scoped/
+  M2b(전 레벨 bit)/ALM smoke(median 1.1e-4) PASS. 클러스터 4-rank 재검증 대기.

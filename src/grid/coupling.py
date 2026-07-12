@@ -384,18 +384,46 @@ class GridCoupling:
     # =================================================================
 
     def _compute_macroscopic(self, f: 'npt.NDArray') -> tuple:
-        """ρ = Σ f_i,  u = (Σ c_i f_i) / ρ"""
+        """ρ = Σ f_i,  u = (Σ c_i f_i) / ρ
+
+        Fixed-order accumulation, NOT xp.sum/einsum: library reductions pick
+        shape- and device-dependent accumulation orders (CuPy reduction /
+        cuBLAS split), which broke decomposed-vs-single bit-parity on small
+        rank-local F2C blocks (patch 17 M5, anode1 4090 L0: 1-ulp on the two
+        thinnest rank slabs only). Serial q-ascending +/- accumulation is
+        order-identical for every shape on every device; c in {-1,0,+1}.
+        """
         xp = self._xp
-        rho = xp.sum(f, axis=0)
-        momentum = xp.einsum('dq,q...->d...', self._c, f)
-        u = momentum / rho
+        rho = f[0].copy()
+        for q in range(1, self._Q):
+            rho += f[q]
+        u = xp.zeros((3,) + f.shape[1:], dtype=f.dtype)
+        c = self._c
+        for q in range(self._Q):
+            for d in range(3):
+                cd = float(c[d, q])
+                if cd > 0:
+                    u[d] += f[q]
+                elif cd < 0:
+                    u[d] -= f[q]
+        u /= rho
         return rho, u
 
     def _compute_f_eq(self, rho: 'npt.NDArray', u: 'npt.NDArray') -> 'npt.NDArray':
-        """Maxwellian equilibrium: f^eq = w·ρ·(1 + cu/cs² + ...)"""
+        """Maxwellian equilibrium: f^eq = w·ρ·(1 + cu/cs² + ...)
+
+        Same fixed-order policy as _compute_macroscopic (no einsum/sum)."""
         xp = self._xp
-        cu = xp.einsum('dq,d...->q...', self._c, u)
-        usqr = xp.sum(u * u, axis=0)
+        cu = xp.zeros((self._Q,) + u.shape[1:], dtype=u.dtype)
+        c = self._c
+        for q in range(self._Q):
+            for d in range(3):
+                cd = float(c[d, q])
+                if cd > 0:
+                    cu[q] += u[d]
+                elif cd < 0:
+                    cu[q] -= u[d]
+        usqr = u[0] * u[0] + u[1] * u[1] + u[2] * u[2]
         cs2 = self._cs2
         return self._w_bc * rho * (
             1.0 + cu / cs2 + 0.5 * cu * cu / (cs2 * cs2) - 0.5 * usqr / cs2
