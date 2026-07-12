@@ -15,6 +15,15 @@ bench5 pure-ALM/archB 양쪽 **전 레벨 bit-identical** 확인된 상태. 이 
 MPIRUN="mpirun --mca pml ucx -x LBM_ESOTERIC=1"
 ```
 
+GPU 지정: 기본은 node-local rank → 0,1,2,... 순서 자동 배정.
+특정 GPU를 쓰려면 `--devices` (node-local rank 순서대로 매핑):
+```bash
+# 예: 2-rank를 GPU 0,1에            예: GPU 2,3만 사용
+... main_mpi.py --devices 0,1 ...   ... main_mpi.py --devices 2,3 ...
+```
+(`CUDA_VISIBLE_DEVICES`로도 가능하지만 런처별 env 전파 문법이 달라
+— OpenMPI `-x`, MPICH `-genv` — CLI 플래그를 권장.)
+
 ## 1. 기능 검증 (bench5, 수 분)
 ```bash
 # (a) 2-rank + ALM, bit 기대

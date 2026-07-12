@@ -36,6 +36,9 @@ def parse_cli(argv):
     ap.add_argument("--steps", type=int, required=True,
                     help="coarse (L0) steps")
     ap.add_argument("--axis", default="auto", choices=["auto", "x", "y", "z"])
+    ap.add_argument("--devices", default=None,
+                    help="comma-separated GPU ids per node-local rank, "
+                         "e.g. '0,1' or '2,3' (default: local_rank %% ndev)")
     ap.add_argument("--ghost", type=int, default=3)
     ap.add_argument("--cuda-aware", default=os.environ.get("LBM_MPI_CUDA", "0"))
     ap.add_argument("--csv", default=None)
@@ -69,7 +72,14 @@ def main():
     local = comm.Split_type(MPI.COMM_TYPE_SHARED).Get_rank()
     import cupy as cp
     ndev = cp.cuda.runtime.getDeviceCount()
-    dev = local % ndev
+    if args.devices:
+        ids = [int(d) for d in args.devices.split(",")]
+        dev = ids[local % len(ids)]
+        if dev >= ndev:
+            raise ValueError(f"--devices {args.devices}: id {dev} >= "
+                             f"visible device count {ndev}")
+    else:
+        dev = local % ndev
     cp.cuda.Device(dev).use()
 
     if rank != 0:                                 # quiet non-root builds
