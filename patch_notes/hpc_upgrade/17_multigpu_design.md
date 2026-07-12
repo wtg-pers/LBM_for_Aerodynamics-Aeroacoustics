@@ -127,3 +127,19 @@
   v2의 SGS 결합(u edge-plane 교환)·MLG 결합(커플링 시점만 v1 물리밴드 하이브리드)·comm/compute 오버랩
   (interior/edge 분할 런치 필요)은 **음향급 강스케일링 실측이 정당화할 때** M5+ 후속으로. v2는 단일레벨
   스트리밍 계층에서 프로토콜 수학이 bit로 증명된 상태.
+
+### ✅ M5 — SPMD 배선 + 로컬 실 mpirun 검증 (2026-07-12)
+- **production 승격**: `src/parallel/local_level.py`(게이트 검증 LocalLevel/extract), `runner.py`
+  (DistributedMLGRunner — G-M2b/M3 재귀의 SPMD화, ALM 훅 배선 포함), `alm_dist.MPIAllreduce`,
+  `MPITransport` 완성(CUDA-aware device-direct / host-staging 폴백, shape-결정적 Recv, flush),
+  exchanger tag_base(레벨별 네임스페이스), `main_mpi.py`(serialized guard, node-local rank→GPU,
+  rank0 thrust CSV, --verify, comm.Abort fail-fast).
+- **★균등분할 함정 발견→해결**: farfield40 NR=4는 균등 L0 분할 시 전 축 infeasible(중첩 박스
+  중앙집중 → 바깥 rank L4 own=0). 해법=`balance_cuts`: **모든 L0 컷을 최내곽 박스 span 내부에**
+  배치(nesting ⇒ 전 rank가 전 레벨 소유 보장) + 업데이트밀도 quantile 배치(밸런스).
+  farfield40 NR=4: bounds=[0,108,121,133,240], worst share 0.266(이상 0.25). `choose_axis_balanced`.
+- **로컬 실 mpirun(MPICH host-staged, 1 GPU 2 프로세스) 검증**: bench5 pure-ALM/archB 2-rank
+  `--verify` **전 레벨 bit-identical**. 4-rank 로컬은 동시빌드 4개로 비현실적(스로틀) — 파티션
+  타당성은 드라이 체인체크로 확정.
+- 남음(사용자 클러스터, runbook 18): OpenMPI+UCX cuda-aware 실검증, 4-rank verify, farfield40
+  1-rev 스모크+스케일링. 이후 검토용 철학 보고서 작성 예정.

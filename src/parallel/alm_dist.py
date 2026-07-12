@@ -31,6 +31,22 @@ def alm_partial_sums(u_owned_view, positions_owned, epsilon, n_cut, xp):
         return_sums=True)
 
 
+class MPIAllreduce:
+    """comm.Allreduce adapter — same interface as ThreadAllreduce."""
+
+    def __init__(self, comm) -> None:
+        self._comm = comm
+
+    def allreduce(self, rank: int, num: np.ndarray, den: np.ndarray):
+        n = den.shape[0]
+        send = np.empty(4 * n, np.float64)
+        send[:3 * n] = num.ravel()
+        send[3 * n:] = den
+        recv = np.empty_like(send)
+        self._comm.Allreduce(send, recv)
+        return recv[:3 * n].reshape(n, 3), recv[3 * n:]
+
+
 class ThreadAllreduce:
     """In-process sum-allreduce across N rank-threads (gate transport)."""
 

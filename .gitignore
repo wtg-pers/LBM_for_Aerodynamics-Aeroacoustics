@@ -10,6 +10,7 @@
 # 3. 무시 대상에서 제외할 파일
 !main.py
 !main_wind_turbine.py
+!main_mpi.py
 !.gitignore
 !README.md
 

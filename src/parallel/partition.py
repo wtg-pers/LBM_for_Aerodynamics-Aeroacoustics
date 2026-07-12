@@ -80,6 +80,135 @@ def choose_axis(level_shapes: Sequence[Tuple[int, int, int]],
     return best_ax
 
 
+def level_spans_L0(level_shapes, pair_boxes, axis):
+    """Per-level [A_k, B_k) span in fractional L0 coordinates along `axis`.
+
+    Composed from the nested fine_domain_coarse boxes: a level-k coordinate
+    x maps to level k-1 as box_lo + x/2 (fine_range_from_coarse inverse).
+    """
+    spans = [(0.0, float(level_shapes[0][axis]))]
+    lo_acc, scale = 0.0, 1.0
+    for k in range(1, len(level_shapes)):
+        lo, _hi = pair_boxes[k - 1][axis]
+        lo_acc = lo_acc + lo * scale
+        scale *= 0.5
+        spans.append((lo_acc, lo_acc + level_shapes[k][axis] * scale))
+    return spans
+
+
+def chain_owns(level_shapes, pair_boxes, axis, bounds, ghost=3):
+    """Exact per-rank chain from explicit L0 cut bounds.
+
+    Returns (min_own, worst_share, owns_last): the smallest own_count over
+    all (rank, level), the worst-rank share of total updates, and the
+    finest-level own counts. Uses the same fine_range_from_coarse math as
+    the runner, so feasibility here == feasibility there.
+    """
+    from src.parallel.mlg_coupling import fine_range_from_coarse
+    nl, nr = len(level_shapes), len(bounds) - 1
+    weights = [float(s[0] * s[1] * s[2]) * (2.0 ** k)
+               for k, s in enumerate(level_shapes)]
+    total = sum(weights)
+    loads = [0.0] * nr
+    min_own = 10 ** 9
+    owns_last = []
+    for r in range(nr):
+        part = Partition1D.from_range(
+            level_shapes[0], nr, r, axis, bounds[r],
+            bounds[r + 1] - bounds[r], ghost=ghost)
+        min_own = min(min_own, part.own_count)
+        loads[r] += weights[0] * part.own_count / level_shapes[0][axis]
+        for k in range(1, nl):
+            lo, hi = pair_boxes[k - 1][axis]
+            nf = level_shapes[k][axis]
+            f0, fc = fine_range_from_coarse(part, lo, hi, nf)
+            min_own = min(min_own, fc)
+            loads[r] += weights[k] * fc / nf
+            part = Partition1D.from_range(
+                level_shapes[k], nr, r, axis, f0, fc, ghost=ghost)
+            if k == nl - 1:
+                owns_last.append(fc)
+    return min_own, max(loads) / total, owns_last
+
+
+def balance_cuts(level_shapes, pair_boxes, axis, n_ranks, ghost=3):
+    """Load-balanced L0 cut bounds [0, c1, ..., c_{R-1}, N0] along `axis`.
+
+    Even L0 splits fail on nested MLG cases: the fine boxes concentrate in
+    the center, so outer ranks own ZERO fine cells (farfield40 at 4 ranks —
+    all axes infeasible). The fix and the balance are the same move: place
+    every cut STRICTLY INSIDE the innermost box's L0 span. Nesting then
+    guarantees every rank intersects every level, and since the finest
+    levels carry most updates (L3+L4 = 86% at farfield40), the load-quantile
+    positions land there anyway.
+
+    Cuts are the quantiles of the per-L0-cell update-density profile,
+    clamped into the innermost span with spacing >= ghost (interior L0 owns)
+    and verified with the exact chain (raises if infeasible).
+    """
+    import numpy as _np
+    n0 = level_shapes[0][axis]
+    if n_ranks == 1:
+        return [0, n0]
+    spans = level_spans_L0(level_shapes, pair_boxes, axis)
+    w = _np.zeros(n0)
+    for k, (A, B) in enumerate(spans):
+        upd = float(level_shapes[k][0] * level_shapes[k][1]
+                    * level_shapes[k][2]) * (2.0 ** k)
+        dens = upd / (B - A)
+        for iy in range(int(A), min(n0, int(_np.ceil(B)))):
+            ov = min(iy + 1.0, B) - max(float(iy), A)
+            if ov > 0:
+                w[iy] += dens * ov
+    cum = _np.concatenate([[0.0], _np.cumsum(w)])
+    cuts = [int(_np.searchsorted(cum, cum[-1] * q / n_ranks))
+            for q in range(1, n_ranks)]
+    lo_lim = int(_np.floor(spans[-1][0])) + 1
+    hi_lim = int(_np.ceil(spans[-1][1])) - 1
+    gap = max(int(ghost), 2)
+    for i in range(len(cuts)):
+        cuts[i] = max(cuts[i], lo_lim + i * gap)
+        if i > 0:
+            cuts[i] = max(cuts[i], cuts[i - 1] + gap)
+    for i in range(len(cuts) - 1, -1, -1):
+        cuts[i] = min(cuts[i], hi_lim - (len(cuts) - 1 - i) * gap)
+        if i < len(cuts) - 1:
+            cuts[i] = min(cuts[i], cuts[i + 1] - gap)
+    bounds = [0] + cuts + [n0]
+    if any(b1 - b0 < ghost for b0, b1 in zip(bounds, bounds[1:])):
+        raise ValueError(f"axis {AXIS_NAME[axis]}: cannot place {n_ranks - 1} "
+                         f"cuts with spacing >= {ghost} inside the innermost "
+                         f"box span [{lo_lim},{hi_lim}]")
+    min_own, worst, _ = chain_owns(
+        level_shapes, pair_boxes, axis, bounds, ghost)
+    if min_own < ghost:
+        raise ValueError(f"axis {AXIS_NAME[axis]}: balanced cuts {cuts} give "
+                         f"min own {min_own} < ghost {ghost}")
+    return bounds
+
+
+def choose_axis_balanced(level_shapes, pair_boxes, n_ranks, ghost=3):
+    """Axis + balanced bounds minimizing the worst-rank update share.
+
+    The runner's production rule (M5). Falls back across axes: infeasible
+    axes (cuts can't fit inside the innermost span) are rejected. Ties break
+    to _AUTO_ORDER (halo-contiguity descending x, y, z).
+    """
+    best = None
+    for ax in _AUTO_ORDER:
+        try:
+            bounds = balance_cuts(level_shapes, pair_boxes, ax,
+                                  n_ranks, ghost)
+        except ValueError:
+            continue
+        _, worst, _ = chain_owns(level_shapes, pair_boxes, ax, bounds, ghost)
+        if best is None or worst < best[2] - 1e-12:
+            best = (ax, bounds, worst)
+    if best is None:
+        raise ValueError(f"no feasible split axis for {n_ranks} ranks")
+    return best[0], best[1]
+
+
 class Partition1D:
     """Contiguous 1D split of a (Nx, Ny, Nz) grid along `axis` with ghosts.
 

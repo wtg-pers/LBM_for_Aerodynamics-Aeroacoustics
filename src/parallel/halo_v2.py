@@ -52,7 +52,7 @@ def _slot_tables(axis: int) -> Tuple[List[List[int]], List[List[int]]]:
 class SlotHaloExchangerV2:
     """Post/complete slot-subset exchange for one esoteric field (ghost=1)."""
 
-    def __init__(self, partition, transport, xp) -> None:
+    def __init__(self, partition, transport, xp, tag_base: int = 0) -> None:
         if partition.ghost != 1:
             raise ValueError("v2 slot halo requires ghost=1")
         if partition.own_count < 2:
@@ -67,6 +67,10 @@ class SlotHaloExchangerV2:
         # plane index along the axis (local coords)
         self._ghost_pl = {0: 0, 1: g + n}          # low/high ghost plane
         self._edge_pl = {0: g, 1: g + n - 1}       # low/high owned edge
+        self._tb = int(tag_base)
+        pl = list(partition.local_shape)
+        del pl[a]
+        self._plane_shape = tuple(pl)
         self.bytes_sent = 0
 
     def _plane(self, f_mem, slots, pl):
@@ -96,8 +100,10 @@ class SlotHaloExchangerV2:
             pa = self._plane(f_mem, A, self._ghost_pl[side])
             pb = self._plane(f_mem, B, self._edge_pl[side])
             self.bytes_sent += pa.nbytes + pb.nbytes
-            self._t.post(self._p.rank, nbr, tag=((1 - side) << 1) | 0, arr=pa)
-            self._t.post(self._p.rank, nbr, tag=((1 - side) << 1) | 1, arr=pb)
+            self._t.post(self._p.rank, nbr,
+                         tag=self._tb + (((1 - side) << 1) | 0), arr=pa)
+            self._t.post(self._p.rank, nbr,
+                         tag=self._tb + (((1 - side) << 1) | 1), arr=pb)
 
     def complete(self, f_mem, t_step: int) -> None:
         par = t_step & 1
@@ -110,10 +116,20 @@ class SlotHaloExchangerV2:
             # 1-side), which are complementary to the slots our own STORE
             # wrote there — no collision, the esoteric layout separates the
             # two populations of each pair by construction.
-            pa = self._t.collect(nbr, self._p.rank, tag=(side << 1) | 0)
-            pb = self._t.collect(nbr, self._p.rank, tag=(side << 1) | 1)
-            self._put(f_mem, self._recv_A(side, par), self._edge_pl[side], pa)
-            self._put(f_mem, self._recv_B(side, par), self._ghost_pl[side], pb)
+            ra = self._recv_A(side, par)
+            rb = self._recv_B(side, par)
+            import numpy as _np
+            pa = self._t.collect(nbr, self._p.rank,
+                                 tag=self._tb + ((side << 1) | 0),
+                                 shape=(len(ra),) + self._plane_shape,
+                                 dtype=_np.float32)
+            pb = self._t.collect(nbr, self._p.rank,
+                                 tag=self._tb + ((side << 1) | 1),
+                                 shape=(len(rb),) + self._plane_shape,
+                                 dtype=_np.float32)
+            self._put(f_mem, ra, self._edge_pl[side], pa)
+            self._put(f_mem, rb, self._ghost_pl[side], pb)
+        self._t.flush()
 
     # -- receive-side slot labels: the sender computed labels for HIS face
     #    (opposite side); by the same formulas those are:
