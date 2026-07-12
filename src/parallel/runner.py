@@ -182,10 +182,18 @@ class DistributedMLGRunner:
 
     def run(self, n_coarse: int, log_every: int = 0, on_log=None) -> dict:
         t0 = time.perf_counter()
+        t_last = t0
+        self.last_interval = None      # {"s_per_step", "elapsed_s"} per log
         for s in range(1, n_coarse + 1):
             self.step_coarse()
             if log_every and on_log and s % log_every == 0:
                 cp.cuda.runtime.deviceSynchronize()
+                now = time.perf_counter()
+                self.last_interval = {
+                    "s_per_step": (now - t_last) / log_every,
+                    "elapsed_s": now - t0,
+                }
+                t_last = now
                 on_log(s, self)
         cp.cuda.runtime.deviceSynchronize()
         dt = time.perf_counter() - t0

@@ -116,6 +116,10 @@ def main():
         if rank != 0:
             return
         line = f"[mpi] step {s}/{args.steps}"
+        if rn.last_interval:
+            sps = rn.last_interval["s_per_step"]
+            eta_h = (args.steps - s) * sps / 3600.0
+            line += f"  {sps:.3f}s/step  ETA {eta_h:.2f}h"
         if rn.model is not None:
             perf = rn.model.get_rotor_performance()
             line += (f"  T={perf['thrust']:.6e}  CT={perf['C_T']:.6e}"
