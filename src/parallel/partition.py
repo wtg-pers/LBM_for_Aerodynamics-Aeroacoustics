@@ -14,8 +14,13 @@ from typing import List, Optional, Sequence, Tuple
 
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 AXIS_NAME = {v: k for k, v in AXIS_INDEX.items()}
-# auto tie-break preference (see patch 17): y, then z, then x.
-_AUTO_ORDER = (1, 2, 0)
+# auto tie-break: balance first (strict >), ties fall to the CHEAPEST-halo
+# axis. Arrays are (Q, x, y, z) C-order, so a halo band cut along x is a
+# fully contiguous plane, along y it is Nz-long contiguous chunks, and along
+# z it is 2-element fragments (worst for gather/scatter + MPI packing).
+# Hence contiguity-descending scan order x, y, z — the first axis to reach
+# the best balance value wins.
+_AUTO_ORDER = (0, 1, 2)
 
 
 def choose_axis(level_shapes: Sequence[Tuple[int, int, int]]) -> int:

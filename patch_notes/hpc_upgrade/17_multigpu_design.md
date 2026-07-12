@@ -18,7 +18,7 @@
 ## 1. 결정 사항 (설계 확정치)
 | 항목 | 결정 | 근거 |
 |---|---|---|
-| 분할 축 | ★**axis-generic 1D 분할 — config 파라미터**(`parallel.axis ∈ {auto,x,y,z}`). 모든 Partition/halo/슬라이스 코드는 축 인덱스를 인자로 받아 동작(하드코딩 금지 — 유입류/회전축이 케이스마다 ±x/±y/±z로 다름, 사용자 지시 2026-07-12). `auto` = 레벨별 해당 축 extent의 최소값을 최대화하는 축(=지배 레벨 일 균등분할 보장; farfield40은 y/z 동률→y tie-break) | ①x-분할은 farfield40 nested 토폴로지에 불균형 치명(L4=x-두께 57셀 슬랩) — 단 이는 이 케이스의 사정이지 코드 제약이 아님 ②ALM partial-sum 프로토콜은 축·회전축 불가지론적이라 어떤 축에도 동일 적용 ③region gather/scatter 프리미티브도 이미 축별 slice 3-튜플 인자라 generic ④1D가 halo 면 2개=최소 |
+| 분할 축 | ★**axis-generic 1D 분할 — config 파라미터**(`parallel.axis ∈ {auto,x,y,z}`). 모든 Partition/halo/슬라이스 코드는 축 인덱스를 인자로 받아 동작(하드코딩 금지 — 유입류/회전축이 케이스마다 ±x/±y/±z로 다름, 사용자 지시 2026-07-12). `auto` = 레벨별 해당 축 extent의 최소값을 최대화하는 축(=지배 레벨 일 균등분할 보장; 동률 시 tie-break=**halo 연속성 내림차순 x→y→z**((Q,x,y,z) C-순서라 x-cut 밴드=연속 평면, y-cut=Nz-연속 조각, z-cut=2원소 파편=패킹 최악; 사용자 질의로 원칙화 2026-07-12). farfield40은 x 탈락(57)·y/z 동률→y) | ①x-분할은 farfield40 nested 토폴로지에 불균형 치명(L4=x-두께 57셀 슬랩) — 단 이는 이 케이스의 사정이지 코드 제약이 아님 ②ALM partial-sum 프로토콜은 축·회전축 불가지론적이라 어떤 축에도 동일 적용 ③region gather/scatter 프리미티브도 이미 축별 slice 3-튜플 인자라 generic ④1D가 halo 면 2개=최소 |
 | 통신 | **mpi4py CUDA-aware(UCX device-direct)** 우선, NCCL은 옵션 | Task1에서 실검증된 경로. runner=`mpirun -np N python main.py ...` |
 | esoteric halo v1 | **ghost=2 + 물리-밴드 교환**(스텝 전: 자기 경계 2셀 밴드 `esoteric_gather_std_region`→MPI→상대 ghost에 `scatter_std_region`; 커널은 ghost 포함 전체 계산=1층 중복계산 후 다음 교환이 덮어씀) | bit-검증된 프리미티브 재사용 → 정확성이 구성적으로 보장. 슬롯-parity 추론 불필요 |
 | esoteric halo v2 | **raw 슬롯 교환**(halo=1, 스텝 후 경계면의 '건너간 슬롯 부분집합'만 merge; parity별 13쌍 매핑) | blueprint §2.3 권장. v1 대비 데이터 ~4×↓(2면·27슬롯→1면·~13슬롯) — PCIe에서 중요. **v1을 참조로 게이트** |
