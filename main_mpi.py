@@ -46,6 +46,9 @@ def parse_cli(argv):
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--profile", action="store_true",
                     help="per-section wall-time attribution (adds sync overhead)")
+    ap.add_argument("--strict-bit", action="store_true",
+                    help="verify passes ONLY on bit-identity (pure-LBM cases; "
+                         "reviewer F-4)")
     return ap.parse_args(argv)
 
 
@@ -188,7 +191,7 @@ def verify(comm, rank, nr, runner, args):
         d = np.abs(getattr(runner, f"_asm{k}") - rf)
         df = float(d.max())
         bit = bool(df == 0.0)
-        ok = ok and (df < 1e-4)
+        ok = ok and (bit if args.strict_bit else df < 1e-4)
         print(f"[verify] L{k}: max|df|={df:.3e}  bit={bit}", flush=True)
         if not bit:
             # localize: owning rank per diff y tells devices apart; x range

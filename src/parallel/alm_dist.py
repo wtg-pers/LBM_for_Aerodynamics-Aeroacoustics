@@ -12,6 +12,13 @@ order.
 
 ThreadAllreduce mirrors the MPI.Allreduce control flow in-process (barrier +
 shared slots) so the gate exercises the exact production call structure.
+
+KNOWN RESIDUAL (review F-1): the partial sums themselves go through CuPy
+reductions inside interpolate_velocity_batch_gpu — shapes are rank-local, so
+a device/library strategy change can move results by fp last-bits (same
+class as the coupling §6 finding). This stays within the ALM fp-lastbit
+verification tier (the allreduce already reassociates), but it is why the
+ALM gate is tolerance-based, not bit.
 """
 
 from __future__ import annotations

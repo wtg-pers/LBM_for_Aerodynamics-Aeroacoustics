@@ -167,9 +167,11 @@ Esoteric Pull(단일버퍼 in-place 스트리밍)은 f-메모리를 절반으로
 - 따라서 소유 셀의 진화는 단일 실행과 정의상 동일 — 이것이 G-M1/M2b의 bit 결과다.
 
 **ghost 폭**: 순수 LBM은 2, SGS(dyn. Smagorinsky) 실행은 3. 후자는 게이트가 잡아낸
-발견이다 — SGS의 u-구배 스텐실이 ghost 2단의 오염된 u를 읽어 owned에 침투했다.
-"ghost 층 1 중복계산" 논증은 SGS처럼 **비국소 입력을 읽는 커널이 끼면 한 층 더**
-필요하다는 일반 교훈을 남겼다.
+발견이다. 기제(검토 ①의 정리를 따름): 동기화된 ghost의 population 집합은 완전하므로
+u 자체는 ghost 전 층에서 유효하고, 오염은 dyn_smag의 반경-2 스텐실이 로컬 wrap 경계를
+넘을 때만 발생한다 — 즉 ghost=3은 마진 0으로 정확히 충족이다. 일반 규칙으로 명문화한다:
+**ghost ≥ 1 + (커널의 비국소 입력 총 반경)**. 향후 더 넓은 test filter 등 커널 추가 시
+이 식으로 재검토한다.
 
 ### 3.3 왜 커플링 통신이 없는가
 
@@ -287,6 +289,7 @@ f32 1 ulp) 차이가 났다. tolerance 게이트는 PASS였지만 예측("순수
 | v2 halo production 미결합 | 프로토콜은 bit 증명 완료 | 강스케일링 실측 후 결정 |
 | 1D 분해 한정 | 4~8 GPU 규모에 적정 | 그 이상 규모에서 재평가 |
 | >2 rank ALM Allreduce 결합순서 | fp last-bit 등급(원리) | 게이트 기준에 반영됨 |
+| ALM 부분합 내부의 CuPy 리덕션 (검토 F-1) | rank-로컬 shape → §6과 동일 버그 클래스 잠재 | fp-lastbit 등급 내(allreduce가 이미 재결합); 장기적으로 커널화 후보 |
 
 ## 8. 검토 요청 포인트
 
@@ -336,3 +339,25 @@ patch_notes/hpc_upgrade/17_multigpu_design.md   설계 + M1~M5 전 단계 로그
 patch_notes/hpc_upgrade/18_m5_cluster_runbook.md 클러스터 절차
 patch_notes/hpc_upgrade/gates/mgpu_m*.py         게이트 원본
 ```
+
+---
+
+## 부록 C. 외부 검토 반영 (2026-07-13)
+
+검토 결과: **승인** (`docs/MULTIGPU_REVIEW_kr.md`) — 검토 포인트 5건 전부 성립,
+게이트 4종 독립 재현, 핵심 논증 3건 독립 재유도 확인. 발견 사항 처리:
+
+| 발견 | 처리 |
+|---|---|
+| F-1 ALM 부분합의 CuPy 리덕션 잔존 | §7 표에 명시 + `alm_dist.py` docstring에 KNOWN RESIDUAL 기록. fp-lastbit 등급 내 |
+| F-2 러너 이중 sync (2× halo 트래픽) | 수정 완료(294516a) — 검토 시점 HEAD 이후. 멱등이라 bit-중립 |
+| F-3 메시지당 deviceSynchronize | 수정 완료(294516a) — staged commit + 라운드당 1회 stream sync + persistent 버퍼 |
+| F-4 verify --strict-bit | 추가 완료 — 순수-LBM 케이스는 bit로만 PASS 가능 |
+| ①의 ghost 규칙 정밀화 | §3.2에 "ghost ≥ 1 + 비국소 입력 총 반경"으로 명문화 |
+
+검토 후 성능 실측(§2 프로파일)이 §6의 교훈을 한 번 더 실증했다: 커플링의 고정순서
+elementwise 체인(§6 수정의 1차 형태)이 D40 4-rank에서 1.0 s/step를 차지함이 드러나
+**융합 RawKernel(셀별 직렬 = 결정성과 성능을 동시에)**로 재수정되었고, 이 과정에서
+rank-로컬 f2c가 모멘트 시퀀스를 인라인 재기술하고 있던 것(§1.4 원칙의 사각지대)도
+`_feq_fneq` 프리미티브 공유로 교정되었다 — 두 경로가 연산자를 공유하지 않으면
+kernel-vs-elementwise 라운딩으로 갈라진다는 G-M2b 실증 포함.

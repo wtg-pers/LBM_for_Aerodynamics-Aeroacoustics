@@ -182,3 +182,15 @@
   (fprev 직후 mem 무변경 재교환 = 멱등 낭비; sync 라운드 ~25%↓). bench5 2-rank bit 유지.
 - `--profile` 추가: 섹션별(halo_post/halo_complete/kernel/alm/coupling/fprev) 랭크별 초 집계
   (rank0 gather 출력) — 다음 클러스터 측정으로 어트리뷰션 확정 후 2차 수리.
+
+### 검토 승인 + 프로파일 어트리뷰션 + 2차 수리 (2026-07-13)
+- **외부 검토 승인**(docs/MULTIGPU_REVIEW_kr.md): 5개 포인트 성립, 게이트 재현, F-1~F-4 발견.
+  F-2/F-3=294516a에서 기수정, F-4=--strict-bit 추가, F-1=문서화(alm_dist KNOWN RESIDUAL).
+- **--profile 실측(D40 4-rank, 64 steps)**: coupling 1.00 / halo_complete 0.95 / halo_post 0.58 /
+  alm 0.34 / **kernel 0.10** s/step — LBM 커널은 이상적 분할, 전부 오케스트레이션 고정비.
+- **2차 수리**: coupling 1.0s의 범인 = 2c40712의 고정순서 elementwise 체인(호출당 ~150 런치+4×
+  메모리트래픽). → `GridCoupling._feq_fneq` **융합 RawKernel**(셀별 직렬 q-루프 = shape-불변
+  결정성 + 단일 패스). G-M2b가 3.9e-07 회귀를 즉시 검출 → 원인=rank-로컬 f2c가 모멘트 시퀀스
+  인라인 재기술(연산자 미공유 → kernel-vs-elementwise 라운딩 분기) → `_feq_fneq` 공유로 교정.
+  회귀: scoped/M2b/mpirun 2-rank 전부 bit 복원. 교훈 추가: **분해 코드는 프리미티브의 '수식'이
+  아니라 '연산자 객체'를 공유해야 한다**.

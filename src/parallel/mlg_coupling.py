@@ -172,9 +172,11 @@ class RankLocalCouplingV1:
         f_at[a] = slice(self._l_f(g0), self._l_f(g0) + (g1 - g0), R)
         f_fine_at = esoteric_gather_std_region(xp, mem_f, t_f, tuple(f_at))
 
-        rho_f, u_f = gc._compute_macroscopic(f_fine_at)
-        f_eq = gc._compute_f_eq(rho_f, u_f)
-        f_neq = gc._filter_f_neq(f_fine_at - f_eq)
+        # same fused feq/fneq primitive as GridCoupling.fine_to_coarse —
+        # the decomposition MUST share the production op or the two sides
+        # split by kernel-vs-elementwise rounding (few f32 ulps, G-M2b)
+        f_eq, f_neq_raw = gc._feq_fneq(f_fine_at)
+        f_neq = gc._filter_f_neq(f_neq_raw)
         recon = f_eq + gc._factor_f2c * f_neq
 
         # excised extraction: global excised offsets within the box on the

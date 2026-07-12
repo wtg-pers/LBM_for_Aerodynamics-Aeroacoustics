@@ -358,9 +358,7 @@ class GridCoupling:
                             else f_fine[:, 0::R, 0::R, 0::R])
 
         # ── Compute macroscopic (unfiltered) ─────────────────────
-        rho_f, u_f = self._compute_macroscopic(f_fine_at_coarse)
-        f_eq = self._compute_f_eq(rho_f, u_f)
-        f_neq_f = f_fine_at_coarse - f_eq
+        f_eq, f_neq_f = self._feq_fneq(f_fine_at_coarse)
 
         # ── Filter f^neq ────────────────────────────────────────
         f_neq_filtered = self._filter_f_neq(f_neq_f)
@@ -382,6 +380,86 @@ class GridCoupling:
     # =================================================================
     # Private: Equilibrium & Macroscopic
     # =================================================================
+
+    def _feq_fneq(self, f: 'npt.NDArray') -> tuple:
+        """(f_eq, f_neq) in ONE pass.
+
+        GPU: fused per-cell RawKernel with a serial q loop — deterministic
+        for every array shape and launch config (the §M5 requirement), and
+        one read/two writes instead of the ~100-launch fixed-order
+        elementwise chain that M5 profiling showed dominating the F2C cost
+        (coupling ~1.0 s/step of 3.0 at D40 4-rank). CPU / non-f32 inputs
+        fall back to the fixed-order python path (same per-cell math).
+        """
+        xp = self._xp
+        if xp.__name__ == 'cupy' and f.dtype == xp.float32:
+            import numpy as _np
+            fc = xp.ascontiguousarray(f)
+            N = fc.size // self._Q
+            if getattr(self, '_feq_kernel', None) is None:
+                self._feq_kernel = self._build_feq_kernel()
+            feq = xp.empty_like(fc)
+            fneq = xp.empty_like(fc)
+            bs = 256
+            self._feq_kernel(((N + bs - 1) // bs,), (bs,),
+                             (fc, feq, fneq, _np.int64(N)))
+            return feq, fneq
+        rho, u = self._compute_macroscopic(f)
+        f_eq = self._compute_f_eq(rho, u)
+        return f_eq, f - f_eq
+
+    def _build_feq_kernel(self):
+        """Compile the fused feq/fneq kernel from this lattice's tables."""
+        import cupy as cp
+        import numpy as _np
+        c = _np.asarray(cp.asnumpy(self._c) if hasattr(self._c, 'get')
+                        else self._c, dtype=_np.float64)
+        w = _np.asarray(cp.asnumpy(self._w_bc) if hasattr(self._w_bc, 'get')
+                        else self._w_bc, dtype=_np.float64).ravel()
+        Q = self._Q
+        fmt = lambda arr: ", ".join(f"{v:.9e}f" for v in arr)
+        inv2 = 1.0 / self._cs2
+        inv4 = inv2 * inv2
+        src = f"""
+extern "C" __global__ void feq_fneq(
+    const float* __restrict__ f,
+    float* __restrict__ feq,
+    float* __restrict__ fneq,
+    const long long N)
+{{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    const float cx[{Q}] = {{{fmt(c[0])}}};
+    const float cy[{Q}] = {{{fmt(c[1])}}};
+    const float cz[{Q}] = {{{fmt(c[2] if c.shape[0] > 2 else _np.zeros(Q))}}};
+    const float w[{Q}]  = {{{fmt(w)}}};
+    float fl[{Q}];
+    float rho = 0.0f;
+    for (int q = 0; q < {Q}; q++) {{
+        fl[q] = f[(long long)q * N + idx];
+        rho += fl[q];
+    }}
+    float ux = 0.0f, uy = 0.0f, uz = 0.0f;
+    for (int q = 0; q < {Q}; q++) {{
+        ux += cx[q] * fl[q];
+        uy += cy[q] * fl[q];
+        uz += cz[q] * fl[q];
+    }}
+    float inv_rho = 1.0f / rho;
+    ux *= inv_rho; uy *= inv_rho; uz *= inv_rho;
+    float usqr = ux * ux + uy * uy + uz * uz;
+    for (int q = 0; q < {Q}; q++) {{
+        float cu = cx[q] * ux + cy[q] * uy + cz[q] * uz;
+        float e = w[q] * rho * (1.0f + cu * {inv2:.9e}f
+                  + 0.5f * cu * cu * {inv4:.9e}f
+                  - 0.5f * usqr * {inv2:.9e}f);
+        long long o = (long long)q * N + idx;
+        feq[o] = e;
+        fneq[o] = fl[q] - e;
+    }}
+}}
+"""
+        return cp.RawKernel(src, "feq_fneq")
 
     def _compute_macroscopic(self, f: 'npt.NDArray') -> tuple:
         """ρ = Σ f_i,  u = (Σ c_i f_i) / ρ
