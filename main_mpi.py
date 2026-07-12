@@ -44,6 +44,8 @@ def parse_cli(argv):
     ap.add_argument("--csv", default=None)
     ap.add_argument("--log-every", type=int, default=8)
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--profile", action="store_true",
+                    help="per-section wall-time attribution (adds sync overhead)")
     return ap.parse_args(argv)
 
 
@@ -131,8 +133,18 @@ def main():
                 csv_f.flush()
         print(line, flush=True)
 
+    if args.profile:
+        runner.profile = {}
     stats = runner.run(args.steps, log_every=args.log_every, on_log=on_log)
     comm.Barrier()
+    if args.profile:
+        prof = comm.gather(runner.profile, root=0)
+        if rank == 0:
+            keys = sorted({k for d in prof for k in d})
+            print("[profile] per-rank seconds over the whole run:", flush=True)
+            for k in keys:
+                vals = " ".join(f"{d.get(k, 0.0):7.2f}" for d in prof)
+                print(f"[profile]   {k:14s} {vals}", flush=True)
     if rank == 0:
         print(f"[mpi] done: {stats['steps']} coarse steps, "
               f"{stats['wall_s']:.2f}s ({stats['s_per_step']:.3f} s/step)",

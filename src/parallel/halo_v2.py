@@ -104,6 +104,8 @@ class SlotHaloExchangerV2:
                          tag=self._tb + (((1 - side) << 1) | 0), arr=pa)
             self._t.post(self._p.rank, nbr,
                          tag=self._tb + (((1 - side) << 1) | 1), arr=pb)
+        if hasattr(self._t, "commit"):
+            self._t.commit()
 
     def complete(self, f_mem, t_step: int) -> None:
         par = t_step & 1

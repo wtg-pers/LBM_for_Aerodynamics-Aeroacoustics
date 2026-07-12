@@ -48,6 +48,9 @@ class LoopbackTransport:
     def collect(self, src: int, dst: int, tag: int, shape=None, dtype=None):
         return self._box.pop((src, dst, tag))
 
+    def commit(self) -> None:
+        pass
+
     def flush(self) -> None:
         pass
 
@@ -74,25 +77,59 @@ class MPITransport:
         self._comm = comm
         self._cuda_aware = bool(cuda_aware)
         self._pending = []          # (request, buffer kept alive)
+        self._staged = []           # (dst, tag) staged before commit()
+        self._sbuf = {}             # persistent send buffers per (dst, tag)
+        self._rbuf = {}             # persistent recv buffers per (src, tag)
 
     def post(self, src: int, dst: int, tag: int, arr) -> None:
+        """Stage a message. Persistent per-(dst,tag) buffers keep addresses
+        stable so the UCX registration cache hits; the device copy is queued
+        async and ONE stream sync in commit() covers the whole round (the
+        first version did a full deviceSynchronize per message — ~hundreds
+        of pipeline drains per coarse step, the M5 scaling killer)."""
         import cupy as cp
+        key = (dst, tag)
         if self._cuda_aware:
-            buf = cp.ascontiguousarray(arr)
-            cp.cuda.runtime.deviceSynchronize()   # buffer complete before RDMA
+            buf = self._sbuf.get(key)
+            if buf is None or buf.shape != arr.shape:
+                buf = cp.empty(arr.shape, arr.dtype)
+                self._sbuf[key] = buf
+            buf[...] = arr
         else:
-            buf = np.ascontiguousarray(cp.asnumpy(arr))
-        self._pending.append((self._comm.Isend(buf, dest=dst, tag=tag), buf))
+            buf = np.ascontiguousarray(cp.asnumpy(arr))   # implicit sync
+            self._sbuf[key] = buf
+        self._staged.append(key)
+
+    def commit(self) -> None:
+        """One stream sync, then Isend everything staged this round."""
+        if not self._staged:
+            return
+        if self._cuda_aware:
+            import cupy as cp
+            cp.cuda.get_current_stream().synchronize()
+        for key in self._staged:
+            dst, tag = key
+            buf = self._sbuf[key]
+            self._pending.append(
+                (self._comm.Isend(buf, dest=dst, tag=tag), buf))
+        self._staged.clear()
 
     def collect(self, src: int, dst: int, tag: int, shape=None, dtype=None):
         import cupy as cp
         if shape is None:
             raise ValueError("MPITransport.collect needs shape+dtype")
+        key = (src, tag)
         if self._cuda_aware:
-            buf = cp.empty(shape, dtype)
+            buf = self._rbuf.get(key)
+            if buf is None or buf.shape != tuple(shape):
+                buf = cp.empty(shape, dtype)
+                self._rbuf[key] = buf
             self._comm.Recv(buf, source=src, tag=tag)
             return buf
-        buf = np.empty(shape, dtype)
+        buf = self._rbuf.get(key)
+        if buf is None or buf.shape != tuple(shape):
+            buf = np.empty(shape, dtype)
+            self._rbuf[key] = buf
         self._comm.Recv(buf, source=src, tag=tag)
         return cp.asarray(buf)
 
@@ -126,6 +163,7 @@ class HaloBandExchangerV1:
                 self._xp, f_mem, t_step, p.edge_band(side))
             # tag encodes the side AS SEEN BY THE RECEIVER (opposite side)
             self._t.post(p.rank, nbr, tag=self._tb + (1 - side), arr=band)
+        self._t.commit()
 
     # -- phase B: everyone receives + scatters into its ghosts --
     def complete(self, f_mem, t_step: int) -> None:

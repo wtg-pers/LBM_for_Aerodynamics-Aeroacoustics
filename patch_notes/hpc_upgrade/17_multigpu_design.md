@@ -172,3 +172,13 @@
   free_all_blocks) — 과도 피크가 (t=0 상태 + 슬랩 1개)로 상한, 레벨 진행마다 단조 감소.
 - 검증: bench5 2-rank mpirun bit 유지. **D40 로컬 프로브**: 빌드 피크 19.2GB → 러너 구축 피크
   미증가 → 정착 rank0 5.0GB/rank1 3.7GB. 게이트는 자체 extract 사본이라 무영향.
+
+### M5 §2 성능 이슈: 4-rank D40 = 3.24 s/step (가속 ~1.0×) → 1차 수리 (2026-07-13)
+- 단서: bench5 4-rank 2.9s vs D40 4-rank 3.2s(업데이트 6× 차인데 시간 동일) → **coarse-step당
+  고정비 지배**(커널 아님). GPU util 20-39% 정합.
+- 1차 수리(커밋): ①`MPITransport.post`의 **메시지당 deviceSynchronize 제거**(step당 ~200회
+  파이프라인 드레인) → staged post + **commit()당 1회 stream sync** ②송수신 **persistent 버퍼**
+  (dst,tag)/(src,tag) — 주소 고정으로 UCX 등록캐시 적중 ③러너 재귀의 **중복 이중 sync 제거**
+  (fprev 직후 mem 무변경 재교환 = 멱등 낭비; sync 라운드 ~25%↓). bench5 2-rank bit 유지.
+- `--profile` 추가: 섹션별(halo_post/halo_complete/kernel/alm/coupling/fprev) 랭크별 초 집계
+  (rank0 gather 출력) — 다음 클러스터 측정으로 어트리뷰션 확정 후 2차 수리.

@@ -103,6 +103,7 @@ class DistributedMLGRunner:
                     for k in range(NL - 1)]
         self._fprev = [None] * (NL - 1)
         self.NL = NL
+        self.profile = None          # dict -> per-section seconds (opt-in)
 
         # distributed ALM (M3 hooks) on the finest level, if present
         self.model = None
@@ -125,50 +126,85 @@ class DistributedMLGRunner:
         self.alm_lev = alm_lev
 
     # ── plumbing ─────────────────────────────────────────────────────
+    def _tic(self):
+        if self.profile is not None:
+            cp.cuda.get_current_stream().synchronize()
+            return time.perf_counter()
+        return 0.0
+
+    def _toc(self, key, t0):
+        if self.profile is not None:
+            cp.cuda.get_current_stream().synchronize()
+            self.profile[key] = self.profile.get(key, 0.0) \
+                + time.perf_counter() - t0
+
     def _sync(self, k: int) -> None:
+        t0 = self._tic()
         self.ex[k].post(self.lv[k].mem, self.lv[k].t)
+        self._toc("halo_post", t0)
+        t0 = self._tic()
         self.ex[k].complete(self.lv[k].mem, self.lv[k].t)
+        self._toc("halo_complete", t0)
 
     def _save_fprev(self, k: int) -> None:
+        t0 = self._tic()
         reg = self.rlc[k].coarse_block_region_local()
         self._fprev[k] = (esoteric_gather_std_region(
             cp, self.lv[k].mem, self.lv[k].t, reg) if reg else None)
+        self._toc("fprev", t0)
 
     def _advance_level(self, k: int) -> None:
         L = self.lv[k]
         if k == self.alm_lev and self.model is not None:
+            t0 = self._tic()
             L.macro_pre_pass()                      # rho/u for ALM sampling
             F = self.model.step(L.u, dt=1.0)        # collective inside
+            self._toc("alm", t0)
+            t0 = self._tic()
             L.advance(force=F.astype(cp.float32) if F.dtype != cp.float32
                       else F)
+            self._toc("kernel", t0)
         else:
+            t0 = self._tic()
             L.advance()
+            self._toc("kernel", t0)
 
     def _advance_fine(self, k: int) -> None:
+        # NOTE sync cadence: ghosts must be fresh for (a) the fprev gather
+        # (block extends into ghosts), (b) the kernel, (c) the coupling
+        # reads. One sync covers fprev+advance back-to-back — the mem is
+        # unchanged between them (the first version synced twice; exchange
+        # of unchanged mem is idempotent, so dropping it is bit-neutral).
         has_finer = k + 1 < self.NL
-        if has_finer:
-            self._sync(k); self._save_fprev(k)
         self._sync(k)
+        if has_finer:
+            self._save_fprev(k)
         self._advance_level(k)
         self._sync(k - 1)
+        t0 = self._tic()
         self.rlc[k - 1].c2f(self.lv[k - 1].mem, self.lv[k].mem,
                             self.lv[k - 1].t, self.lv[k].t,
                             is_half_step=True,
                             f_prev_sub_loc=self._fprev[k - 1])
+        self._toc("coupling", t0)
         if has_finer:
             self._advance_fine(k + 1)
-        if has_finer:
-            self._sync(k); self._save_fprev(k)
         self._sync(k)
+        if has_finer:
+            self._save_fprev(k)
         self._advance_level(k)
+        t0 = self._tic()
         self.rlc[k - 1].c2f(self.lv[k - 1].mem, self.lv[k].mem,
                             self.lv[k - 1].t, self.lv[k].t,
                             is_half_step=False)
+        self._toc("coupling", t0)
         if has_finer:
             self._advance_fine(k + 1)
         self._sync(k)
+        t0 = self._tic()
         self.rlc[k - 1].f2c(self.lv[k].mem, self.lv[k - 1].mem,
                             self.lv[k].t, self.lv[k - 1].t)
+        self._toc("coupling", t0)
 
     # ── public API ───────────────────────────────────────────────────
     def step_coarse(self) -> None:
