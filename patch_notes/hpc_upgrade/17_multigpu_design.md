@@ -114,3 +114,16 @@
   (field<1e-4, F rel<1e-5) 유지. BEM/kleine solve는 동일 u_markers로 전 랭크 복제=결정적 동일.
 - M3 범위 제외(문서화): kleine free-wake(웨이크 점 속도 샘플링 미분산 — production은 straight 사용이라 무영향),
   비-gaussian 연구용 샘플러들.
+
+### ✅ M4 — halo v2: raw parity-slot 부분집합 교환 (2026-07-12, 로컬 3090)
+- `src/parallel/halo_v2.py` `SlotHaloExchangerV2`: **ghost=1**, 고스트 평면=SOLID 마킹(커널이 아예 스킵 —
+  v1의 중복계산 제거, 순수 transit mailbox). 스텝 **후** 면당 횡단 population 9개/셀만 두 그룹으로 교환:
+  A(우리 edge STORE가 고스트에 예치한 유출 슬롯 → 이웃 owned edge), B(이웃의 다음 LOAD가 원격으로 읽는
+  우리 edge 상주 슬롯 → 이웃 고스트). **두 그룹 모두 same-slot copy** — esoteric parity swap이 스트리밍을
+  이미 인코딩하므로 재라벨링 불필요. 수신 슬롯과 자기 STORE 슬롯은 pair 내 상보 슬롯이라 충돌 불가(레이아웃 성질).
+  테이블: A_hi(t)={c_i[a]=+1: i+1 odd/i even}, B_hi(t)={c_i[a]=−1: i odd/i+1 even}, low면은 parity 라벨 반전 미러.
+- **G-M4 PASS: 3축 전부 f/rho/u bit-identical, 트래픽 v1 대비 정확히 6.00×↓**(486→81 KiB/step, 2-rank TGV).
+- 범위/이연(§5 실측-후-최적화 원칙): production 기본은 v1 유지(D40 4-rank v1 오버헤드 ~1%).
+  v2의 SGS 결합(u edge-plane 교환)·MLG 결합(커플링 시점만 v1 물리밴드 하이브리드)·comm/compute 오버랩
+  (interior/edge 분할 런치 필요)은 **음향급 강스케일링 실측이 정당화할 때** M5+ 후속으로. v2는 단일레벨
+  스트리밍 계층에서 프로토콜 수학이 bit로 증명된 상태.
