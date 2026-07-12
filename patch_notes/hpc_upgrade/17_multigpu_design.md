@@ -157,3 +157,10 @@
 - **수정**: 고정순서 ±누적으로 교체(c∈{−1,0,+1}이라 곱셈 불요; q승순·d승순 serial) — 어떤 shape/
   디바이스에서도 결합순서 동일 → 분산-vs-단일 bit 보장이 구조적으로 회복. 회귀: eso_coupling_scoped/
   M2b(전 레벨 bit)/ALM smoke(median 1.1e-4) PASS. 클러스터 4-rank 재검증 대기.
+
+### M5 §1 클러스터 완전 통과 + 실런 준비 (2026-07-12)
+- coupling 고정순서 수정 후 **클러스터 4-rank 전 레벨 bit 확인**(사용자 보고) — §1 (a)(b)(c) 전부 통과.
+- 실런 config: `configs/hvab/hvab_hover_c10_farfield40_eso_mpi4.py`(case1 물리 동일, run_tag만 분리).
+- 검토용 보고서: `docs/MULTIGPU_DESIGN_PHILOSOPHY_kr.md` — 설계 철학(§1 bit-parity 사다리/축일반성/
+  no-fork 훅/프리미티브 재사용/복제빌드/게이트 사다리/실측후 최적화), 분해·halo·ALM·러너 상세,
+  1-ulp 사건 사례연구, 한계·로드맵, 검토 요청 포인트 5건.

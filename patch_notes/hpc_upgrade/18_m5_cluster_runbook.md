@@ -52,10 +52,17 @@ L4 owns=[148,208,192,133], worst-rank share 0.266 (이상 0.250, 밸런스 효�
 
 ```bash
 # 1-rev 스모크 (1257 coarse steps ≈ 단일GPU 대비 ~3.5× 빠를 것으로 기대)
+# 전용 config (run_tag=farfield40_eso_mpi4 — 단일GPU case1 결과와 디렉토리 충돌 방지)
 $MPIRUN -n 4 python main_mpi.py \
-  --config configs/hvab/hvab_hover_c10_farfield40_eso.py \
+  --config configs/hvab/hvab_hover_c10_farfield40_eso_mpi4.py \
   --steps 1257 --log-every 16 --cuda-aware 1 \
   --csv mpi4_case1_rev1.csv
+
+# 좋으면 풀런 (25 rev)
+$MPIRUN -n 4 python main_mpi.py \
+  --config configs/hvab/hvab_hover_c10_farfield40_eso_mpi4.py \
+  --steps 31425 --log-every 64 --cuda-aware 1 \
+  --csv mpi4_case1_full.csv
 ```
 비교: 단일GPU case1 CSV의 같은 rev 구간과 thrust 곡선 겹쳐보기
 (ramp 구간이라 초기 일치 뚜렷해야 함; CV-band ±3% 이내).
