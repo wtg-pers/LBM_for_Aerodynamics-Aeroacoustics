@@ -381,7 +381,8 @@ def interpolate_velocity_batch_gpu(
     marker_epsilon: 'npt.NDArray',
     xp,
     n_cut: float = 3.0,
-    gpu_mem_limit_mb: float = 512.0
+    gpu_mem_limit_mb: float = 512.0,
+    return_sums: bool = False
 ) -> 'npt.NDArray':
     """GPU-capable batch velocity interpolation at all marker positions
 
@@ -419,6 +420,10 @@ def interpolate_velocity_batch_gpu(
         u_markers: Velocity at each marker, shape (N_markers, 3)  [Δx/Δt]
                    Always numpy (CPU) — feeds into BEM pipeline.
     """
+    if return_sums and xp.__name__ == 'numpy':
+        raise NotImplementedError(
+            "return_sums (distributed partial sums) is GPU-only")
+
     # ── CPU fallback: delegate to existing functions ──
     if xp.__name__ == 'numpy':
         # Always use §3 (per-marker loop) as the reference implementation.
@@ -441,18 +446,23 @@ def interpolate_velocity_batch_gpu(
         n_markers, epsilon_for_stencil, n_cut, gpu_mem_limit_mb
     )
 
+    if return_sums and chunk_size < n_markers:
+        raise NotImplementedError("return_sums with chunking not supported")
+
     if chunk_size >= n_markers:
         # ── Single batch (no chunking needed) ──
         if is_uniform:
             u_gpu = _interpolate_uniform_eps_gpu(
                 u_field, marker_positions,
-                float(eps_unique[0]), xp, n_cut
+                float(eps_unique[0]), xp, n_cut, return_sums=return_sums
             )
         else:
             u_gpu = _interpolate_varying_eps_gpu(
                 u_field, marker_positions,
-                marker_epsilon, xp, n_cut
+                marker_epsilon, xp, n_cut, return_sums=return_sums
             )
+        if return_sums:
+            return xp.asnumpy(u_gpu[0]), xp.asnumpy(u_gpu[1])
         return xp.asnumpy(u_gpu)
 
     # ── Chunked processing ──
@@ -530,7 +540,8 @@ def _interpolate_uniform_eps_gpu(
     marker_positions: 'npt.NDArray',
     epsilon: float,
     xp,
-    n_cut: float
+    n_cut: float,
+    return_sums: bool = False
 ) -> 'npt.NDArray':
     """Fully vectorized GPU interpolation for uniform Gaussian width
 
@@ -618,8 +629,8 @@ def _interpolate_uniform_eps_gpu(
     )   # (N_markers, S, S, S)
 
     # Normalization per marker
-    W_sum = xp.sum(weights, axis=(1, 2, 3))        # (N_markers,) [dimless]
-    W_sum = xp.maximum(W_sum, 1e-30)               # avoid division by zero
+    W_raw = xp.sum(weights, axis=(1, 2, 3))        # (N_markers,) [dimless]
+    W_sum = xp.maximum(W_raw, 1e-30)               # avoid division by zero
 
     # ── Weighted velocity for each component ──
     u_markers = xp.zeros((n_markers, 3), dtype=xp.float64)   # [Δx/Δt]
@@ -628,8 +639,11 @@ def _interpolate_uniform_eps_gpu(
         # Gather grid velocity at stencil nodes: u_field[d, gx, gy, gz]
         u_local = u_field[d, gx_c, gy_c, gz_c]     # (N_markers, S, S, S) [Δx/Δt]
         u_local = u_local * weights                  # weighted [Δx/Δt × dimless]
-        u_markers[:, d] = xp.sum(u_local, axis=(1, 2, 3)) / W_sum   # [Δx/Δt]
+        u_markers[:, d] = xp.sum(u_local, axis=(1, 2, 3))   # [Δx/Δt]
 
+    if return_sums:
+        return u_markers, W_raw       # raw sums (distributed allreduce)
+    u_markers /= W_sum[:, None]
     return u_markers   # (N_markers, 3) GPU array [Δx/Δt]
 
 
@@ -642,7 +656,8 @@ def _interpolate_varying_eps_gpu(
     marker_positions: 'npt.NDArray',
     marker_epsilon: 'npt.NDArray',
     xp,
-    n_cut: float
+    n_cut: float,
+    return_sums: bool = False
 ) -> 'npt.NDArray':
     """GPU interpolation when markers have different Gaussian widths
 
@@ -719,8 +734,8 @@ def _interpolate_varying_eps_gpu(
         0.0
     )
 
-    W_sum = xp.sum(weights, axis=(1, 2, 3))
-    W_sum = xp.maximum(W_sum, 1e-30)
+    W_raw = xp.sum(weights, axis=(1, 2, 3))
+    W_sum = xp.maximum(W_raw, 1e-30)
 
     # ── Weighted velocity ──
     u_markers = xp.zeros((n_markers, 3), dtype=xp.float64)
@@ -728,8 +743,13 @@ def _interpolate_varying_eps_gpu(
     for d in range(3):
         u_local = u_field[d, gx_c, gy_c, gz_c]
         u_local = u_local * weights
-        u_markers[:, d] = xp.sum(u_local, axis=(1, 2, 3)) / W_sum
+        u_markers[:, d] = xp.sum(u_local, axis=(1, 2, 3))
 
+    if return_sums:
+        # Distributed partial sums (multi-GPU, patch 17 M3): raw numerator
+        # and UNclamped denominator — the caller allreduces then divides.
+        return u_markers, W_raw
+    u_markers /= W_sum[:, None]
     return u_markers   # (N_markers, 3) GPU array [Δx/Δt]
 
 

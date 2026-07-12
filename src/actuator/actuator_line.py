@@ -63,6 +63,23 @@ try:
 except Exception:                          # pragma: no cover — CPU-only env
     cp = None
 
+
+def _am(x):
+    """Array module (cupy for a cupy array, else numpy) — BEM GPU dispatch."""
+    if cp is not None and isinstance(x, cp.ndarray):
+        return cp
+    return np
+
+
+# Singular-solve error(s) for the Kleine safety net — numpy and (if present) the
+# cupy analogue, so a GPU-resident solve that raises still triggers the fallback.
+_LINALG_ERR = (np.linalg.LinAlgError,)
+if cp is not None:
+    try:
+        _LINALG_ERR = (np.linalg.LinAlgError, cp.linalg.LinAlgError)
+    except Exception:                      # pragma: no cover
+        pass
+
 if TYPE_CHECKING:
     import numpy.typing as npt
 
@@ -324,6 +341,20 @@ class ActuatorLineModel:
         # tip-inflow contribution of the ±3ε sampling kernel:
         #   "point" (B-i), "aniso" (B-ii), "mask_disk" (B-iii).
         self._sampling_mode: str = "gaussian"
+        # ── Multi-GPU hooks (patch_notes/hpc_upgrade/17, M3) ──
+        # _grid_offset: LOCAL-array origin in GLOBAL lu (own_start - ghost per
+        #   axis). Grid-relative ops (velocity sampling, force spreading) use
+        #   positions - offset; rotor physics / wake geometry stay GLOBAL
+        #   (relative distances are shift-invariant).
+        # _velocity_sampler: distributed sampling override — called INSIDE
+        #   step() after the rotor advance with (u_field, positions_grid,
+        #   epsilon_all, active_all, n_cut); must return (N,3) numpy f64.
+        #   The MPI implementation allreduces Gaussian partial sums.
+        # _global_domain_shape: full-grid shape for radial-trunc scale
+        #   computation (scales must be identical on every rank).
+        self._grid_offset = None
+        self._velocity_sampler = None
+        self._global_domain_shape = None
         self._sampling_eps_r_factor: float = 0.5  # B-ii: ε_r = factor·ε (radial)
         # Ring sampling (Natelson ②): N sensors on a circle in the section plane,
         # radius ring_r_factor·ε. Only used when _sampling_mode == "ring".
@@ -438,9 +469,26 @@ class ActuatorLineModel:
         epsilon_all = self.rotor.get_all_marker_epsilon()    # (N_total,) [lu]
         active_all = self.rotor.get_all_marker_active()      # (N_total,) bool
 
-        if self._sampling_mode == "gaussian":
+        # Multi-GPU: grid ops see LOCAL coordinates (positions - offset).
+        positions_grid = (positions - self._grid_offset
+                          if self._grid_offset is not None else positions)
+        if self._grid_offset is not None:
+            if self._velocity_sampler is None and self._sampling_mode != "gaussian":
+                raise NotImplementedError(
+                    f"distributed ALM: sampling mode '{self._sampling_mode}' "
+                    "not supported (gaussian partial sums only)")
+            if self._eps_corr and self._kleine_wake_mode == "free":
+                raise NotImplementedError(
+                    "distributed ALM: kleine free-wake needs wake-point "
+                    "velocity sampling across ranks (unsupported; use "
+                    "wake='straight')")
+
+        if self._velocity_sampler is not None:
+            u_markers = self._velocity_sampler(
+                u_field, positions_grid, epsilon_all, active_all, self.n_cut)
+        elif self._sampling_mode == "gaussian":
             u_markers = interpolate_velocity_batch_gpu(
-                u_field, positions, epsilon_all,
+                u_field, positions_grid, epsilon_all,
                 xp=xp, n_cut=self.n_cut
             )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
         else:
@@ -489,12 +537,22 @@ class ActuatorLineModel:
         if getattr(self, '_radial_trunc', False):
             blade0 = self.rotor.blades[0]
             _r_root = float(blade0.marker_r[0] - blade0.marker_dr / 2)
+            _hub_g = np.asarray(self.rotor.hub_center, dtype=np.float64)
             _radial_trunc = {
                 'axis': np.asarray(self.rotor.rotation_axis, dtype=np.float64),
-                'hub': np.asarray(self.rotor.hub_center, dtype=np.float64),
+                'hub': (_hub_g - self._grid_offset
+                        if self._grid_offset is not None else _hub_g),
                 'r_root': _r_root,
                 'r_tip': float(self.rotor.radius),
             }
+            if self._grid_offset is not None:
+                # Renormalisation scales must be IDENTICAL on every rank:
+                # compute them from GLOBAL geometry (full domain clipping),
+                # while the spreading kernel's per-node radial cut uses the
+                # local-shifted hub above.
+                _radial_trunc['scale_domain_shape'] = self._global_domain_shape
+                _radial_trunc['scale_positions'] = positions
+                _radial_trunc['scale_hub'] = _hub_g
 
         # Anisotropic Gaussian (Natelson Eq. 7): per-marker blade-local frame and
         # per-axis widths (factor × isotropic ε). None → isotropic path.
@@ -502,15 +560,31 @@ class ActuatorLineModel:
         if self._aniso is not None:
             ec, et, er = self.rotor.get_all_marker_aero_frame()
             fc = self._aniso['c']; ft = self._aniso['t']; fr = self._aniso['r']
+            # ε_r: Churchfield 2017 §II.A.2 scales the radial (span) width by the
+            # actuator-element spacing δr, NOT the chord (ε_r = a_r·δr). This keeps
+            # adjacent markers' projections overlapping into a continuous line
+            # regardless of chord, so the tip does not break into disjoint blobs.
+            #   r_ref="spacing" (default): ε_r = max(a_r·δr, 2Δx)  [2Δx = 2 lu floor]
+            #   r_ref="chord"   (legacy) : ε_r = a_r·ε_iso  (pre-2026-07 behaviour)
+            if self._aniso.get('r_ref', 'spacing') == 'spacing':
+                dr = self.rotor.get_marker_spacing()          # [lu] scalar or (n,)
+                if np.ndim(dr) == 0:
+                    dr_all = np.full_like(epsilon_all, float(dr))
+                else:
+                    dr_all = np.tile(np.asarray(dr, dtype=epsilon_all.dtype),
+                                     self.rotor.n_blades)
+                eps_r = np.maximum(fr * dr_all, 2.0)          # a_r·δr, 2Δx floor
+            else:
+                eps_r = fr * epsilon_all
             _aniso = {
                 'ec': ec, 'et': et, 'er': er,
                 'eps_c': fc * epsilon_all, 'eps_t': ft * epsilon_all,
-                'eps_r': fr * epsilon_all,
+                'eps_r': eps_r,
             }
 
         spread_forces_to_grid_gpu(
             self.domain_shape,
-            positions,
+            positions_grid,
             F_global,
             epsilon_all,
             xp=xp,
@@ -633,11 +707,14 @@ class ActuatorLineModel:
         BEM cost (profiled 21 ms/call on HVAB).  Scalar-only query functions
         (CSV / NeuralFoil databases) keep the original per-marker loop.
         """
+        # xp-agnostic (P2/S3b): cupy alpha_deg → GPU-resident polar (C81 LUT is
+        # GPU-capable, S1). Output/scratch arrays follow alpha_deg's module.
+        xp = _am(alpha_deg)
         active = blade.marker_active
-        CL = np.zeros(n, dtype=np.float64)
-        CD = np.zeros(n, dtype=np.float64)
-        valid = np.asarray(active, dtype=bool) & (np.asarray(u_rel) >= 1e-10)
-        if not valid.any():
+        CL = xp.zeros(n, dtype=xp.float64)
+        CD = xp.zeros(n, dtype=xp.float64)
+        valid = xp.asarray(active, dtype=bool) & (xp.asarray(u_rel) >= 1e-10)
+        if not bool(valid.any()):
             return CL, CD
 
         # --- resolve marker→airfoil groups and query functions (cached) -----
@@ -665,11 +742,12 @@ class ActuatorLineModel:
                         groups.append((qf, np.flatnonzero(arr == nm)))
                     self._polar_groups[key] = (names, groups)
         else:
-            groups = [(self.polar_query, np.arange(n))]
+            groups = [(self.polar_query, xp.arange(n))]
 
         if groups is not None:
             slow = []                                   # scalar-only remainders
             for qf, gidx in groups:
+                gidx = xp.asarray(gidx)                 # static cache is numpy → xp
                 idx = gidx[valid[gidx]]
                 if idx.size == 0:
                     continue
@@ -801,6 +879,18 @@ class ActuatorLineModel:
         eps = blade.marker_epsilon
         twist = blade.marker_twist
 
+        # ── P2/S3b: the Kleine correction CAN run on the GPU (A resident from
+        # the free-wake build; polar via the GPU C81 LUT), but it operates on
+        # TINY per-blade arrays (n≈48) → on the cluster the solve REGRESSED
+        # 10→148 ms/sub-step (cupy.linalg.solve + many small C81-lookup kernels
+        # + a forced D2H sync per call are all launch-overhead bound). So it is
+        # **OFF by default** (ALM_CORR_GPU=1 to opt in for experiments). Only the
+        # free-wake Biot-Savart (S2, ~360k-element) is large enough to win on GPU.
+        # See patch_notes/hpc_upgrade/07_p2_s3_correction_gpu.md (cluster result).
+        _gpu_corr = (cp is not None
+                     and os.environ.get('ALM_CORR_GPU', '0') != '0')
+        xpc = cp if _gpu_corr else np
+
         # Influence matrix A_ik = ∂w_i/∂Γ_k.
         wake = self._kleine_wake.get(k)
         if self._kleine_wake_mode == "free" and wake is not None and len(wake) >= 2:
@@ -816,22 +906,13 @@ class ActuatorLineModel:
                 or (self._kleine_wake_steps % self._kleine_rebuild_every == 0))
             if need_rebuild:
                 ctrl3d = self._last_positions[k * n:(k + 1) * n]
-                # Axial DOWNWASH projection direction = OPPOSITE the thrust
-                # (−thrust_axis). The earlier −sign(ω)·rotation_axis is the THRUST
-                # side when thrust = −rotation_axis (e.g. HVAB: thrust=[−1,0,0]),
-                # which FLIPS the correction sign (projects the induced velocity onto
-                # the thrust direction) — the same root cause fixed in
-                # _dag_prescribed_helix_wcorr, confirmed from the helix wake VTP.
-                # Only the straight-limit was ever validated (test_kleine_freewake_
-                # edge), not this projection on the real rotor. Fall back to the old
-                # form if thrust_axis is unset. See patch_notes/alm_dag_edge_fix/.
-                _td = getattr(rotor, 'thrust_axis', None)
-                if _td is not None:
-                    axis = -np.asarray(_td, dtype=np.float64)
-                    axis = axis / np.sqrt(axis @ axis)
-                else:
-                    axis = -np.sign(rotor.omega) * np.asarray(
-                        rotor.rotation_axis, dtype=np.float64)
+                # Axial DOWNWASH projection = the canonical axial-inflow unit
+                # vector n̂_a (rotor.axial_inflow_dir = −thrust_axis) — the SINGLE
+                # source of truth. Replaces the old −thrust_axis / −sign(ω)·
+                # rotation_axis fallback pair, whose fallback branch was the wrong
+                # ('thrust') side (see _jobs axis-convention audit,
+                # patch_notes/alm_canonical_axis/). Bit-identical when thrust set.
+                axis = rotor.axial_inflow_dir
                 # Q2: free wake may be shed from a subset of markers (e.g. tip
                 # only). The wake rings then hold len(shed_idx) points, so the
                 # ε and trailed-vorticity operator must be restricted to match.
@@ -859,17 +940,23 @@ class ActuatorLineModel:
                 # blocks so the freewake timer captures the GPU compute. Full
                 # ring residency (no per-call H2D) is S4. ALM_FREEWAKE_GPU=0 →
                 # CPU reference (A/B & non-CUDA fallback). ──
-                if cp is not None and os.environ.get(
-                        'ALM_FREEWAKE_GPU', '1') != '0':
-                    B = cp.asnumpy(freewake_influence(
+                if cp is not None and (_gpu_corr or os.environ.get(
+                        'ALM_FREEWAKE_GPU', '1') != '0'):
+                    B = freewake_influence(
                         cp.asarray(ctrl3d),
                         [cp.asarray(rg) for rg in wake.rings],
-                        cp.asarray(eps_edge_src), cp.asarray(axis)))
+                        cp.asarray(eps_edge_src), cp.asarray(axis))
+                    if _gpu_corr:
+                        A = B @ cp.asarray(E_used)      # keep A resident (n, n)
+                    else:
+                        A = cp.asnumpy(B) @ E_used      # S2: D2H B, CPU A
                 else:
                     B = freewake_influence(ctrl3d, wake.rings, eps_edge_src, axis)
-                A = B @ E_used                                      # (n, n)
+                    A = B @ E_used                                  # (n, n)
                 self._kleine_A_free[k] = A
                 if _pb:
+                    if _gpu_corr:                       # sync so timer = GPU compute
+                        cp.cuda.runtime.deviceSynchronize()
                     self._pf_acc['freewake'] += _tm.perf_counter() - _t0
         else:
             # Phase 1: straight semi-infinite (cached; also the free-wake
@@ -879,18 +966,30 @@ class ActuatorLineModel:
                 A = influence_matrix(r, eps, dr)
                 self._kleine_A[k] = A
 
+        # Move A + per-marker inputs to the correction device once (static
+        # geometry upload is tiny; A already resident on the free-wake GPU path).
+        A = xpc.asarray(A)
+        r = xpc.asarray(r); chord = xpc.asarray(chord); eps = xpc.asarray(eps)
+        twist = xpc.asarray(twist); CL = xpc.asarray(CL)
+        active = xpc.asarray(active)
+        u_n = xpc.asarray(u_n); u_theta = xpc.asarray(u_theta)
+        if not isinstance(cos_sweep, (int, float)):
+            cos_sweep = xpc.asarray(cos_sweep)
+
         # Tangential rel. velocity (matches rotor.recompute_velocity_triangle).
-        rsign = np.sign(rotor.omega)
-        u_tan = np.abs(rotor.omega) * r - rsign * u_theta
+        rsign = float(np.sign(rotor.omega))
+        u_tan = abs(rotor.omega) * r - rsign * u_theta
 
         # Γⁿ⁻¹ (persist for warm-start); cold start = uncorrected Γ.
-        u_aero0 = np.sqrt(u_n ** 2 + u_tan ** 2) * cos_sweep
+        u_aero0 = xpc.sqrt(u_n ** 2 + u_tan ** 2) * cos_sweep
         Gprev = self._kleine_gamma_prev.get(k)
         if Gprev is None or len(Gprev) != n:
-            Gprev = np.where(active, 0.5 * chord * u_aero0 * CL, 0.0)
+            Gprev = xpc.where(active, 0.5 * chord * u_aero0 * CL, 0.0)
+        else:
+            Gprev = xpc.asarray(Gprev)                # prev step's device may differ
 
         # Freeze Re/Mach at the linearization point † (u_n† = u_n + A Γⁿ⁻¹).
-        u_aero_d = np.sqrt((u_n + A @ Gprev) ** 2 + u_tan ** 2) * cos_sweep
+        u_aero_d = xpc.sqrt((u_n + A @ Gprev) ** 2 + u_tan ** 2) * cos_sweep
         Re_d = u_aero_d * chord / (self.nu + 1e-30)
         if self._polar_wants_mach and self.a_phys:
             Mach_d = u_aero_d * (self.dx_phys / self.dt_phys) / self.a_phys
@@ -943,13 +1042,16 @@ class ActuatorLineModel:
                 r, chord, dr, eps, u_n, u_tan, twist, cl_eval, dcl_eval,
                 Gprev, A=A, active=active)
             if _pb2:
+                if _gpu_corr:                           # sync so timer = GPU compute
+                    cp.cuda.runtime.deviceSynchronize()
                 self._pf_acc['solve'] += _tm2.perf_counter() - _ts
             # Safety net: a non-finite, or physically-unreasonable (downwash
             # exceeding ~half the tangential scale) solve signals an
             # ill-conditioned/unstable fixed point → fall back to Dağ this step
             # (do NOT persist the bad Γ; keep the previous Γ for warm-start).
-            scale = float(np.max(np.abs(u_tan))) + 1e-30
-            if (not np.all(np.isfinite(w))) or (float(np.max(np.abs(w))) > 0.5 * scale):
+            scale = float(xpc.max(xpc.abs(u_tan))) + 1e-30
+            if (not bool(xpc.all(xpc.isfinite(w)))) or (
+                    float(xpc.max(xpc.abs(w))) > 0.5 * scale):
                 raise np.linalg.LinAlgError("Kleine correction out of bounds")
             # Same w ∝ −Γ″ sawtooth risk as Dağ (shared edge operator): lightly
             # smooth both the persisted warm-start Γ and the applied correction so
@@ -957,17 +1059,48 @@ class ActuatorLineModel:
             if self._eps_corr_smooth > 0:
                 Gnew = self._smooth_active(Gnew, active, self._eps_corr_smooth)
                 w = self._smooth_active(w, active, self._eps_corr_smooth)
-            self._kleine_gamma_prev[k] = Gnew
+            # ── Diagnostic (env ALM_KLEINE_DIAG): free vs straight deficit on the
+            # SAME Γ & kernel — isolates the wake-GEOMETRY effect (A_free = B@E from
+            # the convected wake  vs  A_straight = influence_matrix). Pins exactly
+            # where/why the free wake diverges from the validated straight
+            # correction near the tip. Inert unless enabled. ──
+            if (os.environ.get('ALM_KLEINE_DIAG') and k == 0
+                    and self._kleine_wake_steps % 50 == 0):
+                try:
+                    _np2 = ((lambda a: cp.asnumpy(a)) if _gpu_corr
+                            else (lambda a: np.asarray(a)))
+                    _rr = np.asarray(_np2(r), float).ravel()
+                    _epsn = np.asarray(_np2(eps), float).ravel()
+                    _G = np.asarray(_np2(Gnew), float).ravel()
+                    _Af = np.asarray(_np2(A), float)
+                    _wf = _Af @ _G                               # free geometry
+                    _ws = influence_matrix(_rr, _epsn, dr) @ _G  # straight geometry
+                    _R = float(np.nanmax(_rr))                   # robust to order/NaN
+                    print("[KLEINE_DIAG] step=%d n=%d Rmax=%.3f Afin=%s Gfin=%s"
+                          " | r/R : w_free w_straight d(f-s)"
+                          % (self._kleine_wake_steps, len(_rr), _R,
+                             bool(np.all(np.isfinite(_Af))),
+                             bool(np.all(np.isfinite(_G)))))
+                    for _i in range(len(_rr)):
+                        if _rr[_i] / _R >= 0.8:
+                            print("[KLEINE_DIAG]   %.3f : %+9.5f %+11.5f  %+9.5f"
+                                  % (_rr[_i] / _R, _wf[_i], _ws[_i],
+                                     _wf[_i] - _ws[_i]))
+                except Exception as _e:                          # never break the run
+                    print("[KLEINE_DIAG] ERROR %r" % (_e,))
+            self._kleine_gamma_prev[k] = Gnew           # persisted on device
             self._kleine_w_prev[k] = w
-            return w
-        except np.linalg.LinAlgError:
+            return cp.asnumpy(w) if _gpu_corr else w    # D2H to the numpy caller
+        except _LINALG_ERR:
             # PURE Kleine: on a stiff / non-finite solve do NOT invoke Dağ — that
             # would mix two independent models and break variable control. Freeze
             # the previous Kleine correction (0 on the first step) and count the
             # event so the fallback rate is observable (self._kleine_fallback_count).
             self._kleine_fallback_count += 1
             w_prev = self._kleine_w_prev.get(k)
-            return w_prev if w_prev is not None and len(w_prev) == n else np.zeros(n)
+            if w_prev is not None and len(w_prev) == n:
+                return cp.asnumpy(w_prev) if _gpu_corr else w_prev
+            return np.zeros(n)
 
     def _shed_idx(self, blade):
         """Resolve the spanwise markers that shed the free wake (Q2).
@@ -1126,12 +1259,7 @@ class ActuatorLineModel:
         # came out −(upwash). Using −thrust_axis fixes both: the wake descends on the
         # downwash side and w_corr>0 (added downwash) de-loads the tip like the
         # straight kernel. See patch_notes/alm_dag_edge_fix/.
-        td = getattr(rotor, 'thrust_axis', None)
-        if td is not None:
-            downwash = -np.asarray(td, dtype=np.float64)
-            downwash = downwash / np.sqrt(downwash @ downwash)
-        else:
-            downwash = rsign * axis                            # fallback (opposite the old −rsign·axis)
+        downwash = rotor.axial_inflow_dir                      # canonical n̂_a (single source)
         descent = downwash                                     # wake convects on the downwash side
         proj = downwash                                        # project induced velocity onto downwash
 
@@ -1173,12 +1301,7 @@ class ActuatorLineModel:
         ctrl3d = np.asarray(self._last_positions[k * n:(k + 1) * n], float)
         edge3d = self._edge_positions_3d(ctrl3d)               # (n+1, 3)
         rotor = self.rotor
-        td = getattr(rotor, 'thrust_axis', None)
-        if td is not None:
-            dw = -np.asarray(td, dtype=np.float64)
-        else:
-            dw = np.sign(rotor.omega) * np.asarray(rotor.rotation_axis, float)
-        dw = dw / np.sqrt(dw @ dw)                             # downwash direction
+        dw = rotor.axial_inflow_dir                            # canonical n̂_a (single source)
         R = float(getattr(rotor, 'radius', np.max(blade.marker_r)))
         n_node = 25
         step = (2.0 * R) / (n_node - 1)                        # finite draw length ≈2R
@@ -1197,8 +1320,9 @@ class ActuatorLineModel:
         """
         if iters is None or int(iters) <= 0:
             return x
-        x = np.asarray(x, dtype=np.float64).copy()
-        idx = np.where(active)[0] if active is not None else np.arange(len(x))
+        xp = _am(x)                                  # xp-safe (GPU-resident corr)
+        x = xp.asarray(x, dtype=xp.float64).copy()
+        idx = xp.where(active)[0] if active is not None else xp.arange(len(x))
         if len(idx) < 3:
             return x
         v = x[idx]
@@ -2111,7 +2235,8 @@ def create_actuator_line_from_config(
     if isinstance(ani, dict) and ani.get('enabled', True):
         model._aniso = {'c': float(ani.get('c', 1.0)),
                         't': float(ani.get('t', 1.0)),
-                        'r': float(ani.get('r', 1.0))}
+                        'r': float(ani.get('r', 1.0)),
+                        'r_ref': str(ani.get('r_ref', 'spacing'))}
 
     # Swept-tip refinement (patch_notes/alm_tip_sweep_refine, Step 3).
     #   sweep_alpha_normal → LE-normal α resolution in the BEM (Step 2).

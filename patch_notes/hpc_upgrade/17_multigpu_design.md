@@ -97,3 +97,20 @@
   최소화 → bench5에서 x 기각·y 선택(게이트에 회귀 포함). box 없으면 legacy min-extent 폴백.
 - 잔여(M2c→M5로 이관): mpirun runner/per-rank setup 배선(모든 수학 경로는 이미 게이트됨 → 배선 리스크 낮음),
   own_count=0 랭크 허용(현재 fail-fast assert), checkpoint rank0 조립.
+
+### ✅ M3 — 분산 ALM: partial-sum allreduce (2026-07-12, 로컬 3090)
+- **production 훅 3종**(actuator_line.py, 미설정 시 완전 no-op — 1-rank ALM smoke 자릿수 보존 확인):
+  ①`_grid_offset`(그리드 연산=positions−offset; 로터 물리/wake 기하는 global 유지=이동불변)
+  ②`_velocity_sampler`(step() 내부 주입점 — MPI 구현이 이 자리에서 Allreduce)
+  ③radial-trunc **전역 scale 컨텍스트**(scale_domain_shape/positions/hub — 재정규화 스케일은 전 랭크 동일 필수,
+  커널의 per-node radial cut은 로컬 hub). +`interpolate_velocity_batch_gpu(return_sums=True)`(분자/분모 원시합).
+  가드: 분산+비-gaussian 샘플링, 분산+kleine free-wake → fail-fast(NotImplementedError).
+- `src/parallel/alm_dist.py`: owned-view 부분합(스텐실 박스가 owned 슬랩 경계에서 자연 클립=소유권 정확,
+  ghost 이중계상 불가) + `ThreadAllreduce`(barrier 기반 — MPI.Allreduce와 동형 제어흐름) + 샘플러 팩토리.
+- **게이트 G-M3 PASS**(bench5, 2-rank, y축, 랭크별 실제 ActuatorLineModel을 스레드 step으로 구동):
+  | pure-ALM | **field max|df| = 0.0 (bit)** | F_grid rel 6.5e-17 |
+  | archB-straight(radial trunc+kleine) | **field max|df| = 0.0 (bit)** | F_grid rel 6.6e-17 |
+  bit는 이 구성에서의 실측(부분합 재결합이 우연히 재현)이며 일반 보장은 아님 — 게이트 기준은 tolerance
+  (field<1e-4, F rel<1e-5) 유지. BEM/kleine solve는 동일 u_markers로 전 랭크 복제=결정적 동일.
+- M3 범위 제외(문서화): kleine free-wake(웨이크 점 속도 샘플링 미분산 — production은 straight 사용이라 무영향),
+  비-gaussian 연구용 샘플러들.

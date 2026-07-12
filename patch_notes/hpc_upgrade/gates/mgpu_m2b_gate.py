@@ -109,7 +109,7 @@ class LocalLevel:
             self.nut_in = cp.empty(n, cp.float32)
             self.nut = cp.zeros(n, cp.float32)
 
-    def advance(self):
+    def advance(self, force=None):
         nx, ny, nz = self.dims
         kw = {}
         if self.sgs["model"] == "dyn_smag":
@@ -122,7 +122,7 @@ class LocalLevel:
         self.ker.launch(self.mem, self.rho, self.u, self.nt, self.b_r,
                         self.b_x, self.b_y, self.b_z,
                         self.omega, self.ob, self.oh, nx, ny, nz,
-                        t_step=self.t, force=None,
+                        t_step=self.t, force=force,
                         Cs=float(self.sgs.get("Cs", 0.0)), **kw)
         self.t += 1
 

@@ -1037,9 +1037,17 @@ def spread_forces_to_grid_gpu(
     # gate: alm_radial_scales_gate.py).
     radial_gpu = None
     if radial_trunc is not None:
+        # Multi-GPU (patch 17 M3): the renormalisation scales must be
+        # IDENTICAL on every rank -> compute from GLOBAL geometry when the
+        # caller provides it (scale_*); the kernel's per-node radial cut
+        # still uses the local-shifted hub in radial_trunc['hub'].
         scales_full = compute_radial_scales_batch(
-            xp, domain_shape, marker_positions, marker_epsilon, active_mask,
-            radial_trunc['axis'], radial_trunc['hub'],
+            xp,
+            radial_trunc.get('scale_domain_shape') or domain_shape,
+            radial_trunc.get('scale_positions', marker_positions),
+            marker_epsilon, active_mask,
+            radial_trunc['axis'],
+            radial_trunc.get('scale_hub', radial_trunc['hub']),
             radial_trunc['r_root'], radial_trunc['r_tip'], n_cut=n_cut)
         _ax = np.asarray(radial_trunc['axis'], dtype=np.float64)
         _ax = _ax / (np.linalg.norm(_ax) + 1e-30)
