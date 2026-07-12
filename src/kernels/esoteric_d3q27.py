@@ -499,6 +499,119 @@ def _region_ix(xp, mem_shape, region, shift=(0, 0, 0)):
     return ix[:, None, None], iy[None, :, None], iz[None, None, :]
 
 
+_REGION_KERNEL_CACHE = {}
+
+
+def _region_kernel_source():
+    """Single-launch region gather/scatter (M5 pass 4). The python fancy-
+    index path costs 27 advanced-indexing kernels + 13 index-array builds
+    per call; at D40 the coupling block gathers alone move ~GB per call.
+    These kernels do the identical permutation in ONE launch (exact copies,
+    bit-equal by construction). ASCII only (nvrtc POSIX locale)."""
+    cxp = [CX_ESO[2 * p + 1] for p in range(13)]
+    cyp = [CY_ESO[2 * p + 1] for p in range(13)]
+    czp = [CZ_ESO[2 * p + 1] for p in range(13)]
+    stdi = [_STD_TO_ESO[2 * p + 1] for p in range(13)]
+    stdip = [_STD_TO_ESO[2 * p + 2] for p in range(13)]
+    fmt = lambda a: ", ".join(str(int(v)) for v in a)
+    tables = f"""
+    const int CXP[13] = {{{fmt(cxp)}}};
+    const int CYP[13] = {{{fmt(cyp)}}};
+    const int CZP[13] = {{{fmt(czp)}}};
+    const int STDI[13] = {{{fmt(stdi)}}};
+    const int STDIP[13] = {{{fmt(stdip)}}};
+"""
+    head = """
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long M = (long long)nxr * nyr * nzr;
+    if (idx >= M) return;
+    int cz = (int)(idx % nzr);
+    int cy = (int)((idx / nzr) % nyr);
+    int cx = (int)(idx / ((long long)nzr * nyr));
+    int gx = (x0 + cx * xs) % Nx;
+    int gy = (y0 + cy * ys) % Ny;
+    int gz = (z0 + cz * zs) % Nz;
+    const long long N = (long long)Nx * Ny * Nz;
+    const long long b0 = ((long long)gx * Ny + gy) * Nz + gz;
+"""
+    loop_pre = """
+    for (int p = 0; p < 13; p++) {
+        int i = 2 * p + 1;
+        int sx = gx + CXP[p]; if (sx < 0) sx += Nx; if (sx >= Nx) sx -= Nx;
+        int sy = gy + CYP[p]; if (sy < 0) sy += Ny; if (sy >= Ny) sy -= Ny;
+        int sz = gz + CZP[p]; if (sz < 0) sz += Nz; if (sz >= Nz) sz -= Nz;
+        const long long bs = ((long long)sx * Ny + sy) * Nz + sz;
+        const long long o_i = (long long)STDI[p] * M + idx;
+        const long long o_ip = (long long)STDIP[p] * M + idx;
+"""
+    args = """
+    const int Nx, const int Ny, const int Nz,
+    const int x0, const int xs, const int nxr,
+    const int y0, const int ys, const int nyr,
+    const int z0, const int zs, const int nzr,
+    const int is_odd)
+"""
+    gather = ("""
+extern "C" __global__ void eso_gather_region(
+    const float* __restrict__ f, float* __restrict__ out,""" + args + "{"
+        + tables + head + """
+    out[idx] = f[b0];
+""" + loop_pre + """
+        if (is_odd) {
+            out[o_i]  = f[(long long)i * N + b0];
+            out[o_ip] = f[(long long)(i + 1) * N + bs];
+        } else {
+            out[o_i]  = f[(long long)(i + 1) * N + b0];
+            out[o_ip] = f[(long long)i * N + bs];
+        }
+    }
+}
+""")
+    scatter = ("""
+extern "C" __global__ void eso_scatter_region(
+    float* __restrict__ f, const float* __restrict__ vals,""" + args + "{"
+        + tables + head + """
+    f[b0] = vals[idx];
+""" + loop_pre + """
+        if (is_odd) {
+            f[(long long)i * N + b0]        = vals[o_i];
+            f[(long long)(i + 1) * N + bs]  = vals[o_ip];
+        } else {
+            f[(long long)(i + 1) * N + b0]  = vals[o_i];
+            f[(long long)i * N + bs]        = vals[o_ip];
+        }
+    }
+}
+""")
+    return gather + scatter
+
+
+def _get_region_kernels(cp):
+    if "k" not in _REGION_KERNEL_CACHE:
+        src = _region_kernel_source()
+        assert all(ord(ch) < 128 for ch in src)
+        mod = cp.RawModule(code=src)
+        _REGION_KERNEL_CACHE["k"] = (mod.get_function("eso_gather_region"),
+                                     mod.get_function("eso_scatter_region"))
+    return _REGION_KERNEL_CACHE["k"]
+
+
+def _region_kernel_params(region, shape):
+    """(start, step, count)*3 for the kernel, or None -> python fallback."""
+    ps = []
+    for sl, N in zip(region, shape):
+        if not isinstance(sl, slice):
+            return None
+        if (sl.start is not None and sl.start < 0) or \
+           (sl.stop is not None and sl.stop > N):
+            return None                       # out-of-bounds wrap semantics
+        start, stop, step = sl.indices(N)
+        if step <= 0:
+            return None
+        ps += [start, step, max(0, (stop - start + step - 1) // step)]
+    return ps
+
+
 def esoteric_gather_std_region(xp, f_mem: 'npt.NDArray', t_step: int,
                                region) -> 'npt.NDArray':
     """Gather the physical f (STANDARD ordering) on a spatial region only.
@@ -507,6 +620,22 @@ def esoteric_gather_std_region(xp, f_mem: 'npt.NDArray', t_step: int,
     Returns (27, *region_shape). Equals esoteric_gather_std(...)[:, region].
     """
     shape = f_mem.shape[1:]
+    if xp.__name__ == 'cupy' and f_mem.dtype == xp.float32 \
+            and f_mem.flags.c_contiguous:
+        ps = _region_kernel_params(region, shape)
+        if ps is not None:
+            import numpy as _np
+            gk, _ = _get_region_kernels(xp)
+            out = xp.empty((27, ps[2], ps[5], ps[8]), xp.float32)
+            M = int(ps[2]) * int(ps[5]) * int(ps[8])
+            if M:
+                bs_ = 256
+                gk(((M + bs_ - 1) // bs_,), (bs_,),
+                   (f_mem, out,
+                    _np.int32(shape[0]), _np.int32(shape[1]),
+                    _np.int32(shape[2]),
+                    *(_np.int32(v) for v in ps), _np.int32(t_step & 1)))
+            return out
     ix0, iy0, iz0 = _region_ix(xp, shape, region)
     rs = (len(ix0.ravel()), len(iy0.ravel()), len(iz0.ravel()))
     out = xp.empty((27,) + rs, dtype=f_mem.dtype)
@@ -536,6 +665,22 @@ def esoteric_scatter_std_region(xp, f_mem: 'npt.NDArray',
     local slot at region and the paired slot at region+c_i (wrapped).
     """
     shape = f_mem.shape[1:]
+    if xp.__name__ == 'cupy' and f_mem.dtype == xp.float32 \
+            and f_mem.flags.c_contiguous and values.dtype == xp.float32:
+        ps = _region_kernel_params(region, shape)
+        if ps is not None:
+            import numpy as _np
+            _, sk = _get_region_kernels(xp)
+            vals = xp.ascontiguousarray(values)
+            M = int(ps[2]) * int(ps[5]) * int(ps[8])
+            if M:
+                bs_ = 256
+                sk(((M + bs_ - 1) // bs_,), (bs_,),
+                   (f_mem, vals,
+                    _np.int32(shape[0]), _np.int32(shape[1]),
+                    _np.int32(shape[2]),
+                    *(_np.int32(v) for v in ps), _np.int32(t_step & 1)))
+            return
     ix0, iy0, iz0 = _region_ix(xp, shape, region)
     even = (t_step % 2 == 0)
     f_mem[0][ix0, iy0, iz0] = values[_STD_TO_ESO[0]]

@@ -205,3 +205,17 @@
   ±2행 → owned 스트립 노드는 centered 스텐실 = bit).
 - 회귀: **M2a/M2b/mpirun 2-rank 전부 bit**. 기대: coupling ~1.0 → ~0.1-0.2 s/step + 블록
   fine 배열(~GB급) 할당 churn 소멸. 클러스터 재측정 대기.
+
+### 4차 수리: region gather/scatter 단일-런치 커널화 (2026-07-13)
+- 3차(boundary-only upsample)도 클러스터 무효과(coupling 62.6→61.5s) → 로컬 **NR=1 loopback
+  D40 프로파일**(클러스터 왕복 없는 반복 진단 확보): coupling 5.19 s/step(50%) — 진범 =
+  `esoteric_gather/scatter_std_region`의 **fancy-index 경로**(호출당 27회 advanced-indexing
+  커널 + 13회 인덱스배열 생성; L3 블록 2.9GB급을 이 방식으로 16회/step).
+- 수정: `eso_gather/scatter_region` RawKernel — 영역(stride 지원) 전체를 **단일 런치**로,
+  커널 내 인덱스 산술 + z-coalesced. 순수 치환(값 복사)이라 bit-by-construction; 비정형
+  region(음수/범위초과/비slice)은 python 폴백. halo/fprev/coupling/체크포인트 전 경로 자동 수혜
+  + **단일-GPU esoteric에도 동일 이득**.
+- 로컬 NR=1 실측: coupling 5.19→**1.20**, halo 1.23→0.63, fprev 0.17→0.06 (kernel/alm 항목
+  증가는 로컬 열스로틀 — 연속실행 클럭저하; 상대 개선이 신호).
+- 게이트: eso_gather_scatter(왕복 bit)/coupling_scoped/M2a/M2b(5레벨 bit)/mpirun 2-rank verify
+  전부 PASS.
