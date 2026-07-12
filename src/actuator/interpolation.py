@@ -446,9 +446,6 @@ def interpolate_velocity_batch_gpu(
         n_markers, epsilon_for_stencil, n_cut, gpu_mem_limit_mb
     )
 
-    if return_sums and chunk_size < n_markers:
-        raise NotImplementedError("return_sums with chunking not supported")
-
     if chunk_size >= n_markers:
         # ── Single batch (no chunking needed) ──
         if is_uniform:
@@ -466,7 +463,13 @@ def interpolate_velocity_batch_gpu(
         return xp.asnumpy(u_gpu)
 
     # ── Chunked processing ──
+    # Chunk membership does not change any marker's own weighted sums (each
+    # marker reduces over its own stencil box), so return_sums chunks
+    # transparently: raw (num, W) per chunk, assembled in marker order.
     u_all = np.zeros((n_markers, 3), dtype=np.float64)   # [Δx/Δt]
+    num_all = np.zeros((n_markers, 3), dtype=np.float64) if return_sums \
+        else None
+    den_all = np.zeros(n_markers, dtype=np.float64) if return_sums else None
 
     for c_start in range(0, n_markers, chunk_size):
         c_end = min(c_start + chunk_size, n_markers)
@@ -476,15 +479,22 @@ def interpolate_velocity_batch_gpu(
         if is_uniform:
             u_chunk_gpu = _interpolate_uniform_eps_gpu(
                 u_field, pos_chunk,
-                float(eps_unique[0]), xp, n_cut
+                float(eps_unique[0]), xp, n_cut, return_sums=return_sums
             )
         else:
             u_chunk_gpu = _interpolate_varying_eps_gpu(
-                u_field, pos_chunk, eps_chunk, xp, n_cut
+                u_field, pos_chunk, eps_chunk, xp, n_cut,
+                return_sums=return_sums
             )
 
-        u_all[c_start:c_end] = xp.asnumpy(u_chunk_gpu)
+        if return_sums:
+            num_all[c_start:c_end] = xp.asnumpy(u_chunk_gpu[0])
+            den_all[c_start:c_end] = xp.asnumpy(u_chunk_gpu[1])
+        else:
+            u_all[c_start:c_end] = xp.asnumpy(u_chunk_gpu)
 
+    if return_sums:
+        return num_all, den_all
     return u_all   # (N_markers, 3)  [Δx/Δt]
 
 
