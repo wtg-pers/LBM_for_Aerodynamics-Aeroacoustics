@@ -426,6 +426,34 @@ class Rotor:
             theta=self.theta[blade_idx]
         )
 
+    @property
+    def axial_inflow_dir(self) -> np.ndarray:
+        """Canonical axial-inflow (downwash) unit vector n̂_a — the SINGLE source
+        of truth for every "axial direction" in the ALM wake corrections.
+
+        n̂_a = −disk_normal (= −thrust_axis): the direction air is accelerated
+        through the disk (the wake / downwash side).  Anchoring on the thrust
+        physics — not on the sign-arbitrary shaft label (rotation_axis) — lets a
+        correction "add downwash" as simply +n̂_a, with no −sign(ω)·rotation_axis
+        gymnastics (the source of the inconsistent, sometimes-flipped fallbacks).
+        Falls back to rotation_axis when the disk normal (thrust_axis) is unset.
+        See docs: _jobs/.../ALM_axis_convention_audit_kr.md.
+        """
+        td = getattr(self, 'thrust_axis', None)
+        n = (-np.asarray(td, dtype=np.float64) if td is not None
+             else np.asarray(self.rotation_axis, dtype=np.float64))
+        return n / np.linalg.norm(n)
+
+    @property
+    def _axial_sign(self) -> float:
+        """±1 — sign of (rotation_axis · n̂_a). The coordinate system measures the
+        axial velocity u_n along rotation_axis (a sign-arbitrary shaft label);
+        multiplying by this re-references u_n to n̂_a (downwash-positive), so
+        u_n>0 ≡ downwash regardless of the shaft labelling. setup asserts
+        rotation_axis ∥ disk normal, so this is exactly ±1. HVAB: +1 (no-op)."""
+        return float(np.sign(np.dot(np.asarray(self.rotation_axis, dtype=np.float64),
+                                    self.axial_inflow_dir)))
+
     def compute_relative_velocity(
         self,
         blade_idx: int,
@@ -459,6 +487,12 @@ class Rotor:
             u_global=u_global,
             theta=self.theta[blade_idx]
         )
+        # Canonical axial reference (Step 2): decompose returns u_n along
+        # rotation_axis (sign-arbitrary shaft label). Re-reference to the axial-
+        # inflow direction n̂_a (=−thrust_axis) so u_n>0 ≡ downwash regardless of
+        # how rotation_axis was labelled — and so the wake corrections (which add
+        # +n̂_a·w_corr) stay consistent. HVAB: _axial_sign=+1 → no-op (bit-identical).
+        u_n = u_n * self._axial_sign
 
         # # Blade rotation velocity (Eq. 6 setup)
         # omega_r = self.omega * blade.marker_r  # [m/s or lu/lt]

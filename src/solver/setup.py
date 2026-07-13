@@ -1074,6 +1074,22 @@ class SimulationSetup:
             if hasattr(self.al_model.rotor, 'thrust_axis'):
                 print(f"    Thrust direction: "
                       f"{self.al_model.rotor.thrust_axis.tolist()}")
+                # Canonical-axis invariant (Step 2): the shaft (rotation_axis) must
+                # be parallel to the disk normal (thrust_axis) — SIGN-AGNOSTIC, since
+                # u_n and every wake correction reference n̂_a=−thrust_axis (not the
+                # sign-arbitrary rotation_axis label). A mislabelled/non-parallel
+                # config thus fails loudly here instead of silently flipping the
+                # velocity triangle. See patch_notes/alm_canonical_axis/.
+                import numpy as _np
+                _r = _np.asarray(self.al_model.rotor.rotation_axis, dtype=float)
+                _t = _np.asarray(self.al_model.rotor.thrust_axis, dtype=float)
+                _cos = abs(float(_r @ _t)) / (
+                    _np.linalg.norm(_r) * _np.linalg.norm(_t) + 1e-30)
+                assert _cos > 1 - 1e-6, (
+                    f"ALM axis invariant violated: rotation_axis {_r.tolist()} must "
+                    f"be parallel to the disk normal / thrust_direction "
+                    f"{_t.tolist()} (|cos|={_cos:.4f}). u_n and wake corrections "
+                    f"reference n̂_a=−thrust_axis; a non-parallel shaft is a config error.")
 
         # Force ramp-up
         ramp = al_cfg.get('ramp_steps', 0)
