@@ -91,8 +91,11 @@ python patch_notes/hpc_upgrade/gates/mgpu_m3_gate.py              # 분산 ALM
 python patch_notes/hpc_upgrade/gates/mgpu_verify_gate.py          # --verify 진입점
 python patch_notes/hpc_upgrade/gates/mgpu_restart_gate.py         # 재시작 왕복 bit
 python patch_notes/hpc_upgrade/gates/eso_bench5_alm_smoke.py      # 물리 CV-band
+python patch_notes/hpc_upgrade/gates/eso_mem_force_twin_gate.py   # MEM force 쌍둥이 (std↔eso, R3-2)
+python patch_notes/hpc_upgrade/gates/cyl2d_re100_gate.py          # 2D end-to-end Cd 밴드 (~100s, R3-3)
 ```
 규칙: 커널/커플링/러너 수정 → 전체. ALM만 → M3+smoke. 출력만 → verify 게이트.
+2D(D2Q9) 경로 수정 → cyl2d 게이트. 고체경계(HWBB/eso solid) 수정 → twin 게이트 + sphere 스모크.
 
 ## 6. 알려진 한계 (fail-fast로 명시됨)
 - `--dist-init`: 비균일 IC 미지원, restart 병용 불가 (obstacle은 지원됨)

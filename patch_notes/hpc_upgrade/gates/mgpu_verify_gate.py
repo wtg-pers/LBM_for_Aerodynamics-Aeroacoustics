@@ -18,11 +18,17 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
                                     "..", "..", ".."))
 CFG = "configs/hpc_bench/bench5_purealm_m3.py"
+# strict-bit leg on a PURE-LBM config (review #3, R3-4.1): the ladder grades
+# ALM cases fp-lastbit — their observed bit is probabilistic through the
+# f32-cast firewall — so asserting --strict-bit on an ALM config formally
+# contradicts the ladder. Pure LBM is the tier whose PREDICTION is bit;
+# that is what --strict-bit exists to enforce.
+CFG_STRICT = "configs/hpc_bench/bench5_pure_lbm.py"
 
 
-def run(extra):
+def run(cfg, extra):
     cmd = ["mpirun", "-n", "2", sys.executable, "main_mpi.py",
-           "--config", CFG, "--steps", "2", "--log-every", "0",
+           "--config", cfg, "--steps", "2", "--log-every", "0",
            "--verify"] + extra
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                        timeout=560)
@@ -31,8 +37,9 @@ def run(extra):
 
 def main():
     ok = True
-    for label, extra in (("plain", []), ("strict-bit", ["--strict-bit"])):
-        r = run(extra)
+    for label, cfg, extra in (("plain", CFG, []),
+                              ("strict-bit", CFG_STRICT, ["--strict-bit"])):
+        r = run(cfg, extra)
         bits = re.findall(r"\[verify\] L\d: .*bit=(\w+)", r.stdout)
         passed = "RESULT: PASS" in r.stdout
         good = (r.returncode == 0 and passed

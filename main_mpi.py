@@ -149,6 +149,12 @@ def main():
             alm_marker_spacing=(getattr(setup, "_alm_marker_spacing", None)
                                 if rank == 0 else None))
 
+    # body-tier normalization source (review #3, R3-4.3): keep the reference
+    # dict from the ALREADY-PARSED setup.config — re-executing the config
+    # module later would double-run any config side effects.
+    _force_ref = dict(getattr(setup, "config", {})
+                      .get("force_calculation", {}).get("reference", {}))
+
     # free the full build (runner kept slabs + the ALM model)
     import gc
     del mlg, setup
@@ -192,18 +198,10 @@ def main():
         tier = "body"
         # normalization: force_calculation.reference in the BODY level's
         # lattice units (production 3D convention A = char_length * span)
-        import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location("_cfg", args.config)
-        _cfgmod = _ilu.module_from_spec(_spec)
-        import io as _io, contextlib as _ctx
-        with _ctx.redirect_stdout(_io.StringIO()):
-            _spec.loader.exec_module(_cfgmod)
-        _fc = getattr(_cfgmod, "config", {}).get("force_calculation", {})
-        _ref = _fc.get("reference", {})
-        _q_rho = float(_ref.get("rho", 1.0))
-        _q_u = float(_ref.get("velocity", 0.05))
-        _q_A = float(_ref.get("char_length", 1.0)) * \
-            float(_ref.get("span_length", 1.0))
+        _q_rho = float(_force_ref.get("rho", 1.0))
+        _q_u = float(_force_ref.get("velocity", 0.05))
+        _q_A = float(_force_ref.get("char_length", 1.0)) * \
+            float(_force_ref.get("span_length", 1.0))
         _qA = 0.5 * _q_rho * _q_u * _q_u * _q_A
     else:
         tier = "flow"

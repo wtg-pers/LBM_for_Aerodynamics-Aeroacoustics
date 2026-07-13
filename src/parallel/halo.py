@@ -117,7 +117,17 @@ class MPITransport:
     def prepost(self, src: int, dst: int, tag: int, shape, dtype) -> None:
         """Pre-post the Irecv into the persistent buffer (overlap, #5):
         posted at exchange-post time so the wire transfer progresses under
-        the compute between post and complete."""
+        the compute between post and complete.
+
+        ORDERING CONTRACT (R3-1): the caller must not call this until every
+        prior reader of the persistent recv buffer has retired on the device
+        — in practice, call it only AFTER commit() of the same round, whose
+        stream sync covers the previous round's scatter kernels. An Irecv
+        posted before that sync can be matched by an already-fired Isend and
+        UCX will device-write into a buffer a queued kernel is still reading.
+        Also the assumption most likely to break under further comm/compute
+        overlap work: if commit()'s sync is ever removed, replace this guard
+        with per-buffer double-buffering or a CUDA event wait."""
         import cupy as cp
         key = (src, tag)
         if key in getattr(self, "_rreq", {}):
@@ -190,10 +200,23 @@ class HaloBandExchangerV1:
                 self._xp, f_mem, t_step, p.edge_band(side))
             # tag encodes the side AS SEEN BY THE RECEIVER (opposite side)
             self._t.post(p.rank, nbr, tag=self._tb + (1 - side), arr=band)
+        self._t.commit()
+        # Irecv pre-post strictly AFTER commit(): the persistent recv buffer
+        # is still being READ by the previous round's scatter kernel until the
+        # stream drains, and commit()'s stream sync is what guarantees that
+        # drain. Posting the Irecv earlier opens a write-during-read race on
+        # the cuda-aware path — a skewed neighbour's Isend can match the Irecv
+        # immediately and UCX cuda_ipc device-writes into the buffer on its own
+        # stream (host-staged is immune: its H2D copy is synchronous). Overlap
+        # is unaffected: the transfer still progresses under the compute
+        # between post() and complete().
+        for side in (0, 1):
+            nbr = p.neighbor(side)
+            if nbr is None:
+                continue
             if hasattr(self._t, "prepost"):          # overlap: Irecv early
                 self._t.prepost(nbr, p.rank, tag=self._tb + side,
                                 shape=self._band_shape, dtype=np.float32)
-        self._t.commit()
 
     # -- phase B: everyone receives + scatters into its ghosts --
     def complete(self, f_mem, t_step: int) -> None:

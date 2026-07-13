@@ -33,7 +33,8 @@ MPI. 상세 논증은 철학 문서 §2–5.
 
 | 지표 | 값 |
 |---|---|
-| 정확도 | 분해-vs-단일 **bit-identical** (5레벨 필드·마커·추력; 2/3/4-rank; 25-rev 풀런 CT +0.027%) |
+| 정확도(결정성) | 분해-vs-단일 **bit-identical** — 5레벨 필드·마커·추력, 2/3/4-rank, 2회전 수용시험(40,224 substep) |
+| 정확도(장기 통계) | 25-rev 풀런 CT **+0.027%**(rev-내 σ ±0.6%의 1/20), 팁 max\|ω\| +3.5%(카오스 폭 내). ※bit와 모순 아님 — ALM 경계마커 재결합의 f32-cast 방화벽(플립 확률 ~1e-9/값)이 두 결과를 정량 정합하게 예측: 2-rev 기대 플립 ~0.03회 → bit, 25-rev ~10⁹회 반올림 → 수 회 플립 → 카오스 증폭 → 통계 동일성만 성립 |
 | 성능 (D40 4×4090) | **0.442 s/step** — 동코드 분해이득 2.45×, 병렬구간 분할효율 ~100% (잔여 = BEM 복제 0.08 + lockstep 스큐 0.1) |
 | 용량 | 분산 초기화(dist-init)로 4-GPU ~110M → **~450-500M 셀** (빌드 피크 19.2→0.91GB/rank) |
 | 기능 | 재시작(bit roundtrip), VTK/checkpoint/마커 production 포맷 rank0 조립, 3-tier 진행로그(ALM: CT/CP/FM, body: CD/CL/CS, flow: rho/u_max) |
@@ -92,3 +93,28 @@ HVAB rigid CT 과대예측 +19~27%를 분해: 팁(r/R≥0.9) roll-off 실패가
 - 실행: `docs/SIMULATION_RUN_GUIDE_kr.md` (tier 스모크 3종 = 각 ~1분)
 - 게이트 전수: 같은 문서 §5 (로컬 1-GPU에서 전부 재현 가능)
 - 학습용 해설: `docs/LEARNING_hpc_parallelization_kr.md`
+
+---
+
+## 부록 A. 3차 검토 반영 (2026-07-14)
+
+검토 원문: `docs/MULTIGPU_REVIEW_kr.md` 3차 절(트랙 마감 승인 + 要폐쇄 2건).
+코드 변경 상세: `patch_notes/hpc_upgrade/19_review3_response.md`.
+
+| 지적 | 판정 | 처리 |
+|---|---|---|
+| R3-1 prepost Irecv race (要폐쇄) | 수용 | prepost를 commit() 뒤로 이동(스트림 sync가 직전 scatter 완료를 구조적 보장) + ORDERING CONTRACT docstring. G-verify 재게이트 PASS. cuda-aware 실경로 확인은 다음 클러스터 세션 1회 |
+| R3-2 eso_mem_force 쌍둥이 게이트 (要폐쇄) | 수용 | `eso_mem_force_twin_gate` 신설 → **실결함 #10 즉검출**: "암시적 HWBB"가 실제로는 2-스텝 지연 bounce(정상상태 수렴이라 rank-불변·CD 그럴듯 — "잘못된 규약도 rank-불변일 수 있다"의 실증). LOAD parity-swap 수정 + IC 시딩(`eso_seed_solid_bounce_ic`, restore 제외) + v2 메일박스 NODE_TRANSIT 분리. 추출 규약은 동일 상태 위 f64 완전 일치(diff=0)로 증명 |
+| R3-3 2D end-to-end 게이트 | 수용 | `cyl2d_re100_gate`(~100s, main.py 전 체인) + 기록 Cd 밴드 1.181±0.05. 회귀 스위트 등재 |
+| R3-4.1 strict-bit 레그 ALM config | 수용 | pure_lbm config로 교체(사다리 등급과 게이트 단언의 형식 모순 해소) |
+| R3-4.2 §3 bit/통계 혼합 서술 | 수용 | 본 보고서 §3을 결정성/장기 통계 2행으로 분리, 방화벽 모델의 정량 정합(2-rev bit ↔ 25-rev +0.027%) 명시 |
+| R3-4.3 config 재임포트 | 수용 | setup 해제 전 `setup.config`에서 추출(이중 파싱 제거). 스모크 CD 동일 |
+| R3-4.4 Gaussian 4번째 지점 | 확인 | β kernel 핸드오프 목록 포함 확인 — β 첫 수술 대상 |
+| R3-4.5 하우스키핑 | 수용 | canonical-axis 단독 커밋(45caea9), eps_r/collector/stale-handoff 정리 커밋(b5e5c94), 검토 보고서 track |
+| R3-5 §7 답변 6건 | 백로그 재조정 | 즉시 수정 아닌 로드맵 반영(patch 19 §5): ckpt 슬랩-npz **450M 런 전 필수(최상위)**, CUDA Graph 재도입 승격, 스큐 조성분해 선행·우선순위 하향, 2D 분해 설계 보류, BEM 복제 유지(트리거 명시), 방법론 요건 = 논문 §2 초안 |
+
+게이트 회귀: 기존 14종 + 신규 2종 **전부 PASS** (로컬 3090; sphere 스모크
+replicated·dist-init --verify 전 레벨 bit). HWBB 수정은 순수유동·ALM 케이스에
+bit-중립(분기 미활성; 게이트 무변화로 실증). sphere 스모크 CD 트레이스 기록은
+지연-bounce 값에서 교정판(32-step 종점 +0.3296)으로 대체 — R3-0의 대조 앵커
+(−0.4465)는 구 스킴 기준이었음.
