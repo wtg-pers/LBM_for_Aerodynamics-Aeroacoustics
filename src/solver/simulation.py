@@ -618,12 +618,17 @@ class Simulation:
         import numpy as _np
         from src.kernels.esoteric_d3q27 import (
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE)
-        if self.obstacle_bc is not None:
-            raise NotImplementedError(
-                "dist-init: obstacle BCs not supported (needs slab-scoped "
-                "solid masks)")
         Nx, Ny, Nz = self.domain_shape
         node_type = _np.zeros((Nx, Ny, Nz), dtype=_np.int8)
+        if self.obstacle_bc is not None and \
+                hasattr(self.obstacle_bc, 'solid_mask'):
+            # geometry masks are cell-local functions -> the GPU mask (1B/
+            # cell, cheap even at 400M) marks SOLID on the host metadata;
+            # needs_bounce is NOT materialized (the MEM-force kernel derives
+            # bounce links from node_type on the fly)
+            sm = self.obstacle_bc.solid_mask
+            sm = sm.get() if hasattr(sm, 'get') else sm
+            node_type[sm.reshape(Nx, Ny, Nz)] = 1  # NODE_SOLID
         bc_rho = _np.ones((Nx, Ny, Nz), dtype=_np.float32)
         bc_ux = _np.zeros((Nx, Ny, Nz), dtype=_np.float32)
         bc_uy = _np.zeros((Nx, Ny, Nz), dtype=_np.float32)

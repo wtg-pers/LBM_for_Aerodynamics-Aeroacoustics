@@ -174,18 +174,37 @@ def main():
             append = runner.completed_step > 0 and os.path.exists(args.csv)
             csv_f = open(args.csv, "a" if append else "w")
             if not append:
-                csv_f.write("step,time_lu,thrust,torque,power,C_T,C_P,FM\n"
-                            if runner.model is not None
-                            else "step,rho_mean,u_max\n")
+                if runner.model is not None:
+                    csv_f.write("step,time_lu,thrust,torque,power,"
+                                "C_T,C_P,FM\n")
+                elif runner.body_level is not None:
+                    csv_f.write("step,Fx,Fy,Fz,CD,CL,CS\n")
+                else:
+                    csv_f.write("step,rho_mean,u_max\n")
 
     # case tier for the progress line: ALM -> CT/CP/FM; solid body ->
-    # CL/CD (MEM-force wiring in the MPI runner is a documented TODO —
-    # obstacle cases are not gated distributed yet, so falls back to flow
-    # stats); plain flow -> rho_mean / u_max on the finest level.
+    # CD/CL/CS from the esoteric MEM-force kernel (halfway-BB convention,
+    # same formula as the standard-path mem_force_d3q27); plain flow ->
+    # rho_mean / u_max on the finest level.
     if runner.model is not None:
         tier = "alm"
-    elif any(bool((L.nt == 1).any()) for L in runner.lv):
+    elif runner.body_level is not None:
         tier = "body"
+        # normalization: force_calculation.reference in the BODY level's
+        # lattice units (production 3D convention A = char_length * span)
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("_cfg", args.config)
+        _cfgmod = _ilu.module_from_spec(_spec)
+        import io as _io, contextlib as _ctx
+        with _ctx.redirect_stdout(_io.StringIO()):
+            _spec.loader.exec_module(_cfgmod)
+        _fc = getattr(_cfgmod, "config", {}).get("force_calculation", {})
+        _ref = _fc.get("reference", {})
+        _q_rho = float(_ref.get("rho", 1.0))
+        _q_u = float(_ref.get("velocity", 0.05))
+        _q_A = float(_ref.get("char_length", 1.0)) * \
+            float(_ref.get("span_length", 1.0))
+        _qA = 0.5 * _q_rho * _q_u * _q_u * _q_A
     else:
         tier = "flow"
 
@@ -230,6 +249,13 @@ def main():
                             f"{perf['torque']},{perf['power']},"
                             f"{perf['C_T']},{perf['C_P']},{perf['FM']}\n")
                 csv_f.flush()
+        elif tier == "body" and stats is not None:
+            F = stats
+            cd, cl, cs = F[0] / _qA, F[1] / _qA, F[2] / _qA
+            line += f"  CD={cd:.4f}  CL={cl:.4f}  CS={cs:.4f}"
+            if csv_f:
+                csv_f.write(f"{s},{F[0]},{F[1]},{F[2]},{cd},{cl},{cs}\n")
+                csv_f.flush()
         elif stats is not None:
             rho_m, u_max = stats
             line += f"  rho={rho_m:.6f}  u_max={u_max:.5f}"
@@ -256,7 +282,19 @@ def main():
                 "s_per_step": (now - t_last) / args.log_every,
                 "elapsed_s": now - t0}
             t_last = now
-            stats = flow_stats() if tier in ("flow", "body") else None
+            if tier == "body":
+                F_loc = runner.mem_force_local()
+                if nr > 1:
+                    import numpy as _np
+                    F_tot = _np.empty_like(F_loc)
+                    comm.Allreduce(F_loc, F_tot)
+                else:
+                    F_tot = F_loc
+                stats = F_tot
+            elif tier == "flow":
+                stats = flow_stats()
+            else:
+                stats = None
             on_log(s_, runner, stats)
         if bridge is not None and args.vtk_every and \
                 s_ % args.vtk_every == 0:

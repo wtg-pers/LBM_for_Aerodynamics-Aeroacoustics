@@ -31,7 +31,7 @@ run_tag가 다른 config 2개를 써라(예: `_single0` vs `_mpi4`) — 아니�
 |---|---|---|
 | `--steps N` | 목표 coarse step (절대값; 재시작 시에도 절대) | 1257 = 1 rev (farfield40) |
 | `--log-every N` | 진행 로그/CSV 간격 | 16~64 |
-| `--dist-init` | 슬랩-스코프 초기화(디바이스 풀필드 무할당). 균일 IC 전용, obstacle 미지원 | **항상 켜기**(균일 IC 케이스). NR=1 필수급, 대형 케이스 필수 |
+| `--dist-init` | 슬랩-스코프 초기화(디바이스 풀필드 무할당). 균일 IC 전용. **obstacle 지원**(solid mask 호스트 마킹; bit 검증) | **항상 켜기**. NR=1 필수급, 대형 케이스 필수 |
 | `--devices a,b,..` | node-local rank→GPU id 매핑 | 명시 권장 |
 | `--cuda-aware 1` | UCX device-direct (mpirun+UCX 환경) | 클러스터 멀티랭크에서 1 |
 | `--vtk-every N` | rank0 조립 VTK+마커 VTP (production 포맷) | rev당 1회 = 1257 |
@@ -47,8 +47,10 @@ run_tag가 다른 config 2개를 써라(예: `_single0` vs `_mpi4`) — 아니�
 
 `step, s/step, ETA`는 항상 출력. 이후는 케이스 자동 감지:
 - **ALM 케이스**: `CT, CP, FM` (CSV: step,time_lu,thrust,torque,power,C_T,C_P,FM)
-- **고체 경계 케이스**: 현재 MPI 러너에서 obstacle이 게이트되지 않아 flow-tier로 폴백
-  (CL/CD 배선 = MEM force 어큐뮬레이터 이식, 문서화된 TODO)
+- **고체 경계 케이스**: `CD, CL, CS` — esoteric MEM-force 커널(halfway-BB, 표준경로
+  mem_force_d3q27와 동일 규약; owned-배타 누적 + Allreduce = rank-불변). 정규화는
+  config `force_calculation.reference`(rho/velocity/char_length/span_length —
+  **body 레벨 lattice 단위**; 구는 span=π/4·D로 원면적 인코딩). 진단 tier(atomicAdd)
 - **순수 유동**: `rho_mean, u_max` (finest 레벨 owned, rank-집합 정확값)
 
 ## 4. 메모리/용량 지침 (실측 기반)
@@ -72,9 +74,9 @@ LBM_ESOTERIC=1 python main_mpi.py --config configs/hpc_bench/bench5_purealm_m3.p
 # 순수 유동 tier (rho/u_max 라인; 비영 유입 eq/sponge + dist-init u0!=0 경로)
 LBM_ESOTERIC=1 python main_mpi.py --config configs/hpc_bench/bench_flow_uniform.py \
   --steps 4 --log-every 2 --dist-init --devices 0 --verify
-# 고체 경계 tier (sphere HWBB, 5-level, 컷-관통-solid까지 bit; --dist-init 금지)
+# 고체 경계 tier (sphere HWBB, 5-level; CD/CL/CS 라인 + 컷-관통-solid bit; dist-init 가능)
 LBM_ESOTERIC=1 python main_mpi.py --config configs/hpc_bench/bench_sphere_hwbb.py \
-  --steps 4 --log-every 2 --devices 0 --verify
+  --steps 4 --log-every 2 --dist-init --devices 0 --verify
 ```
 셋 모두 `[verify] RESULT: PASS` + 전 레벨 bit=True가 정상. body tier의 진행 라인은
 CL/CD 배선 전까지 rho/u_max 폴백(SOLID 마스킹 적용 — 미마스킹 시 미초기화 u가 새는
@@ -93,7 +95,9 @@ python patch_notes/hpc_upgrade/gates/eso_bench5_alm_smoke.py      # 물리 CV-ba
 규칙: 커널/커플링/러너 수정 → 전체. ALM만 → M3+smoke. 출력만 → verify 게이트.
 
 ## 6. 알려진 한계 (fail-fast로 명시됨)
-- `--dist-init`: obstacle BC 미지원, 비균일 IC 미지원, restart 병용 불가
+- `--dist-init`: 비균일 IC 미지원, restart 병용 불가 (obstacle은 지원됨)
+- 2D D2Q9(익형 α-sweep 등)는 `main.py` 경로 유지 — nu-마이그레이션 완료(56개 config).
+  hover-ALM 레거시 9개(configs/alm 구형)는 U_inf=0이라 수동 nu(팁속도 기준) 필요 상태로 유지
 - 분산 ALM: kleine free-wake·비gaussian 샘플러 미지원 (production은 straight)
 - `--verify`: 레퍼런스가 풀필드 빌드라 D40급에서는 메모리상 부적합 (bench5급 전용)
 - mpirun 없이 멀티랭크 불가 (NR=1만 plain python 지원)

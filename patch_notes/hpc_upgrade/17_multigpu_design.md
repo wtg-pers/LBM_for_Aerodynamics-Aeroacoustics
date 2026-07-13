@@ -339,3 +339,16 @@
 - ★버그 검출·수정: flow_stats가 SOLID 미마스킹 → 커널이 solid에서 rho/u 미기록(cp.empty
   쓰레기) → rank별 u_max 불일치(0.08 vs 1.84). fluid-마스크 적용 후 rank-불변(0.08082 동일).
 - 가이드 §4b에 tier 스모크 3종 수록.
+
+### 전 물리 케이스 복원: nu-마이그레이션 + body 완전 지원 (2026-07-13)
+- ★**레거시 부채 청산**: nu-only 정책 전환 이래 2D 익형/실린더 등 활성 워크플로우가 loud-error
+  상태였음(문서화된 '69개 마이그레이션 필요'). 기계적 마이그레이션 56개(clf5605 13·cylinders 25·
+  sgs_test 5·alm 12 등; sandbox-exec 검증) — hover-ALM 9개는 U_inf=0이라 의도적 잔류(팁속도 기준
+  수동 필요). **2D end-to-end 회귀**: cyl Re100 IBB+MLG3, Cd 1.40±0.21(문헌 정합), 131 MLUPS.
+- ★버그 수정: 2c40712의 fixed-order 폴백이 range(3) 하드코딩 → D2Q9 IndexError(einsum은 차원
+  불가지였음). dim-generic화 + Q=9 kernel-vs-python 등가(1.6e-7).
+- **body tier 완성**: `eso_mem_force` 커널 — esoteric 예치슬롯=f_post 성질로 halfway-BB MEM
+  (표준경로 mem_force_d3q27와 동일 규약), owned-배타+Allreduce. **1/2-rank CD 완전 일치**
+  (−0.4465→0.5133 임펄시브 과도, CL/CS=0 대칭). CSV=step,Fx,Fy,Fz,CD,CL,CS.
+- **dist-init obstacle 해금**: solid mask(1B/cell) 호스트 마킹, needs_bounce 비물질화(커널이
+  node_type에서 유도). sphere --dist-init 2-rank **전레벨 bit** vs replicated production.

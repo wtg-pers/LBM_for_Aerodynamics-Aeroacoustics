@@ -499,6 +499,116 @@ def _region_ix(xp, mem_shape, region, shift=(0, 0, 0)):
     return ix[:, None, None], iy[None, :, None], iz[None, None, :]
 
 
+_MEM_FORCE_CACHE = {}
+
+
+def _mem_force_kernel_source():
+    """MEM (momentum-exchange) force on SOLID bodies from ESOTERIC memory.
+
+    Halfway-BB convention (matches mem_force_d3q27 on the standard path:
+    F = sum 2 c_i f_i^out over bounce links). In Esoteric Pull the
+    post-collision outgoing population f*_i(x_fluid) IS the slot the STORE
+    deposited: at completed-step parity T-1,
+        toward-solid dir i   -> slot (i+1 if T even else i) AT the solid cell
+        toward-solid dir i+1 -> slot (i   if T even else i+1) AT x itself.
+    Owned-clip bounds make rank contributions exclusive (allreduce outside).
+    atomicAdd accumulation: DIAGNOSTIC tier (log-cadence CL/CD), not physics.
+    ASCII only."""
+    cxp = [CX_ESO[2 * p + 1] for p in range(13)]
+    cyp = [CY_ESO[2 * p + 1] for p in range(13)]
+    czp = [CZ_ESO[2 * p + 1] for p in range(13)]
+    fmt = lambda a: ", ".join(str(int(v)) for v in a)
+    return f"""
+extern "C" __global__ void eso_mem_force(
+    const float* __restrict__ f,
+    const signed char* __restrict__ nt,
+    double* __restrict__ force_out,
+    const int Nx, const int Ny, const int Nz,
+    const int t_next,
+    const int cx0, const int cx1,
+    const int cy0, const int cy1,
+    const int cz0, const int cz1)
+{{
+    const int CXP[13] = {{{fmt(cxp)}}};
+    const int CYP[13] = {{{fmt(cyp)}}};
+    const int CZP[13] = {{{fmt(czp)}}};
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long N = (long long)Nx * Ny * Nz;
+    double fx = 0.0, fy = 0.0, fz = 0.0;
+    if (idx < N) {{
+        int gz = (int)(idx % Nz);
+        int gy = (int)((idx / Nz) % Ny);
+        int gx = (int)(idx / ((long long)Nz * Ny));
+        bool owned = (gx >= cx0 && gx < cx1 && gy >= cy0 && gy < cy1 &&
+                      gz >= cz0 && gz < cz1);
+        if (owned && nt[idx] != 1) {{
+            const int even_next = ((t_next & 1) == 0);
+            for (int p = 0; p < 13; p++) {{
+                int i = 2 * p + 1;
+                int sx = gx + CXP[p]; sx += (sx < 0) ? Nx : ((sx >= Nx) ? -Nx : 0);
+                int sy = gy + CYP[p]; sy += (sy < 0) ? Ny : ((sy >= Ny) ? -Ny : 0);
+                int sz = gz + CZP[p]; sz += (sz < 0) ? Nz : ((sz >= Nz) ? -Nz : 0);
+                long long nb = ((long long)sx * Ny + sy) * Nz + sz;
+                if (nt[nb] == 1) {{
+                    int slot = even_next ? (i + 1) : i;
+                    double fq = 2.0 * (double)f[(long long)slot * N + nb];
+                    fx += fq * CXP[p]; fy += fq * CYP[p]; fz += fq * CZP[p];
+                }}
+                int mx = gx - CXP[p]; mx += (mx < 0) ? Nx : ((mx >= Nx) ? -Nx : 0);
+                int my = gy - CYP[p]; my += (my < 0) ? Ny : ((my >= Ny) ? -Ny : 0);
+                int mz = gz - CZP[p]; mz += (mz < 0) ? Nz : ((mz >= Nz) ? -Nz : 0);
+                long long mb = ((long long)mx * Ny + my) * Nz + mz;
+                if (nt[mb] == 1) {{
+                    int slot2 = even_next ? i : (i + 1);
+                    double fq = 2.0 * (double)f[(long long)slot2 * N + idx];
+                    fx -= fq * CXP[p]; fy -= fq * CYP[p]; fz -= fq * CZP[p];
+                }}
+            }}
+        }}
+    }}
+    __shared__ double sh[3 * 256];
+    int t = threadIdx.x;
+    sh[t] = fx; sh[256 + t] = fy; sh[512 + t] = fz;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {{
+        if (t < st) {{
+            sh[t] += sh[t + st];
+            sh[256 + t] += sh[256 + t + st];
+            sh[512 + t] += sh[512 + t + st];
+        }}
+        __syncthreads();
+    }}
+    if (t == 0) {{
+        atomicAdd(&force_out[0], sh[0]);
+        atomicAdd(&force_out[1], sh[256]);
+        atomicAdd(&force_out[2], sh[512]);
+    }}
+}}
+"""
+
+
+def eso_mem_force(xp, f_mem, node_type_flat, t_next: int, clip_bounds):
+    """(Fx, Fy, Fz) numpy f64 over OWNED fluid cells (see kernel doc)."""
+    import numpy as _np
+    if "k" not in _MEM_FORCE_CACHE:
+        src = _mem_force_kernel_source()
+        assert all(ord(ch) < 128 for ch in src)
+        _MEM_FORCE_CACHE["k"] = xp.RawKernel(src, "eso_mem_force")
+    Nx, Ny, Nz = f_mem.shape[1:]
+    out = xp.zeros(3, xp.float64)
+    N = Nx * Ny * Nz
+    bs = 256
+    cb = clip_bounds
+    _MEM_FORCE_CACHE["k"](
+        ((N + bs - 1) // bs,), (bs,),
+        (f_mem, node_type_flat, out,
+         _np.int32(Nx), _np.int32(Ny), _np.int32(Nz), _np.int32(t_next),
+         _np.int32(cb[0][0]), _np.int32(cb[0][1]),
+         _np.int32(cb[1][0]), _np.int32(cb[1][1]),
+         _np.int32(cb[2][0]), _np.int32(cb[2][1])))
+    return xp.asnumpy(out)
+
+
 _REGION_KERNEL_CACHE = {}
 
 

@@ -26,6 +26,14 @@ config["actuator_line"]["enabled"] = False
 for face, bc in config["boundaries"].items():
     bc["velocity"] = [U_LU, 0.0, 0.0]
 config["physics"]["initial_flow_velocity"] = [U_LU, 0.0, 0.0]
+import math
+config["force_calculation"] = {
+    "enabled": True,
+    # BODY-level (L4) lattice units: D = 2 L0 lu = 32 fine cells;
+    # sphere reference area pi/4 D^2 encoded via span = pi/4 * D
+    "reference": {"rho": 1.0, "velocity": U_LU,
+                  "char_length": 32.0, "span_length": math.pi / 4.0 * 32.0},
+}
 config["internal_geometry"] = {
     "sphere": {"enabled": True, "center": (16.5, 24.0, 24.0),
                "radius": 1.0, "wall_bc": "hwbb"},

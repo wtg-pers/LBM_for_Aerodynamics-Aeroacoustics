@@ -147,6 +147,12 @@ class DistributedMLGRunner:
         # hides under the child's fprev+advance)
         self._fresh = [False] * NL
         self._posted = [False] * NL
+        # solid-body diagnostics: finest level carrying SOLID nodes
+        self.body_level = None
+        for k in range(NL - 1, -1, -1):
+            if bool((self.lv[k].nt == 1).any()):
+                self.body_level = k
+                break
 
     # ── plumbing ─────────────────────────────────────────────────────
     def _tic(self):
@@ -284,6 +290,18 @@ class DistributedMLGRunner:
         cp.cuda.runtime.deviceSynchronize()
         dt = time.perf_counter() - t0
         return {"steps": n_coarse, "wall_s": dt, "s_per_step": dt / n_coarse}
+
+    def mem_force_local(self):
+        """OWNED-cell MEM force partial on the body level (lattice units of
+        that level); allreduce + normalization happen in the caller.
+        Diagnostic tier (atomicAdd accumulation)."""
+        from src.kernels.esoteric_d3q27 import eso_mem_force
+        k = self.body_level
+        L = self.lv[k]
+        p = self.parts[k]
+        cb = [(0, d) for d in L.dims]
+        cb[p.axis] = (p.ghost, p.ghost + p.own_count)
+        return eso_mem_force(cp, L.mem, L.nt, L.t, cb)
 
     def owned_f_std(self, k: int):
         """Owned slab of level k in standard physical ordering (GPU)."""
