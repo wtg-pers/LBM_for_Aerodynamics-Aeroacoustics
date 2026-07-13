@@ -229,3 +229,10 @@
   재사용(rank0가 writers 포함 빌드 유지), owned 슬랩 host-staged gather→글로벌 조립→동일 write/save.
   main_mpi --vtk-every/--ckpt-every. bench5 검증: 5레벨 .vti+.vth, checkpoint npz 키/전레벨 global
   shape 일치(더블슬라이스 버그 1건 shape 체크로 즉검출·수정). 잔여: MPI --restart 배선, 마커 VTP.
+
+### ✅✅ M5 완결: 25-rev 풀런 + 물리 판독 (2026-07-13)
+- 풀런 완주(~6h, VTK 25장+ckpt 5개 production 포맷). **물리 동일성: last-5-rev CT 단일
+  0.010399±6.0e-5 vs MPI 0.010402±5.7e-5 = +0.027%**(σ의 1/20). 팁 max|ω| +3.5%(카오스 폭),
+  방위각평균 유입류 2.3%. MPI측 신생 코어 FWHM 1.68ε = Gaussian-forced 이론한계(1.67ε) 재확인.
+- 보고서 부록 D(검토 유보 해소)·부록 A 최종행 기입. **멀티GPU 트랙 M1~M5 전체 완결**.
+- 잔여(후속 백로그): MPI --restart 배선, 마커 VTP, ALM 로컬화(Amdahl 0.275), v2 결합(음향급).
