@@ -56,13 +56,16 @@ def run_split_v2(f0, axis):
         f_loc = m1.wrap_take(f0, idx, axis)
         mems.append(esoteric_scatter_std(cp, f_loc, 0))
         nx, ny, nz = p.local_shape
-        # ghost planes SOLID: kernel skips them entirely (transit mailboxes)
+        # ghost planes TRANSIT: kernel skips them entirely (mailboxes).
+        # NOT SOLID — since the implicit-HWBB fix, a SOLID neighbor makes
+        # the fluid LOAD read the parity-swapped slot (a physical wall);
+        # transit ghosts must keep the plain-fluid load semantics.
         nt3 = cp.zeros((nx, ny, nz), cp.int8)
         gsl = [slice(None)] * 3
         gsl[axis] = 0
-        nt3[tuple(gsl)] = 1
+        nt3[tuple(gsl)] = 5                      # NODE_TRANSIT
         gsl[axis] = p.local_shape[axis] - 1
-        nt3[tuple(gsl)] = 1
+        nt3[tuple(gsl)] = 5                      # NODE_TRANSIT
         Nl = nx * ny * nz
         rhos.append(cp.empty((nx, ny, nz), cp.float32))
         us.append(cp.empty((3, nx, ny, nz), cp.float32))

@@ -6,7 +6,10 @@ Eliminates f_post, f_new, and Python BC overhead.
 
 Key properties:
     - f array: 1 copy only (in-place read/write)
-    - Bounce-back: implicit (SOLID nodes skip -> auto reversal)
+    - Bounce-back: implicit HWBB (SOLID nodes skip; fluid LOAD reads the
+      parity-swapped slot at solid neighbors = own t-1 outgoing reflected.
+      NOTE a bare skip WITHOUT the swapped-slot read is a 2-step-delayed
+      bounce, not HWBB — found by eso_mem_force_twin_gate)
     - BC: inside kernel (node_type flag)
     - Race-free: each memory address accessed by exactly 1 thread
 
@@ -77,6 +80,10 @@ NODE_SOLID = 1
 NODE_EQ_BC = 2       # Equilibrium BC (f = f_eq at prescribed rho, u)
 NODE_NEUMANN = 3     # Zero-gradient (copy from interior, no collision)
 NODE_SPONGE = 4      # Collision + blending toward target
+NODE_TRANSIT = 5     # v2 halo ghost mailbox: skipped like SOLID but WITHOUT
+                     # the implicit-bounce semantics in neighboring loads
+                     # (a SOLID ghost plane would reflect since the HWBB fix
+                     # reads parity-swapped slots at SOLID neighbors)
 
 
 # ============================================================
@@ -111,7 +118,7 @@ void esoteric_bgk_d3q27(
     if (idx >= N) return;
 
     int type = node_type[idx];
-    if (type == 1) return;  // SOLID: skip (implicit bounce-back)
+    if (type == 1 || type == 5) return;  // SOLID (implicit HWBB) / TRANSIT
 
     // 3D index (C-contiguous: x varies slowest)
     long long ix = idx / ((long long)Ny * Nz);
@@ -142,12 +149,32 @@ void esoteric_bgk_d3q27(
         long long nz = (iz + cz[i] + Nz) % Nz;
         long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
 
+        // Implicit halfway bounce-back (twin-gate fix): a SOLID neighbor
+        // never stores, so the slot the normal LOAD reads there is STALE
+        // (holds the t-2 deposit => a 2-step-DELAYED bounce, not HWBB;
+        // caught by eso_mem_force_twin_gate as an O(f_i - f_opp) transient
+        // divergence vs the standard path). Our own t-1 outgoing toward
+        // that solid sits in the PARITY-SWAPPED slot at the same address;
+        // reading it there is exact textbook HWBB:
+        //     f_in[opp](x, t) = f_out[dir](x, t-1).
+        // Pure-fluid cells never take these branches (bit-neutral).
+        long long mx = (ix - cx[i] + Nx) % Nx;   // upstream nbr x - c_i
+        long long my = (iy - cy[i] + Ny) % Ny;
+        long long mz = (iz - cz[i] + Nz) % Nz;
+        long long j_ip = mx * (long long)Ny * Nz + my * (long long)Nz + mz;
+        bool nb_dn = node_type[j_i]  == 1;   // x + c_i solid: bounce dir i+1
+        bool nb_up = node_type[j_ip] == 1;   // x - c_i solid: bounce dir i
+
         if (is_odd) {
-            fhn[i]   = f[i     * N + idx];   // dir i from slot i at self
-            fhn[i+1] = f[(i+1) * N + j_i];   // dir i+1 from slot i+1 at neighbor
+            fhn[i]   = nb_up ? f[(i+1) * N + idx]
+                             : f[i     * N + idx];   // dir i from slot i at self
+            fhn[i+1] = nb_dn ? f[i     * N + j_i]
+                             : f[(i+1) * N + j_i];   // dir i+1 from slot i+1 at neighbor
         } else {
-            fhn[i]   = f[(i+1) * N + idx];   // dir i from slot i+1 at self
-            fhn[i+1] = f[i     * N + j_i];   // dir i+1 from slot i at neighbor
+            fhn[i]   = nb_up ? f[i     * N + idx]
+                             : f[(i+1) * N + idx];   // dir i from slot i+1 at self
+            fhn[i+1] = nb_dn ? f[(i+1) * N + j_i]
+                             : f[i     * N + j_i];   // dir i+1 from slot i at neighbor
         }
     }
 
@@ -369,6 +396,69 @@ def init_f_esoteric(xp, f_physical: 'npt.NDArray', t_start: int = 0) -> 'npt.NDA
             f_mem[i] = f_physical[i]
             f_mem[i + 1] = rolled
     return f_mem
+
+
+def eso_seed_solid_bounce_ic(xp, f_mem, node_type, get_dir, t0: int) -> None:
+    """Seed the implicit-HWBB bounce slots for a FRESH-IC memory build.
+
+    The fixed implicit-HWBB LOAD reads the parity-swapped slot at/toward a
+    SOLID neighbor — the previous step's deposit of the cell's own outgoing
+    population. At t0 no deposit exists yet; this defines it as the IC's
+    incoming population ("the deposit of step t0-1"), which makes the
+    step-t0 collision input at bounce links exactly the IC — the same
+    convention as the standard path (whose step-t0 collision also consumes
+    the IC as-is). With this seed the esoteric and standard trajectories
+    are bit-identical from step t0 on (eso_mem_force_twin_gate).
+
+    MUST NOT be called on checkpoint restore: gather/scatter is a pure
+    permutation bijection over ALL slots, so scattering the checkpointed
+    std f at the restored parity already reproduces the true deposits
+    bit-exactly — seeding there would overwrite them with IC-rule values.
+
+    Only slots read exclusively by the kernel's solid branches are written
+    (derived in the kernel LOAD comment): pure-fluid cells and fluid-fluid
+    slots are untouched, so solid-free cases are bit-neutral.
+
+    Args:
+        xp: array module
+        f_mem: (27, Nx, Ny, Nz) esoteric memory (modified in place)
+        node_type: (Nx, Ny, Nz) int8 node types (1 = SOLID)
+        get_dir: callable(std_q) -> IC population of STANDARD direction
+                 std_q as a (Nx, Ny, Nz) array OR a python/0-d scalar
+                 (uniform IC). Lazy per-direction access keeps the peak at
+                 ~2 direction fields (the slab builders chunk the full f).
+        t0: start step (parity)
+    """
+    solid = (node_type == NODE_SOLID)
+    if not bool(solid.any()):
+        return
+    even = (int(t0) % 2 == 0)
+    axes = (0, 1, 2)
+    for p in range(13):
+        i = 2 * p + 1
+        ci = (int(CX_ESO[i]), int(CY_ESO[i]), int(CZ_ESO[i]))
+        f_i = get_dir(_STD_TO_ESO[i])        # eso dir i   (toward solid)
+        f_ip = get_dir(_STD_TO_ESO[i + 1])   # eso dir i+1 (opposite)
+        # Write ONLY link pairs whose partner cell is non-solid. The solid
+        # branches are read exclusively by FLUID cells, so this covers every
+        # actual read — and it keeps every written value sourced from a
+        # fluid-cell entry of the IC. That matters for rebuild identity: the
+        # slab builders re-seed from gather(already-seeded memory), where
+        # SOLID-cell entries are stale junk; seeding solid-to-solid links
+        # from them would break the bit match with the direct-IC build
+        # (found by the sphere --verify leg).
+        part_solid = xp.roll(solid, shift=ci, axis=axes)  # x - c_i is solid
+        dn = solid & ~part_solid             # solid s with fluid x = s - c_i
+        up = part_solid & ~solid             # fluid x with solid at x - c_i
+        slot_dn = (i + 1) if even else i     # read at the solid cell
+        slot_up = i if even else (i + 1)     # read at the fluid cell
+        if getattr(f_ip, "ndim", 0) == 0 or not hasattr(f_ip, "shape"):
+            f_mem[slot_dn][dn] = f_ip        # uniform IC: roll is identity
+            f_mem[slot_up][up] = f_i
+        else:
+            rolled = xp.roll(f_ip, shift=ci, axis=axes)
+            f_mem[slot_dn][dn] = rolled[dn]
+            f_mem[slot_up][up] = f_i[up]
 
 
 def convert_f_std_to_esoteric(xp, f_std: 'npt.NDArray') -> 'npt.NDArray':

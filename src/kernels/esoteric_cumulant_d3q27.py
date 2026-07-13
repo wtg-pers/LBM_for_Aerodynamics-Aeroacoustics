@@ -60,7 +60,7 @@ void esoteric_cumulant_d3q27(
     if (idx >= N) return;
 
     int type = node_type[idx];
-    if (type == 1) return;   // SOLID: skip (implicit bounce-back)
+    if (type == 1 || type == 5) return;   // SOLID (implicit HWBB) / TRANSIT
 
     long long ix = idx / ((long long)Ny * Nz);
     long long rem = idx - ix * (long long)Ny * Nz;
@@ -86,12 +86,27 @@ void esoteric_cumulant_d3q27(
         long long ny = (iy + cy[i] + Ny) % Ny;
         long long nz = (iz + cz[i] + Nz) % Nz;
         long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
+        // Implicit halfway bounce-back (twin-gate fix, same as the BGK
+        // esoteric kernel): a SOLID neighbor never stores, so the normal
+        // slot there is stale (t-2 deposit = 2-step-delayed bounce). The
+        // parity-swapped slot holds our own t-1 outgoing toward the solid
+        // -> exact HWBB. Pure-fluid cells never branch (bit-neutral).
+        long long mx = (ix - cx[i] + Nx) % Nx;
+        long long my = (iy - cy[i] + Ny) % Ny;
+        long long mz = (iz - cz[i] + Nz) % Nz;
+        long long j_ip = mx * (long long)Ny * Nz + my * (long long)Nz + mz;
+        bool nb_dn = node_type[j_i]  == 1;
+        bool nb_up = node_type[j_ip] == 1;
         if (is_odd) {
-            fhn[i]   = f[(long long)i     * N + idx];
-            fhn[i+1] = f[(long long)(i+1) * N + j_i];
+            fhn[i]   = nb_up ? f[(long long)(i+1) * N + idx]
+                             : f[(long long)i     * N + idx];
+            fhn[i+1] = nb_dn ? f[(long long)i     * N + j_i]
+                             : f[(long long)(i+1) * N + j_i];
         } else {
-            fhn[i]   = f[(long long)(i+1) * N + idx];
-            fhn[i+1] = f[(long long)i     * N + j_i];
+            fhn[i]   = nb_up ? f[(long long)i     * N + idx]
+                             : f[(long long)(i+1) * N + idx];
+            fhn[i+1] = nb_dn ? f[(long long)(i+1) * N + j_i]
+                             : f[(long long)i     * N + j_i];
         }
     }
 

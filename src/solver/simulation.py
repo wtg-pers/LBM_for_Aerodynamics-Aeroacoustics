@@ -514,6 +514,7 @@ class Simulation:
             EsotericMacroKernelD3Q27,
             convert_f_std_to_esoteric,
             init_f_esoteric,
+            eso_seed_solid_bounce_ic,
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE,
             _STD_TO_ESO,
         )
@@ -546,6 +547,13 @@ class Simulation:
         self._build_esoteric_domain_bc(
             node_type, bc_rho, bc_ux, bc_uy, bc_uz,
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE)
+
+        if not self._esoteric_f_already_set:
+            # fresh IC only: seed the implicit-HWBB bounce slots. Restore
+            # (f already esoteric memory) keeps the checkpointed deposits.
+            eso_seed_solid_bounce_ic(
+                xp, self.f.reshape((27,) + self.domain_shape), node_type,
+                lambda q: f[q], 0)
 
         self._eso_node_type = node_type.ravel()
         self._eso_bc_rho = bc_rho.ravel()

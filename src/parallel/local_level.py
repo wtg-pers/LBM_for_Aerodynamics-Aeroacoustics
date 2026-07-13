@@ -134,6 +134,20 @@ class LocalLevel:
         self.omega = ld["omega"]
         self.ob, self.oh = ld["omega_bulk"], ld["omega_high"]
         self.nt = wrap_slice(ld["node_type"], part).ravel().copy()
+        if t0 == 0:
+            # fresh IC only: seed the implicit-HWBB bounce slots on the slab
+            # (restart t0>0 scatters the checkpointed deposits bit-exactly —
+            # seeding would overwrite them; see eso_seed_solid_bounce_ic).
+            # Ghost-edge seeds touched by the LOCAL wrap of the roll are
+            # overwritten by the first halo sync (every level syncs before
+            # its first advance), so only owned-region correctness matters.
+            from src.kernels.esoteric_d3q27 import eso_seed_solid_bounce_ic
+            if ld["f0"] is not None:
+                get_dir = lambda q: wrap_slice(ld["f0"][q], part)
+            else:
+                get_dir = lambda q: float(ld["feq27"][q].ravel()[0])
+            eso_seed_solid_bounce_ic(
+                cp, self.mem, self.nt.reshape(self.dims), get_dir, t0)
         self.b_r = wrap_slice(ld["bc_rho"], part).ravel().copy()
         self.b_x = wrap_slice(ld["bc_ux"], part).ravel().copy()
         self.b_y = wrap_slice(ld["bc_uy"], part).ravel().copy()

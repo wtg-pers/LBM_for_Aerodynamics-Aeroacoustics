@@ -16,8 +16,12 @@ populations per boundary cell are exchanged per face, in two groups:
 Both directions are same-slot copies — no relabelling — because the pull
 swap already encodes the streaming. Traffic per face pair per step:
 9 slot-planes each way, vs v1's 2-cell x 27-slot physical bands (54) -> 6x
-less. Ghost cells are marked SOLID in node_type so the kernel never collides
-them (they are pure transit mailboxes).
+less. Ghost cells are marked NODE_TRANSIT in node_type so the kernel never
+collides them (pure transit mailboxes). They must NOT be marked SOLID: since
+the implicit-HWBB fix, a SOLID neighbor switches the fluid cell's LOAD to
+the parity-swapped slot (physical bounce-back) — a SOLID ghost plane would
+act as a wall. (Real solids ON a v2 slab edge remain out of scope for the
+deferred v2 production coupling; note it when that work resumes.)
 
 Scope (M4): single-level streaming. SGS needs a u edge-plane exchange and
 MLG coupling needs physical bands at coupling instants (v1 machinery) —
