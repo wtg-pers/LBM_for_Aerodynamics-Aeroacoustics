@@ -329,3 +329,13 @@
   tier별. 2-rank 집합경로 검증.
 - **docs/SIMULATION_RUN_GUIDE_kr.md**: 단일/멀티 통합 실행 가이드(플래그·메모리 지침·게이트
   실행 순서·알려진 한계).
+
+### 3-tier 동작 확인 + 신규 스모크 config 2종 (2026-07-13)
+- `bench_flow_uniform.py`(비영 유입 0.05 lu): flow tier u_max=0.05 표시 ✓, **비영-u0 dist-init
+  + 비영 eq/sponge BC 경로 bit**(vs production).
+- `bench_sphere_hwbb.py`(D=2 L0 스피어, L4 슬랩 내, HWBB): **싱글턴·2-rank 전 레벨 bit** —
+  2-rank는 컷(y=25)이 스피어 관통(solid 걸침 분해 첫 검증). 물리 sanity: u_max 0.081(구 주위
+  가속), rho 파동 정상.
+- ★버그 검출·수정: flow_stats가 SOLID 미마스킹 → 커널이 solid에서 rho/u 미기록(cp.empty
+  쓰레기) → rank별 u_max 불일치(0.08 vs 1.84). fluid-마스크 적용 후 rank-불변(0.08082 동일).
+- 가이드 §4b에 tier 스모크 3종 수록.

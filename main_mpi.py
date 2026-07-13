@@ -190,14 +190,20 @@ def main():
         tier = "flow"
 
     def flow_stats():
-        """COLLECTIVE: owned-cell rho mean + |u| max on the finest level."""
+        """COLLECTIVE: owned FLUID-cell rho mean + |u| max on the finest
+        level. SOLID cells are masked — the kernel returns before writing
+        rho/u there, so their buffers are UNINITIALIZED (caught by the
+        sphere smoke: a rank reported u_max=1.8 from cp.empty garbage)."""
         L = runner.lv[-1]
         sl = runner.parts[-1].owned_local()
+        fluid = (L.nt.reshape(L.dims)[sl] != 1)
         rho = L.rho[sl]
         u = L.u[(slice(None),) + sl]
-        s_loc = float(rho.sum())
-        n_loc = float(rho.size)
-        m_loc = float(cp.sqrt((u * u).sum(axis=0).max()))
+        s_loc = float(rho[fluid].sum())
+        n_loc = float(fluid.sum())
+        usq = (u * u).sum(axis=0)
+        usq = cp.where(fluid, usq, 0.0)
+        m_loc = float(cp.sqrt(usq.max()))
         if nr > 1:
             import numpy as _np
             buf = _np.array([s_loc, n_loc, m_loc])

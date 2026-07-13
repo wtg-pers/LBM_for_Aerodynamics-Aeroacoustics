@@ -63,6 +63,23 @@ run_tag가 다른 config 2개를 써라(예: `_single0` vs `_mpi4`) — 아니�
 메모리 검증은 반드시 하드리밋 에뮬레이션으로: `cp.get_default_memory_pool().set_limit(...)`
 (WSL2 oversubscription이 OOM을 가린 전례 2건).
 
+## 4b. tier별 스모크 config (동작 확인용, bench5 스케일 ~수 분)
+
+```bash
+# ALM tier (CT/CP/FM 라인)
+LBM_ESOTERIC=1 python main_mpi.py --config configs/hpc_bench/bench5_purealm_m3.py \
+  --steps 4 --log-every 2 --dist-init --devices 0 --verify
+# 순수 유동 tier (rho/u_max 라인; 비영 유입 eq/sponge + dist-init u0!=0 경로)
+LBM_ESOTERIC=1 python main_mpi.py --config configs/hpc_bench/bench_flow_uniform.py \
+  --steps 4 --log-every 2 --dist-init --devices 0 --verify
+# 고체 경계 tier (sphere HWBB, 5-level, 컷-관통-solid까지 bit; --dist-init 금지)
+LBM_ESOTERIC=1 python main_mpi.py --config configs/hpc_bench/bench_sphere_hwbb.py \
+  --steps 4 --log-every 2 --devices 0 --verify
+```
+셋 모두 `[verify] RESULT: PASS` + 전 레벨 bit=True가 정상. body tier의 진행 라인은
+CL/CD 배선 전까지 rho/u_max 폴백(SOLID 마스킹 적용 — 미마스킹 시 미초기화 u가 새는
+버그를 sphere 스모크가 검출·수정함).
+
 ## 5. 검증 게이트 (수정 후 실행 순서)
 
 ```bash
