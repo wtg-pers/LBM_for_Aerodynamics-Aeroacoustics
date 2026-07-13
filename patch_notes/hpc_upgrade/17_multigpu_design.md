@@ -243,3 +243,12 @@
   fine→L0 변환 + MarkerVTPWriter.write_from_al_model 재사용. --vtk-every 케이던스에 동승.
 - bench5 검증: markers_*.vtp 192마커, 배열 16종(alpha/CL/CD/F_n/F_theta/w_corr/force 등) —
   blade_diagnostics CSV 미배선을 마커 단위로 보완.
+
+### 백로그 소화 #1: MPI --restart + production 로터 재시작 버그 수정 (2026-07-13)
+- ★**production 버그 발견·수정**(initializer._restart_mlg): 재시작이 로터 theta/time/_step_count를
+  복원하지 않음 → 블레이드 방위각 0 점프 + **force ramp 재적용**(단일GPU 재시작도 동일 영향).
+  수정=rotor.advance() 재생(replay) — fp 누적까지 연속런과 정확히 동일한 기구학 상태.
+- MPI: LocalLevel t0(esoteric parity를 복원 step에서 연속), runner.completed_step(L0 step_count에서),
+  main_mpi --restart/--restart-latest 관통 + CSV append + 절대 step 루프.
+- **G-restart PASS: 2+2 재시작 vs 4 연속 — 전 5레벨 checkpoint f bit-identical**(ramp 활성 구간이라
+  로터 상태 오차에 최대 민감).

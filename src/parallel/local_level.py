@@ -57,12 +57,15 @@ def wrap_slice(arr, part, spatial_offset: int = 0):
 class LocalLevel:
     """Rank-local esoteric level replicating Simulation._advance_esoteric."""
 
-    def __init__(self, ld: dict, part) -> None:
+    def __init__(self, ld: dict, part, t0: int = 0) -> None:
         self.part = part
         self.dims = tuple(part.local_shape)
         n = int(np.prod(self.dims))
-        self.mem = esoteric_scatter_std(cp, wrap_slice(ld["f0"], part, 1), 0)
-        self.t = 0
+        # t0: restart support — the esoteric parity must CONTINUE from the
+        # restored step (checkpoints store parity-free std f; scattering at
+        # the restored parity reproduces the uninterrupted memory state)
+        self.mem = esoteric_scatter_std(cp, wrap_slice(ld["f0"], part, 1), t0)
+        self.t = t0
         self.omega = ld["omega"]
         self.ob, self.oh = ld["omega_bulk"], ld["omega_high"]
         self.nt = wrap_slice(ld["node_type"], part).ravel().copy()

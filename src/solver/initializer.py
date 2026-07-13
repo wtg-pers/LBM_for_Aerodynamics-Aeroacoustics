@@ -391,6 +391,24 @@ class SolverInitializer:
                 f_k = level_sim.collision.compute_equilibrium(rho_0, u_0)
                 level_sim.set_distribution(f_k)
 
+        # ── ALM: fast-forward rotor kinematics (restart bug fix) ──
+        # theta/time/_step_count previously reset to 0 on restart, which
+        # snapped the blades back to azimuth 0 AND re-applied the force
+        # ramp. Replaying rotor.advance() reproduces the kinematic state
+        # EXACTLY (same fp accumulation as the uninterrupted run).
+        al = setup.al_model
+        if al is not None:
+            models = al.models if hasattr(al, 'models') else [al]
+            sub = 2 ** (mlg.num_levels - 1)      # ALM lives on the finest
+            t_fine = completed_step * sub
+            for m_ in models:
+                for _ in range(t_fine):
+                    m_.rotor.advance(1.0)
+                m_._step_count = t_fine
+            print(f"  ALM: rotor fast-forwarded {t_fine} fine steps "
+                  f"(theta[0]={models[0].rotor.theta[0]:.4f} rad, "
+                  f"ramp done={t_fine >= models[0].ramp_steps})")
+
         print(f"  Resuming from step {start_step}")
         return start_step
 

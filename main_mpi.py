@@ -46,6 +46,10 @@ def parse_cli(argv):
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--profile", action="store_true",
                     help="per-section wall-time attribution (adds sync overhead)")
+    ap.add_argument("--restart", default=None,
+                    help="checkpoint file to resume from (absolute steps)")
+    ap.add_argument("--restart-latest", action="store_true",
+                    help="resume from the latest checkpoint")
     ap.add_argument("--vtk-every", type=int, default=0,
                     help="coarse steps between assembled VTK writes (0=off)")
     ap.add_argument("--ckpt-every", type=int, default=0,
@@ -56,10 +60,15 @@ def parse_cli(argv):
     return ap.parse_args(argv)
 
 
-def build(config, dev: int, with_writers: bool = False):
+def build(config, dev: int, with_writers: bool = False,
+          restart=None, restart_latest=False):
     sys.argv = ["mpi", "--config", config, "--gpu", str(dev), "--no-force"]
     if not with_writers:
         sys.argv.append("--no-vtk")      # writers only needed on rank 0
+    if restart:
+        sys.argv += ["--restart", restart]
+    elif restart_latest:
+        sys.argv.append("--restart-latest")
     from src.io.args_parser import parse_args
     from src.solver.setup import SimulationSetup
     from src.solver.initializer import SolverInitializer
@@ -96,7 +105,9 @@ def main():
     if rank != 0:                                 # quiet non-root builds
         sys.stdout = open(os.devnull, "w")
     mlg, setup = build(args.config, dev,
-                       with_writers=(rank == 0 and want_out))
+                       with_writers=(rank == 0 and want_out),
+                       restart=args.restart,
+                       restart_latest=args.restart_latest)
     sys.stdout = sys.__stdout__
 
     from src.parallel import MPITransport
@@ -135,14 +146,26 @@ def main():
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
 
+    start_step = runner.completed_step + 1
+    if start_step > args.steps:
+        if rank == 0:
+            print(f"[mpi] nothing to do: restored step {start_step - 1} "
+                  f">= --steps {args.steps}", flush=True)
+        MPI.Finalize()
+        return
     if rank == 0:
         print(f"[mpi] ranks={nr} axis={'xyz'[runner.axis]} "
-              f"ghost={args.ghost} cuda_aware={args.cuda_aware}", flush=True)
+              f"ghost={args.ghost} cuda_aware={args.cuda_aware}"
+              + (f"  RESTART from {runner.completed_step}"
+                 if runner.completed_step else ""), flush=True)
         for k, p in enumerate(runner.parts):
             print(f"[mpi]   L{k} rank0 {p}", flush=True)
-        csv_f = open(args.csv, "w") if args.csv else None
-        if csv_f:
-            csv_f.write("step,time_lu,thrust,torque,power,C_T,C_P,FM\n")
+        csv_f = None
+        if args.csv:
+            append = runner.completed_step > 0 and os.path.exists(args.csv)
+            csv_f = open(args.csv, "a" if append else "w")
+            if not append:
+                csv_f.write("step,time_lu,thrust,torque,power,C_T,C_P,FM\n")
 
     def on_log(s, rn):
         if rank != 0:
@@ -171,7 +194,8 @@ def main():
     t0 = _time.perf_counter()
     t_last = t0
     runner.last_interval = None
-    for s_ in range(1, args.steps + 1):
+    n_todo = args.steps - start_step + 1
+    for s_ in range(start_step, args.steps + 1):
         runner.step_coarse()
         if args.log_every and s_ % args.log_every == 0:
             cp.cuda.runtime.deviceSynchronize()
@@ -179,6 +203,7 @@ def main():
             runner.last_interval = {
                 "s_per_step": (now - t_last) / args.log_every,
                 "elapsed_s": now - t0}
+            _ = n_todo                       # (total for this session)
             t_last = now
             on_log(s_, runner)
         if bridge is not None and args.vtk_every and \
@@ -189,8 +214,8 @@ def main():
             bridge.save_checkpoint(s_, runner)
     cp.cuda.runtime.deviceSynchronize()
     dt_all = _time.perf_counter() - t0
-    stats = {"steps": args.steps, "wall_s": dt_all,
-             "s_per_step": dt_all / max(args.steps, 1)}
+    stats = {"steps": n_todo, "wall_s": dt_all,
+             "s_per_step": dt_all / max(n_todo, 1)}
     comm.Barrier()
     if args.profile:
         prof = comm.gather(runner.profile, root=0)

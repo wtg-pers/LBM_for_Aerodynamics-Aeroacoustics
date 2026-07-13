@@ -76,6 +76,11 @@ class DistributedMLGRunner:
             self.parts.append(Partition1D.from_range(
                 shapes[k], n_ranks, rank, self.axis, f0_, fc_, ghost=ghost))
 
+        # restart: continue esoteric parity + step numbering from the
+        # restored state (initializer sets L0 step_count = completed+1)
+        sc = int(getattr(mlg.get_level(0), "step_count", 0) or 0)
+        self.completed_step = max(0, sc - 1) if sc > 0 else 0
+
         # local slabs: extract views level-by-level and RELEASE each source
         # level's device arrays right after its slab is built — keeps the
         # transient peak at (t=0 build state + one slab), shrinking per level
@@ -84,7 +89,8 @@ class DistributedMLGRunner:
         for k in range(NL):
             lev = mlg.get_level(k)
             ld = extract_level(lev)
-            self.lv.append(LocalLevel(ld, self.parts[k]))
+            self.lv.append(LocalLevel(ld, self.parts[k],
+                                      t0=self.completed_step * (2 ** k)))
             del ld
             for a in ("f", "f_post", "f_prev", "rho", "u",
                       "_eso_node_type", "_eso_bc_rho", "_eso_bc_ux",
