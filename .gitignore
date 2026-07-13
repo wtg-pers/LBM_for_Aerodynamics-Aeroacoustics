@@ -11,6 +11,7 @@
 !main.py
 !main_wind_turbine.py
 !main_mpi.py
+!run_collective_sweep.sh
 !.gitignore
 !README.md
 

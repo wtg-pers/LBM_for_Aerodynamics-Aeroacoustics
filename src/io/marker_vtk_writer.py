@@ -285,7 +285,11 @@ class MarkerVTPWriter:
 
         scalars['blade_id'] = blade_ids
         scalars['marker_id'] = marker_ids
-        scalars['radius'] = rotor.get_all_marker_radii()
+        radii = rotor.get_all_marker_radii()
+        scalars['radius'] = radii
+        scalars['r_R'] = (radii / rotor.radius).astype(np.float32)
+        scalars['chord_lu'] = \
+            rotor.get_all_marker_chords().astype(np.float32)
         scalars['active'] = rotor.get_all_marker_active().astype(np.float32)
 
         bem = al_model._last_bem_result
