@@ -86,7 +86,9 @@ gather가 돌므로 해당 step은 수 초 느려짐.)
 ## 4. 현재 한계 (M5 스코프)
 - ~~thrust CSV만~~ → **VTK(.vti/.vth)·checkpoint(npz) rank0 조립 지원**(--vtk-every/
   --ckpt-every; production 포맷 동일 = 기존 분석스크립트·단일GPU restart 그대로 사용 가능).
-  잔여: MPI 러너 자체의 --restart 재개 배선, ALM 마커 VTP
+  ~~잔여: MPI --restart, 마커 VTP~~ → 전부 배선됨(--restart/--restart-latest[재개 bit 게이트],
+  마커 VTP[--vtk-every 동승], **--dist-init**[균일-IC 케이스, rank당 풀필드 미할당 →
+  4-GPU 용량 ~450M셀; 빌드 0.91GB/rank 정착 3.7GB @D40])
 - kleine free-wake·비gaussian 샘플러 분산 미지원(fail-fast) — production은 straight
 - 케이스가 단일 GPU 메모리를 초과하면 분산 초기화 필요(후속; D40은 해당 없음)
 - v2 slot halo(M4)는 게이트 검증만, production 미결합 — 강스케일링 실측 후 결정

@@ -70,7 +70,9 @@ class SolverInitializer:
             sim.step_count = start_step
 
         # ── Step 4: Conservation initialization ──────────────────
-        if self._setup.conservation_mgr and self._setup.conservation_mgr.enabled:
+        if os.environ.get("LBM_DIST_INIT", "0") == "1":
+            pass                        # no full fields exist (MPI runner)
+        elif self._setup.conservation_mgr and self._setup.conservation_mgr.enabled:
             f_for_monitor = sim.f
             rho_init, _ = self._setup.macro.compute(f_for_monitor)
             self._setup.conservation_mgr.initialize(rho_init, step=start_step)
@@ -254,6 +256,23 @@ class SolverInitializer:
         print(f"\n[5] Initializing MultiLevelGrid ({mlg.num_levels} levels)")
 
         dtype = setup.compute_dtype
+
+        if os.environ.get("LBM_DIST_INIT", "0") == "1":
+            # Distributed init (patch 17 backlog #4): host metadata only,
+            # no device fields. The uniform IC (rho=1, u=flow_vel const)
+            # makes slab f a broadcast of ONE equilibrium vector — computed
+            # by the runner per slab, bit-equal to the full elementwise
+            # equilibrium (same per-cell math).
+            for k in range(mlg.num_levels):
+                level_sim = mlg.get_level(k)
+                level_sim.init_esoteric_metadata_host()
+                level_sim._dist_init_ic = (1.0, list(flow_vel)
+                                           if isinstance(flow_vel,
+                                                         (list, tuple))
+                                           else [float(flow_vel), 0.0, 0.0])
+                print(f"  Level {k}: dist-init metadata (host), "
+                      f"tau={level_sim.tau:.6f}")
+            return 0
 
         for k in range(mlg.num_levels):
             level_sim = mlg.get_level(k)

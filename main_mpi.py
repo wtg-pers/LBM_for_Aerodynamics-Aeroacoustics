@@ -50,6 +50,10 @@ def parse_cli(argv):
                     help="checkpoint file to resume from (absolute steps)")
     ap.add_argument("--restart-latest", action="store_true",
                     help="resume from the latest checkpoint")
+    ap.add_argument("--dist-init", action="store_true",
+                    help="slab-scoped initialization: no full-size device "
+                         "fields per rank (uniform-IC cases; lifts 4-GPU "
+                         "capacity to ~4x a single GPU)")
     ap.add_argument("--vtk-every", type=int, default=0,
                     help="coarse steps between assembled VTK writes (0=off)")
     ap.add_argument("--ckpt-every", type=int, default=0,
@@ -61,7 +65,8 @@ def parse_cli(argv):
 
 
 def build(config, dev: int, with_writers: bool = False,
-          restart=None, restart_latest=False):
+          restart=None, restart_latest=False, dist_init=False):
+    os.environ["LBM_DIST_INIT"] = "1" if dist_init else "0"
     sys.argv = ["mpi", "--config", config, "--gpu", str(dev), "--no-force"]
     if not with_writers:
         sys.argv.append("--no-vtk")      # writers only needed on rank 0
@@ -104,10 +109,14 @@ def main():
     want_out = bool(args.vtk_every or args.ckpt_every)
     if rank != 0:                                 # quiet non-root builds
         sys.stdout = open(os.devnull, "w")
+    if args.dist_init and (args.restart or args.restart_latest):
+        raise ValueError("--dist-init + restart: restore path loads full "
+                         "fields (use replicated build for restarts for now)")
     mlg, setup = build(args.config, dev,
                        with_writers=(rank == 0 and want_out),
                        restart=args.restart,
-                       restart_latest=args.restart_latest)
+                       restart_latest=args.restart_latest,
+                       dist_init=args.dist_init)
     sys.stdout = sys.__stdout__
 
     from src.parallel import MPITransport
@@ -259,7 +268,7 @@ def verify(comm, rank, nr, runner, args):
     if rank != 0:
         return
     print("[verify] building 1-rank reference...", flush=True)
-    ref, _ = build(args.config, 0)
+    ref, _ = build(args.config, 0)          # dist_init=False: full fields
     for _ in range(args.steps):
         ref.advance()
     ok = True

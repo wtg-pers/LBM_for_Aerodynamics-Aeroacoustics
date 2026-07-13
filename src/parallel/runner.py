@@ -76,6 +76,28 @@ class DistributedMLGRunner:
             self.parts.append(Partition1D.from_range(
                 shapes[k], n_ranks, rank, self.axis, f0_, fc_, ghost=ghost))
 
+        # distributed ALM (M3 hooks) on the finest level — wired BEFORE the
+        # slab loop so the model's GLOBAL-shape f64 F_grid (2.5GB at 400M
+        # scale) is replaced and freed before slabs start accumulating
+        self.model = None
+        alm_lev = NL - 1
+        if getattr(mlg.get_level(alm_lev), "al_model", None) is not None:
+            if allreduce is None:
+                raise ValueError("ALM case needs an allreduce adapter")
+            m = mlg.get_level(alm_lev).al_model
+            p = self.parts[alm_lev]
+            off = np.zeros(3)
+            off[self.axis] = p.own_start - p.ghost
+            m._global_domain_shape = tuple(shapes[alm_lev])
+            m.domain_shape = tuple(p.local_shape)
+            m._F_grid = cp.zeros((3,) + tuple(p.local_shape), cp.float64)
+            m._grid_offset = off
+            m._velocity_sampler = make_distributed_sampler(
+                allreduce, rank, p, cp)
+            self.model = m
+            cp.get_default_memory_pool().free_all_blocks()
+        self.alm_lev = alm_lev
+
         # restart: continue esoteric parity + step numbering from the
         # restored state (initializer sets L0 step_count = completed+1)
         sc = int(getattr(mlg.get_level(0), "step_count", 0) or 0)
@@ -110,26 +132,6 @@ class DistributedMLGRunner:
         self._fprev = [None] * (NL - 1)
         self.NL = NL
         self.profile = None          # dict -> per-section seconds (opt-in)
-
-        # distributed ALM (M3 hooks) on the finest level, if present
-        self.model = None
-        alm_lev = NL - 1
-        if getattr(mlg.get_level(alm_lev), "al_model", None) is not None:
-            if allreduce is None:
-                raise ValueError("ALM case needs an allreduce adapter")
-            m = mlg.get_level(alm_lev).al_model
-            p = self.parts[alm_lev]
-            off = np.zeros(3)
-            off[self.axis] = p.own_start - p.ghost
-            m._global_domain_shape = tuple(shapes[alm_lev])
-            m.domain_shape = tuple(p.local_shape)
-            m._F_grid = cp.zeros((3,) + tuple(p.local_shape), cp.float64)
-            m._grid_offset = off
-            m._velocity_sampler = make_distributed_sampler(
-                allreduce, rank, p, cp)
-            self.model = m
-            cp.get_default_memory_pool().free_all_blocks()   # old global F_grid
-        self.alm_lev = alm_lev
 
     # ── plumbing ─────────────────────────────────────────────────────
     def _tic(self):

@@ -31,6 +31,16 @@ def extract_level(lev) -> dict:
     peak stays at (t=0 build state + one slab) and shrinks level by level.
     """
     shape = lev.domain_shape
+    feq27 = None
+    if lev.f is None:                                  # dist-init: uniform IC
+        rho0, u0 = lev._dist_init_ic
+        xp0 = lev.xp
+        rho_t = xp0.full((1, 1, 1), rho0, dtype=xp0.float32)
+        u_t = xp0.zeros((3, 1, 1, 1), dtype=xp0.float32)
+        for d in range(min(3, len(u0))):
+            u_t[d] = u0[d]
+        # same per-cell math as the full elementwise init -> bit-equal
+        feq27 = lev.collision.compute_equilibrium(rho_t, u_t)
     return dict(
         shape=shape,
         omega=1.0 / lev.tau,
@@ -38,6 +48,7 @@ def extract_level(lev) -> dict:
         omega_high=lev._eso_omega_high,
         sgs=dict(lev._sgs_cfg),
         f0=lev.physical_f,                             # standard phys, t=0
+        feq27=feq27,                                   # dist-init constant
         node_type=lev._eso_node_type.reshape(shape),
         bc_rho=lev._eso_bc_rho.reshape(shape),
         bc_ux=lev._eso_bc_ux.reshape(shape),
@@ -47,10 +58,15 @@ def extract_level(lev) -> dict:
 
 
 def wrap_slice(arr, part, spatial_offset: int = 0):
-    """Wrap-slice along the partition axis (works for (...,X,Y,Z) arrays)."""
+    """Wrap-slice along the partition axis (works for (...,X,Y,Z) arrays).
+
+    Accepts host numpy (dist-init metadata) or device arrays; always
+    returns a device array."""
     ax = spatial_offset + part.axis
     lo = part.own_start - part.ghost
     idx = (np.arange(lo, lo + part.local_shape[part.axis]) % arr.shape[ax])
+    if isinstance(arr, np.ndarray):
+        return cp.asarray(np.take(arr, idx, axis=ax))
     return cp.take(arr, cp.asarray(idx), axis=ax)
 
 
@@ -64,7 +80,14 @@ class LocalLevel:
         # t0: restart support — the esoteric parity must CONTINUE from the
         # restored step (checkpoints store parity-free std f; scattering at
         # the restored parity reproduces the uninterrupted memory state)
-        self.mem = esoteric_scatter_std(cp, wrap_slice(ld["f0"], part, 1), t0)
+        if ld["f0"] is not None:
+            f_loc = wrap_slice(ld["f0"], part, 1)
+        else:                            # dist-init: constant equilibrium
+            f_loc = cp.ascontiguousarray(cp.broadcast_to(
+                cp.asarray(ld["feq27"], dtype=cp.float32).reshape(27, 1, 1, 1),
+                (27,) + self.dims))
+        self.mem = esoteric_scatter_std(cp, f_loc, t0)
+        del f_loc
         self.t = t0
         self.omega = ld["omega"]
         self.ob, self.oh = ld["omega_bulk"], ld["omega_high"]

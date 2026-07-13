@@ -606,6 +606,46 @@ class Simulation:
             self._esoteric_is_cumulant = False
         self._use_esoteric = True
 
+    def init_esoteric_metadata_host(self) -> None:
+        """Distributed-init (patch 17 backlog #4): esoteric BC/node metadata
+        ONLY, full-size on HOST numpy (~17 B/cell of RAM), zero device field
+        allocation. The distributed runner wrap-slices its slab from these
+        host arrays and builds slab f from the uniform-IC equilibrium
+        (spatially constant), so no full-size f/rho/u ever exists anywhere —
+        this is what lifts the 4-GPU capacity from "one GPU's worth" to
+        ~4x (replicated build allocated every full field per rank).
+        """
+        import numpy as _np
+        from src.kernels.esoteric_d3q27 import (
+            NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE)
+        if self.obstacle_bc is not None:
+            raise NotImplementedError(
+                "dist-init: obstacle BCs not supported (needs slab-scoped "
+                "solid masks)")
+        Nx, Ny, Nz = self.domain_shape
+        node_type = _np.zeros((Nx, Ny, Nz), dtype=_np.int8)
+        bc_rho = _np.ones((Nx, Ny, Nz), dtype=_np.float32)
+        bc_ux = _np.zeros((Nx, Ny, Nz), dtype=_np.float32)
+        bc_uy = _np.zeros((Nx, Ny, Nz), dtype=_np.float32)
+        bc_uz = _np.zeros((Nx, Ny, Nz), dtype=_np.float32)
+        self._build_esoteric_domain_bc(          # pure indexing: xp-agnostic
+            node_type, bc_rho, bc_ux, bc_uy, bc_uz,
+            NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE)
+        self._eso_node_type = node_type.ravel()
+        self._eso_bc_rho = bc_rho.ravel()
+        self._eso_bc_ux = bc_ux.ravel()
+        self._eso_bc_uy = bc_uy.ravel()
+        self._eso_bc_uz = bc_uz.ravel()
+        from src.collision.cumulant import CumulantCollision
+        if isinstance(self.collision, CumulantCollision):
+            self._eso_omega_bulk = float(self.collision.omega_bulk)
+            self._eso_omega_high = float(self.collision.omega_3)
+        else:
+            self._eso_omega_bulk = 1.0 / self.tau
+            self._eso_omega_high = 1.0 / self.tau
+        self._esoteric_step = 0
+        self._use_esoteric = True
+
     def _build_esoteric_domain_bc(self, node_type, bc_rho, bc_ux, bc_uy, bc_uz,
                                   NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN,
                                   NODE_SPONGE):

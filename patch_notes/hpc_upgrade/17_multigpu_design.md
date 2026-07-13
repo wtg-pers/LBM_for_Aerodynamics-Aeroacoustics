@@ -271,3 +271,13 @@
 - 게이트: ALM smoke(median 2.0e-4), G-M3(**field bit 유지**, F rel 6.5e-17), G-restart(전레벨
   bit), mpirun verify(전레벨 bit). +verify build 튜플 unpack 버그 수정.
 - 단일GPU 동일 수혜(같은 엔트리 경로). 잔여 alm 0.261@NR=1 = macro 0.073+BEM ~0.13+spread 0.067.
+
+### 백로그 #4: 분산 초기화 (2026-07-13)
+- `LBM_DIST_INIT=1`(main_mpi `--dist-init`): ①f/rho/u/SGS 디바이스 필드 전부 미할당
+  ②BC/node 메타데이터=**호스트 numpy full-size**(동일 빌더 `_build_esoteric_domain_bc` 재사용 —
+  순수 인덱싱이라 xp-불가지, 17B/cell RAM) ③슬랩 f=균일 IC 평형 **상수 27-벡터 broadcast**
+  (tiny-array compute_equilibrium — 풀 elementwise와 per-cell 동일 수학=bit) ④runner의 ALM
+  배선을 슬랩 루프 앞으로(글로벌 F_grid 조기 해제). 미지원 fail-fast: obstacle BC, restart 병용.
+- **게이트: bench5 2-rank --dist-init --verify 전 레벨 bit**(풀필드 production reference 대비).
+- **D40 메모리 프로브: 빌드 0.91GB(replicated 19.2GB→21×↓), rank1/4 정착 3.69GB** →
+  4×4090 용량 ~110M → **~450-500M 셀**(worst-share 0.266 기준). 호스트 RAM 요구 17B/cell.
