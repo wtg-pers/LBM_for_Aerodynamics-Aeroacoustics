@@ -294,3 +294,11 @@
   버퍼) → 자식 프레임 B-sync가 complete — 전송이 자식의 fprev+advance 커널 밑에 은닉.
   in-flight 중 변이 assert로 스케줄 버그 fail-fast.
 - 게이트: mpirun 2-rank verify(전레벨 bit), G-restart(bit), dist-init verify(PASS). 
+
+### 재측정 확정 + NR=1 OOM 수리 (2026-07-13)
+- **4-rank 0.442 s/step**(0.671→; #3 alm 0.275→0.117, #5 halo_c 0.18→0.116, halo_p→0.009).
+  25-rev ≈ 3.9h. 예측밴드(0.40-0.45) 적중.
+- 클러스터 NR=1 OOM 2건: ①pull 이전 코드(비청크 scatter 3중 transient) ②본질 — replicated
+  NR=1은 최대레벨 source f+슬랩 mem 동시보유로 native 24GB 불가(WSL2가 가려옴; 23GB 하드리밋
+  로컬 재현). 수리: LocalLevel **재사용 청크버퍼**(cp.take(out=), 청크당 할당 0)+사전 트림
+  — bench5 bit 유지. **NR=1 측정은 --dist-init 경로 공식화**(하드리밋 하 used 16.8/total 20.0 OK).

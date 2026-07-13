@@ -79,15 +79,57 @@ class LocalLevel:
         n = int(np.prod(self.dims))
         # t0: restart support — the esoteric parity must CONTINUE from the
         # restored step (checkpoints store parity-free std f; scattering at
-        # the restored parity reproduces the uninterrupted memory state)
+        # the restored parity reproduces the uninterrupted memory state).
+        #
+        # CHUNKED construction: the whole-slab scatter held THREE slab-sized
+        # transients (wrap copy + eso convert + roll) — native-24GB OOM at
+        # NR=1 D40 (WSL2 oversubscription masked it locally) and it would
+        # break the 450M dist-init slabs the same way. Chunk regions scatter
+        # additively (each pair-slot write is independent and sourced from
+        # its own chunk) -> union over chunks == full scatter, bit-exact.
+        from src.kernels.esoteric_d3q27 import esoteric_scatter_std_region
+        cp.get_default_memory_pool().free_all_blocks()   # defragment first
+        self.mem = cp.empty((27,) + self.dims, cp.float32)
+        cax = 0 if part.axis != 0 else 1          # chunk along a non-split axis
+        rest = 1
+        for d in range(3):
+            if d != cax:
+                rest *= self.dims[d]
+        ch = min(self.dims[cax], max(1, int(4_000_000 // max(rest, 1))))
+        # ONE reused chunk buffer (cp.take(out=...)): per-chunk allocations
+        # fragmented the pool under a hard 24GB limit — the level-mem
+        # allocs then found no contiguous block despite GBs nominally free
+        cshape = list(self.dims)
+        cshape[cax] = ch
+        cbuf = cp.empty((27,) + tuple(cshape), cp.float32)
+        wrap_idx = None
         if ld["f0"] is not None:
-            f_loc = wrap_slice(ld["f0"], part, 1)
-        else:                            # dist-init: constant equilibrium
-            f_loc = cp.ascontiguousarray(cp.broadcast_to(
-                cp.asarray(ld["feq27"], dtype=cp.float32).reshape(27, 1, 1, 1),
-                (27,) + self.dims))
-        self.mem = esoteric_scatter_std(cp, f_loc, t0)
-        del f_loc
+            lo = part.own_start - part.ghost
+            wrap_idx = cp.asarray(
+                (np.arange(lo, lo + part.local_shape[part.axis])
+                 % ld["f0"].shape[1 + part.axis]))
+        else:
+            cp.copyto(cbuf, cp.asarray(ld["feq27"],
+                                       dtype=cp.float32).reshape(27, 1, 1, 1))
+        for c0 in range(0, self.dims[cax], ch):
+            n_c = min(ch, self.dims[cax] - c0)
+            sl = slice(c0, c0 + n_c)
+            reg = [slice(None)] * 3
+            reg[cax] = sl
+            view_ix = [slice(None)] * 4
+            view_ix[1 + cax] = slice(0, n_c)
+            view = cbuf[tuple(view_ix)]
+            if ld["f0"] is not None:
+                # non-split axes: local == global index, so the chunk slice
+                # applies to the source directly; wrap only on the axis
+                src = [slice(None)] * 4
+                src[1 + cax] = sl
+                cp.take(ld["f0"][tuple(src)], wrap_idx,
+                        axis=1 + part.axis, out=view)
+            vals = view if view.flags.c_contiguous \
+                else cp.ascontiguousarray(view)
+            esoteric_scatter_std_region(cp, self.mem, vals, t0, tuple(reg))
+        del cbuf
         self.t = t0
         self.omega = ld["omega"]
         self.ob, self.oh = ld["omega_bulk"], ld["omega_high"]

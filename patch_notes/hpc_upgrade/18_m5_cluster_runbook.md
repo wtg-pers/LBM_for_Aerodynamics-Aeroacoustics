@@ -92,3 +92,18 @@ gather가 돌므로 해당 step은 수 초 느려짐.)
 - kleine free-wake·비gaussian 샘플러 분산 미지원(fail-fast) — production은 straight
 - 케이스가 단일 GPU 메모리를 초과하면 분산 초기화 필요(후속; D40은 해당 없음)
 - v2 slot halo(M4)는 게이트 검증만, production 미결합 — 강스케일링 실측 후 결정
+
+## 5. 재측정 확정치 + NR=1 주의 (2026-07-13)
+- **4-rank D40: 0.442 s/step** (백로그 #3+#5 반영; 25-rev ≈ 3.9h). 내역: alm 0.117/
+  halo_c 0.116/kernel 0.103/coupling 0.096/halo_p 0.009.
+- **NR=1(단일 기준 측정)은 반드시 `--dist-init`으로**: replicated 모드 NR=1은 최대 레벨의
+  source f와 슬랩 mem을 동시 보유(2.85GB×2)해 native 24GB에서 OOM(로컬 WSL2는
+  oversubscription으로 가려짐; 23GB 하드리밋 검증으로 확정). --dist-init NR=1은
+  used 16.8/total 20.0GB로 안전:
+```bash
+mpirun --mca pml ucx -x LBM_ESOTERIC=1 -n 1 python main_mpi.py \
+  --config configs/hvab/hvab_hover_c10_farfield40_eso_mpi4.py \
+  --steps 32 --log-every 16 --cuda-aware 1 --profile --dist-init
+```
+  (2~4 rank replicated는 rank당 슬랩이 1/4이라 무관. LocalLevel 슬랩 구축은 재사용
+  청크버퍼(take out=)+사전 트림으로 개선됨 — 대형 슬랩 3중 transient 제거.)
