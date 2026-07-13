@@ -132,6 +132,13 @@ class DistributedMLGRunner:
         self._fprev = [None] * (NL - 1)
         self.NL = NL
         self.profile = None          # dict -> per-section seconds (opt-in)
+        # halo scheduling state (backlog #5): ghosts_fresh -> skip idempotent
+        # re-exchanges of unchanged mem (the A-syncs after a same-cycle
+        # D-sync, ~30% of all rounds); posted -> band already in flight
+        # (early post fired right after the last mutation, so the transfer
+        # hides under the child's fprev+advance)
+        self._fresh = [False] * NL
+        self._posted = [False] * NL
 
     # ── plumbing ─────────────────────────────────────────────────────
     def _tic(self):
@@ -146,12 +153,32 @@ class DistributedMLGRunner:
             self.profile[key] = self.profile.get(key, 0.0) \
                 + time.perf_counter() - t0
 
-    def _sync(self, k: int) -> None:
+    def _touch(self, k: int) -> None:
+        assert not self._posted[k], \
+            f"L{k} mutated with a band in flight (scheduling bug)"
+        self._fresh[k] = False
+
+    def _post(self, k: int) -> None:
+        """Early post: bands gathered from the FINAL state before the next
+        consumer; MPITransport also pre-posts the Irecv (true overlap)."""
+        if self._fresh[k] or self._posted[k]:
+            return
         t0 = self._tic()
         self.ex[k].post(self.lv[k].mem, self.lv[k].t)
+        self._posted[k] = True
         self._toc("halo_post", t0)
+
+    def _sync(self, k: int) -> None:
+        if self._fresh[k]:
+            return                    # unchanged mem: exchange is idempotent
+        if not self._posted[k]:
+            t0 = self._tic()
+            self.ex[k].post(self.lv[k].mem, self.lv[k].t)
+            self._toc("halo_post", t0)
         t0 = self._tic()
         self.ex[k].complete(self.lv[k].mem, self.lv[k].t)
+        self._posted[k] = False
+        self._fresh[k] = True
         self._toc("halo_complete", t0)
 
     def _save_fprev(self, k: int) -> None:
@@ -176,6 +203,7 @@ class DistributedMLGRunner:
             t0 = self._tic()
             L.advance()
             self._toc("kernel", t0)
+        self._touch(k)
 
     def _advance_fine(self, k: int) -> None:
         # NOTE sync cadence: ghosts must be fresh for (a) the fprev gather
@@ -195,8 +223,10 @@ class DistributedMLGRunner:
                             is_half_step=True,
                             f_prev_sub_loc=self._fprev[k - 1])
         self._toc("coupling", t0)
+        self._touch(k)                # c2f wrote our strips
         if has_finer:
-            self._advance_fine(k + 1)
+            self._post(k)             # child completes at its B-sync while
+            self._advance_fine(k + 1)  # ...its fprev+advance run
         self._sync(k)
         if has_finer:
             self._save_fprev(k)
@@ -206,13 +236,16 @@ class DistributedMLGRunner:
                             self.lv[k - 1].t, self.lv[k].t,
                             is_half_step=False)
         self._toc("coupling", t0)
+        self._touch(k)
         if has_finer:
+            self._post(k)
             self._advance_fine(k + 1)
         self._sync(k)
         t0 = self._tic()
         self.rlc[k - 1].f2c(self.lv[k].mem, self.lv[k - 1].mem,
                             self.lv[k].t, self.lv[k - 1].t)
         self._toc("coupling", t0)
+        self._touch(k - 1)            # f2c wrote the coarse excised rows
 
     # ── public API ───────────────────────────────────────────────────
     def step_coarse(self) -> None:
@@ -222,6 +255,7 @@ class DistributedMLGRunner:
             self._save_fprev(0)
         self._advance_level(0)
         if self.NL > 1:
+            self._post(0)             # L0 bands ride under L1's advance
             self._advance_fine(1)
 
     def run(self, n_coarse: int, log_every: int = 0, on_log=None) -> dict:

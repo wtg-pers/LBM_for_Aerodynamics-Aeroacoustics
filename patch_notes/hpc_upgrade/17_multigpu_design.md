@@ -281,3 +281,16 @@
 - **게이트: bench5 2-rank --dist-init --verify 전 레벨 bit**(풀필드 production reference 대비).
 - **D40 메모리 프로브: 빌드 0.91GB(replicated 19.2GB→21×↓), rank1/4 정착 3.69GB** →
   4×4090 용량 ~110M → **~450-500M 셀**(worst-share 0.266 기준). 호스트 RAM 요구 17B/cell.
+
+### 백로그 #5: halo 스케줄링 — fresh-skip + early-post/Irecv 오버랩 (2026-07-13)
+- **v2 production 결합은 근거와 함께 이연**: v2 mailbox 고스트는 MLG c2f 스트립 scatter의
+  region+c_i 스필이 슬롯을 클로버(전 커플링 시점 복원 필요) + SGS u 반경-2가 ghost=2 레이아웃
+  강제 + 커플링 읽기마다 v1 밴드 하이브리드 → 모드 전환 기계가 이득(~0.1s)을 초과. 단일레벨
+  음향급 케이스가 생기면 재개(G-M4 증명은 유효).
+- 대신 의존성 감사로 두 가지 구조 개선(주장 전부 게이트로 증명):
+  ①**fresh-skip**: 레벨별 ghosts_fresh 플래그 — D-sync 후 무변경 상태의 A-sync는 멱등 재교환
+  → 자동 스킵(~15/46 라운드=30% 소멸). 변이 지점(_touch)=advance/c2f쓰기/f2c쓰기.
+  ②**early-post + Irecv prepost**: c2f 스트립 쓰기 직후 post(k)(+MPI Irecv 프리포스트, persistent
+  버퍼) → 자식 프레임 B-sync가 complete — 전송이 자식의 fprev+advance 커널 밑에 은닉.
+  in-flight 중 변이 assert로 스케줄 버그 fail-fast.
+- 게이트: mpirun 2-rank verify(전레벨 bit), G-restart(bit), dist-init verify(PASS). 

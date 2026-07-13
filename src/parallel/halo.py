@@ -114,11 +114,38 @@ class MPITransport:
                 (self._comm.Isend(buf, dest=dst, tag=tag), buf))
         self._staged.clear()
 
+    def prepost(self, src: int, dst: int, tag: int, shape, dtype) -> None:
+        """Pre-post the Irecv into the persistent buffer (overlap, #5):
+        posted at exchange-post time so the wire transfer progresses under
+        the compute between post and complete."""
+        import cupy as cp
+        key = (src, tag)
+        if key in getattr(self, "_rreq", {}):
+            return                                   # already in flight
+        if not hasattr(self, "_rreq"):
+            self._rreq = {}
+        if self._cuda_aware:
+            buf = self._rbuf.get(key)
+            if buf is None or buf.shape != tuple(shape):
+                buf = cp.empty(shape, dtype)
+                self._rbuf[key] = buf
+        else:
+            buf = self._rbuf.get(key)
+            if buf is None or buf.shape != tuple(shape):
+                buf = np.empty(shape, dtype)
+                self._rbuf[key] = buf
+        self._rreq[key] = self._comm.Irecv(buf, source=src, tag=tag)
+
     def collect(self, src: int, dst: int, tag: int, shape=None, dtype=None):
         import cupy as cp
         if shape is None:
             raise ValueError("MPITransport.collect needs shape+dtype")
         key = (src, tag)
+        req = getattr(self, "_rreq", {}).pop(key, None)
+        if req is not None:
+            req.Wait()
+            buf = self._rbuf[key]
+            return buf if self._cuda_aware else cp.asarray(buf)
         if self._cuda_aware:
             buf = self._rbuf.get(key)
             if buf is None or buf.shape != tuple(shape):
@@ -163,6 +190,9 @@ class HaloBandExchangerV1:
                 self._xp, f_mem, t_step, p.edge_band(side))
             # tag encodes the side AS SEEN BY THE RECEIVER (opposite side)
             self._t.post(p.rank, nbr, tag=self._tb + (1 - side), arr=band)
+            if hasattr(self._t, "prepost"):          # overlap: Irecv early
+                self._t.prepost(nbr, p.rank, tag=self._tb + side,
+                                shape=self._band_shape, dtype=np.float32)
         self._t.commit()
 
     # -- phase B: everyone receives + scatters into its ghosts --
