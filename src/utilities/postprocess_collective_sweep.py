@@ -29,6 +29,12 @@ import matplotlib.pyplot as plt
 
 REV = 1257
 CS2 = 1.0 / 3.0
+# Solidity for CT/sigma: the PUBLISHED nominal-chord convention
+# (sigma = Nb*c_ref/(pi*R), HVAB documented value) — NOT the
+# marker-integrated blade-area ratio, which excludes the root cutout
+# (~0.24R) and includes tip taper and therefore comes out ~25% lower
+# (geometric integral prints as a diagnostic: ~0.0784).
+SIGMA_REF = 0.1013
 
 # ── case table: (deg, csv, result_dir, last_snapshot_steps) ─────────────
 # 10 deg = the existing 25-rev 4-rank archive; 6/8/12 = the 22-rev sweep.
@@ -143,15 +149,17 @@ def main():
         if perf is None and sp is None:
             print(f"[{deg:>2}deg] no data yet — skipped")
             continue
-        sigma = sp[3] if sp else np.nan
+        sigma_geom = sp[3] if sp else np.nan
         if sp:
             span[deg] = sp
-        rows.append({"deg": deg, "sigma": sigma,
+        rows.append({"deg": deg, "sigma": SIGMA_REF,
+                     "sigma_geom": sigma_geom,
                      **(perf or {k: np.nan for k in
                                  ("C_T", "C_P", "FM", "C_T_std",
                                   "C_P_std", "FM_std")})})
         print(f"[{deg:>2}deg] CT={rows[-1]['C_T']:.6f}  CP={rows[-1]['C_P']:.6f}"
-              f"  FM={rows[-1]['FM']:.4f}  sigma={sigma:.5f}")
+              f"  FM={rows[-1]['FM']:.4f}  sigma_ref={SIGMA_REF}"
+              f"  (geom diag {sigma_geom:.5f})")
 
     if not rows:
         raise SystemExit("no case data found — check paths in CASES")
@@ -204,10 +212,12 @@ def main():
     plt.close()
 
     with open(os.path.join(a.out, "sweep_summary.csv"), "w") as f:
-        f.write("deg,sigma,C_T,C_T_std,C_P,C_P_std,FM,FM_std,CT_over_sigma\n")
+        f.write("deg,sigma_ref,sigma_geom,C_T,C_T_std,C_P,C_P_std,"
+                "FM,FM_std,CT_over_sigma\n")
         for r in rows:
-            f.write(f"{r['deg']},{r['sigma']:.6f},{r['C_T']:.7f},"
-                    f"{r['C_T_std']:.2e},{r['C_P']:.7f},{r['C_P_std']:.2e},"
+            f.write(f"{r['deg']},{r['sigma']:.6f},{r['sigma_geom']:.6f},"
+                    f"{r['C_T']:.7f},{r['C_T_std']:.2e},"
+                    f"{r['C_P']:.7f},{r['C_P_std']:.2e},"
                     f"{r['FM']:.5f},{r['FM_std']:.2e},"
                     f"{r['C_T'] / r['sigma']:.5f}\n")
     print(f"wrote {a.out}/: spanwise x2, ct_sigma_vs_fom, "
