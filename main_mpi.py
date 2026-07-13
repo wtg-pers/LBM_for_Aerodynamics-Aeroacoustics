@@ -259,7 +259,7 @@ def verify(comm, rank, nr, runner, args):
     if rank != 0:
         return
     print("[verify] building 1-rank reference...", flush=True)
-    ref = build(args.config, 0)
+    ref, _ = build(args.config, 0)
     for _ in range(args.steps):
         ref.advance()
     ok = True

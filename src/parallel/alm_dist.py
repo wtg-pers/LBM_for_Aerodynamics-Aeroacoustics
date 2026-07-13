@@ -84,13 +84,16 @@ def make_distributed_sampler(allred: ThreadAllreduce, rank: int, part,
     """
     ax = part.axis
     ghost = part.ghost
-    owned = part.owned_local()
 
     def sampler(u_field, positions_grid, epsilon, active, n_cut):
-        u_owned = u_field[(slice(None),) + owned]
-        pos = positions_grid.copy()
-        pos[:, ax] -= ghost
-        num, den = alm_partial_sums(u_owned, pos, epsilon, n_cut, xp)
+        # OWNED ownership via clip bounds on the FULL local array (backlog
+        # #3: the RawKernel path takes bounds directly — no view, no
+        # position shift; cell set identical to the old owned-view clip)
+        cb = [(0, d) for d in u_field.shape[1:]]
+        cb[ax] = (ghost, ghost + part.own_count)
+        num, den = interpolate_velocity_batch_gpu(
+            u_field, positions_grid, epsilon, xp=xp, n_cut=n_cut,
+            return_sums=True, clip_bounds=tuple(cb))
         num_t, den_t = allred.allreduce(rank, num, den)
         return num_t / np.maximum(den_t, 1e-30)[:, None]
 

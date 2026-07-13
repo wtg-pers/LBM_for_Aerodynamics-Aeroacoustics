@@ -259,3 +259,15 @@
 - **성능 주장 정정(보고서 부록 E)**: 동코드 분해 이득 ~1.6-1.8×(4090 단일 추정 ~1.1s),
   "4.6×"=코드세대 혼합 비교. 저효율 원인=ALM 0.275 비병렬+halo 0.20 상수 → #3·#5의 정량 동기.
   클러스터 단일 재기준 명령 문서화(mpirun -n 1 --profile).
+
+### 백로그 #3: ALM 샘플링 RawKernel (2026-07-13)
+- cProfile 반전: alm 구간의 85-90% = **chunked GPU 샘플링**(청크당 CPU 인덱스빌드+D2H sync,
+  (N,S³) 중간배열), BEM+폴라는 ~0.05 s/step뿐(가정 오류였음).
+- `alm_sample_markers` RawKernel: **마커당 1블록**, 스레드 stride 직렬 f64 누적 + 고정
+  shared-mem tree 리덕션 = **무원자성·결정적**(shape/런 불변). 중간배열·청크·검증루프 소멸.
+  분산은 clip_bounds(owned 경계 인자)로 — 뷰/포지션 시프트 제거(셀 집합 동일 증명 2e-16).
+- 등가성: kernel↔구경로/clip↔view/uniform 전부 f64 last-bit(~2-6e-16). NR=1 D40: alm
+  0.605→**0.261**(샘플링 0.40→0.06), 총 1.734→**1.410 s/step**. bench5 2-rank 0.665 s/step.
+- 게이트: ALM smoke(median 2.0e-4), G-M3(**field bit 유지**, F rel 6.5e-17), G-restart(전레벨
+  bit), mpirun verify(전레벨 bit). +verify build 튜플 unpack 버그 수정.
+- 단일GPU 동일 수혜(같은 엔트리 경로). 잔여 alm 0.261@NR=1 = macro 0.073+BEM ~0.13+spread 0.067.

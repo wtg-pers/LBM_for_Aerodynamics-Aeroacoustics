@@ -382,7 +382,8 @@ def interpolate_velocity_batch_gpu(
     xp,
     n_cut: float = 3.0,
     gpu_mem_limit_mb: float = 512.0,
-    return_sums: bool = False
+    return_sums: bool = False,
+    clip_bounds=None
 ) -> 'npt.NDArray':
     """GPU-capable batch velocity interpolation at all marker positions
 
@@ -433,6 +434,22 @@ def interpolate_velocity_batch_gpu(
             u_field, marker_positions,
             marker_epsilon, n_cut=n_cut
         )
+
+    # ── GPU fast path: one-launch RawKernel (backlog #3) ──
+    import os as _os
+    if u_field.dtype == xp.float32 and u_field.flags.c_contiguous and \
+            _os.environ.get("LBM_ALM_SAMPLE_KERNEL", "1") == "1":
+        num, den = _sample_markers_rawkernel(
+            u_field, marker_positions, marker_epsilon, xp, n_cut,
+            clip_bounds=clip_bounds)
+        if return_sums:
+            return num, den
+        return num / np.maximum(den, 1e-30)[:, None]
+
+    if clip_bounds is not None:
+        raise NotImplementedError(
+            "clip_bounds requires the RawKernel sampling path "
+            "(LBM_ALM_SAMPLE_KERNEL=1, f32 contiguous u_field)")
 
     # ── GPU path with auto-chunking (P4) ──
     n_markers = marker_positions.shape[0]
@@ -660,6 +677,115 @@ def _interpolate_uniform_eps_gpu(
 # -----------------------------------------------------------------------------
 # §6.2 Varying ε — Padded GPU Interpolation
 # -----------------------------------------------------------------------------
+
+_SAMPLE_KERNEL_CACHE = {}
+
+_SAMPLE_KERNEL_SRC = r"""
+extern "C" __global__ void alm_sample_markers(
+    const float* __restrict__ u,
+    const double* __restrict__ pos,
+    const double* __restrict__ eps2,
+    const double* __restrict__ rc2,
+    double* __restrict__ num,
+    double* __restrict__ den,
+    const int Nx, const int Ny, const int Nz,
+    const int half,
+    const int cx0, const int cx1,
+    const int cy0, const int cy1,
+    const int cz0, const int cz1)
+{
+    const int m = blockIdx.x;
+    const int T = blockDim.x;
+    const int t = threadIdx.x;
+    const int S = 2 * half + 1;
+    const long long SC = (long long)S * S * S;
+    const double px = pos[3 * m], py = pos[3 * m + 1], pz = pos[3 * m + 2];
+    const int ix0 = (int)llrint(px);
+    const int iy0 = (int)llrint(py);
+    const int iz0 = (int)llrint(pz);
+    const double e2 = eps2[m], r2 = rc2[m];
+    const long long NN = (long long)Nx * Ny * Nz;
+    double a0 = 0.0, a1 = 0.0, a2 = 0.0, aw = 0.0;
+    for (long long c = t; c < SC; c += T) {
+        int oz = (int)(c % S) - half;
+        int oy = (int)((c / S) % S) - half;
+        int ox = (int)(c / ((long long)S * S)) - half;
+        int gx = ix0 + ox;
+        int gy = iy0 + oy;
+        int gz = iz0 + oz;
+        if (gx < cx0 || gx >= cx1 || gy < cy0 || gy >= cy1 ||
+            gz < cz0 || gz >= cz1) continue;
+        double dxx = (double)gx - px;
+        double dyy = (double)gy - py;
+        double dzz = (double)gz - pz;
+        double d2 = dxx * dxx + dyy * dyy + dzz * dzz;
+        if (d2 > r2) continue;
+        double w = exp(-d2 / e2);
+        long long b = ((long long)gx * Ny + gy) * Nz + gz;
+        a0 += w * (double)u[b];
+        a1 += w * (double)u[NN + b];
+        a2 += w * (double)u[2 * NN + b];
+        aw += w;
+    }
+    __shared__ double sh[4 * 256];
+    sh[t] = a0; sh[256 + t] = a1; sh[512 + t] = a2; sh[768 + t] = aw;
+    __syncthreads();
+    for (int st = T / 2; st > 0; st >>= 1) {
+        if (t < st) {
+            sh[t] += sh[t + st];
+            sh[256 + t] += sh[256 + t + st];
+            sh[512 + t] += sh[512 + t + st];
+            sh[768 + t] += sh[768 + t + st];
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        num[3 * m] = sh[0];
+        num[3 * m + 1] = sh[256];
+        num[3 * m + 2] = sh[512];
+        den[m] = sh[768];
+    }
+}
+"""
+
+
+def _sample_markers_rawkernel(u_field, marker_positions, marker_epsilon,
+                              xp, n_cut, clip_bounds=None):
+    """One-launch marker sampling (patch 17 backlog #3).
+
+    One BLOCK per marker; each thread strides the stencil box with serial
+    f64 accumulation and a fixed shared-memory tree reduction ->
+    DETERMINISTIC for any shape/run (no atomics). Replaces the chunked
+    (N, S^3) intermediate path whose per-chunk CPU index builds + D2H
+    syncs dominated the ALM section (~85-90% of step() at D40). Same
+    semantics as _interpolate_varying_eps_gpu: box center llrint(pos)
+    (numpy round = half-even = llrint), half = ceil(n_cut*eps_max)+1,
+    w = exp(-d2/eps_m^2) within the per-marker radius, f64 sums.
+    clip_bounds restricts valid cells (distributed OWNED clip).
+    """
+    import numpy as _np
+    _, Nx, Ny, Nz = u_field.shape
+    if "k" not in _SAMPLE_KERNEL_CACHE:
+        _SAMPLE_KERNEL_CACHE["k"] = xp.RawKernel(
+            _SAMPLE_KERNEL_SRC, "alm_sample_markers")
+    ker = _SAMPLE_KERNEL_CACHE["k"]
+    n = marker_positions.shape[0]
+    eps = _np.asarray(marker_epsilon, dtype=_np.float64)
+    half = int(_np.ceil(n_cut * float(eps.max()))) + 1
+    pos = xp.asarray(marker_positions, dtype=xp.float64).ravel()
+    eps2 = xp.asarray(eps * eps)
+    rc2 = xp.asarray((n_cut * eps) ** 2)
+    num = xp.empty(3 * n, xp.float64)
+    den = xp.empty(n, xp.float64)
+    cb = clip_bounds or ((0, Nx), (0, Ny), (0, Nz))
+    ker((n,), (256,),
+        (u_field, pos, eps2, rc2, num, den,
+         _np.int32(Nx), _np.int32(Ny), _np.int32(Nz), _np.int32(half),
+         _np.int32(max(0, cb[0][0])), _np.int32(min(Nx, cb[0][1])),
+         _np.int32(max(0, cb[1][0])), _np.int32(min(Ny, cb[1][1])),
+         _np.int32(max(0, cb[2][0])), _np.int32(min(Nz, cb[2][1]))))
+    return xp.asnumpy(num).reshape(n, 3), xp.asnumpy(den)
+
 
 def _interpolate_varying_eps_gpu(
     u_field: 'npt.NDArray',
