@@ -236,3 +236,10 @@
   방위각평균 유입류 2.3%. MPI측 신생 코어 FWHM 1.68ε = Gaussian-forced 이론한계(1.67ε) 재확인.
 - 보고서 부록 D(검토 유보 해소)·부록 A 최종행 기입. **멀티GPU 트랙 M1~M5 전체 완결**.
 - 잔여(후속 백로그): MPI --restart 배선, 마커 VTP, ALM 로컬화(Amdahl 0.275), v2 결합(음향급).
+
+### M5c: 마커 VTP (2026-07-13)
+- Rank0OutputBridge._write_markers — **통신 불필요**: M3 훅이 positions/_last_positions를 global
+  fine 좌표로 유지하므로 rank0의 복제 모델 상태가 곧 production 상태. OutputManager와 동일한
+  fine→L0 변환 + MarkerVTPWriter.write_from_al_model 재사용. --vtk-every 케이던스에 동승.
+- bench5 검증: markers_*.vtp 192마커, 배열 16종(alpha/CL/CD/F_n/F_theta/w_corr/force 등) —
+  blade_diagnostics CSV 미배선을 마커 단위로 보완.

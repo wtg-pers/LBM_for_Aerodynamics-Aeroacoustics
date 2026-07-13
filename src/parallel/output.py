@@ -67,12 +67,18 @@ class Rank0OutputBridge:
     def __init__(self, comm, rank: int, nr: int,
                  mlg_vtk_writer=None, checkpoint_mgr=None,
                  sim_params: Optional[dict] = None,
-                 tau: float = 0.5) -> None:
+                 tau: float = 0.5,
+                 marker_vtk_writer=None,
+                 alm_marker_origin=None,
+                 alm_marker_spacing=None) -> None:
         self._comm, self._rank, self._nr = comm, rank, nr
         self._vtk = mlg_vtk_writer
         self._ckpt = checkpoint_mgr
         self._sim_params = sim_params or {}
         self._tau = tau
+        self._marker_vtk = marker_vtk_writer
+        self._m_origin = alm_marker_origin
+        self._m_spacing = alm_marker_spacing
 
     # ── VTK: assembled rho/u per level -> MLGVTKWriter.write ─────────
     def write_vtk(self, step: int, runner) -> None:
@@ -88,7 +94,33 @@ class Rank0OutputBridge:
                 views.append(_LevelView(rho[0], u))
         if rank == 0 and self._vtk is not None:
             self._vtk.write(step, _MLGView(views), time=float(step))
+        self._write_markers(step, runner)
         comm.Barrier()
+
+    def _write_markers(self, step: int, runner) -> None:
+        """ALM marker VTP from rank 0's REPLICATED model — no comms needed:
+        the M3 hooks keep positions/_last_positions in GLOBAL fine coords on
+        every rank, so rank 0's copy is the exact production state. Same
+        fine->L0 transform as OutputManager._write_markers."""
+        if self._rank != 0 or self._marker_vtk is None or \
+                runner.model is None:
+            return
+        model = runner.model
+        orig = model._last_positions
+        if self._m_origin is not None and orig is not None:
+            ox, oy, oz = self._m_origin
+            dxs = self._m_spacing
+            t = orig.copy()
+            t[:, 0] = ox + orig[:, 0] * dxs
+            t[:, 1] = oy + orig[:, 1] * dxs
+            t[:, 2] = oz + orig[:, 2] * dxs
+            model._last_positions = t
+        try:
+            self._marker_vtk.write_from_al_model(
+                step=step, al_model=model, time=float(step))
+        finally:
+            if self._m_origin is not None and orig is not None:
+                model._last_positions = orig
 
     # ── Checkpoint: assembled std f -> CheckpointManager.save ────────
     def save_checkpoint(self, step: int, runner) -> None:

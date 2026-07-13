@@ -121,7 +121,13 @@ def main():
                             if rank == 0 else None),
             sim_params=(getattr(setup, "sim_params", None)
                         if rank == 0 else None),
-            tau=float(mlg.get_level(0).tau))
+            tau=float(mlg.get_level(0).tau),
+            marker_vtk_writer=(getattr(setup, "marker_vtk_writer", None)
+                               if rank == 0 else None),
+            alm_marker_origin=(getattr(setup, "_alm_marker_origin", None)
+                               if rank == 0 else None),
+            alm_marker_spacing=(getattr(setup, "_alm_marker_spacing", None)
+                                if rank == 0 else None))
 
     # free the full build (runner kept slabs + the ALM model)
     import gc
