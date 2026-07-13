@@ -107,6 +107,7 @@ simulation = {"device_mode": "gpu", "precision": "float32", "dimension": 3,
               "lattice_model": "D3Q27", "collision_model": "cumulant",
               "omega_3": 0.6, "omega_4": 1.4}
 physics    = {"rho": RHO_PHYS, "U_inf": U_INF_PHYS, "Re": RE,
+ "nu": ((U_INF_PHYS) * (D_PHYS) / (RE)),  # [m^2/s] auto-migrated (nu-only policy; Re key now ignored)
               "L_char": D_PHYS, "flow_direction": [1.0, 0.0, 0.0]}
 grid       = {"Nx": Nx, "Ny": Ny, "Nz": Nz, "resolution": CPC_L0}
 numerics   = {"u_max": U_MAX_LU, "collision": "cumulant"}

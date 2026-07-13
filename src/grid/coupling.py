@@ -475,10 +475,11 @@ extern "C" __global__ void feq_fneq(
         rho = f[0].copy()
         for q in range(1, self._Q):
             rho += f[q]
-        u = xp.zeros((3,) + f.shape[1:], dtype=f.dtype)
+        dim = self._c.shape[0]          # 2 (D2Q9) or 3 — NOT hardcoded
+        u = xp.zeros((dim,) + f.shape[1:], dtype=f.dtype)
         c = self._c
         for q in range(self._Q):
-            for d in range(3):
+            for d in range(dim):
                 cd = float(c[d, q])
                 if cd > 0:
                     u[d] += f[q]
@@ -494,14 +495,17 @@ extern "C" __global__ void feq_fneq(
         xp = self._xp
         cu = xp.zeros((self._Q,) + u.shape[1:], dtype=u.dtype)
         c = self._c
+        dim = c.shape[0]                # 2 (D2Q9) or 3 — NOT hardcoded
         for q in range(self._Q):
-            for d in range(3):
+            for d in range(dim):
                 cd = float(c[d, q])
                 if cd > 0:
                     cu[q] += u[d]
                 elif cd < 0:
                     cu[q] -= u[d]
-        usqr = u[0] * u[0] + u[1] * u[1] + u[2] * u[2]
+        usqr = u[0] * u[0] + u[1] * u[1]
+        if dim > 2:
+            usqr = usqr + u[2] * u[2]
         cs2 = self._cs2
         return self._w_bc * rho * (
             1.0 + cu / cs2 + 0.5 * cu * cu / (cs2 * cs2) - 0.5 * usqr / cs2

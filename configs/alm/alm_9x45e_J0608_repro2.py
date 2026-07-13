@@ -141,6 +141,7 @@ physics = {
     "rho":            RHO_PHYS,
     "U_inf":          U_INF_PHYS,
     "Re":             RE,
+    "nu": ((U_INF_PHYS) * (D_PHYS) / (RE)),  # [m^2/s] auto-migrated (nu-only policy; Re key now ignored)
     "L_char":         D_PHYS,
     "flow_direction": [1.0, 0.0, 0.0],
 }
