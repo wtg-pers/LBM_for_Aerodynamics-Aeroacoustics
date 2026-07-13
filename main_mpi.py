@@ -174,9 +174,40 @@ def main():
             append = runner.completed_step > 0 and os.path.exists(args.csv)
             csv_f = open(args.csv, "a" if append else "w")
             if not append:
-                csv_f.write("step,time_lu,thrust,torque,power,C_T,C_P,FM\n")
+                csv_f.write("step,time_lu,thrust,torque,power,C_T,C_P,FM\n"
+                            if runner.model is not None
+                            else "step,rho_mean,u_max\n")
 
-    def on_log(s, rn):
+    # case tier for the progress line: ALM -> CT/CP/FM; solid body ->
+    # CL/CD (MEM-force wiring in the MPI runner is a documented TODO —
+    # obstacle cases are not gated distributed yet, so falls back to flow
+    # stats); plain flow -> rho_mean / u_max on the finest level.
+    if runner.model is not None:
+        tier = "alm"
+    elif any(bool((L.nt == 1).any()) for L in runner.lv):
+        tier = "body"
+    else:
+        tier = "flow"
+
+    def flow_stats():
+        """COLLECTIVE: owned-cell rho mean + |u| max on the finest level."""
+        L = runner.lv[-1]
+        sl = runner.parts[-1].owned_local()
+        rho = L.rho[sl]
+        u = L.u[(slice(None),) + sl]
+        s_loc = float(rho.sum())
+        n_loc = float(rho.size)
+        m_loc = float(cp.sqrt((u * u).sum(axis=0).max()))
+        if nr > 1:
+            import numpy as _np
+            buf = _np.array([s_loc, n_loc, m_loc])
+            out = _np.empty_like(buf)
+            comm.Allreduce(buf[:2], out[:2])           # sum
+            comm.Allreduce(buf[2:], out[2:], op=MPI.MAX)
+            s_loc, n_loc, m_loc = out[0], out[1], out[2]
+        return s_loc / max(n_loc, 1.0), m_loc
+
+    def on_log(s, rn, stats=None):
         if rank != 0:
             return
         line = f"[mpi] step {s}/{args.steps}"
@@ -184,14 +215,20 @@ def main():
             sps = rn.last_interval["s_per_step"]
             eta_h = (args.steps - s) * sps / 3600.0
             line += f"  {sps:.3f}s/step  ETA {eta_h:.2f}h"
-        if rn.model is not None:
+        if tier == "alm":
             perf = rn.model.get_rotor_performance()
-            line += (f"  T={perf['thrust']:.6e}  CT={perf['C_T']:.6e}"
+            line += (f"  CT={perf['C_T']:.6e}  CP={perf['C_P']:.6e}"
                      f"  FM={perf['FM']:.4f}")
             if csv_f:
                 csv_f.write(f"{s},{perf['time']},{perf['thrust']},"
                             f"{perf['torque']},{perf['power']},"
                             f"{perf['C_T']},{perf['C_P']},{perf['FM']}\n")
+                csv_f.flush()
+        elif stats is not None:
+            rho_m, u_max = stats
+            line += f"  rho={rho_m:.6f}  u_max={u_max:.5f}"
+            if csv_f:
+                csv_f.write(f"{s},{rho_m},{u_max}\n")
                 csv_f.flush()
         print(line, flush=True)
 
@@ -212,9 +249,9 @@ def main():
             runner.last_interval = {
                 "s_per_step": (now - t_last) / args.log_every,
                 "elapsed_s": now - t0}
-            _ = n_todo                       # (total for this session)
             t_last = now
-            on_log(s_, runner)
+            stats = flow_stats() if tier in ("flow", "body") else None
+            on_log(s_, runner, stats)
         if bridge is not None and args.vtk_every and \
                 s_ % args.vtk_every == 0:
             bridge.write_vtk(s_, runner)

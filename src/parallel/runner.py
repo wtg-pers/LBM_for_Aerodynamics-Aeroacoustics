@@ -40,6 +40,13 @@ class DistributedMLGRunner:
                  allreduce=None, axis: Optional[int] = None,
                  ghost: int = 3) -> None:
         self.rank, self.nr = rank, n_ranks
+        if n_ranks == 1:
+            # Single rank needs NO halo at all: with ghost=0 the local array
+            # IS the domain and the kernel's %N wrap IS the periodicity —
+            # identical to the production single-GPU path. (The previous
+            # ghost=3 self-exchange was correct but paid the MPI transport;
+            # without mpirun/UCX the ob1 fallback made it ~7x slower.)
+            ghost = 0
         NL = mlg.num_levels
         couplings = mlg._couplings
         shapes = [mlg.get_level(k).domain_shape for k in range(NL)]
@@ -123,9 +130,10 @@ class DistributedMLGRunner:
                     except AttributeError:
                         pass                     # read-only property
             cp.get_default_memory_pool().free_all_blocks()
-        self.ex = [HaloBandExchangerV1(self.parts[k], transport, cp,
-                                       tag_base=16 * k)
-                   for k in range(NL)]
+        self.ex = None if n_ranks == 1 else \
+            [HaloBandExchangerV1(self.parts[k], transport, cp,
+                                 tag_base=16 * k)
+             for k in range(NL)]
         self.rlc = [RankLocalCouplingV1(couplings[k], self.parts[k],
                                         self.parts[k + 1], cp)
                     for k in range(NL - 1)]
@@ -161,7 +169,7 @@ class DistributedMLGRunner:
     def _post(self, k: int) -> None:
         """Early post: bands gathered from the FINAL state before the next
         consumer; MPITransport also pre-posts the Irecv (true overlap)."""
-        if self._fresh[k] or self._posted[k]:
+        if self.ex is None or self._fresh[k] or self._posted[k]:
             return
         t0 = self._tic()
         self.ex[k].post(self.lv[k].mem, self.lv[k].t)
@@ -169,8 +177,8 @@ class DistributedMLGRunner:
         self._toc("halo_post", t0)
 
     def _sync(self, k: int) -> None:
-        if self._fresh[k]:
-            return                    # unchanged mem: exchange is idempotent
+        if self.ex is None or self._fresh[k]:
+            return                    # NR=1: no halo / unchanged: idempotent
         if not self._posted[k]:
             t0 = self._tic()
             self.ex[k].post(self.lv[k].mem, self.lv[k].t)

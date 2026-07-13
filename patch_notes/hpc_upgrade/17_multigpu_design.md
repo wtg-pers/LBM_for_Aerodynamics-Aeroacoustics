@@ -318,3 +318,14 @@
   에서 0회). 그 외 전 경로 bit-by-construction → 단일·3분할이 동일 궤적. bench5/4-rank의 지속적
   bit 관측도 같은 기제로 소급 설명.
 - 물리 sanity: thrust 40.2@1257(ramp 종료 시점)→32.2@2514 정착 과도 정상.
+
+### 마이너 마감 3종 (2026-07-13)
+- **plain-python 7× 저하 해결**: mpirun 없는 싱글턴 MPI는 UCX 미선택→ob1 폴백이 NR=1
+  self-halo(주기 wrap 구현)를 host 파이프라인으로 처리한 것. 구조적 해법=**NR=1 ghost=0**
+  (로컬배열=도메인, 커널 %N wrap=물리 주기성=production 단일과 동일) — halo 자체 소멸.
+  bench5 싱글턴: bit + 0.244 s/step. **단일GPU는 이제 mpirun 불필요**.
+- **진행 로그 3-tier 일반화**: step/s-per-step/ETA 공통 + ALM→CT/CP/FM, 고체경계→(MEM force
+  미배선 TODO, flow 폴백), 순수유동→rho_mean/u_max(finest owned, rank-집합 정확). CSV 헤더도
+  tier별. 2-rank 집합경로 검증.
+- **docs/SIMULATION_RUN_GUIDE_kr.md**: 단일/멀티 통합 실행 가이드(플래그·메모리 지침·게이트
+  실행 순서·알려진 한계).
