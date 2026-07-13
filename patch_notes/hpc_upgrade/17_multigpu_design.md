@@ -252,3 +252,10 @@
   main_mpi --restart/--restart-latest 관통 + CSV append + 절대 step 루프.
 - **G-restart PASS: 2+2 재시작 vs 4 연속 — 전 5레벨 checkpoint f bit-identical**(ramp 활성 구간이라
   로터 상태 오차에 최대 민감).
+
+### 백로그 #2: 단일GPU 재기준 (2026-07-13)
+- 로컬 3090 back-to-back: production 단일 1.633 s/step, NR=1 러너 1.734(+6% 오버헤드).
+  이전 8.8/10.3s NR=1 수치=열스로틀 아티팩트 확정. region 커널이 단일 커플링도 ~2.6× 가속.
+- **성능 주장 정정(보고서 부록 E)**: 동코드 분해 이득 ~1.6-1.8×(4090 단일 추정 ~1.1s),
+  "4.6×"=코드세대 혼합 비교. 저효율 원인=ALM 0.275 비병렬+halo 0.20 상수 → #3·#5의 정량 동기.
+  클러스터 단일 재기준 명령 문서화(mpirun -n 1 --profile).
