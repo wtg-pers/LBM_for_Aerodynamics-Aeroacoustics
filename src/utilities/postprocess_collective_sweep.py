@@ -164,9 +164,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="sweep_analysis")
     ap.add_argument("--chord-donor", default=None)
+    ap.add_argument("--suite", default="pure", choices=["pure", "archb"])
     a = ap.parse_args()
-    global CHORD_DONOR
+    global CHORD_DONOR, CASES
     CHORD_DONOR = a.chord_donor
+    if a.suite == "archb":
+        CASES = [(d, f"sweep_archb_c{d}.csv",
+                  f"result_hvab_hover_c{d:02d}.0_M650_mlg5_D40_farfield40_"
+                  f"farfield40_eso_archB_c{d}_mpi2",
+                  (26397, 27654)) for d in (6, 8, 10, 12)]
     os.makedirs(a.out, exist_ok=True)
 
     rows, span = [], {}
