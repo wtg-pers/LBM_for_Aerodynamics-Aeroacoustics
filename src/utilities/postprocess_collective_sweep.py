@@ -28,7 +28,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 REV = 1257
-CS2 = 1.0 / 3.0
+# M2cn normalization sound speed: the PHYSICAL a in lattice units. With
+# acoustic_scaling=False the lattice cs=1/sqrt(3) is NOT the physical sound
+# speed; a_lu = V_tip_lu / M_tip (farfield40: 0.1/0.65). Using cs made the
+# curves ~14x too small vs the EXP sectional data (caught by anchor check).
+A_LU = 0.1 / 0.65
 # Solidity for CT/sigma: the PUBLISHED nominal-chord convention
 # (sigma = Nb*c_ref/(pi*R), HVAB documented value) — NOT the
 # marker-integrated blade-area ratio, which excludes the root cutout
@@ -70,6 +74,28 @@ def load_markers(path):
     return out
 
 
+CHORD_DONOR = None      # set via --chord-donor: NEW-writer VTP of the SAME
+                        # rotor/marker layout; legacy VTPs (pre chord_lu)
+                        # join chord/r_R by nearest radius (exact stations)
+
+
+def _donor_join(m):
+    d = load_markers(CHORD_DONOR)
+    ri = np.argsort(d["radius"][d["blade_id"] == 0])
+    dr_ = d["radius"][d["blade_id"] == 0][ri]
+    dc_ = d["chord_lu"][d["blade_id"] == 0][ri]
+    drr = d["r_R"][d["blade_id"] == 0][ri]
+    idx = np.searchsorted(dr_, m["radius"]).clip(0, len(dr_) - 1)
+    idx2 = (idx - 1).clip(0)
+    pick = np.where(np.abs(dr_[idx] - m["radius"]) <=
+                    np.abs(dr_[idx2] - m["radius"]), idx, idx2)
+    assert float(np.max(np.abs(dr_[pick] - m["radius"]))) < 0.5, \
+        "chord donor stations do not match this rotor"
+    m["chord_lu"] = dc_[pick]
+    m["r_R"] = drr[pick]
+    return m
+
+
 def spanwise(case_dir, snaps):
     """Blade+snapshot-averaged (r_R, M2cn, M2cc) + geometric sigma, R.
     `snaps` = candidate steps; the NEWEST TWO that exist are used."""
@@ -86,9 +112,12 @@ def spanwise(case_dir, snaps):
             continue
         m = load_markers(p)
         if "chord_lu" not in m:
-            print(f"  [warn] {p}: legacy VTP without chord_lu — spanwise "
-                  "needs a re-run with the current writer")
-            continue
+            if CHORD_DONOR:
+                m = _donor_join(m)
+            else:
+                print(f"  [warn] {p}: legacy VTP without chord_lu — pass "
+                      "--chord-donor or re-run with the current writer")
+                continue
         act = m.get("active", np.ones_like(m["radius"])) > 0
         r_lu = m["radius"][act]
         rr = (m["r_R"][act] if "r_R" in m
@@ -103,7 +132,7 @@ def spanwise(case_dir, snaps):
             rs = np.sort(r_lu[sel])
             d = np.median(np.diff(rs))
             dr[sel] = d
-        q = 0.5 * CS2 * c_lu                      # rho = 1
+        q = 0.5 * (A_LU ** 2) * c_lu              # rho = 1
         m2cn = (fn / dr) / q
         m2cc = (ft / dr) / q
         prof.append((rr, m2cn, m2cc))
@@ -138,7 +167,10 @@ def perf_last2rev(csv_path, last_step):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="sweep_analysis")
+    ap.add_argument("--chord-donor", default=None)
     a = ap.parse_args()
+    global CHORD_DONOR
+    CHORD_DONOR = a.chord_donor
     os.makedirs(a.out, exist_ok=True)
 
     rows, span = [], {}

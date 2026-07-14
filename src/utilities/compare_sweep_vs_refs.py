@@ -132,7 +132,12 @@ def main():
                 plt.plot(ename[:, 0], ename[:, 1], "kd", ms=7, mfc="none",
                          label="EXP sectional NF")
             plt.plot(mine[:, 0], mine[:, col], "-", color="tab:red", lw=2,
-                     label="present LBM-ALM (10°)")
+                     label="present pure ALM (10°)")
+            spb = os.path.join(a.sweep, "spanwise_archB10.csv")
+            if os.path.exists(spb):
+                mb = rd(spb, ["r_R", "M2Cn", "M2Cc"])
+                plt.plot(mb[:, 0], mb[:, col], "-", color="tab:orange",
+                         lw=2, label="present archB (trunc+Kleine, 10°)")
             plt.xlabel("r/R"); plt.ylabel(rf"$M^2 c_{{{key[-1].lower()}}}$")
             plt.title(f"spanwise {key} @ collective 10° — vs KSAS Fig10")
             plt.grid(alpha=0.3); plt.legend(fontsize=9)
