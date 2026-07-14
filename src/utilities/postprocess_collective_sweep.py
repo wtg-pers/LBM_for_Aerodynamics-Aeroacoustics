@@ -49,13 +49,9 @@ CASES = [
     (8,  "sweep_c8.csv",
      "result_hvab_hover_c08.0_M650_mlg5_D40_farfield40_farfield40_eso_c8_mpi2",
      (26397, 27654)),
-    # 10 deg: the 25-rev archive has NO marker VTPs (predates M5c) — the
-    # sweep script backfills 2 extra revs via checkpoint restart, giving
-    # snapshots 32682/33939. Candidates listed newest-last; the newest two
-    # that exist are used.
-    (10, "mpi4_case1_full.csv",
-     "result_hvab_hover_c10.0_M650_mlg5_D40_farfield40_farfield40_eso_mpi4",
-     (30168, 31425, 32682, 33939)),
+    (10, "sweep_c10.csv",
+     "result_hvab_hover_c10.0_M650_mlg5_D40_farfield40_farfield40_eso_c10_mpi2",
+     (26397, 27654)),
     (12, "sweep_c12.csv",
      "result_hvab_hover_c12.0_M650_mlg5_D40_farfield40_farfield40_eso_c12_mpi2",
      (26397, 27654)),
