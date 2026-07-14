@@ -178,6 +178,14 @@ def main():
                     dpi=130, bbox_inches="tight")
         plt.close()
 
+    # spanwise CSV dump (consumed by compare_sweep_vs_refs.py overlays)
+    for deg in sorted(span):
+        g = span[deg]
+        with open(os.path.join(a.out, f"spanwise_c{deg}.csv"), "w") as f:
+            f.write("r_R,M2Cn,M2Cc\n")
+            for i in range(len(g[0])):
+                f.write(f"{g[0][i]:.5f},{g[1][i]:.6f},{g[2][i]:.6f}\n")
+
     # ── performance plots ──
     rows.sort(key=lambda r: r["deg"])
     deg = np.array([r["deg"] for r in rows])
