@@ -124,22 +124,39 @@ class ALMKernelSpec:
     def deficit_K(self, xp, d, eps):
         """Smearing-correction deficit kernel K(d; eps) = 1 - Gamma_enc/Gamma
         of the kernel-smeared straight trailed vortex (01_design.md #8).
+        Even in d; the semi-infinite (rotor-plane) case carries the same
+        factor by the end-plane mirror symmetry of a straight core.
 
         gaussian: exp(-(d/eps)^2)  (Lamb-Oseen; bit-contract with the
                   pre-refactor _viscous_core_correction / influence_matrix).
-        winckelmans: 1/(1 + (d/eps)^2)^2  (derived 01_design.md #7b from the
-                  high-order algebraic filament integral).
-        wendland: closed-form derivation is the 02_correction work item -
-                  fail fast until it lands (running beta physics without its
-                  own correction would silently mix kernel families).
+        winckelmans: 1/(1 + (d/eps)^2)^2  (01_design.md #7b filament
+                  integral; identical via the 2D-projection route:
+                  eta2 = (2/pi)(s^2+1)^{-3} -> F = 1 - (1+x^2)^{-2}).
+        wendland: closed form derived in 03_correction_derivation.md by
+                  projecting eta3 along the filament (Gamma_enc of the 2D
+                  core), verified against double quadrature to ~1e-12:
+                    x = |d|/R_s (R_s = sqrt(7.5) eps), a = sqrt(1-x^2)
+                    K = [a(945 - 2625a^2 + 2359a^4 - 663a^6)
+                         - 105 x^6 (8+x^2) ln((1+a)/x)] / 16
+                  K(0) = (945-2625+2359-663)/16 = 1 exactly; K = 0 for
+                  x >= 1 (compact: the far field is EXACT, so the
+                  correction acts only inside the support).
         """
         if self.name == "gaussian":
             return xp.exp(-(d / eps) ** 2)
         if self.name == "winckelmans":
             return 1.0 / (1.0 + (d / eps) ** 2) ** 2
+        if self.name == "wendland":
+            x = xp.minimum(xp.abs(d) / (_SQRT_7_5 * eps), 1.0)
+            a = xp.sqrt(xp.maximum(1.0 - x * x, 0.0))
+            a2 = a * a
+            # x=0: L is finite under the clamp and multiplied by x^6 = 0
+            L = xp.log((1.0 + a) / xp.maximum(x, 1e-300))
+            poly = a * (945.0 + a2 * (-2625.0 + a2 * (2359.0 - 663.0 * a2)))
+            return (poly - 105.0 * x ** 6 * (8.0 + x * x) * L) / 16.0
         raise NotImplementedError(
-            f"deficit kernel for '{self.name}' not derived yet "
-            "(patch_notes/alm_beta_kernel: 02_correction)")
+            f"deficit kernel for '{self.name}' not derived "
+            "(patch_notes/alm_beta_kernel)")
 
 
 # --- CUDA snippet definitions -------------------------------------------
