@@ -96,6 +96,8 @@ python patch_notes/hpc_upgrade/gates/cyl2d_re100_gate.py          # 2D end-to-en
 ```
 규칙: 커널/커플링/러너 수정 → 전체. ALM만 → M3+smoke. 출력만 → verify 게이트.
 2D(D2Q9) 경로 수정 → cyl2d 게이트. 고체경계(HWBB/eso solid) 수정 → twin 게이트 + sphere 스모크.
+ALM 정규화 커널(alm_kernel/spreading/interpolation/보정) 수정 → β 게이트 3종:
+`patch_notes/alm_beta_kernel/gates/gbeta{0,2,3}_*.py` (추상화 bit / 보정 유도 / bench5 A/B).
 
 ## 6. 알려진 한계 (fail-fast로 명시됨)
 - `--dist-init`: 비균일 IC 미지원, restart 병용 불가 (obstacle은 지원됨)
