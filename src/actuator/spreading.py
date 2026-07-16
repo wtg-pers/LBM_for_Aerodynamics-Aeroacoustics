@@ -51,6 +51,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
+from .alm_kernel import GAUSSIAN
+
 if TYPE_CHECKING:
     import numpy.typing as npt
 
@@ -73,7 +75,7 @@ def _cylindrical_radius(gx, gy, gz, axis, hub):
 
 def compute_radial_scales(
     domain_shape, marker_positions, marker_epsilon, marker_active,
-    axis, hub, r_root, r_tip, n_cut: float = 3.0
+    axis, hub, r_root, r_tip, n_cut: float = 3.0, kernel_spec=None
 ) -> 'npt.NDArray':
     """Per-marker renormalisation factor for radial truncation at [r_root, r_tip].
 
@@ -127,8 +129,9 @@ def compute_radial_scales(
         sph = d_sq <= r_cut * r_cut
         if not np.any(sph):
             continue
-        norm = 1.0 / (np.pi ** 1.5 * eps ** 3)
-        eta = np.where(sph, norm * np.exp(-d_sq / (eps * eps)), 0.0)
+        spec = kernel_spec or GAUSSIAN
+        norm = spec.np_norm(eps)
+        eta = np.where(sph, norm * spec.np_shape(np, d_sq, eps * eps), 0.0)
         S_all = float(eta.sum())
         rn = _cylindrical_radius(gx, gy, gz, axis, hub)
         keep = (rn >= r_root) & (rn <= r_tip)
@@ -139,7 +142,7 @@ def compute_radial_scales(
 
 def compute_radial_scales_batch(
     xp, domain_shape, marker_positions, marker_epsilon, marker_active,
-    axis, hub, r_root, r_tip, n_cut: float = 3.0
+    axis, hub, r_root, r_tip, n_cut: float = 3.0, kernel_spec=None
 ) -> 'npt.NDArray':
     """Vectorised (xp-agnostic) compute_radial_scales — same node selection.
 
@@ -202,10 +205,11 @@ def compute_radial_scales_batch(
     d_sq = dx * dx + dy * dy + dz * dz                # (M, K, K, K)
     sph = (mx & my & mz) & (d_sq <= (rc_x ** 2)[:, None, None, None])
 
-    norm = 1.0 / (np.pi ** 1.5) / (eps_x ** 3)        # (M,)
+    spec = kernel_spec or GAUSSIAN
+    norm = spec.norm_const / (eps_x ** 3)             # (M,)
     eta = xp.where(
         sph, norm[:, None, None, None]
-        * xp.exp(-d_sq / (eps_x ** 2)[:, None, None, None]), 0.0)
+        * spec.np_shape(xp, d_sq, (eps_x ** 2)[:, None, None, None]), 0.0)
     S_all = eta.sum(axis=(1, 2, 3))                   # (M,)
 
     ax_x = xp.asarray(axis_np); hub_x = xp.asarray(hub_np)
@@ -228,7 +232,8 @@ def spread_force_single_marker(
     marker_force: 'npt.NDArray',
     epsilon: float,
     n_cut: float = 3.0,
-    radial: Optional[tuple] = None
+    radial: Optional[tuple] = None,
+    kernel_spec=None
 ) -> None:
     """Spread a single marker's force onto the grid (in-place accumulation)
 
@@ -252,8 +257,9 @@ def spread_force_single_marker(
     r_cut = n_cut * epsilon                             # [lu]
     r_cut_sq = r_cut * r_cut                            # [lu²]
 
-    # Gaussian normalization: 1 / (π^{3/2} · ε³)  [1/lu³]
-    norm = 1.0 / (np.pi ** 1.5 * epsilon ** 3)
+    # Kernel normalization (family spec; gaussian = 1/(π^{3/2}·ε³))  [1/lu³]
+    spec = kernel_spec or GAUSSIAN
+    norm = spec.np_norm(epsilon)
 
     # --- Bounding box of affected grid nodes ---
     ix_min = max(int(np.floor(marker_pos[0] - r_cut)), 0)
@@ -286,9 +292,9 @@ def spread_force_single_marker(
     if not np.any(mask):
         return
 
-    # Gaussian kernel values at valid nodes
+    # Kernel values at valid nodes (family shape from the spec)
     eta = np.zeros_like(d_sq)
-    eta[mask] = norm * np.exp(-d_sq[mask] / eps_sq)     # [1/lu³]
+    eta[mask] = norm * spec.np_shape(np, d_sq[mask], eps_sq)   # [1/lu³]
 
     # Radial truncation + renormalisation (Merabet 2021): zero nodes outside
     # the blade's geometric span [r_root, r_tip] and rescale the kept nodes so
@@ -316,6 +322,7 @@ def spread_force_single_marker_aniso(
     ec: 'npt.NDArray', et: 'npt.NDArray', er: 'npt.NDArray',
     eps_c: float, eps_t: float, eps_r: float,
     n_cut: float = 3.0,
+    kernel_spec=None,
 ) -> None:
     """Anisotropic Gaussian spread of one marker (Natelson 2026 Eq. 7).
 
@@ -355,9 +362,10 @@ def spread_force_single_marker_aniso(
     mask = arg <= (n_cut * n_cut)                       # ellipsoidal cutoff
     if not np.any(mask):
         return
-    norm = 1.0 / (np.pi ** 1.5 * eps_c * eps_t * eps_r)  # [1/lu³]
+    spec = kernel_spec or GAUSSIAN
+    norm = spec.np_norm3(eps_c, eps_t, eps_r)          # [1/lu³]
     eta = np.zeros_like(arg)
-    eta[mask] = norm * np.exp(-arg[mask])              # [1/lu³]
+    eta[mask] = norm * spec.np_shape_arg(np, arg[mask])   # [1/lu³]
 
     for d in range(3):
         F_grid[d, ix_min:ix_max+1, iy_min:iy_max+1, iz_min:iz_max+1] += (
@@ -377,7 +385,8 @@ def spread_forces_to_grid(
     n_cut: float = 3.0,
     F_grid: Optional['npt.NDArray'] = None,
     radial_trunc: Optional[dict] = None,
-    aniso: Optional[dict] = None
+    aniso: Optional[dict] = None,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """Spread all marker forces onto the LBM grid (Eq. 13)
 
@@ -429,7 +438,8 @@ def spread_forces_to_grid(
             spread_force_single_marker_aniso(
                 F_grid, marker_positions[j], marker_forces[j],
                 ec[j], et[j], er[j],
-                float(eps_c[j]), float(eps_t[j]), float(eps_r[j]), n_cut=n_cut)
+                float(eps_c[j]), float(eps_t[j]), float(eps_r[j]),
+                n_cut=n_cut, kernel_spec=kernel_spec)
         return F_grid
 
     # Radial truncation: precompute per-marker renorm scales once (shared with
@@ -439,7 +449,8 @@ def spread_forces_to_grid(
         _scales = compute_radial_scales(
             domain_shape, marker_positions, marker_epsilon, marker_active,
             radial_trunc['axis'], radial_trunc['hub'],
-            radial_trunc['r_root'], radial_trunc['r_tip'], n_cut=n_cut)
+            radial_trunc['r_root'], radial_trunc['r_tip'], n_cut=n_cut,
+            kernel_spec=kernel_spec)
         _ax = np.asarray(radial_trunc['axis'], dtype=np.float64)
         _ax = _ax / (np.linalg.norm(_ax) + 1e-30)
         _hub = np.asarray(radial_trunc['hub'], dtype=np.float64)
@@ -465,7 +476,8 @@ def spread_forces_to_grid(
             marker_forces[j],
             float(marker_epsilon[j]),
             n_cut=n_cut,
-            radial=_radial
+            radial=_radial,
+            kernel_spec=kernel_spec
         )
 
     return F_grid  # (3, Nx, Ny, Nz)  [lattice force / lu³]
@@ -482,7 +494,8 @@ def spread_forces_uniform_epsilon(
     epsilon_uniform: float,
     marker_active: Optional['npt.NDArray'] = None,
     n_cut: float = 3.0,
-    F_grid: Optional['npt.NDArray'] = None
+    F_grid: Optional['npt.NDArray'] = None,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """Optimized spreading when all markers share the same ε
 
@@ -514,7 +527,7 @@ def spread_forces_uniform_epsilon(
     eps_sq = epsilon_uniform ** 2                        # [lu²]
     r_cut = n_cut * epsilon_uniform                      # [lu]
     r_cut_sq = r_cut * r_cut                            # [lu²]
-    norm = 1.0 / (np.pi ** 1.5 * epsilon_uniform ** 3)  # [1/lu³]
+    norm = (kernel_spec or GAUSSIAN).np_norm(epsilon_uniform)   # [1/lu³]
     half = int(np.ceil(r_cut))
 
     # Precompute stencil offsets
@@ -560,9 +573,10 @@ def spread_forces_uniform_epsilon(
         if not np.any(active_mask):
             continue
 
-        # Gaussian kernel
+        # Kernel shape (family spec)
         eta = np.zeros_like(d_sq)
-        eta[active_mask] = norm * np.exp(-d_sq[active_mask] / eps_sq)
+        eta[active_mask] = norm * (kernel_spec or GAUSSIAN).np_shape(
+            np, d_sq[active_mask], eps_sq)
 
         # Absolute grid indices for accumulation
         gx_int = gx.astype(int)
@@ -673,8 +687,14 @@ def check_force_conservation(
 #
 # =============================================================================
 
-# --- CUDA kernel source (P5) ---
-_SPREAD_KERNEL_SRC = r"""
+# --- CUDA kernel sources (P5) ---
+# G-beta0: the kernel-family eta block is substituted from the ALMKernelSpec
+# ({{ETA_*}} markers). r_cut/n_cut carry the family's SUPPORT factor (the old
+# gaussian n_cut generalizes: compact families pass their exact support), so
+# the cutoff logic needs no templating. The 'inv_pi32' parameter slot carries
+# the family normalization constant (name kept for gaussian byte-parity; the
+# generated gaussian sources are sha256-pinned by the G-beta0 gate).
+_SPREAD_KERNEL_TMPL = r"""
 extern "C" __global__
 void spread_forces_kernel(
     double* F_grid,             // (3, Nx, Ny, Nz) - output, atomicAdd target
@@ -742,9 +762,7 @@ void spread_forces_kernel(
     // Cutoff check (spherical)
     if (d_sq > r_cut_sq) return;
 
-    // Gaussian kernel: eta = (1 / (pi^{3/2} * eps^3)) * exp(-d_sq / eps_sq)
-    double norm = inv_pi32 / (eps * eps * eps);     // [1/lu^3]
-    double eta = norm * exp(-d_sq / eps_sq);         // [1/lu^3]
+{{ETA_ISO}}
 
     // Force components (Newton's third law: negative sign)
     double fx = -forces[m * 3 + 0] * eta;  // [lattice force / lu^3]
@@ -767,7 +785,7 @@ void spread_forces_kernel(
 # geometric radial span [r_root, r_tip] (Merabet 2021) and rescales the kept
 # nodes by a per-marker factor (computed on the host to match the CPU path so
 # the marker's total deposited force is conserved, relocated inboard).
-_SPREAD_KERNEL_RADIAL_SRC = r"""
+_SPREAD_KERNEL_RADIAL_TMPL = r"""
 extern "C" __global__
 void spread_forces_kernel_radial(
     double* F_grid,
@@ -810,8 +828,7 @@ void spread_forces_kernel_radial(
     double qx = px - dot*axis[0], qy = py - dot*axis[1], qz = pz - dot*axis[2];
     double rn = sqrt(qx*qx + qy*qy + qz*qz);
     if (rn < r_root || rn > r_tip) return;      // radial truncation
-    double norm = inv_pi32 / (eps * eps * eps);
-    double eta = norm * exp(-d_sq / eps_sq) * scales[m];   // renormalised
+{{ETA_RADIAL}}
     double fx = -forces[m*3+0] * eta;
     double fy = -forces[m*3+1] * eta;
     double fz = -forces[m*3+2] * eta;
@@ -829,7 +846,7 @@ void spread_forces_kernel_radial(
 # axes ec (chord), et (thickness), er (radial), each with its own width. Reduces
 # EXACTLY to the isotropic kernel when ec/et/er are orthonormal and the three
 # widths are equal. ASCII ONLY (nvrtc breaks on non-ASCII under POSIX locale).
-_SPREAD_KERNEL_ANISO_SRC = r"""
+_SPREAD_KERNEL_ANISO_TMPL = r"""
 extern "C" __global__
 void spread_forces_kernel_aniso(
     double* F_grid,
@@ -871,8 +888,7 @@ void spread_forces_kernel_aniso(
     double ac = dc / epc, at = dt / ept, ar = dr / epr;
     double arg = ac*ac + at*at + ar*ar;
     if (arg > n_cut * n_cut) return;           // ellipsoidal cutoff
-    double norm = inv_pi32 / (epc * ept * epr);
-    double eta = norm * exp(-arg);
+{{ETA_ANISO}}
     double fx = -forces[m*3+0] * eta;
     double fy = -forces[m*3+1] * eta;
     double fz = -forces[m*3+2] * eta;
@@ -885,38 +901,49 @@ void spread_forces_kernel_aniso(
 """
 
 
-# Compiled kernel cache (lazy init)
+# Compiled kernel cache (lazy init; keyed by kernel-family name)
 _spread_kernel_cache = {}
 
 
-def _get_spread_kernel(xp):
-    """Get or compile the spreading CUDA kernel (cached)"""
-    if 'kernel' not in _spread_kernel_cache:
-        _spread_kernel_cache['kernel'] = xp.RawKernel(
-            _SPREAD_KERNEL_SRC,
+def _bake(tmpl: str, marker: str, snippet: str) -> str:
+    src = tmpl.replace(marker, snippet)
+    assert all(ord(ch) < 128 for ch in src)   # nvrtc POSIX-locale guard
+    return src
+
+
+def _get_spread_kernel(xp, spec):
+    """Get or compile the spreading CUDA kernel (cached per family)"""
+    key = ('kernel', spec.name)
+    if key not in _spread_kernel_cache:
+        _spread_kernel_cache[key] = xp.RawKernel(
+            _bake(_SPREAD_KERNEL_TMPL, '{{ETA_ISO}}', spec.cuda_eta_iso),
             'spread_forces_kernel'
         )
-    return _spread_kernel_cache['kernel']
+    return _spread_kernel_cache[key]
 
 
-def _get_spread_kernel_radial(xp):
+def _get_spread_kernel_radial(xp, spec):
     """Get or compile the radial-truncation spreading kernel (cached)"""
-    if 'kernel_radial' not in _spread_kernel_cache:
-        _spread_kernel_cache['kernel_radial'] = xp.RawKernel(
-            _SPREAD_KERNEL_RADIAL_SRC,
+    key = ('kernel_radial', spec.name)
+    if key not in _spread_kernel_cache:
+        _spread_kernel_cache[key] = xp.RawKernel(
+            _bake(_SPREAD_KERNEL_RADIAL_TMPL, '{{ETA_RADIAL}}',
+                  spec.cuda_eta_radial),
             'spread_forces_kernel_radial'
         )
-    return _spread_kernel_cache['kernel_radial']
+    return _spread_kernel_cache[key]
 
 
-def _get_spread_kernel_aniso(xp):
+def _get_spread_kernel_aniso(xp, spec):
     """Get or compile the anisotropic spreading kernel (cached)"""
-    if 'kernel_aniso' not in _spread_kernel_cache:
-        _spread_kernel_cache['kernel_aniso'] = xp.RawKernel(
-            _SPREAD_KERNEL_ANISO_SRC,
+    key = ('kernel_aniso', spec.name)
+    if key not in _spread_kernel_cache:
+        _spread_kernel_cache[key] = xp.RawKernel(
+            _bake(_SPREAD_KERNEL_ANISO_TMPL, '{{ETA_ANISO}}',
+                  spec.cuda_eta_aniso),
             'spread_forces_kernel_aniso'
         )
-    return _spread_kernel_cache['kernel_aniso']
+    return _spread_kernel_cache[key]
 
 
 def spread_forces_to_grid_gpu(
@@ -929,7 +956,8 @@ def spread_forces_to_grid_gpu(
     n_cut: float = 3.0,
     F_grid: Optional['npt.NDArray'] = None,
     radial_trunc: Optional[dict] = None,
-    aniso: Optional[dict] = None
+    aniso: Optional[dict] = None,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """GPU-capable batch force spreading (Eq. 13) — xp dispatch
 
@@ -970,7 +998,7 @@ def spread_forces_to_grid_gpu(
             domain_shape, marker_positions, marker_forces,
             marker_epsilon, marker_active=marker_active,
             n_cut=n_cut, F_grid=F_grid, radial_trunc=radial_trunc,
-            aniso=aniso
+            aniso=aniso, kernel_spec=kernel_spec
         )
 
     # ── GPU path ──
@@ -1010,7 +1038,8 @@ def spread_forces_to_grid_gpu(
         try:
             _spread_rawkernel_aniso_gpu(
                 F_grid, active_pos, active_forces, a_ec, a_et, a_er,
-                a_epc, a_ept, a_epr, domain_shape, xp, n_cut)
+                a_epc, a_ept, a_epr, domain_shape, xp, n_cut,
+                kernel_spec=kernel_spec)
         except Exception as _e:
             # Correct-but-slower fallback: compute on the host, add to GPU F_grid.
             if not _spread_kernel_cache.get('warned_aniso_fallback'):
@@ -1026,7 +1055,8 @@ def spread_forces_to_grid_gpu(
                 domain_shape, active_pos, active_forces, active_eps,
                 n_cut=n_cut, F_grid=F_host,
                 aniso={'ec': a_ec, 'et': a_et, 'er': a_er,
-                       'eps_c': a_epc, 'eps_t': a_ept, 'eps_r': a_epr})
+                       'eps_c': a_epc, 'eps_t': a_ept, 'eps_r': a_epr},
+                kernel_spec=kernel_spec)
             F_grid += xp.asarray(F_host)
         return F_grid
 
@@ -1048,7 +1078,8 @@ def spread_forces_to_grid_gpu(
             marker_epsilon, active_mask,
             radial_trunc['axis'],
             radial_trunc.get('scale_hub', radial_trunc['hub']),
-            radial_trunc['r_root'], radial_trunc['r_tip'], n_cut=n_cut)
+            radial_trunc['r_root'], radial_trunc['r_tip'], n_cut=n_cut,
+            kernel_spec=kernel_spec)
         _ax = np.asarray(radial_trunc['axis'], dtype=np.float64)
         _ax = _ax / (np.linalg.norm(_ax) + 1e-30)
         radial_gpu = {
@@ -1063,7 +1094,8 @@ def spread_forces_to_grid_gpu(
     try:
         _spread_rawkernel_gpu(
             F_grid, active_pos, active_forces, active_eps,
-            domain_shape, xp, n_cut, radial=radial_gpu
+            domain_shape, xp, n_cut, radial=radial_gpu,
+            kernel_spec=kernel_spec
         )
     except Exception as _e:
         # Fallback to Method A (marker loop) if kernel fails. WARN ONCE — a silent
@@ -1079,7 +1111,7 @@ def spread_forces_to_grid_gpu(
                 + repr(_e), RuntimeWarning)
         _spread_method_a_gpu(
             F_grid, active_pos, active_forces, active_eps,
-            xp, n_cut
+            xp, n_cut, kernel_spec=kernel_spec
         )
 
     return F_grid   # (3, Nx, Ny, Nz) GPU array [lattice force / lu³]
@@ -1097,7 +1129,8 @@ def _spread_rawkernel_gpu(
     domain_shape: Tuple[int, int, int],
     xp,
     n_cut: float,
-    radial: Optional[dict] = None
+    radial: Optional[dict] = None,
+    kernel_spec=None
 ) -> None:
     """Spread all marker forces using CUDA RawKernel with atomicAdd
 
@@ -1137,7 +1170,8 @@ def _spread_rawkernel_gpu(
     eps_gpu = xp.asarray(epsilons.astype(np.float64),
                          dtype=xp.float64)         # (N_active,)
 
-    inv_pi32 = 1.0 / (np.pi ** 1.5)                # [dimensionless]
+    spec = kernel_spec or GAUSSIAN
+    inv_pi32 = spec.norm_const   # family norm constant [dimensionless]
 
     # Launch kernel
     total_threads = n_active * S * S * S
@@ -1145,7 +1179,7 @@ def _spread_rawkernel_gpu(
     grid_size = (total_threads + block_size - 1) // block_size
 
     if radial is None:
-        kernel = _get_spread_kernel(xp)
+        kernel = _get_spread_kernel(xp, spec)
         kernel(
             (grid_size,), (block_size,),
             (
@@ -1161,7 +1195,7 @@ def _spread_rawkernel_gpu(
                                 dtype=xp.float64)
         axis_gpu = xp.asarray(radial['axis'].astype(np.float64), dtype=xp.float64)
         hub_gpu = xp.asarray(radial['hub'].astype(np.float64), dtype=xp.float64)
-        kernel = _get_spread_kernel_radial(xp)
+        kernel = _get_spread_kernel_radial(xp, spec)
         kernel(
             (grid_size,), (block_size,),
             (
@@ -1179,7 +1213,7 @@ def _spread_rawkernel_gpu(
 
 def _spread_rawkernel_aniso_gpu(
     F_grid, positions, forces, ec, et, er, eps_c, eps_t, eps_r,
-    domain_shape, xp, n_cut
+    domain_shape, xp, n_cut, kernel_spec=None
 ) -> None:
     """Anisotropic (Natelson Eq. 7) spread via CUDA RawKernel with atomicAdd.
 
@@ -1200,12 +1234,13 @@ def _spread_rawkernel_aniso_gpu(
     pos_gpu = _g(positions, 3); force_gpu = _g(forces, 3)
     ec_gpu = _g(ec, 3); et_gpu = _g(et, 3); er_gpu = _g(er, 3)
     epc_gpu = _g(eps_c); ept_gpu = _g(eps_t); epr_gpu = _g(eps_r)
-    inv_pi32 = 1.0 / (np.pi ** 1.5)
+    spec = kernel_spec or GAUSSIAN
+    inv_pi32 = spec.norm_const
 
     total_threads = n_active * S * S * S
     block_size = 256
     grid_size = (total_threads + block_size - 1) // block_size
-    kernel = _get_spread_kernel_aniso(xp)
+    kernel = _get_spread_kernel_aniso(xp, spec)
     kernel(
         (grid_size,), (block_size,),
         (F_grid, pos_gpu, force_gpu, ec_gpu, et_gpu, er_gpu,
@@ -1226,7 +1261,8 @@ def _spread_method_a_gpu(
     forces: 'npt.NDArray',
     epsilons: 'npt.NDArray',
     xp,
-    n_cut: float
+    n_cut: float,
+    kernel_spec=None
 ) -> None:
     """Fallback: spread via Python marker loop (Method A from P2)
 
@@ -1241,7 +1277,8 @@ def _spread_method_a_gpu(
             forces[j],
             float(epsilons[j]),
             xp,
-            n_cut
+            n_cut,
+            kernel_spec=kernel_spec
         )
 
 
@@ -1255,7 +1292,8 @@ def _spread_single_marker_gpu(
     marker_force: 'npt.NDArray',
     epsilon: float,
     xp,
-    n_cut: float
+    n_cut: float,
+    kernel_spec=None
 ) -> None:
     """Spread one marker's force onto GPU-resident F_grid
 
@@ -1278,8 +1316,8 @@ def _spread_single_marker_gpu(
     r_cut = n_cut * epsilon                               # [lu]
     r_cut_sq = r_cut * r_cut                              # [lu²]
 
-    # Gaussian normalization: 1 / (π^{3/2} · ε³)  [1/lu³]
-    norm = 1.0 / (np.pi ** 1.5 * epsilon ** 3)
+    # Kernel normalization (family spec)  [1/lu³]
+    norm = (kernel_spec or GAUSSIAN).np_norm(epsilon)
 
     # ── Bounding box (matches §1 floor/ceil convention) ──
     xj, yj, zj = float(marker_pos[0]), float(marker_pos[1]), float(marker_pos[2])
@@ -1309,7 +1347,9 @@ def _spread_single_marker_gpu(
 
     # ── Gaussian kernel with spherical cutoff ──
     mask = d_sq <= r_cut_sq
-    eta = xp.where(mask, norm * xp.exp(-d_sq / eps_sq), 0.0)   # [1/lu³]
+    eta = xp.where(
+        mask, norm * (kernel_spec or GAUSSIAN).np_shape(xp, d_sq, eps_sq),
+        0.0)   # [1/lu³]
 
     # ── Accumulate: F_grid(x) += -F^AL · η_ε ──
     # Negative sign = Newton's third law (reaction on fluid)

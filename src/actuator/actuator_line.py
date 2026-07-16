@@ -197,6 +197,7 @@ class ActuatorLineModel:
         coeff_mode: str = 'auto',
         xp=None,
         sound_speed: Optional[float] = None,
+        kernel: Optional[dict] = None,
     ) -> None:
         """Initialize the Actuator Line model
 
@@ -231,7 +232,14 @@ class ActuatorLineModel:
         # ALM BEM cost (~21 ms/sub-step → sub-ms on the HVAB C81 decks).
         self._polar_groups: Dict[int, Tuple[object, list]] = {}
         self._polar_qf_cache: Dict[str, object] = {}
-        self.n_cut = n_cut
+        # ── Regularization-kernel family (G-beta0, patch_notes/alm_beta_kernel)
+        # THE single source for eta in spreading/sampling/scales/correction.
+        # self.n_cut generalizes to the family SUPPORT factor: gaussian keeps
+        # the config cutoff; compact families override with their exact
+        # support (kernel="gaussian" is bit-identical to the pre-G-beta0 code).
+        from .alm_kernel import get_alm_kernel
+        self._alm_kernel = get_alm_kernel((kernel or {}).get('type'))
+        self.n_cut = self._alm_kernel.support_factor(n_cut)
         self.dx_phys = dx_phys          # [m/lu]
         self.dt_phys = dt_phys          # [s/lt]
         self.a_phys = sound_speed       # [m/s] free-stream sound speed or None
@@ -485,11 +493,12 @@ class ActuatorLineModel:
 
         if self._velocity_sampler is not None:
             u_markers = self._velocity_sampler(
-                u_field, positions_grid, epsilon_all, active_all, self.n_cut)
+                u_field, positions_grid, epsilon_all, active_all, self.n_cut,
+                kernel_spec=self._alm_kernel)
         elif self._sampling_mode == "gaussian":
             u_markers = interpolate_velocity_batch_gpu(
                 u_field, positions_grid, epsilon_all,
-                xp=xp, n_cut=self.n_cut
+                xp=xp, n_cut=self.n_cut, kernel_spec=self._alm_kernel
             )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
         else:
             # A/B alternatives (point/aniso/mask_disk/ring) — patch_notes/*.
@@ -592,7 +601,8 @@ class ActuatorLineModel:
             n_cut=self.n_cut,
             F_grid=self._F_grid,
             radial_trunc=_radial_trunc,
-            aniso=_aniso
+            aniso=_aniso,
+            kernel_spec=self._alm_kernel
         )
 
         if _pf:
@@ -845,15 +855,20 @@ class ActuatorLineModel:
             eps_opt_e[0] = eps_opt[0]; eps_opt_e[-1] = eps_opt[-1]
 
         # --- Biot-Savart deficit sum at each marker (Eq. 17), +1/(4π) ----------
+        # Deficit kernel K from the family spec (G-beta0): gaussian is
+        # exactly exp(-(d/eps)^2); other families use their own derived
+        # deficit (fail-fast until derived — see ALMKernelSpec.deficit_K).
+        _spec = self._alm_kernel
         w = np.zeros(N)                                 # [Δx/Δt]
         for i in range(N):
             d = r[i] - edges                            # signed distance (Eq. 20)
             far = np.abs(d) > 1e-9                       # skip a coincident edge
             safe_d = np.where(far, d, 1.0)
             if use_opt:
-                K = np.exp(-(d / eps_e) ** 2) - np.exp(-(d / eps_opt_e) ** 2)
+                K = (_spec.deficit_K(np, d, eps_e)
+                     - _spec.deficit_K(np, d, eps_opt_e))
             else:
-                K = np.exp(-(d / eps_e) ** 2)
+                K = _spec.deficit_K(np, d, eps_e)
             kernel = np.where(far, K / safe_d, 0.0)
             w[i] = inv4pi * np.sum(Gw * kernel)         # +1/(4π): downwash at the tip
         return w
@@ -963,7 +978,8 @@ class ActuatorLineModel:
             # cold-start fallback while < 2 rings).
             A = self._kleine_A.get(k)
             if A is None or A.shape[0] != n:
-                A = influence_matrix(r, eps, dr)
+                A = influence_matrix(r, eps, dr,
+                                     kernel_spec=self._alm_kernel)
                 self._kleine_A[k] = A
 
         # Move A + per-marker inputs to the correction device once (static
@@ -2167,6 +2183,10 @@ def create_actuator_line_from_config(
         coeff_mode=resolved_mode,
         xp=xp,
         sound_speed=sound_speed,
+        # G-beta0: regularization-kernel family, e.g.
+        # {"type": "gaussian"|"wendland"|"winckelmans"} (default gaussian
+        # = bit-identical pre-refactor behavior).
+        kernel=config.get('kernel'),
     )
 
     # Prandtl tip/root loss
@@ -2250,6 +2270,22 @@ def create_actuator_line_from_config(
         for _b in model.rotor.blades:
             _b.sweep_geometric = True
             _b._sweep_sign = _sgn
+
+    # ── G-beta0 guard: machinery whose closed forms are gaussian-analytic
+    # (or that carries its own weighting) must fail FAST for other kernel
+    # families — silently mixing families would defeat the physics-code
+    # unity that the kernel spec exists to enforce.
+    if model._alm_kernel.name != 'gaussian':
+        if model._eps_corr and model._kleine_wake_mode == 'free':
+            raise NotImplementedError(
+                "kernel != gaussian: kleine free-wake correction uses "
+                "gaussian-analytic segment forms (phi_smeared/erf) — "
+                "use wake='straight' (production) or kernel='gaussian'")
+        if model._sampling_mode != 'gaussian':
+            raise NotImplementedError(
+                f"kernel != gaussian: sampling mode "
+                f"'{model._sampling_mode}' has its own weighting and is "
+                "not generalized — use sampling mode 'gaussian'")
 
     return model
 
@@ -2335,6 +2371,7 @@ def create_multi_rotor_from_config(
         'epsilon_tip_factor': config.get('epsilon_tip_factor', 1.0),
         'epsilon_taper_start': config.get('epsilon_taper_start', 0.7),
         'sampling': config.get('sampling', None),
+        'kernel': config.get('kernel', None),      # G-beta0 family
     }
 
     # ── Create each rotor ──
@@ -2363,6 +2400,7 @@ def create_multi_rotor_from_config(
                 'epsilon_taper_start', shared_defaults['epsilon_taper_start']
             ),
             'sampling': rotor_entry.get('sampling', shared_defaults['sampling']),
+            'kernel': rotor_entry.get('kernel', shared_defaults['kernel']),
         }
 
         # Per-rotor u_inf override

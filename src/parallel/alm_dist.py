@@ -33,11 +33,12 @@ import numpy as np
 from src.actuator.interpolation import interpolate_velocity_batch_gpu
 
 
-def alm_partial_sums(u_owned_view, positions_owned, epsilon, n_cut, xp):
+def alm_partial_sums(u_owned_view, positions_owned, epsilon, n_cut, xp,
+                     kernel_spec=None):
     """(num (N,3), den (N,)) over the owned slab. positions in VIEW coords."""
     return interpolate_velocity_batch_gpu(
         u_owned_view, positions_owned, epsilon, xp=xp, n_cut=n_cut,
-        return_sums=True)
+        return_sums=True, kernel_spec=kernel_spec)
 
 
 class MPIAllreduce:
@@ -87,7 +88,8 @@ def make_distributed_sampler(allred: ThreadAllreduce, rank: int, part,
     ax = part.axis
     ghost = part.ghost
 
-    def sampler(u_field, positions_grid, epsilon, active, n_cut):
+    def sampler(u_field, positions_grid, epsilon, active, n_cut,
+                kernel_spec=None):
         # OWNED ownership via clip bounds on the FULL local array (backlog
         # #3: the RawKernel path takes bounds directly — no view, no
         # position shift; cell set identical to the old owned-view clip)
@@ -95,7 +97,7 @@ def make_distributed_sampler(allred: ThreadAllreduce, rank: int, part,
         cb[ax] = (ghost, ghost + part.own_count)
         num, den = interpolate_velocity_batch_gpu(
             u_field, positions_grid, epsilon, xp=xp, n_cut=n_cut,
-            return_sums=True, clip_bounds=tuple(cb))
+            return_sums=True, clip_bounds=tuple(cb), kernel_spec=kernel_spec)
         num_t, den_t = allred.allreduce(rank, num, den)
         return num_t / np.maximum(den_t, 1e-30)[:, None]
 

@@ -50,6 +50,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
+from .alm_kernel import GAUSSIAN
+
 if TYPE_CHECKING:
     import numpy.typing as npt
 
@@ -89,7 +91,8 @@ def interpolate_velocity_at_marker(
     u_field: 'npt.NDArray',
     marker_pos: 'npt.NDArray',
     epsilon: float,
-    n_cut: float = 3.0
+    n_cut: float = 3.0,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """Interpolate grid velocity at a single marker position
 
@@ -145,10 +148,11 @@ def interpolate_velocity_at_marker(
     if not np.any(mask):
         return np.zeros(3)
 
-    # Gaussian kernel weights (normalization cancels, but compute for clarity)
+    # Kernel shape weights (normalization cancels in the ratio); the family
+    # comes from the spec (G-beta0) — gaussian reproduces exp(-d²/ε²) exactly
+    spec = kernel_spec or GAUSSIAN
     weights = np.zeros_like(d_sq)
-    weights[mask] = np.exp(-d_sq[mask] / (epsilon * epsilon))  # [dimensionless]
-    # Note: the 1/(π^{3/2}·ε³) prefactor cancels in numerator/denominator
+    weights[mask] = spec.np_shape(np, d_sq[mask], epsilon * epsilon)
 
     # Sum of weights for normalization
     W_sum = np.sum(weights)                  # [dimensionless]
@@ -173,7 +177,8 @@ def interpolate_velocity_batch(
     u_field: 'npt.NDArray',
     marker_positions: 'npt.NDArray',
     marker_epsilon: 'npt.NDArray',
-    n_cut: float = 3.0
+    n_cut: float = 3.0,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """Interpolate grid velocity at all marker positions
 
@@ -203,7 +208,8 @@ def interpolate_velocity_batch(
             u_field,
             marker_positions[j],
             float(marker_epsilon[j]),
-            n_cut=n_cut
+            n_cut=n_cut,
+            kernel_spec=kernel_spec
         )
 
     return u_markers  # (N_markers, 3)  [Δx/Δt]
@@ -217,7 +223,8 @@ def interpolate_velocity_batch_fast(
     u_field: 'npt.NDArray',
     marker_positions: 'npt.NDArray',
     epsilon_uniform: float,
-    n_cut: float = 3.0
+    n_cut: float = 3.0,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """Fast batch interpolation when all markers share the same ε
 
@@ -299,8 +306,8 @@ def interpolate_velocity_batch_fast(
         dz = gz_v.astype(np.float64) - zj          # [lu]
         d_sq = dx * dx + dy * dy + dz * dz          # [lu²]
 
-        # Gaussian weights (prefactor cancels in normalization)
-        w = np.exp(-d_sq / eps_sq)                   # [dimensionless]
+        # Kernel shape weights (prefactor cancels in normalization)
+        w = (kernel_spec or GAUSSIAN).np_shape(np, d_sq, eps_sq)
         W_sum = np.sum(w)
 
         if W_sum < 1e-30:
@@ -383,7 +390,8 @@ def interpolate_velocity_batch_gpu(
     n_cut: float = 3.0,
     gpu_mem_limit_mb: float = 512.0,
     return_sums: bool = False,
-    clip_bounds=None
+    clip_bounds=None,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """GPU-capable batch velocity interpolation at all marker positions
 
@@ -432,7 +440,7 @@ def interpolate_velocity_batch_gpu(
         # vs §2's floor/ceil stencils, causing ~1e-5 discrepancies.
         return interpolate_velocity_batch(
             u_field, marker_positions,
-            marker_epsilon, n_cut=n_cut
+            marker_epsilon, n_cut=n_cut, kernel_spec=kernel_spec
         )
 
     # ── GPU fast path: one-launch RawKernel (backlog #3) ──
@@ -441,7 +449,7 @@ def interpolate_velocity_batch_gpu(
             _os.environ.get("LBM_ALM_SAMPLE_KERNEL", "1") == "1":
         num, den = _sample_markers_rawkernel(
             u_field, marker_positions, marker_epsilon, xp, n_cut,
-            clip_bounds=clip_bounds)
+            clip_bounds=clip_bounds, kernel_spec=kernel_spec)
         if return_sums:
             return num, den
         return num / np.maximum(den, 1e-30)[:, None]
@@ -468,12 +476,14 @@ def interpolate_velocity_batch_gpu(
         if is_uniform:
             u_gpu = _interpolate_uniform_eps_gpu(
                 u_field, marker_positions,
-                float(eps_unique[0]), xp, n_cut, return_sums=return_sums
+                float(eps_unique[0]), xp, n_cut, return_sums=return_sums,
+                kernel_spec=kernel_spec
             )
         else:
             u_gpu = _interpolate_varying_eps_gpu(
                 u_field, marker_positions,
-                marker_epsilon, xp, n_cut, return_sums=return_sums
+                marker_epsilon, xp, n_cut, return_sums=return_sums,
+                kernel_spec=kernel_spec
             )
         if return_sums:
             return xp.asnumpy(u_gpu[0]), xp.asnumpy(u_gpu[1])
@@ -496,12 +506,13 @@ def interpolate_velocity_batch_gpu(
         if is_uniform:
             u_chunk_gpu = _interpolate_uniform_eps_gpu(
                 u_field, pos_chunk,
-                float(eps_unique[0]), xp, n_cut, return_sums=return_sums
+                float(eps_unique[0]), xp, n_cut, return_sums=return_sums,
+                kernel_spec=kernel_spec
             )
         else:
             u_chunk_gpu = _interpolate_varying_eps_gpu(
                 u_field, pos_chunk, eps_chunk, xp, n_cut,
-                return_sums=return_sums
+                return_sums=return_sums, kernel_spec=kernel_spec
             )
 
         if return_sums:
@@ -568,7 +579,8 @@ def _interpolate_uniform_eps_gpu(
     epsilon: float,
     xp,
     n_cut: float,
-    return_sums: bool = False
+    return_sums: bool = False,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """Fully vectorized GPU interpolation for uniform Gaussian width
 
@@ -647,11 +659,12 @@ def _interpolate_uniform_eps_gpu(
     dz = gz.astype(xp.float64) - pos_gpu[:, 2, None, None, None]   # [lu]
     d_sq = dx * dx + dy * dy + dz * dz                              # [lu²]
 
-    # ── Gaussian weights with cutoff ──
-    # η ∝ exp(-d²/ε²), masked by domain bounds and cutoff radius
+    # ── Kernel weights with cutoff ──
+    # shape from the family spec (prefactor cancels), masked by domain
+    # bounds and cutoff radius; gaussian = exp(-d²/ε²) exactly
     weights = xp.where(
         valid & (d_sq <= r_cut_sq),
-        xp.exp(-d_sq / eps_sq),    # [dimensionless] (prefactor cancels)
+        (kernel_spec or GAUSSIAN).np_shape(xp, d_sq, eps_sq),
         0.0
     )   # (N_markers, S, S, S)
 
@@ -680,7 +693,12 @@ def _interpolate_uniform_eps_gpu(
 
 _SAMPLE_KERNEL_CACHE = {}
 
-_SAMPLE_KERNEL_SRC = r"""
+# Template (G-beta0): the kernel-family weight line is substituted from the
+# ALMKernelSpec ({{W_SAMPLE}} sets `double w` from d2/e2/r2; r2 is the
+# squared support radius, so compact families get q = d/R_s for free).
+# The gaussian substitution reproduces the pre-refactor source BYTE-FOR-BYTE
+# (sha256-pinned by the G-beta0 gate).
+_SAMPLE_KERNEL_TMPL = r"""
 extern "C" __global__ void alm_sample_markers(
     const float* __restrict__ u,
     const double* __restrict__ pos,
@@ -720,7 +738,7 @@ extern "C" __global__ void alm_sample_markers(
         double dzz = (double)gz - pz;
         double d2 = dxx * dxx + dyy * dyy + dzz * dzz;
         if (d2 > r2) continue;
-        double w = exp(-d2 / e2);
+{{W_SAMPLE}}
         long long b = ((long long)gx * Ny + gy) * Nz + gz;
         a0 += w * (double)u[b];
         a1 += w * (double)u[NN + b];
@@ -750,7 +768,7 @@ extern "C" __global__ void alm_sample_markers(
 
 
 def _sample_markers_rawkernel(u_field, marker_positions, marker_epsilon,
-                              xp, n_cut, clip_bounds=None):
+                              xp, n_cut, clip_bounds=None, kernel_spec=None):
     """One-launch marker sampling (patch 17 backlog #3).
 
     One BLOCK per marker; each thread strides the stencil box with serial
@@ -765,10 +783,13 @@ def _sample_markers_rawkernel(u_field, marker_positions, marker_epsilon,
     """
     import numpy as _np
     _, Nx, Ny, Nz = u_field.shape
-    if "k" not in _SAMPLE_KERNEL_CACHE:
-        _SAMPLE_KERNEL_CACHE["k"] = xp.RawKernel(
-            _SAMPLE_KERNEL_SRC, "alm_sample_markers")
-    ker = _SAMPLE_KERNEL_CACHE["k"]
+    spec = kernel_spec or GAUSSIAN
+    if spec.name not in _SAMPLE_KERNEL_CACHE:
+        src = _SAMPLE_KERNEL_TMPL.replace("{{W_SAMPLE}}", spec.cuda_w_sample)
+        assert all(ord(ch) < 128 for ch in src)
+        _SAMPLE_KERNEL_CACHE[spec.name] = xp.RawKernel(
+            src, "alm_sample_markers")
+    ker = _SAMPLE_KERNEL_CACHE[spec.name]
     n = marker_positions.shape[0]
     eps = _np.asarray(marker_epsilon, dtype=_np.float64)
     half = int(_np.ceil(n_cut * float(eps.max()))) + 1
@@ -793,7 +814,8 @@ def _interpolate_varying_eps_gpu(
     marker_epsilon: 'npt.NDArray',
     xp,
     n_cut: float,
-    return_sums: bool = False
+    return_sums: bool = False,
+    kernel_spec=None
 ) -> 'npt.NDArray':
     """GPU interpolation when markers have different Gaussian widths
 
@@ -862,11 +884,13 @@ def _interpolate_varying_eps_gpu(
     dz = gz.astype(xp.float64) - pos_gpu[:, 2, None, None, None]
     d_sq = dx * dx + dy * dy + dz * dz   # (N, S, S, S) [lu²]
 
-    # ── Per-marker Gaussian weights with per-marker cutoff ──
-    # eps_sq_gpu, r_cut_sq_gpu: (N,) → (N,1,1,1) for broadcasting
+    # ── Per-marker kernel weights with per-marker cutoff ──
+    # eps_sq_gpu, r_cut_sq_gpu: (N,) → (N,1,1,1) for broadcasting;
+    # shape from the family spec (gaussian = exp(-d²/ε²) exactly)
     weights = xp.where(
         valid & (d_sq <= r_cut_sq_gpu[:, None, None, None]),
-        xp.exp(-d_sq / eps_sq_gpu[:, None, None, None]),
+        (kernel_spec or GAUSSIAN).np_shape(
+            xp, d_sq, eps_sq_gpu[:, None, None, None]),
         0.0
     )
 

@@ -349,7 +349,8 @@ def edge_operator(r: np.ndarray, eps: np.ndarray, dr):
     return E, r_edge, eps_edge
 
 
-def influence_matrix(r: np.ndarray, eps: np.ndarray, dr) -> np.ndarray:
+def influence_matrix(r: np.ndarray, eps: np.ndarray, dr,
+                     kernel_spec=None) -> np.ndarray:
     """A_ik = ∂w_i/∂Γ_k  for the semi-infinite straight trailed wake (edge-based,
     Dağ & Sørensen 2020 Eq. 17-18 — matches `_viscous_core_correction`):
 
@@ -366,8 +367,12 @@ def influence_matrix(r: np.ndarray, eps: np.ndarray, dr) -> np.ndarray:
     E, r_edge, eps_edge = edge_operator(r, eps, dr)
     d = r[:, None] - r_edge[None, :]                # (N, N+1) signed distance
     far = np.abs(d) > 1e-9
-    Kmat = np.where(far, np.exp(-(d / eps_edge[None, :]) ** 2)
-                    / np.where(far, d, 1.0), 0.0)   # (N, N+1)
+    # Deficit kernel from the family spec (G-beta0; gaussian = exp(-(d/e)^2)
+    # exactly — same operator object as _viscous_core_correction).
+    if kernel_spec is None:
+        from .alm_kernel import GAUSSIAN as kernel_spec
+    K = kernel_spec.deficit_K(np, d, eps_edge[None, :])
+    Kmat = np.where(far, K / np.where(far, d, 1.0), 0.0)   # (N, N+1)
     return _INV4PI * (Kmat @ E)                      # +1/(4π), (N, N)
 
 
