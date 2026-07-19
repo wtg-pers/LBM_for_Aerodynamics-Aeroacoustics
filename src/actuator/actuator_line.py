@@ -1603,6 +1603,20 @@ class ActuatorLineModel:
                     rlx = self._eps_corr_relax
                     w_corr = rlx * w_new + (1.0 - rlx) * w_prev
                     self._dag_w_prev[k] = w_corr
+                # Ramp consistency: the deficit being recovered is that of the
+                # force the grid actually receives, and step 9 deposits only
+                # ramp·F (_F_grid *= _ramp_factor) — so the applied correction
+                # must carry the same factor. Unramped w over-adds downwash by
+                # 1/ramp early in the ramp (the D40 case-4' tip deep-stall
+                # entry window, patch_notes/alm_beta_kernel/05 §5c). The
+                # factor mirrors THIS step's _F_grid ramp (_step_count
+                # increments after spreading); solver warm-start state
+                # (Γⁿ⁻¹, w_prev) stays unramped — only the application and
+                # the logged diagnostic are gated. Past the ramp the branch
+                # is skipped: bit-identical.
+                if self.ramp_steps > 0 and self._step_count < self.ramp_steps:
+                    w_corr = w_corr * (
+                        float(self._step_count + 1) / float(self.ramp_steps))
                 u_n = u_n + np.where(active, w_corr, 0.0)        # added downwash
                 u_rel, phi_deg, alpha_deg = \
                     rotor.recompute_velocity_triangle(k, u_n, u_theta)

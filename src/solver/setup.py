@@ -1097,6 +1097,12 @@ class SimulationSetup:
             self.al_model.ramp_steps = ramp
             print(f"    Force ramp: {ramp} steps")
 
+        # Kernel family echo — the D40 case-4' debug showed the log carried no
+        # record of which spreading/sampling/deficit family a run used.
+        if self.al_model is not None:
+            _kern = (al_cfg.get('kernel') or {}).get('type', 'gaussian')
+            print(f"    Kernel family: {_kern}")
+
     # =====================================================================
     # [6] Multi-Level Grid Setup (NEW)
     # =====================================================================
