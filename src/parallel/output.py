@@ -81,19 +81,23 @@ class Rank0OutputBridge:
         self._m_spacing = alm_marker_spacing
 
     # ── VTK: assembled rho/u per level -> MLGVTKWriter.write ─────────
-    def write_vtk(self, step: int, runner) -> None:
+    def write_vtk(self, step: int, runner, fields: bool = True) -> None:
+        """fields=False skips the level gathers + field files (the per-
+        snapshot GB cost) but still writes the marker VTPs. The flag must be
+        computed identically on every rank (the gathers are collective)."""
         comm, rank, nr = self._comm, self._rank, self._nr
-        views = []
-        for k in range(runner.NL):
-            L = runner.lv[k]
-            rho = _gather_level(comm, rank, nr, runner,
-                                L.rho[None], k, tag0=300 + 4 * k)
-            u = _gather_level(comm, rank, nr, runner,
-                              L.u, k, tag0=302 + 4 * k)
-            if rank == 0:
-                views.append(_LevelView(rho[0], u))
-        if rank == 0 and self._vtk is not None:
-            self._vtk.write(step, _MLGView(views), time=float(step))
+        if fields:
+            views = []
+            for k in range(runner.NL):
+                L = runner.lv[k]
+                rho = _gather_level(comm, rank, nr, runner,
+                                    L.rho[None], k, tag0=300 + 4 * k)
+                u = _gather_level(comm, rank, nr, runner,
+                                  L.u, k, tag0=302 + 4 * k)
+                if rank == 0:
+                    views.append(_LevelView(rho[0], u))
+            if rank == 0 and self._vtk is not None:
+                self._vtk.write(step, _MLGView(views), time=float(step))
         self._write_markers(step, runner)
         comm.Barrier()
 

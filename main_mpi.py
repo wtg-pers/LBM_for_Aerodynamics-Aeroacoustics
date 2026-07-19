@@ -56,6 +56,9 @@ def parse_cli(argv):
                          "capacity to ~4x a single GPU)")
     ap.add_argument("--vtk-every", type=int, default=0,
                     help="coarse steps between assembled VTK writes (0=off)")
+    ap.add_argument("--vtk-fields-last", type=int, default=0,
+                    help="write level-field VTK only for the last N vtk "
+                         "events; marker VTPs still every --vtk-every (0=all)")
     ap.add_argument("--ckpt-every", type=int, default=0,
                     help="coarse steps between assembled checkpoints (0=off)")
     ap.add_argument("--strict-bit", action="store_true",
@@ -296,7 +299,12 @@ def main():
             on_log(s_, runner, stats)
         if bridge is not None and args.vtk_every and \
                 s_ % args.vtk_every == 0:
-            bridge.write_vtk(s_, runner)
+            # --vtk-fields-last N: level-field files only for the last N vtk
+            # events (the ~GB/snapshot cost); marker VTPs keep the full
+            # rev-locked history (the spanwise/convergence analysis input).
+            fields = (args.vtk_fields_last <= 0 or
+                      s_ > args.steps - args.vtk_fields_last * args.vtk_every)
+            bridge.write_vtk(s_, runner, fields=fields)
         if bridge is not None and args.ckpt_every and \
                 s_ % args.ckpt_every == 0:
             bridge.save_checkpoint(s_, runner)
