@@ -260,10 +260,16 @@ class ActuatorLineModel:
         self.ramp_steps: int = 0
         self._ramp_factor: float = 1.0
 
-        # ── Prandtl tip/root loss correction ──
+        # ── Prandtl / Shen tip/root loss correction ──
         self.prandtl_loss: bool = False
         self._prandtl_tip: bool = True
         self._prandtl_root: bool = True
+        # Tip-loss load-factor model. "prandtl": F=(2/π)arccos(exp(-f)),
+        # f=(B/2)(R-r)/(r sinφ). "shen" (Shen et al. 2005): the SAME form with
+        # f -> g·f, where g<1 broadens the load roll-off inboard. Shen's g =
+        # exp(-c1(Bλ-c2))+0.1 (c1=0.125, c2=21) → hover (λ=ΩR/U∞→∞) limit g=0.1.
+        # g=1.0 reduces exactly to Prandtl (bit-identical).
+        self._tip_loss_g: float = 1.0
         # Effective-radius ε offset for Prandtl: R_tip_eff = R_tip - ε_tip.
         # True (default) reproduces the existing non-standard behavior; False
         # uses the textbook R_tip_eff = R_tip (matches BEMT / standard Prandtl,
@@ -646,13 +652,13 @@ class ActuatorLineModel:
         r: np.ndarray,
         phi_deg: np.ndarray,
     ) -> np.ndarray:
-        """Prandtl combined tip/root loss factor.
+        """Prandtl / Shen combined tip/root loss factor.
 
-        F_pr = F_tip × F_root  ∈ [0, 1]
+        F = F_tip × F_root  ∈ [0, 1]
 
-        where:
-            f_tip  = B·(R_tip,eff  - r) / (2·r·sin|φ|)
-            f_root = B·(r - R_root,eff) / (2·r·sin|φ|)
+        where (g = self._tip_loss_g; g=1 → Prandtl, g<1 → Shen 2005):
+            f_tip  = g · B·(R_tip,eff  - r) / (2·r·sin|φ|)
+            f_root = g · B·(r - R_root,eff) / (2·r·sin|φ|)
             F      = (2/π)·arccos(exp(-f))
 
         Effective radii account for Gaussian force spreading:
@@ -689,15 +695,16 @@ class ActuatorLineModel:
         sin_phi = np.abs(np.sin(np.radians(phi_deg)))
         sin_phi = np.maximum(sin_phi, 1e-4)            # avoid division by zero
 
+        g = self._tip_loss_g               # 1.0 = Prandtl, <1 = Shen 2005
         F_pr = np.ones_like(r, dtype=np.float64)
 
         if self._prandtl_tip:
-            f_tip = B * np.maximum(R_tip_eff - r, 0.0) / (2.0 * r * sin_phi)
+            f_tip = g * B * np.maximum(R_tip_eff - r, 0.0) / (2.0 * r * sin_phi)
             F_tip = (2.0 / np.pi) * np.arccos(np.clip(np.exp(-f_tip), -1.0, 1.0))
             F_pr *= F_tip
 
         if self._prandtl_root:
-            f_root = B * np.maximum(r - R_root_eff, 0.0) / (2.0 * r * sin_phi)
+            f_root = g * B * np.maximum(r - R_root_eff, 0.0) / (2.0 * r * sin_phi)
             F_root = (2.0 / np.pi) * np.arccos(np.clip(np.exp(-f_root), -1.0, 1.0))
             F_pr *= F_root
 
@@ -2218,6 +2225,12 @@ def create_actuator_line_from_config(
         # eps_offset True (default) = legacy R_tip_eff = R - ε_tip;
         # False = standard R_tip_eff = R_tip (BEMT-consistent, ε-decoupled).
         model._prandtl_eps_offset = prandtl.get('eps_offset', True)
+        # Tip-loss model: "prandtl" (g=1) | "shen" (g<1, load roll-off broadened).
+        # Shen g default 0.1 = the hover limit of exp(-c1(Bλ-c2))+0.1.
+        if prandtl.get('model', 'prandtl') == 'shen':
+            model._tip_loss_g = float(prandtl.get('g', 0.1))
+        else:
+            model._tip_loss_g = 1.0
     else:
         model.prandtl_loss = bool(prandtl)
 
