@@ -257,7 +257,8 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
                  tip_sweep=False, sampling=None, smoke_levels=2,
                  n_rev=18, polar_source="neuralfoil",
                  marker_distribution="uniform", cosine_side="both",
-                 radial_truncation=False, anisotropic=None, n_radial=None):
+                 radial_truncation=False, anisotropic=None, n_radial=None,
+                 epsilon_chord_factor=0.25):
     """HVAB hover config (주어진 collective, tip Mach).
 
     eps_correction : None|bool|dict  — viscous-core smearing 보정 (기본 off).
@@ -390,6 +391,10 @@ def build_config(collective_deg, mtip=0.65, smoke=False,
             "grid": {"n_radial": N_RADIAL if n_radial is None else int(n_radial),
                      "marker_distribution": marker_distribution,
                      "cosine_side": cosine_side},
+            # ε_base = factor·chord (Watanabe; 0.25 = Martinez-Tossas opt).
+            # ε-sweep knob for the finite-ε correction-convergence test
+            # (patch_notes/alm_beta_kernel/08). Default 0.25 = bit-identical.
+            "epsilon_chord_factor": float(epsilon_chord_factor),
         },
         "gaussian_cutoff": 3.0, "rho_ref": 1.0, "coeff_mode": "rotorcraft",
         "ramp_steps": STEPS_REV, "prandtl_loss": prandtl_loss,

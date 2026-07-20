@@ -1101,6 +1101,7 @@ class Rotor:
         blade.epsilon_mode = config.get('epsilon_mode', 'default')
         blade.epsilon_tip_factor = config.get('epsilon_tip_factor', 1.0)
         blade.epsilon_taper_start = config.get('epsilon_taper_start', 0.7)
+        blade.epsilon_chord_factor = config.get('epsilon_chord_factor', 0.25)
 
         # Grid
         grid_cfg = config.get('grid', {})

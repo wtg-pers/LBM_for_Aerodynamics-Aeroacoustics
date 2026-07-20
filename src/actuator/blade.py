@@ -246,6 +246,7 @@ class Blade:
         self.epsilon_mode: str = "default"      # "default" | "tip_taper"
         self.epsilon_tip_factor: float = 1.0    # tip ε target = max(factor·2·Δx, 2·Δx)
         self.epsilon_taper_start: float = 0.7   # r/R where taper begins
+        self.epsilon_chord_factor: float = 0.25  # ε_base = max(factor·c, 2·Δx); 0.25 = Martinez-Tossas opt
 
         # Coordinate system (set by Rotor or explicitly)
         # If None, falls back to legacy hardcoded X-axis rotation
@@ -439,7 +440,9 @@ class Blade:
 
         The baseline regularization parameter ε for each marker is:
 
-            ε_j = max(c_a(r_j) / 4, 2 · Δx)    (Watanabe et al., Eq. 13 note)
+            ε_j = max(epsilon_chord_factor · c_a(r_j), 2 · Δx)
+                (Watanabe et al., Eq. 13 note; factor 0.25 = original c/4,
+                 the Martínez-Tossas optimal for correct 2D lift)
 
         When ``self.epsilon_mode == "tip_taper"`` the baseline is linearly
         blended toward a narrower tip value beyond ``epsilon_taper_start``
@@ -458,9 +461,9 @@ class Blade:
             raise RuntimeError("Call generate_markers() before set_lattice_spacing()")
 
         eps_base = np.maximum(
-            self.marker_chord / 4.0,
+            self.marker_chord * self.epsilon_chord_factor,
             2.0 * dx
-        )  # [same units as chord and dx]
+        )  # [same units as chord and dx]; factor 0.25 = original chord/4
 
         if self.epsilon_mode == "tip_taper":
             r_norm = self.marker_r / self.r_tip                      # [dimensionless]
@@ -928,6 +931,7 @@ class Blade:
         new_blade.epsilon_mode = self.epsilon_mode
         new_blade.epsilon_tip_factor = self.epsilon_tip_factor
         new_blade.epsilon_taper_start = self.epsilon_taper_start
+        new_blade.epsilon_chord_factor = self.epsilon_chord_factor
         # Sharp-sweep params are r/R- and degree-based (unit-independent) — carry
         # them so the LU generate_markers below rebuilds the step Λ and exact Δs.
         new_blade.sweep_break_rR = self.sweep_break_rR
