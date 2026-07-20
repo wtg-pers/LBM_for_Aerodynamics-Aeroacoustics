@@ -283,6 +283,8 @@ class ActuatorLineModel:
         # as dense as ε (ε/Δr≈2 here). 0 = off (paper-literal, unstable on dense
         # ALM markers); 1-3 = light [0.25,0.5,0.25] passes break the sawtooth.
         self._eps_corr_smooth: int = 0
+        # Correction soft-start window multiple of ramp_steps (patch 07).
+        self._eps_corr_soft: float = 2.0
         # Correction method: "dag" (single-pass, current) | "kleine" (Kleine 2022
         # non-iterative linear solve, Phase 1 — patch_notes/kleine_smearing_correction/).
         self._eps_corr_method: str = "dag"
@@ -1603,20 +1605,24 @@ class ActuatorLineModel:
                     rlx = self._eps_corr_relax
                     w_corr = rlx * w_new + (1.0 - rlx) * w_prev
                     self._dag_w_prev[k] = w_corr
-                # Ramp consistency: the deficit being recovered is that of the
-                # force the grid actually receives, and step 9 deposits only
-                # ramp·F (_F_grid *= _ramp_factor) — so the applied correction
-                # must carry the same factor. Unramped w over-adds downwash by
-                # 1/ramp early in the ramp (the D40 case-4' tip deep-stall
-                # entry window, patch_notes/alm_beta_kernel/05 §5c). The
-                # factor mirrors THIS step's _F_grid ramp (_step_count
-                # increments after spreading); solver warm-start state
-                # (Γⁿ⁻¹, w_prev) stays unramped — only the application and
-                # the logged diagnostic are gated. Past the ramp the branch
-                # is skipped: bit-identical.
-                if self.ramp_steps > 0 and self._step_count < self.ramp_steps:
-                    w_corr = w_corr * (
-                        float(self._step_count + 1) / float(self.ramp_steps))
+                # Ramp consistency + soft start: the deficit being recovered
+                # is that of the force the grid actually receives (step 9
+                # deposits ramp·F), so the applied correction must never
+                # exceed that factor — unramped w over-adds downwash by
+                # 1/ramp (the D40 case-4' deep-stall entry, patch 05 §5c).
+                # The gate window is soft·ramp_steps (soft >= 1, config
+                # eps_correction.soft_start, default 2): with soft=1 the gate
+                # exactly mirrors the force ramp, but full correction strength
+                # arriving at ramp end — before the flow reaches its full-
+                # force equilibrium — still captured a blade (patch 06 §6
+                # 25rev b2 lock). soft=2 approaches full strength a ramp's
+                # worth of time later, always from below (factor <= force
+                # ramp since window >= ramp). Warm-start state (Γⁿ⁻¹, w_prev)
+                # stays unramped; past the window the branch is skipped:
+                # identical steady state.
+                _w_win = self._eps_corr_soft * float(self.ramp_steps)
+                if self.ramp_steps > 0 and (self._step_count + 1) < _w_win:
+                    w_corr = w_corr * (float(self._step_count + 1) / _w_win)
                 u_n = u_n + np.where(active, w_corr, 0.0)        # added downwash
                 u_rel, phi_deg, alpha_deg = \
                     rotor.recompute_velocity_triangle(k, u_n, u_theta)
@@ -2223,6 +2229,13 @@ def create_actuator_line_from_config(
         model._eps_opt_factor = ec.get('eps_opt_factor', 0.25)
         model._eps_corr_relax = ec.get('relax', 1.0)
         model._eps_corr_smooth = int(ec.get('smooth', 0))  # spanwise Γ smoothing passes
+        # Correction soft-start window as a multiple of ramp_steps (>=1).
+        # 1.0 = gate exactly mirrors the force ramp (patch 06); the default
+        # 2.0 keeps the applied correction BELOW the force-consistent level
+        # through the ramp and approaches full strength only after the flow
+        # has had ~a ramp's worth of time to catch up — closes the ramp-END
+        # capture window (patch 07: the 25rev case-4' blade-2 lock).
+        model._eps_corr_soft = max(1.0, float(ec.get('soft_start', 2.0)))
         model._eps_corr_method = ec.get('method', 'dag')  # "dag" | "kleine"
         model._eps_endpoint_closure = ec.get('endpoint_closure', False)  # option 3
         model._kleine_wake_mode = ec.get('wake', 'straight')  # "straight" | "free"
