@@ -89,15 +89,26 @@ def make_distributed_sampler(allred: ThreadAllreduce, rank: int, part,
     ghost = part.ghost
 
     def sampler(u_field, positions_grid, epsilon, active, n_cut,
-                kernel_spec=None):
+                kernel_spec=None, aniso=None):
         # OWNED ownership via clip bounds on the FULL local array (backlog
         # #3: the RawKernel path takes bounds directly — no view, no
         # position shift; cell set identical to the old owned-view clip)
         cb = [(0, d) for d in u_field.shape[1:]]
         cb[ax] = (ghost, ghost + part.own_count)
-        num, den = interpolate_velocity_batch_gpu(
-            u_field, positions_grid, epsilon, xp=xp, n_cut=n_cut,
-            return_sums=True, clip_bounds=tuple(cb), kernel_spec=kernel_spec)
+        if aniso is not None:
+            # Anisotropic 3-axis partial sums over owned cells (same clip
+            # bounds); the (N,4) sums allreduce identically to gaussian.
+            from src.actuator.interpolation import _sample_aniso
+            num, den = _sample_aniso(
+                u_field, positions_grid, aniso['ec'], aniso['et'], aniso['er'],
+                aniso['eps_c'], aniso['eps_t'], aniso['eps_r'], xp, n_cut,
+                return_sums=True, clip_bounds=tuple(cb))
+            if xp.__name__ != 'numpy':
+                num = xp.asnumpy(num); den = xp.asnumpy(den)
+        else:
+            num, den = interpolate_velocity_batch_gpu(
+                u_field, positions_grid, epsilon, xp=xp, n_cut=n_cut,
+                return_sums=True, clip_bounds=tuple(cb), kernel_spec=kernel_spec)
         num_t, den_t = allred.allreduce(rank, num, den)
         return num_t / np.maximum(den_t, 1e-30)[:, None]
 

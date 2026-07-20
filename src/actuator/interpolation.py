@@ -1015,6 +1015,10 @@ def sample_velocity_alt(
     eps_r_factor: float = 0.5,
     ec: 'npt.NDArray' = None,
     et: 'npt.NDArray' = None,
+    er: 'npt.NDArray' = None,
+    eps_c: 'npt.NDArray' = None,
+    eps_t: 'npt.NDArray' = None,
+    eps_r: 'npt.NDArray' = None,
     ring_n: int = 20,
     ring_r_factor: float = 1.0,
 ) -> 'npt.NDArray':
@@ -1041,8 +1045,8 @@ def sample_velocity_alt(
         u = _sample_ring(u_field, marker_positions, ec, et, marker_epsilon,
                          xp, ring_n, ring_r_factor)
     elif mode == "aniso":
-        u = _sample_aniso(u_field, marker_positions, marker_epsilon, xp,
-                          n_cut, hub, axis, eps_r_factor)
+        u = _sample_aniso(u_field, marker_positions, ec, et, er,
+                          eps_c, eps_t, eps_r, xp, n_cut)
     elif mode == "mask_disk":
         u = _sample_mask_disk(u_field, marker_positions, marker_epsilon, xp,
                               n_cut, hub, axis, radius)
@@ -1056,7 +1060,8 @@ def sample_velocity_alt(
     return u  # (N_markers, 3) numpy [Δx/Δt]
 
 
-def _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut):
+def _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut,
+                 clip_bounds=None):
     """Build the shared (N, S, S, S) stencil tensors (mirrors §6.2).
 
     Returns a dict of arrays on xp's device:
@@ -1064,6 +1069,8 @@ def _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut):
         dx, dy, dz       : float64 offsets g - marker  [lu]
         d_sq             : squared distance  [lu²]
         valid            : bool — node inside the domain
+        owned            : bool — node inside clip_bounds (== valid if None);
+                           distributed ALM ownership mask (partial sums)
         pos              : (N,3) marker positions  [lu]
         eps              : (N,)  per-marker ε  [lu]
     """
@@ -1089,6 +1096,16 @@ def _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut):
         (gy >= 0) & (gy < Ny) &
         (gz >= 0) & (gz < Nz)
     )
+    # Distributed ALM ownership: a node counts for this rank's partial sums
+    # only if it lies in the owned slab clip_bounds=((x0,x1),(y0,y1),(z0,z1))
+    # (half-open [lo, hi)); tested on the UNCLIPPED indices. None → owned=valid.
+    owned = valid
+    if clip_bounds is not None:
+        (x0, x1), (y0, y1), (z0, z1) = clip_bounds
+        owned = (valid
+                 & (gx >= x0) & (gx < x1)
+                 & (gy >= y0) & (gy < y1)
+                 & (gz >= z0) & (gz < z1))
     gx_c = xp.clip(gx, 0, Nx - 1)
     gy_c = xp.clip(gy, 0, Ny - 1)
     gz_c = xp.clip(gz, 0, Nz - 1)
@@ -1100,7 +1117,7 @@ def _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut):
 
     return {'gx_c': gx_c, 'gy_c': gy_c, 'gz_c': gz_c,
             'dx': dx, 'dy': dy, 'dz': dz, 'd_sq': d_sq,
-            'valid': valid, 'pos': pos, 'eps': eps}
+            'valid': valid, 'owned': owned, 'pos': pos, 'eps': eps}
 
 
 def _alt_gather(u_field, st, weights, xp):
@@ -1170,35 +1187,57 @@ def _sample_ring(u_field, marker_positions, ec, et, marker_epsilon, xp,
     return acc / float(n_sensors)                                   # (N,3) [Δx/Δt]
 
 
-def _sample_aniso(u_field, marker_positions, marker_epsilon, xp,
-                  n_cut, hub, axis, eps_r_factor):
-    """B-ii: anisotropic Gaussian — radial width ε_r=factor·ε, ε_⊥=ε."""
-    st = _alt_stencil(u_field, marker_positions, marker_epsilon, xp, n_cut)
-    eps = st['eps']
-    rcut_sq = ((n_cut * eps) ** 2)[:, None, None, None]
-    eps_sq = (eps ** 2)[:, None, None, None]
-    eps_r_sq = ((eps_r_factor * eps) ** 2)[:, None, None, None]
+def _sample_aniso(u_field, marker_positions, ec, et, er,
+                  eps_c, eps_t, eps_r, xp, n_cut,
+                  return_sums=False, clip_bounds=None):
+    """Anisotropic Gaussian velocity sampling — full blade-local 3-axis.
 
-    hub = xp.asarray(hub, dtype=xp.float64)
-    axis = xp.asarray(axis, dtype=xp.float64)
-    axis = axis / xp.sqrt(xp.sum(axis * axis))
+        w(x) = exp(-(d_c/ε_c)² - (d_t/ε_t)² - (d_r/ε_r)²)
 
-    # Per-marker radial unit vector ê_r = normalize((p-hub)_⊥axis)
-    ph = st['pos'] - hub[None, :]                              # (N,3)
-    pa = ph[:, 0] * axis[0] + ph[:, 1] * axis[1] + ph[:, 2] * axis[2]
-    er = ph - pa[:, None] * axis[None, :]                      # (N,3)
-    er = er / xp.maximum(xp.sqrt(xp.sum(er * er, axis=1)), 1e-30)[:, None]
+    with d_c/d_t/d_r the components of (x - x_j) along the marker's chord (ec),
+    thickness (et), and span (er) unit vectors — the SAME frame and per-axis
+    widths as the anisotropic SPREADING (spread_force_single_marker_aniso), so
+    sampling and spreading are consistent. Ellipsoidal cutoff arg ≤ n_cut².
+    Reduces EXACTLY to the isotropic Gaussian sampling when ε_c=ε_t=ε_r and
+    the frame is orthonormal (validated).
 
-    # Radial / perpendicular split of the offset d
-    d_r = (st['dx'] * er[:, 0, None, None, None] +
-           st['dy'] * er[:, 1, None, None, None] +
-           st['dz'] * er[:, 2, None, None, None])              # (N,S,S,S)
-    d_perp_sq = xp.maximum(st['d_sq'] - d_r * d_r, 0.0)
-    arg = d_r * d_r / eps_r_sq + d_perp_sq / eps_sq
+    return_sums=True → (num (N,3), den (N,)) over OWNED nodes (clip_bounds),
+    the distributed-ALM partial sums; allreduced by the caller. Else the
+    normalized per-marker velocity u = num/den.
+    """
+    ec = xp.asarray(ec, dtype=xp.float64)
+    et = xp.asarray(et, dtype=xp.float64)
+    er = xp.asarray(er, dtype=xp.float64)
+    eps_c = xp.asarray(eps_c, dtype=xp.float64)
+    eps_t = xp.asarray(eps_t, dtype=xp.float64)
+    eps_r = xp.asarray(eps_r, dtype=xp.float64)
+    # Stencil box sized by the widest per-marker axis width (ellipsoid bound).
+    eps_eff = xp.maximum(xp.maximum(eps_c, eps_t), eps_r)
+    st = _alt_stencil(u_field, marker_positions, eps_eff, xp, n_cut,
+                      clip_bounds=clip_bounds)
 
-    weights = xp.where(st['valid'] & (st['d_sq'] <= rcut_sq),
-                       xp.exp(-arg), 0.0)
-    return _alt_gather(u_field, st, weights, xp)
+    # Project node offsets onto the blade-local axes (broadcast over stencil).
+    def _proj(e):
+        return (st['dx'] * e[:, 0, None, None, None] +
+                st['dy'] * e[:, 1, None, None, None] +
+                st['dz'] * e[:, 2, None, None, None])
+    d_c = _proj(ec); d_t = _proj(et); d_r = _proj(er)          # (N,S,S,S)
+    ec_sq = (eps_c ** 2)[:, None, None, None]
+    et_sq = (eps_t ** 2)[:, None, None, None]
+    er_sq = (eps_r ** 2)[:, None, None, None]
+    arg = d_c * d_c / ec_sq + d_t * d_t / et_sq + d_r * d_r / er_sq
+
+    weights = xp.where(st['owned'] & (arg <= n_cut * n_cut),
+                       xp.exp(-arg), 0.0)                       # (N,S,S,S)
+    n = weights.shape[0]
+    den = xp.sum(weights, axis=(1, 2, 3))                      # (N,)
+    num = xp.zeros((n, 3), dtype=xp.float64)
+    for d in range(3):
+        u_local = u_field[d, st['gx_c'], st['gy_c'], st['gz_c']]
+        num[:, d] = xp.sum(u_local * weights, axis=(1, 2, 3))
+    if return_sums:
+        return num, den
+    return num / xp.maximum(den, 1e-30)[:, None]               # (N,3)
 
 
 def _sample_mask_disk(u_field, marker_positions, marker_epsilon, xp,

@@ -376,6 +376,8 @@ class ActuatorLineModel:
         # radius ring_r_factor·ε. Only used when _sampling_mode == "ring".
         self._sampling_ring_n: int = 20
         self._sampling_ring_r_factor: float = 1.0
+        # Anisotropic sampling factors {c,t,r} (None unless mode == "aniso").
+        self._sampling_aniso: Optional[dict] = None
 
         # Swept-tip aero mode (patch_notes/alm_tip_sweep_refine, Step 2).
         # False (default) = legacy aero-only: u_aero = u_rel·cosΛ (cos²Λ dynamic
@@ -489,27 +491,41 @@ class ActuatorLineModel:
         positions_grid = (positions - self._grid_offset
                           if self._grid_offset is not None else positions)
         if self._grid_offset is not None:
-            if self._velocity_sampler is None and self._sampling_mode != "gaussian":
+            if self._sampling_mode not in ("gaussian", "aniso"):
                 raise NotImplementedError(
                     f"distributed ALM: sampling mode '{self._sampling_mode}' "
-                    "not supported (gaussian partial sums only)")
+                    "unsupported (gaussian / aniso partial-sum paths only; "
+                    "point/ring/mask_disk have no cross-rank path)")
             if self._eps_corr and self._kleine_wake_mode == "free":
                 raise NotImplementedError(
                     "distributed ALM: kleine free-wake needs wake-point "
                     "velocity sampling across ranks (unsupported; use "
                     "wake='straight')")
 
+        # Anisotropic sampling spec (blade-local frame + per-axis widths); the
+        # azimuth-dependent frame must be rebuilt each step, so it is passed at
+        # CALL time (distributed and single-rank share it).
+        _asamp = self._build_sampling_aniso(epsilon_all) \
+            if self._sampling_mode == "aniso" else None
+
         if self._velocity_sampler is not None:
             u_markers = self._velocity_sampler(
                 u_field, positions_grid, epsilon_all, active_all, self.n_cut,
-                kernel_spec=self._alm_kernel)
+                kernel_spec=self._alm_kernel, aniso=_asamp)
         elif self._sampling_mode == "gaussian":
             u_markers = interpolate_velocity_batch_gpu(
                 u_field, positions_grid, epsilon_all,
                 xp=xp, n_cut=self.n_cut, kernel_spec=self._alm_kernel
             )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
+        elif self._sampling_mode == "aniso":
+            u_markers = sample_velocity_alt(
+                "aniso", u_field, positions_grid, epsilon_all,
+                xp=xp, n_cut=self.n_cut,
+                ec=_asamp['ec'], et=_asamp['et'], er=_asamp['er'],
+                eps_c=_asamp['eps_c'], eps_t=_asamp['eps_t'],
+                eps_r=_asamp['eps_r'])
         else:
-            # A/B alternatives (point/aniso/mask_disk/ring) — patch_notes/*.
+            # A/B alternatives (point/mask_disk/ring) — patch_notes/*.
             # "ring" (Natelson) needs the per-marker section-plane frame (ê_c, ê_t).
             _ec = _et = None
             if self._sampling_mode == "ring":
@@ -709,6 +725,23 @@ class ActuatorLineModel:
             F_pr *= F_root
 
         return F_pr
+
+    def _build_sampling_aniso(self, epsilon_all):
+        """Blade-local frame + per-axis widths for anisotropic sampling.
+
+        ε_{c,t,r} = {c,t,r}·ε_iso; frame ê_c/ê_t/ê_r from
+        get_all_marker_aero_frame() — the SAME construction as the anisotropic
+        spreading, so the two share a consistent ellipsoid. c=t=r=1 → isotropic.
+        Rebuilt each step (the frame rotates with azimuth).
+        """
+        ec, et, er = self.rotor.get_all_marker_aero_frame()
+        f = self._sampling_aniso
+        return {
+            'ec': ec, 'et': et, 'er': er,
+            'eps_c': f['c'] * epsilon_all,
+            'eps_t': f['t'] * epsilon_all,
+            'eps_r': f['r'] * epsilon_all,
+        }
 
     def _lookup_cl_cd(self, alpha_deg, Re, u_rel, Mach, blade, n):
         """Per-marker CL/CD polar lookup (multi-airfoil and/or Mach-pass aware).
@@ -2278,6 +2311,15 @@ def create_actuator_line_from_config(
         model._sampling_eps_r_factor = samp.get('eps_r_factor', 0.5)
         model._sampling_ring_n = int(samp.get('ring_n', 20))          # ② ring
         model._sampling_ring_r_factor = float(samp.get('ring_r_factor', 1.0))
+        # Anisotropic sampling widths ε_{c,t,r} = {c,t,r}·ε_iso (full 3-axis,
+        # same blade-local frame as the aniso SPREADING). c=t=r=1 → isotropic
+        # (== gaussian sampling). Default c=1,t=0.5,r=1 (Churchfield thickness).
+        if model._sampling_mode == "aniso":
+            model._sampling_aniso = {
+                'c': float(samp.get('c', 1.0)),
+                't': float(samp.get('t', 0.5)),
+                'r': float(samp.get('r', 1.0)),
+            }
     elif isinstance(samp, str):
         model._sampling_mode = samp
 
