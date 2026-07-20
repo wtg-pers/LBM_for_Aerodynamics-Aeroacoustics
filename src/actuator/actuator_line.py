@@ -600,7 +600,7 @@ class ActuatorLineModel:
             #   r_ref="spacing" (default): ε_r = max(a_r·δr, 2Δx)  [2Δx = 2 lu floor]
             #   r_ref="chord"   (legacy) : ε_r = a_r·ε_iso  (pre-2026-07 behaviour)
             if self._aniso.get('r_ref', 'spacing') == 'spacing':
-                dr = self.rotor.get_marker_spacing()          # [lu] scalar or (n,)
+                dr = self.rotor.get_all_marker_dr()           # [lu] scalar or (n,)
                 if np.ndim(dr) == 0:
                     dr_all = np.full_like(epsilon_all, float(dr))
                 else:
@@ -729,19 +729,29 @@ class ActuatorLineModel:
     def _build_sampling_aniso(self, epsilon_all):
         """Blade-local frame + per-axis widths for anisotropic sampling.
 
-        ε_{c,t,r} = {c,t,r}·ε_iso; frame ê_c/ê_t/ê_r from
-        get_all_marker_aero_frame() — the SAME construction as the anisotropic
-        spreading, so the two share a consistent ellipsoid. c=t=r=1 → isotropic.
-        Rebuilt each step (the frame rotates with azimuth).
+        ε_c = c·ε_iso, ε_t = t·ε_iso (chord/thickness scaled by ε_iso=0.25c),
+        ε_r = r·δr (r_ref="spacing", default) or r·ε_iso (r_ref="chord").
+        Frame ê_c/ê_t/ê_r from get_all_marker_aero_frame() — same construction
+        as the anisotropic spreading. Rebuilt each step (frame rotates with
+        azimuth). Physical example (c=1,t=0.4,r=0.5,spacing): ε_c=0.25c,
+        ε_t=0.1c, ε_r=0.5·δr. c=t=r=1 & r_ref="chord" → isotropic (== gaussian).
         """
         ec, et, er = self.rotor.get_all_marker_aero_frame()
         f = self._sampling_aniso
-        return {
-            'ec': ec, 'et': et, 'er': er,
-            'eps_c': f['c'] * epsilon_all,
-            'eps_t': f['t'] * epsilon_all,
-            'eps_r': f['r'] * epsilon_all,
-        }
+        eps_c = f['c'] * epsilon_all
+        eps_t = f['t'] * epsilon_all
+        if f.get('r_ref', 'spacing') == 'spacing':
+            dr = self.rotor.get_all_marker_dr()               # [lu] scalar or (n,)
+            if np.ndim(dr) == 0:
+                dr_all = np.full_like(epsilon_all, float(dr))
+            else:
+                dr_all = np.tile(np.asarray(dr, dtype=epsilon_all.dtype),
+                                 self.rotor.n_blades)
+            eps_r = f['r'] * dr_all
+        else:
+            eps_r = f['r'] * epsilon_all
+        return {'ec': ec, 'et': et, 'er': er,
+                'eps_c': eps_c, 'eps_t': eps_t, 'eps_r': eps_r}
 
     def _lookup_cl_cd(self, alpha_deg, Re, u_rel, Mach, blade, n):
         """Per-marker CL/CD polar lookup (multi-airfoil and/or Mach-pass aware).
@@ -2311,14 +2321,16 @@ def create_actuator_line_from_config(
         model._sampling_eps_r_factor = samp.get('eps_r_factor', 0.5)
         model._sampling_ring_n = int(samp.get('ring_n', 20))          # ② ring
         model._sampling_ring_r_factor = float(samp.get('ring_r_factor', 1.0))
-        # Anisotropic sampling widths ε_{c,t,r} = {c,t,r}·ε_iso (full 3-axis,
-        # same blade-local frame as the aniso SPREADING). c=t=r=1 → isotropic
-        # (== gaussian sampling). Default c=1,t=0.5,r=1 (Churchfield thickness).
+        # Anisotropic sampling widths (full 3-axis, blade-local frame):
+        #   ε_c=c·ε_iso, ε_t=t·ε_iso, ε_r = r·δr (r_ref="spacing") | r·ε_iso.
+        # Physical default {c:1,t:0.4,r:0.5,spacing} = ε_c=0.25c, ε_t=0.1c,
+        # ε_r=0.5·δr. c=t=r=1 & r_ref="chord" → isotropic (== gaussian).
         if model._sampling_mode == "aniso":
             model._sampling_aniso = {
                 'c': float(samp.get('c', 1.0)),
-                't': float(samp.get('t', 0.5)),
-                'r': float(samp.get('r', 1.0)),
+                't': float(samp.get('t', 0.4)),
+                'r': float(samp.get('r', 0.5)),
+                'r_ref': samp.get('r_ref', 'spacing'),
             }
     elif isinstance(samp, str):
         model._sampling_mode = samp

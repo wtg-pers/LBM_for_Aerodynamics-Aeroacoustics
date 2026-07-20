@@ -44,3 +44,19 @@ pure ALM 2×2 factorial (sampling {iso,aniso} × spreading {iso,aniso}):
 - 단계1(iso,iso)·3(iso samp+aniso spread) = MPI 다중-GPU.
 - 단계2·4(aniso samp) = **이제 MPI 지원** → 다중-GPU 가능(이전엔 단일-rank).
 config·factorial 확정 후 진행 (Prandtl은 승자에 나중에).
+
+## 물리적 폭 + spacing ε_r (2026-07-21 후속, 사용자 지적)
+
+기본 c=1,t=0.5,r=1은 chord·radial이 ε_iso로 등방이라 사실상 thickness만
+좁힌 near-등방(과거 aniso "약함"의 원인). 사용자 물리 spec 채택:
+- **ε_c=0.25c (c=1.0), ε_t=0.1c (t=0.4), ε_r=0.5·δr (r=0.5, r_ref="spacing")**.
+- ε_r을 δr 기반으로 쓰려 `_build_sampling_aniso`에 r_ref 추가(스프레딩 미러).
+- ★버그 수정: 스프레딩 aniso가 `get_marker_spacing()`(미정의) 호출 →
+  `get_all_marker_dr()`로 수정(aniso 스프레딩 spacing 경로는 실행 전무였음).
+- 검증: D40 팁서 ε_c=22.0mm(0.25c)·ε_t=8.8mm(0.1c)·ε_r=9.87mm(0.5δr) 정확.
+  bench5 single=2-rank MPI CT 0.01892036 정확일치.
+- ★caveat: ε_t=0.1c=1.67Δx (<2Δx) sub-grid → 두께방향 샘플링 격자제약
+  (Churchfield도 물리 ε_t는 sub-grid라 지적). 효과는 factorial이 판정.
+- ★factorial 주의: 스프레딩 aniso의 ε_r은 0.5δr 쓰면 안 됨(δr<δr →
+  라인 불연속/blob). 스프레딩은 ε_r≥δr 필요(continuity). 샘플링(국소)과
+  스프레딩(연속)의 ε_r은 달라야 함 — 사용자 확정 필요.
