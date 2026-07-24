@@ -89,13 +89,24 @@ def make_distributed_sampler(allred: ThreadAllreduce, rank: int, part,
     ghost = part.ghost
 
     def sampler(u_field, positions_grid, epsilon, active, n_cut,
-                kernel_spec=None, aniso=None):
+                kernel_spec=None, aniso=None, ring=None):
         # OWNED ownership via clip bounds on the FULL local array (backlog
         # #3: the RawKernel path takes bounds directly — no view, no
         # position shift; cell set identical to the old owned-view clip)
         cb = [(0, d) for d in u_field.shape[1:]]
         cb[ax] = (ghost, ghost + part.own_count)
-        if aniso is not None:
+        if ring is not None:
+            # LineAverage: per-sensor POSITION ownership inside the owned
+            # half-open bounds -> (sum, count) partial sums; counts allreduce
+            # to exactly n_points (ranks tile the split axis).
+            from src.actuator.interpolation import _sample_ring
+            num, den = _sample_ring(
+                u_field, positions_grid, ring['ec'], ring['et'], epsilon,
+                xp, n_sensors=ring['n'], radii=ring['radii'],
+                return_sums=True, clip_bounds=tuple(cb))
+            if xp.__name__ != 'numpy':
+                num = xp.asnumpy(num); den = xp.asnumpy(den)
+        elif aniso is not None:
             # Anisotropic 3-axis partial sums over owned cells (same clip
             # bounds); the (N,4) sums allreduce identically to gaussian.
             from src.actuator.interpolation import _sample_aniso

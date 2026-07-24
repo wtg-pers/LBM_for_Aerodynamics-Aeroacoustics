@@ -109,7 +109,10 @@ void esoteric_bgk_d3q27(
     float*        __restrict__ force_out,    // (3,) force accumulator (atomicAdd), or NULL
     const float omega,
     const int Nx, const int Ny, const int Nz,
-    const int t_step                       // time step (parity: t_step & 1)
+    const int t_step,                      // time step (parity: t_step & 1)
+    const float*  __restrict__ force,      // (3, N) body force (ALM), or NULL
+    const float*  __restrict__ nu_t_in,    // (N,) SGS eddy viscosity, or NULL
+    float*        __restrict__ nu_t_out    // (N,) nu_t diagnostics, or NULL
 ) {
     // 64-bit indexing: q*N+idx overflows int32 above ~79.5M nodes/level
     // (see project int32 kernel ceiling; cumulant esoteric already 64-bit).
@@ -194,6 +197,23 @@ void esoteric_bgk_d3q27(
     float uy = mom_y * inv_rho;
     float uz = mom_z * inv_rho;
 
+    // Body force (ALM): half-force velocity shift (same scheme as the
+    // esoteric cumulant kernel; Guo source term added after collision).
+    float Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
+    if (force != NULL) {
+        Fx = force[0 * N + idx]; Fy = force[1 * N + idx]; Fz = force[2 * N + idx];
+        float h = 0.5f * inv_rho;
+        ux += Fx * h; uy += Fy * h; uz += Fz * h;
+    }
+
+    // SGS: local relaxation rate from eddy viscosity (dyn_smag pre-pass)
+    float om = omega;
+    if (nu_t_in != NULL) {
+        float nu0 = (1.0f / omega - 0.5f) / 3.0f;
+        om = 1.0f / (3.0f * (nu0 + nu_t_in[idx]) + 0.5f);
+        if (nu_t_out != NULL) nu_t_out[idx] = nu_t_in[idx];
+    }
+
     // ========================================================
     // BC + COLLISION
     // ========================================================
@@ -208,12 +228,23 @@ void esoteric_bgk_d3q27(
         }
     }
     else if (type == 0) {
-        // FLUID: BGK collision
+        // FLUID: BGK collision (om = local rate incl. SGS nu_t)
         float usqr = ux*ux + uy*uy + uz*uz;
         for (int q = 0; q < 27; q++) {
             float cu = (float)cx[q]*ux + (float)cy[q]*uy + (float)cz[q]*uz;
             float f_eq = w[q] * rho * (1.0f + 3.0f*cu + 4.5f*cu*cu - 1.5f*usqr);
-            fhn[q] = fhn[q] - omega * (fhn[q] - f_eq);
+            fhn[q] = fhn[q] - om * (fhn[q] - f_eq);
+        }
+        // Guo source term (matches the cumulant kernel's Step 9)
+        if (force != NULL) {
+            float pf = 1.0f - 0.5f * om;
+            for (int q = 0; q < 27; q++) {
+                float cxq = (float)cx[q], cyq = (float)cy[q], czq = (float)cz[q];
+                float ci_F = cxq*Fx + cyq*Fy + czq*Fz;
+                float ci_u = cxq*ux + cyq*uy + czq*uz;
+                float u_F  = ux*Fx + uy*Fy + uz*Fz;
+                fhn[q] += pf * w[q] * ((ci_F - u_F)*3.0f + ci_u*ci_F*9.0f);
+            }
         }
     }
     else if (type == 4) {
@@ -228,7 +259,7 @@ void esoteric_bgk_d3q27(
         for (int q = 0; q < 27; q++) {
             float cu = (float)cx[q]*ux + (float)cy[q]*uy + (float)cz[q]*uz;
             float f_eq = w[q] * rho * (1.0f + 3.0f*cu + 4.5f*cu*cu - 1.5f*usqr);
-            fhn[q] = fhn[q] - omega * (fhn[q] - f_eq);
+            fhn[q] = fhn[q] - om * (fhn[q] - f_eq);
         }
 
         // Blending toward target
@@ -333,6 +364,9 @@ class EsotericBGKKernelD3Q27:
         t_step: int,
         needs_bounce: Optional['npt.NDArray'] = None,
         force_out: Optional['npt.NDArray'] = None,
+        force: Optional['npt.NDArray'] = None,
+        nu_t_in: Optional['npt.NDArray'] = None,
+        nu_t_out: Optional['npt.NDArray'] = None,
     ) -> None:
         if self._kernel is None:
             self._compile()
@@ -343,6 +377,9 @@ class EsotericBGKKernelD3Q27:
 
         nb_arg = needs_bounce if needs_bounce is not None else cp.int32(0)
         fo_arg = force_out if force_out is not None else cp.int32(0)
+        f_arg = force if force is not None else cp.int32(0)
+        nti_arg = nu_t_in if nu_t_in is not None else cp.int32(0)
+        nto_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
 
         self._kernel(
             (grid,), (self._block_size,),
@@ -351,7 +388,8 @@ class EsotericBGKKernelD3Q27:
              nb_arg, fo_arg,
              cp.float32(omega),
              cp.int32(Nx), cp.int32(Ny), cp.int32(Nz),
-             cp.int32(t_step)),
+             cp.int32(t_step),
+             f_arg, nti_arg, nto_arg),
         )
 
 

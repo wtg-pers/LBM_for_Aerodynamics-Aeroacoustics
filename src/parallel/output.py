@@ -45,11 +45,12 @@ def _gather_level(comm, rank: int, nr: int, runner, arr_local,
 
 
 class _LevelView:
-    """Duck-typed level for MLGVTKWriter (needs .rho/.u/.obstacle_bc)."""
+    """Duck-typed level for MLGVTKWriter (needs .rho/.u/.nu_t/.obstacle_bc)."""
 
-    def __init__(self, rho, u):
+    def __init__(self, rho, u, nu_t=None):
         self.rho = rho
         self.u = u
+        self.nu_t = nu_t
         self.obstacle_bc = None
 
 
@@ -94,8 +95,17 @@ class Rank0OutputBridge:
                                     L.rho[None], k, tag0=300 + 4 * k)
                 u = _gather_level(comm, rank, nr, runner,
                                   L.u, k, tag0=302 + 4 * k)
+                # SGS eddy viscosity (dyn_smag levels allocate .nut, flat N —
+                # config-uniform across ranks, so the gather stays collective)
+                nut = None
+                if getattr(L, "nut", None) is not None:
+                    nut = _gather_level(
+                        comm, rank, nr, runner,
+                        L.nut.reshape((1,) + tuple(L.dims)), k,
+                        tag0=600 + 2 * k)
                 if rank == 0:
-                    views.append(_LevelView(rho[0], u))
+                    views.append(_LevelView(
+                        rho[0], u, nu_t=(None if nut is None else nut[0])))
             if rank == 0 and self._vtk is not None:
                 self._vtk.write(step, _MLGView(views), time=float(step))
         self._write_markers(step, runner)

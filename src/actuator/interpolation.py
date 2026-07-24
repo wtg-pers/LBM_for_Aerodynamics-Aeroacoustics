@@ -1021,6 +1021,7 @@ def sample_velocity_alt(
     eps_r: 'npt.NDArray' = None,
     ring_n: int = 20,
     ring_r_factor: float = 1.0,
+    ring_radii: 'npt.NDArray' = None,
 ) -> 'npt.NDArray':
     """Dispatch to an alternative velocity sampler (B-i / B-ii / B-iii / ring).
 
@@ -1043,7 +1044,7 @@ def sample_velocity_alt(
         u = _sample_trilinear(u_field, marker_positions, xp)
     elif mode == "ring":
         u = _sample_ring(u_field, marker_positions, ec, et, marker_epsilon,
-                         xp, ring_n, ring_r_factor)
+                         xp, ring_n, ring_r_factor, radii=ring_radii)
     elif mode == "aniso":
         u = _sample_aniso(u_field, marker_positions, ec, et, er,
                           eps_c, eps_t, eps_r, xp, n_cut)
@@ -1154,37 +1155,71 @@ def _sample_trilinear(u_field, marker_positions, xp):
 
 
 def _sample_ring(u_field, marker_positions, ec, et, marker_epsilon, xp,
-                 n_sensors=20, r_factor=1.0):
-    """Ring inflow sampling (Natelson 2026 / ROAM): average the trilinear velocity
-    over ``n_sensors`` points on a circle in the airfoil SECTION plane (spanned by
-    the chord ec and thickness et unit vectors) at radius ``r_factor·ε`` around
-    each marker. This averages out the marker's own smeared body-force deficit at
-    the centre, giving a cleaner estimate of the inflow the blade section sees.
+                 n_sensors=20, r_factor=1.0, radii=None,
+                 return_sums=False, clip_bounds=None):
+    """Ring / LineAverage inflow sampling (Natelson 2026; Melani 2024).
+
+    Averages the trilinear velocity over ``n_sensors`` points on a circle in
+    the airfoil SECTION plane (spanned by the chord ec and thickness et unit
+    vectors) around each marker (= the LineAverage of Melani et al. 2024 when
+    the radius is 0.25c, N_s=80). Averaging cancels the marker's own bound-
+    vortex / smeared-body-force field at the centre by symmetry.
 
     Args:
         u_field: (3, Nx, Ny, Nz)  [Δx/Δt]
         marker_positions: (N, 3)  [lu]
         ec, et: (N, 3) chord / thickness unit vectors (section plane basis)
         marker_epsilon: (N,)  [lu]
-        n_sensors: number of ring points (Natelson: 20)
-        r_factor: ring radius = r_factor · ε
+        n_sensors: number of ring points (Natelson: 20; Melani LineAverage: 80)
+        r_factor: ring radius = r_factor · ε (used when radii is None)
+        radii: optional (N,) per-marker radius override [lu] (LineAverage
+               profiles: constant/elliptic/Schrenk, computed by the caller)
+        return_sums: True -> distributed partial sums (sum (N,3), count (N,))
+               over sensors whose POSITION lies inside clip_bounds (per-axis
+               half-open [lo, hi) node-index bounds of the owned region);
+               sensors outside are neither sampled nor counted, so ranks
+               tile exactly and the allreduced count sums to n_sensors.
 
     Returns:
-        u_markers: (N, 3)  [Δx/Δt]  (xp array; caller moves to host)
+        u_markers (N,3), or (sum (N,3), count (N,)) when return_sums.
     """
     n = marker_positions.shape[0]
+    S = int(n_sensors)
     mp = np.asarray(marker_positions, dtype=np.float64)              # (N,3)
     ec = np.asarray(ec, dtype=np.float64)
     et = np.asarray(et, dtype=np.float64)
-    R = (r_factor * np.asarray(marker_epsilon, dtype=np.float64))[:, None]  # (N,1)
+    if radii is not None:
+        R = np.asarray(radii, dtype=np.float64)[:, None]             # (N,1)
+    else:
+        R = (r_factor * np.asarray(marker_epsilon, dtype=np.float64))[:, None]
+    # All sensors in ONE interpolation call (a python loop over sensors costs
+    # seconds/step at S=80 x 16 substeps). Sensor offsets lie in the section
+    # plane -> zero component along span. Layout (S, N, 3): flat k = s*N + j.
+    phi = 2.0 * np.pi * np.arange(S) / S
+    offs = (np.cos(phi)[:, None, None] * ec[None, :, :]
+            + np.sin(phi)[:, None, None] * et[None, :, :])          # (S,N,3)
+    pos = (mp[None, :, :] + R[None, :, :] * offs).reshape(-1, 3)    # (S*N,3)
+    if clip_bounds is None:
+        u = _sample_trilinear(u_field, pos, xp)                     # (S*N,3)
+        u_mean = u.reshape(S, n, 3).mean(axis=0)
+        if return_sums:
+            return u_mean * float(S), xp.full((n,), float(S))
+        return u_mean                                               # (N,3)
+    own = np.ones(S * n, dtype=bool)
+    for d, (lo, hi) in enumerate(clip_bounds):
+        own &= (pos[:, d] >= lo) & (pos[:, d] < hi)
     acc = xp.zeros((n, 3), dtype=xp.float64)
-    for i in range(n_sensors):
-        phi = 2.0 * np.pi * i / n_sensors
-        # sensor offset lies in the section plane -> zero component along span
-        offset = np.cos(phi) * ec + np.sin(phi) * et                # (N,3) unit
-        sensor_pos = mp + R * offset                                # (N,3) [lu]
-        acc = acc + _sample_trilinear(u_field, sensor_pos, xp)
-    return acc / float(n_sensors)                                   # (N,3) [Δx/Δt]
+    cnt = xp.zeros(n, dtype=xp.float64)
+    if own.any():
+        idx = np.where(own)[0]
+        u_sub = _sample_trilinear(u_field, pos[idx], xp)            # (M,3)
+        mk = xp.asarray(idx % n)                                    # marker id
+        for d in range(3):
+            acc[:, d] = xp.bincount(mk, weights=u_sub[:, d], minlength=n)
+        cnt = xp.bincount(mk, minlength=n).astype(xp.float64)
+    if return_sums:
+        return acc, cnt
+    return acc / xp.maximum(cnt, 1e-30)[:, None]                    # (N,3)
 
 
 def _sample_aniso(u_field, marker_positions, ec, et, er,

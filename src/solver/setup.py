@@ -802,7 +802,8 @@ class SimulationSetup:
         self._blade_csv_header = (
             'step,revolutions,blade,r_R,r_lu,chord_lu,eps_lu,twist,'
             'u_n,u_theta,u_rel,phi,alpha,Re,CL,CD,'
-            'F_n,F_theta,F_L,F_D\n'
+            'F_n,F_theta,F_L,F_D,'
+            'eps_c,eps_t,eps_r,eps_samp_c,eps_samp_t,eps_samp_r\n'
         )
         if self.al_enabled:
             self.perf_csv_path = os.path.join(
@@ -863,12 +864,22 @@ class SimulationSetup:
                 from src.collision.cumulant import CumulantCollision
                 omega_bulk = self.sim_params.get('omega_bulk', 1.0)
                 omega_high = self.sim_params.get('omega_high', 1.0)
+                omega_3 = self.sim_params.get('omega_3', None)
+                omega_4 = self.sim_params.get('omega_4', None)
+                omega_5 = self.sim_params.get('omega_5', None)
+                limiter = self.sim_params.get('cumulant_limiter', 0.0)
                 self.collision = CumulantCollision(
                     self.xp, self.lattice,
                     omega_bulk=omega_bulk,
                     omega_high=omega_high,
+                    omega_3=omega_3, omega_4=omega_4, omega_5=omega_5,
+                    limiter=limiter,
                 )
-                print(f"  Collision: Cumulant D3Q27 (ω_bulk={omega_bulk}, ω_high={omega_high})")
+                print(f"  Collision: Cumulant D3Q27 (ω_bulk={omega_bulk}, "
+                      f"ω_high={omega_high}, "
+                      f"ω_345=({self.collision.omega_3}, "
+                      f"{self.collision.omega_4}, {self.collision.omega_5}), "
+                      f"limiter λ={limiter})")
         elif model_name == 'bgk':
             self.collision = BGKCollision(self.xp, self.lattice)
             print(f"  Collision: BGK")

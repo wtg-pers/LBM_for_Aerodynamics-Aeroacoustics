@@ -51,7 +51,11 @@ void esoteric_cumulant_d3q27(
     const float*  __restrict__ force,      // (3, N) body force or NULL
     const float omega_1,                   // shear: 1/tau
     const float omega_bulk,                // bulk viscosity rate
-    const float omega_high,                // higher-order rate (omega_3-10)
+    const float omega_high,                // rate for omega_6-10
+    const float omega_3,                   // third-order sum rate
+    const float omega_4,                   // third-order difference rate
+    const float omega_5,                   // C111 rate
+    const float lambda_lim,                // Geier limiter threshold (<=0 off)
     const int Nx, const int Ny, const int Nz,
     const int t_step{{SGS_PARAM}}
 ) {
@@ -201,8 +205,10 @@ void esoteric_cumulant_d3q27(
         ) * inv_rho2;
 
         // Step 6: Relax cumulants (Galilean-corrected)
+        // w3/w4/w5 (third order) independent of omega_high (Geier 2017 I);
+        // lambda_lim > 0 enables the eq.(116) limiter per cumulant group.
         float w1 = omega_1, w2 = omega_bulk;
-        float w3 = omega_high, w4 = omega_high, w5 = omega_high;
+        float w3 = omega_3, w4 = omega_4, w5 = omega_5;
         float w6 = omega_high, w7 = omega_high, w8 = omega_high;
         float w9 = omega_high, w10 = omega_high;
 {{SGS_BLOCK}}
@@ -226,19 +232,42 @@ void esoteric_cumulant_d3q27(
         K[2][0][0] = (trace + diff_xy + diff_xz) / 3.0f;
         K[0][2][0] = K[2][0][0] - diff_xy;
         K[0][0][2] = K[2][0][0] - diff_xz;
-        float s120 = (1.0f-w3)*(K[1][2][0] + K[1][0][2]);
-        float s210 = (1.0f-w3)*(K[2][1][0] + K[0][1][2]);
-        float s201 = (1.0f-w3)*(K[2][0][1] + K[0][2][1]);
-        float d120 = (1.0f-w4)*(K[1][2][0] - K[1][0][2]);
-        float d210 = (1.0f-w4)*(K[2][1][0] - K[0][1][2]);
-        float d201 = (1.0f-w4)*(K[2][0][1] - K[0][2][1]);
+        // Third-order relaxation; Geier limiter (2017 I eq.116):
+        //   w_lim = w + (1-w)|C| / (rho*lambda + |C|)   [lambda<=0: off]
+        float w3a = w3, w3b = w3, w3c = w3;
+        float w4a = w4, w4b = w4, w4c = w4;
+        float w5a = w5;
+        if (lambda_lim > 0.0f) {
+            float rl = rho * lambda_lim;
+            float su, di;
+            su = fabsf(K[1][2][0] + K[1][0][2]);
+            w3a = w3 + (1.0f - w3) * su / (rl + su);
+            su = fabsf(K[2][1][0] + K[0][1][2]);
+            w3b = w3 + (1.0f - w3) * su / (rl + su);
+            su = fabsf(K[2][0][1] + K[0][2][1]);
+            w3c = w3 + (1.0f - w3) * su / (rl + su);
+            di = fabsf(K[1][2][0] - K[1][0][2]);
+            w4a = w4 + (1.0f - w4) * di / (rl + di);
+            di = fabsf(K[2][1][0] - K[0][1][2]);
+            w4b = w4 + (1.0f - w4) * di / (rl + di);
+            di = fabsf(K[2][0][1] - K[0][2][1]);
+            w4c = w4 + (1.0f - w4) * di / (rl + di);
+            di = fabsf(K[1][1][1]);
+            w5a = w5 + (1.0f - w5) * di / (rl + di);
+        }
+        float s120 = (1.0f-w3a)*(K[1][2][0] + K[1][0][2]);
+        float s210 = (1.0f-w3b)*(K[2][1][0] + K[0][1][2]);
+        float s201 = (1.0f-w3c)*(K[2][0][1] + K[0][2][1]);
+        float d120 = (1.0f-w4a)*(K[1][2][0] - K[1][0][2]);
+        float d210 = (1.0f-w4b)*(K[2][1][0] - K[0][1][2]);
+        float d201 = (1.0f-w4c)*(K[2][0][1] - K[0][2][1]);
         K[1][2][0] = 0.5f*(s120 + d120);
         K[1][0][2] = 0.5f*(s120 - d120);
         K[2][1][0] = 0.5f*(s210 + d210);
         K[0][1][2] = 0.5f*(s210 - d210);
         K[2][0][1] = 0.5f*(s201 + d201);
         K[0][2][1] = 0.5f*(s201 - d201);
-        K[1][1][1] *= (1.0f - w5);
+        K[1][1][1] *= (1.0f - w5a);
         float tC220 = K[2][2][0], tC202 = K[2][0][2], tC022 = K[0][2][2];
         float cb1 = (1.0f-w6)*(tC220 - 2.0f*tC202 + tC022);
         float cb2 = (1.0f-w6)*(tC220 + tC202 - 2.0f*tC022);
@@ -435,6 +464,10 @@ class EsotericCumulantKernelD3Q27:
         Cs: float = 0.0,
         nu_t_out: Optional['npt.NDArray'] = None,
         nu_t_in: Optional['npt.NDArray'] = None,
+        omega_3: Optional[float] = None,
+        omega_4: Optional[float] = None,
+        omega_5: Optional[float] = None,
+        lambda_lim: float = 0.0,
     ) -> None:
         if self._kernel is None:
             self._compile()
@@ -442,10 +475,15 @@ class EsotericCumulantKernelD3Q27:
         N = Nx * Ny * Nz
         grid = (N + self._block_size - 1) // self._block_size
         force_arg = force if force is not None else cp.int32(0)
+        o3 = omega_high if omega_3 is None else omega_3
+        o4 = omega_high if omega_4 is None else omega_4
+        o5 = omega_high if omega_5 is None else omega_5
         base_args = (
             f, rho_out, u_out, node_type,
             bc_rho, bc_ux, bc_uy, bc_uz, force_arg,
             cp.float32(omega_1), cp.float32(omega_bulk), cp.float32(omega_high),
+            cp.float32(o3), cp.float32(o4), cp.float32(o5),
+            cp.float32(lambda_lim),
             cp.int32(Nx), cp.int32(Ny), cp.int32(Nz), cp.int32(t_step),
         )
         if self._sgs_model == "smagorinsky":

@@ -357,6 +357,9 @@ class ActuatorLineModel:
         # tip-inflow contribution of the ±3ε sampling kernel:
         #   "point" (B-i), "aniso" (B-ii), "mask_disk" (B-iii).
         self._sampling_mode: str = "gaussian"
+        self._lineavg_cfg: Optional[dict] = None       # LineAverage knobs
+        self._lineavg_radii_cache: Optional[np.ndarray] = None
+        self._lineavg_u_filt: Optional[np.ndarray] = None  # EMA state
         # ── Multi-GPU hooks (patch_notes/hpc_upgrade/17, M3) ──
         # _grid_offset: LOCAL-array origin in GLOBAL lu (own_start - ghost per
         #   axis). Grid-relative ops (velocity sampling, force spreading) use
@@ -491,11 +494,11 @@ class ActuatorLineModel:
         positions_grid = (positions - self._grid_offset
                           if self._grid_offset is not None else positions)
         if self._grid_offset is not None:
-            if self._sampling_mode not in ("gaussian", "aniso"):
+            if self._sampling_mode not in ("gaussian", "aniso", "lineavg"):
                 raise NotImplementedError(
                     f"distributed ALM: sampling mode '{self._sampling_mode}' "
-                    "unsupported (gaussian / aniso partial-sum paths only; "
-                    "point/ring/mask_disk have no cross-rank path)")
+                    "unsupported (gaussian / aniso / lineavg partial-sum "
+                    "paths only; point/ring/mask_disk have no cross-rank path)")
             if self._eps_corr and self._kleine_wake_mode == "free":
                 raise NotImplementedError(
                     "distributed ALM: kleine free-wake needs wake-point "
@@ -507,11 +510,33 @@ class ActuatorLineModel:
         # CALL time (distributed and single-rank share it).
         _asamp = self._build_sampling_aniso(epsilon_all) \
             if self._sampling_mode == "aniso" else None
+        self._last_eps_samp = _asamp        # marker VTP/CSV diagnostics
+
+        # LineAverage spec (section-plane frame rotates with azimuth ->
+        # rebuilt each call; radius profile is static -> cached).
+        _ring = None
+        if self._sampling_mode == "lineavg":
+            if self._lineavg_radii_cache is None:
+                self._lineavg_radii_cache = self._build_lineavg_radii()
+            _lec, _let, _ = self.rotor.get_all_marker_aero_frame()
+            _ring = {'ec': _lec, 'et': _let,
+                     'radii': self._lineavg_radii_cache,
+                     'n': self._lineavg_cfg['n_points']}
+            _z = np.zeros_like(self._lineavg_radii_cache)
+            self._last_eps_samp = {'eps_c': self._lineavg_radii_cache,
+                                   'eps_t': self._lineavg_radii_cache,
+                                   'eps_r': _z}   # rs recorded as eps_samp_c/t
 
         if self._velocity_sampler is not None:
             u_markers = self._velocity_sampler(
                 u_field, positions_grid, epsilon_all, active_all, self.n_cut,
-                kernel_spec=self._alm_kernel, aniso=_asamp)
+                kernel_spec=self._alm_kernel, aniso=_asamp, ring=_ring)
+        elif self._sampling_mode == "lineavg":
+            u_markers = sample_velocity_alt(
+                "ring", u_field, positions_grid, epsilon_all,
+                xp=xp, n_cut=self.n_cut,
+                ec=_ring['ec'], et=_ring['et'],
+                ring_n=_ring['n'], ring_radii=_ring['radii'])
         elif self._sampling_mode == "gaussian":
             u_markers = interpolate_velocity_batch_gpu(
                 u_field, positions_grid, epsilon_all,
@@ -541,6 +566,22 @@ class ActuatorLineModel:
                 ring_n=self._sampling_ring_n,
                 ring_r_factor=self._sampling_ring_r_factor,
             )  # (N_total, 3) [Δx/Δt] — always numpy (CPU)
+
+        # LineAverage time filter: per-marker EMA over rotation angle
+        # (tau = time_filter_deg of azimuth). Guards the coupled loop against
+        # reading discrete passing-vortex noise raw (Melani ran steady RANS;
+        # our LES is unsteady). alpha = dpsi/tau, clipped to 1.
+        if self._sampling_mode == "lineavg":
+            tf = self._lineavg_cfg['time_filter_deg']
+            if tf > 0.0:
+                dpsi = abs(self.rotor.omega) * dt * 180.0 / np.pi
+                a_f = min(1.0, dpsi / tf)
+                if self._lineavg_u_filt is None:
+                    self._lineavg_u_filt = np.array(u_markers, dtype=np.float64)
+                else:
+                    self._lineavg_u_filt += a_f * (u_markers
+                                                   - self._lineavg_u_filt)
+                u_markers = self._lineavg_u_filt.copy()
 
         # --- Phase 2 free-wake: convect + shed (before BEM uses it) ---
         if (self._eps_corr and self._eps_corr_method == "kleine"
@@ -599,6 +640,9 @@ class ActuatorLineModel:
             # regardless of chord, so the tip does not break into disjoint blobs.
             #   r_ref="spacing" (default): ε_r = max(a_r·δr, 2Δx)  [2Δx = 2 lu floor]
             #   r_ref="chord"   (legacy) : ε_r = a_r·ε_iso  (pre-2026-07 behaviour)
+            # Every axis is floored at 2Δx: a Gaussian narrower than 2Δx leaves
+            # exp(-π²ε²/4Δx²) ≥ 8% of its spectrum beyond grid Nyquist (aliasing
+            # ripple). Discretization guard, unconditional (EPS_FLOORS patch).
             if self._aniso.get('r_ref', 'spacing') == 'spacing':
                 dr = self.rotor.get_all_marker_dr()           # [lu] scalar or (n,)
                 if np.ndim(dr) == 0:
@@ -608,12 +652,14 @@ class ActuatorLineModel:
                                      self.rotor.n_blades)
                 eps_r = np.maximum(fr * dr_all, 2.0)          # a_r·δr, 2Δx floor
             else:
-                eps_r = fr * epsilon_all
+                eps_r = np.maximum(fr * epsilon_all, 2.0)
             _aniso = {
                 'ec': ec, 'et': et, 'er': er,
-                'eps_c': fc * epsilon_all, 'eps_t': ft * epsilon_all,
+                'eps_c': np.maximum(fc * epsilon_all, 2.0),
+                'eps_t': np.maximum(ft * epsilon_all, 2.0),
                 'eps_r': eps_r,
             }
+        self._last_eps_spread = _aniso      # marker VTP/CSV diagnostics
 
         spread_forces_to_grid_gpu(
             self.domain_shape,
@@ -726,6 +772,33 @@ class ActuatorLineModel:
 
         return F_pr
 
+    def _build_lineavg_radii(self) -> np.ndarray:
+        """Per-marker LineAverage circle radius [lu] (static; cached).
+
+        rs = rs_chord_factor * chord, shaped by the profile (Melani 2024):
+            constant: rs0                     (their benchmark winner)
+            elliptic: max(rs0*sqrt(1-xi^2), 0.1c),  xi = span fraction
+            schrenk : mean(constant, elliptic)
+        floored at max(0.1c, 2dx) — the 2dx grid floor follows the
+        EPS_FLOORS convention (a sub-2dx circle samples too few cells).
+        """
+        cfg = self._lineavg_cfg
+        rotor = self.rotor
+        c = np.asarray(rotor.get_all_marker_chords(), dtype=np.float64)
+        r = np.asarray(rotor.get_all_marker_radii(), dtype=np.float64)
+        blade0 = rotor.blades[0]
+        r_root = float(blade0.marker_r[0])
+        span = max(float(rotor.radius) - r_root, 1e-12)
+        xi = np.clip((r - r_root) / span, 0.0, 1.0)
+        rs0 = cfg['rs_chord_factor'] * c
+        if cfg['profile'] == 'constant':
+            rs = rs0
+        else:
+            ell = np.maximum(rs0 * np.sqrt(np.maximum(1.0 - xi ** 2, 0.0)),
+                             0.1 * c)
+            rs = ell if cfg['profile'] == 'elliptic' else 0.5 * (rs0 + ell)
+        return np.maximum(rs, 2.0)                    # 2dx floor [fine-lu]
+
     def _build_sampling_aniso(self, epsilon_all):
         """Blade-local frame + per-axis widths for anisotropic sampling.
 
@@ -733,13 +806,20 @@ class ActuatorLineModel:
         ε_r = r·δr (r_ref="spacing", default) or r·ε_iso (r_ref="chord").
         Frame ê_c/ê_t/ê_r from get_all_marker_aero_frame() — same construction
         as the anisotropic spreading. Rebuilt each step (frame rotates with
-        azimuth). Physical example (c=1,t=0.4,r=0.5,spacing): ε_c=0.25c,
-        ε_t=0.1c, ε_r=0.5·δr. c=t=r=1 & r_ref="chord" → isotropic (== gaussian).
+        azimuth). Physical example (c=1,t=0.4,r=1.0,spacing): ε_c=0.25c,
+        ε_t=max(0.1c,2Δx), ε_r=max(δr,2Δx). c=t=r=1 & r_ref="chord" →
+        isotropic (== gaussian).
+
+        Every axis is floored at 2Δx (same discretization guard as the
+        spreading path; sub-2Δx kernels alias beyond grid Nyquist and, on the
+        sampling side, average too few cells to act as a spatial filter —
+        the s2 ripple mechanism, EPS_FLOORS patch). NOTE: this changed legacy
+        behaviour of pre-floor aniso-sampling configs (fact_s2/s4).
         """
         ec, et, er = self.rotor.get_all_marker_aero_frame()
         f = self._sampling_aniso
-        eps_c = f['c'] * epsilon_all
-        eps_t = f['t'] * epsilon_all
+        eps_c = np.maximum(f['c'] * epsilon_all, 2.0)
+        eps_t = np.maximum(f['t'] * epsilon_all, 2.0)
         if f.get('r_ref', 'spacing') == 'spacing':
             dr = self.rotor.get_all_marker_dr()               # [lu] scalar or (n,)
             if np.ndim(dr) == 0:
@@ -747,9 +827,9 @@ class ActuatorLineModel:
             else:
                 dr_all = np.tile(np.asarray(dr, dtype=epsilon_all.dtype),
                                  self.rotor.n_blades)
-            eps_r = f['r'] * dr_all
+            eps_r = np.maximum(f['r'] * dr_all, 2.0)
         else:
-            eps_r = f['r'] * epsilon_all
+            eps_r = np.maximum(f['r'] * epsilon_all, 2.0)
         return {'ec': ec, 'et': et, 'er': er,
                 'eps_c': eps_c, 'eps_t': eps_t, 'eps_r': eps_r}
 
@@ -1854,12 +1934,28 @@ class ActuatorLineModel:
         r = blade.marker_r                      # [lu]
         r_norm = r / rotor.radius               # [dimensionless]
 
+        # Per-axis effective widths (aniso spreading/sampling stashes; the
+        # isotropic paths use eps_iso on every axis so the schema is uniform).
+        eps_iso = blade.marker_epsilon
+
+        def _trio(stash):
+            if stash is None:
+                return eps_iso, eps_iso, eps_iso
+            return (np.asarray(stash['eps_c'][idx_s:idx_e]),
+                    np.asarray(stash['eps_t'][idx_s:idx_e]),
+                    np.asarray(stash['eps_r'][idx_s:idx_e]))
+
+        sp_c, sp_t, sp_r = _trio(getattr(self, '_last_eps_spread', None))
+        sm_c, sm_t, sm_r = _trio(getattr(self, '_last_eps_samp', None))
+
         return {
             'blade_idx': blade_idx,
             'r': r,                             # [lu]
             'r_R': r_norm,                      # [dimensionless]
             'chord': blade.marker_chord,        # [lu]
             'epsilon': blade.marker_epsilon,    # [lu] Gaussian projection width
+            'eps_c': sp_c, 'eps_t': sp_t, 'eps_r': sp_r,       # [lu] spreading
+            'eps_samp_c': sm_c, 'eps_samp_t': sm_t, 'eps_samp_r': sm_r,  # [lu]
             'twist': blade.marker_twist,        # [degrees]
             'active': blade.marker_active,
             'u_n': bem.u_n[idx_s:idx_e],        # [Δx/Δt] axial (induced) velocity
@@ -2331,6 +2427,17 @@ def create_actuator_line_from_config(
                 't': float(samp.get('t', 0.4)),
                 'r': float(samp.get('r', 0.5)),
                 'r_ref': samp.get('r_ref', 'spacing'),
+            }
+        # LineAverage (Melani et al. 2024): section-plane circle average,
+        # coupled. rs = rs_chord_factor * local chord (profile-shaped),
+        # floored at max(0.1c, 2dx). time_filter_deg: per-marker EMA over
+        # rotation angle (guards BVI-noise feedback in unsteady LES; 0=off).
+        if model._sampling_mode == "lineavg":
+            model._lineavg_cfg = {
+                'profile': samp.get('profile', 'constant'),
+                'n_points': int(samp.get('n_points', 80)),
+                'rs_chord_factor': float(samp.get('rs_chord_factor', 0.25)),
+                'time_filter_deg': float(samp.get('time_filter_deg', 6.0)),
             }
     elif isinstance(samp, str):
         model._sampling_mode = samp

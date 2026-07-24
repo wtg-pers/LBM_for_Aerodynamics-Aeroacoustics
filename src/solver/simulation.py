@@ -591,7 +591,13 @@ class Simulation:
                 sgs_model=sgs_kernel)
             self._esoteric_is_cumulant = True
             self._eso_omega_bulk = float(self.collision.omega_bulk)
-            self._eso_omega_high = float(self.collision.omega_3)
+            self._eso_omega_high = float(getattr(self.collision, 'omega_high',
+                                                 self.collision.omega_3))
+            self._eso_omega_345 = (float(self.collision.omega_3),
+                                   float(self.collision.omega_4),
+                                   float(self.collision.omega_5))
+            self._eso_lambda = float(getattr(self.collision,
+                                             'cumulant_limiter', 0.0))
             # SGS buffers (mirrors the standard fused path, f32/esoteric).
             if sgs_model in ("smagorinsky", "wale", "dyn_smag"):
                 self.nu_t = xp.zeros(self.domain_shape, dtype=xp.float32)
@@ -609,7 +615,9 @@ class Simulation:
         else:
             if sgs_model not in ("off", "none"):
                 raise ValueError(
-                    "esoteric BGK does not support SGS (cumulant only)")
+                    "esoteric BGK + SGS: supported via the MPI runner "
+                    "(main_mpi/LocalLevel, dyn_smag only) — the single-GPU "
+                    "esoteric path has no BGK pre-pass wiring")
             self._esoteric_kernel = EsotericBGKKernelD3Q27()
             self._esoteric_is_cumulant = False
         self._use_esoteric = True
@@ -652,10 +660,18 @@ class Simulation:
         from src.collision.cumulant import CumulantCollision
         if isinstance(self.collision, CumulantCollision):
             self._eso_omega_bulk = float(self.collision.omega_bulk)
-            self._eso_omega_high = float(self.collision.omega_3)
+            self._eso_omega_high = float(getattr(self.collision, 'omega_high',
+                                                 self.collision.omega_3))
+            self._eso_omega_345 = (float(self.collision.omega_3),
+                                   float(self.collision.omega_4),
+                                   float(self.collision.omega_5))
+            self._eso_lambda = float(getattr(self.collision,
+                                             'cumulant_limiter', 0.0))
         else:
             self._eso_omega_bulk = 1.0 / self.tau
             self._eso_omega_high = 1.0 / self.tau
+            self._eso_omega_345 = (self._eso_omega_high,) * 3
+            self._eso_lambda = 0.0
         self._esoteric_step = 0
         self._use_esoteric = True
 
@@ -791,6 +807,13 @@ class Simulation:
                 Cs=float(self._sgs_cfg["Cs"]),
                 nu_t_out=(self.nu_t.ravel() if self.nu_t is not None else None),
                 nu_t_in=getattr(self, '_nu_t_in', None),
+                omega_3=getattr(self, '_eso_omega_345',
+                                (self._eso_omega_high,) * 3)[0],
+                omega_4=getattr(self, '_eso_omega_345',
+                                (self._eso_omega_high,) * 3)[1],
+                omega_5=getattr(self, '_eso_omega_345',
+                                (self._eso_omega_high,) * 3)[2],
+                lambda_lim=getattr(self, '_eso_lambda', 0.0),
             )
         else:
             force_out = None

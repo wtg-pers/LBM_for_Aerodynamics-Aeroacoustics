@@ -292,6 +292,19 @@ class MarkerVTPWriter:
             rotor.get_all_marker_chords().astype(np.float32)
         scalars['active'] = rotor.get_all_marker_active().astype(np.float32)
 
+        # Kernel widths: isotropic base + per-axis effective widths for the
+        # aniso spreading/sampling paths (iso paths fall back to eps_lu on
+        # every axis so the array set is mode-independent).
+        eps_iso = rotor.get_all_marker_epsilon().astype(np.float32)
+        scalars['eps_lu'] = eps_iso
+        for key, stash in (
+                ('eps', getattr(al_model, '_last_eps_spread', None)),
+                ('eps_samp', getattr(al_model, '_last_eps_samp', None))):
+            for ax in ('c', 't', 'r'):
+                scalars[f'{key}_{ax}'] = (
+                    np.asarray(stash[f'eps_{ax}'], dtype=np.float32)
+                    if stash is not None else eps_iso)
+
         bem = al_model._last_bem_result
         if bem is not None:
             scalars['alpha'] = bem.alpha

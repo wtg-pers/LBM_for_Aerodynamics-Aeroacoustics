@@ -41,11 +41,15 @@ def extract_level(lev) -> dict:
             u_t[d] = u0[d]
         # same per-cell math as the full elementwise init -> bit-equal
         feq27 = lev.collision.compute_equilibrium(rho_t, u_t)
+    _oh = getattr(lev, '_eso_omega_high', 1.0 / lev.tau)
     return dict(
         shape=shape,
         omega=1.0 / lev.tau,
-        omega_bulk=lev._eso_omega_bulk,
-        omega_high=lev._eso_omega_high,
+        omega_bulk=getattr(lev, '_eso_omega_bulk', 1.0 / lev.tau),
+        omega_high=_oh,
+        omega_345=getattr(lev, '_eso_omega_345', (_oh, _oh, _oh)),
+        lam=getattr(lev, '_eso_lambda', 0.0),
+        bgk=(type(lev.collision).__name__ == 'BGKCollision'),
         sgs=dict(lev._sgs_cfg),
         f0=lev.physical_f,                             # standard phys, t=0
         feq27=feq27,                                   # dist-init constant
@@ -133,6 +137,8 @@ class LocalLevel:
         self.t = t0
         self.omega = ld["omega"]
         self.ob, self.oh = ld["omega_bulk"], ld["omega_high"]
+        self.w345 = ld.get("omega_345", (self.oh, self.oh, self.oh))
+        self.lam = ld.get("lam", 0.0)
         self.nt = wrap_slice(ld["node_type"], part).ravel().copy()
         if t0 == 0:
             # fresh IC only: seed the implicit-HWBB bounce slots on the slab
@@ -156,8 +162,17 @@ class LocalLevel:
         self.u = cp.empty((3,) + self.dims, cp.float32)
         self.sgs = ld["sgs"]
         dyn = self.sgs["model"] == "dyn_smag"
-        self.ker = EsotericCumulantKernelD3Q27(
-            sgs_model=("wale" if dyn else "off"))
+        self.is_bgk = ld.get("bgk", False)
+        if self.is_bgk:
+            if self.sgs["model"] not in ("off", "none", "dyn_smag"):
+                raise ValueError(
+                    "esoteric BGK runner: SGS must be off or dyn_smag "
+                    f"(got '{self.sgs['model']}')")
+            from src.kernels.esoteric_d3q27 import EsotericBGKKernelD3Q27
+            self.ker = EsotericBGKKernelD3Q27()
+        else:
+            self.ker = EsotericCumulantKernelD3Q27(
+                sgs_model=("wale" if dyn else "off"))
         self.mk = EsotericMacroKernelD3Q27()           # ALM macro pre-pass
         if dyn:
             self.dk = DynSmagKernelD3Q27()
@@ -182,9 +197,17 @@ class LocalLevel:
                            Cs_max=float(self.sgs["Cs_max"]),
                            alpha_sq=float(self.sgs["alpha_sq"]))
             kw = dict(nu_t_in=self.nut_in, nu_t_out=self.nut)
-        self.ker.launch(self.mem, self.rho, self.u, self.nt, self.b_r,
-                        self.b_x, self.b_y, self.b_z,
-                        self.omega, self.ob, self.oh, nx, ny, nz,
-                        t_step=self.t, force=force,
-                        Cs=float(self.sgs.get("Cs", 0.0)), **kw)
+        if self.is_bgk:
+            self.ker.launch(self.mem, self.rho, self.u, self.nt, self.b_r,
+                            self.b_x, self.b_y, self.b_z,
+                            self.omega, nx, ny, nz,
+                            t_step=self.t, force=force, **kw)
+        else:
+            self.ker.launch(self.mem, self.rho, self.u, self.nt, self.b_r,
+                            self.b_x, self.b_y, self.b_z,
+                            self.omega, self.ob, self.oh, nx, ny, nz,
+                            t_step=self.t, force=force,
+                            Cs=float(self.sgs.get("Cs", 0.0)),
+                            omega_3=self.w345[0], omega_4=self.w345[1],
+                            omega_5=self.w345[2], lambda_lim=self.lam, **kw)
         self.t += 1

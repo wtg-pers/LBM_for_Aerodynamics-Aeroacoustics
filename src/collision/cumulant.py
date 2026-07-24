@@ -91,6 +91,10 @@ class CumulantCollision(CollisionOperator):
         lattice: 'Lattice',
         omega_bulk: float = 1.0,
         omega_high: float = 1.0,
+        omega_3: Optional[float] = None,
+        omega_4: Optional[float] = None,
+        omega_5: Optional[float] = None,
+        limiter: float = 0.0,
     ) -> None:
         """Initialize Cumulant collision operator.
 
@@ -124,11 +128,17 @@ class CumulantCollision(CollisionOperator):
         self._inv_cs4: float = 1.0 / (self._cs2 ** 2)       # 9.0      [Δt⁴/Δx⁴]
 
         # ── Relaxation parameters ────────────────────────────────
-        # ω₁ is computed from tau at each collide() call
+        # ω₁ is computed from tau at each collide() call.
+        # ω₃/ω₄/ω₅ (third-order cumulants) may be set independently of
+        # omega_high (Geier 2017 Part I parametrization: at ω₁→2 the
+        # fourth-order-accurate choice is ω₃=ω₄=ω₅→0, stabilized by the
+        # eq.(116) limiter with threshold `limiter` λ; λ=0 disables it).
         self.omega_bulk: float = omega_bulk     # ω₂  [1/Δt]
-        self.omega_3: float = omega_high        # ω₃  [1/Δt]
-        self.omega_4: float = omega_high        # ω₄  [1/Δt]
-        self.omega_5: float = omega_high        # ω₅  [1/Δt]
+        self.omega_high: float = omega_high     # default for ω₃-ω₁₀
+        self.cumulant_limiter: float = limiter  # λ (third-order limiter)
+        self.omega_3: float = omega_high if omega_3 is None else omega_3
+        self.omega_4: float = omega_high if omega_4 is None else omega_4
+        self.omega_5: float = omega_high if omega_5 is None else omega_5
         self.omega_6: float = omega_high        # ω₆  [1/Δt]
         self.omega_7: float = omega_high        # ω₇  [1/Δt]
         self.omega_8: float = omega_high        # ω₈  [1/Δt]

@@ -158,6 +158,14 @@ def main():
     _force_ref = dict(getattr(setup, "config", {})
                       .get("force_calculation", {}).get("reference", {}))
 
+    # result-folder rotor CSVs (rank 0): setup wrote the headers; the MPI
+    # loop must append the rows itself (OutputManager.process never runs
+    # here — the 0718/0721 result folders were header-only because of this).
+    perf_csv_path = (getattr(setup, "perf_csv_path", None)
+                     if rank == 0 else None)
+    blade_csv_dir = (getattr(setup, "blade_csv_dir", None)
+                     if rank == 0 else None)
+
     # free the full build (runner kept slabs + the ALM model)
     import gc
     del mlg, setup
@@ -250,6 +258,13 @@ def main():
                             f"{perf['torque']},{perf['power']},"
                             f"{perf['C_T']},{perf['C_P']},{perf['FM']}\n")
                 csv_f.flush()
+            # result-folder CSVs (same schema/cadence as the single-GPU loop)
+            if perf_csv_path:
+                from src.solver.output_manager import (
+                    log_rotor_performance_row, log_blade_diagnostics_rows)
+                log_rotor_performance_row(rn.model, perf_csv_path, s)
+                if blade_csv_dir:
+                    log_blade_diagnostics_rows(rn.model, blade_csv_dir, s)
         elif tier == "body" and stats is not None:
             F = stats
             cd, cl, cs = F[0] / _qA, F[1] / _qA, F[2] / _qA

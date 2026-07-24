@@ -640,66 +640,21 @@ class OutputManager:
             C_T(prop)      = thrust_lu / (rho_ref * n_lu^2 * D_lu^4)
             C_T(rotorcraft)= thrust_lu / (rho_ref * area_lu * tip_speed_lu^2)
         """
-        import math
         if self.al_model is None or self.perf_csv_path is None:
             return
 
-        def _norm_params(model) -> str:
-            """Build normalization parameter string from a single ALM."""
-            rotor = model.rotor
-            rho_ref      = model.rho_ref
-            R_lu         = float(rotor.radius)
-            D_lu         = 2.0 * R_lu
-            omega_lu     = float(abs(rotor.omega))
-            tip_speed_lu = omega_lu * R_lu
-            area_lu      = math.pi * R_lu ** 2
-            n_lu         = omega_lu / (2.0 * math.pi)   # [rev/lt]
-            return (f"{rho_ref:.6f},{area_lu:.6f},{tip_speed_lu:.9f},"
-                    f"{omega_lu:.9f},{R_lu:.6f},{D_lu:.6f},{n_lu:.9f}")
-
-        def _time_phys(model, time_lt: float) -> float:
-            return time_lt * model.dt_phys
-
-        if self._is_multi_rotor:
-            for ri, rname in enumerate(self.al_model.names):
-                model = self.al_model.models[ri]
-                perf  = model.get_rotor_performance()
-                self._last_ct  = perf.get('C_T', 0)
-                self._last_cp  = perf.get('C_P', 0)
-                self._last_thrust_lu = perf.get('thrust', 0)
-                self._last_power_lu  = perf.get('power', 0)
-                self._last_rev = perf.get('revolutions', 0)
-                time_lt  = float(perf.get('time', 0))
-                time_phys = _time_phys(model, time_lt)
-                norm = _norm_params(model)
-                with open(self.perf_csv_path, 'a') as fh:
-                    fh.write(
-                        f"{step},{time_lt:.6f},{time_phys:.9f},"
-                        f"{self._last_rev:.6f},"
-                        f"{self._last_thrust_lu:.9f},"
-                        f"{perf.get('torque', 0):.9f},"
-                        f"{self._last_power_lu:.9f},"
-                        f"{norm}\n"
-                    )
-        else:
-            perf = self.al_model.get_rotor_performance()
+        models = (
+            [self.al_model.models[i] for i in range(self.al_model.n_rotors)]
+            if self._is_multi_rotor
+            else [self.al_model]
+        )
+        for model in models:
+            perf = log_rotor_performance_row(model, self.perf_csv_path, step)
             self._last_ct  = perf.get('C_T', 0)
             self._last_cp  = perf.get('C_P', 0)
             self._last_thrust_lu = perf.get('thrust', 0)
             self._last_power_lu  = perf.get('power', 0)
             self._last_rev = perf.get('revolutions', 0)
-            time_lt   = float(perf.get('time', 0))
-            time_phys = _time_phys(self.al_model, time_lt)
-            norm = _norm_params(self.al_model)
-            with open(self.perf_csv_path, 'a') as fh:
-                fh.write(
-                    f"{step},{time_lt:.6f},{time_phys:.9f},"
-                    f"{self._last_rev:.6f},"
-                    f"{self._last_thrust_lu:.9f},"
-                    f"{perf.get('torque', 0):.9f},"
-                    f"{self._last_power_lu:.9f},"
-                    f"{norm}\n"
-                )
 
     def _log_blade_diagnostics(self, step: int, sim: 'Simulation') -> None:
         """Log per-marker BEM diagnostics to individual CSV files.
@@ -725,36 +680,7 @@ class OutputManager:
         )
 
         for model in models:
-            rev = model.rotor.n_revolutions
-            n_blades = model.rotor.n_blades
-            for bi in range(n_blades):
-                diag = model.get_blade_diagnostics(blade_idx=bi)
-                if 'error' in diag:
-                    continue
-                n_mk = len(diag['r'])
-                for j in range(n_mk):
-                    path = os.path.join(self.blade_csv_dir, f'{j}.csv')
-                    with open(path, 'a') as fh:
-                        fh.write(
-                            f"{step},{rev:.6f},{bi},"
-                            f"{diag['r_R'][j]:.4f},"
-                            f"{diag['r'][j]:.4f},"
-                            f"{diag['chord'][j]:.4f},"
-                            f"{diag['epsilon'][j]:.4f},"
-                            f"{diag['twist'][j]:.3f},"
-                            f"{diag['u_n'][j]:.6f},"
-                            f"{diag['u_theta'][j]:.6f},"
-                            f"{diag['u_rel'][j]:.6f},"
-                            f"{diag['phi'][j]:.3f},"
-                            f"{diag['alpha'][j]:.3f},"
-                            f"{diag['Re'][j]:.1f},"
-                            f"{diag['CL'][j]:.5f},"
-                            f"{diag['CD'][j]:.5f},"
-                            f"{diag['F_n'][j]:.6f},"
-                            f"{diag['F_theta'][j]:.6f},"
-                            f"{diag['F_L'][j]:.6f},"
-                            f"{diag['F_D'][j]:.6f}\n"
-                        )
+            log_blade_diagnostics_rows(model, self.blade_csv_dir, step)
 
     def _check_convergence(
         self, step: int, sim: 'Simulation',
@@ -983,3 +909,74 @@ class OutputManager:
         print("=" * 70)
         self._print_postrun_hints()
         return True
+
+# =====================================================================
+# Module-level CSV row appenders (single source for the single-GPU
+# OutputManager loop AND main_mpi's rank-0 lockstep loop — the MPI path
+# used to leave rotor_performance.csv / blade_diagnostics header-only).
+# =====================================================================
+def log_rotor_performance_row(model, path: str, step: int) -> dict:
+    """Append one rotor_performance.csv row (schema = setup._perf_csv_header).
+
+    Returns the model's get_rotor_performance() dict so callers can reuse it.
+    """
+    import math
+    perf = model.get_rotor_performance()
+    rotor = model.rotor
+    rho_ref = model.rho_ref
+    R_lu = float(rotor.radius)
+    omega_lu = float(abs(rotor.omega))
+    time_lt = float(perf.get('time', 0))
+    with open(path, 'a') as fh:
+        fh.write(
+            f"{step},{time_lt:.6f},{time_lt * model.dt_phys:.9f},"
+            f"{perf.get('revolutions', 0):.6f},"
+            f"{perf.get('thrust', 0):.9f},"
+            f"{perf.get('torque', 0):.9f},"
+            f"{perf.get('power', 0):.9f},"
+            f"{rho_ref:.6f},{math.pi * R_lu ** 2:.6f},"
+            f"{omega_lu * R_lu:.9f},{omega_lu:.9f},"
+            f"{R_lu:.6f},{2.0 * R_lu:.6f},"
+            f"{omega_lu / (2.0 * math.pi):.9f}\n"
+        )
+    return perf
+
+
+def log_blade_diagnostics_rows(model, csv_dir: str, step: int) -> None:
+    """Append one row per (blade, marker) to csv_dir/<marker>.csv
+    (schema = setup._blade_csv_header, incl. per-axis kernel widths)."""
+    import os
+    rev = model.rotor.n_revolutions
+    for bi in range(model.rotor.n_blades):
+        diag = model.get_blade_diagnostics(blade_idx=bi)
+        if 'error' in diag:
+            continue
+        for j in range(len(diag['r'])):
+            path = os.path.join(csv_dir, f'{j}.csv')
+            with open(path, 'a') as fh:
+                fh.write(
+                    f"{step},{rev:.6f},{bi},"
+                    f"{diag['r_R'][j]:.4f},"
+                    f"{diag['r'][j]:.4f},"
+                    f"{diag['chord'][j]:.4f},"
+                    f"{diag['epsilon'][j]:.4f},"
+                    f"{diag['twist'][j]:.3f},"
+                    f"{diag['u_n'][j]:.6f},"
+                    f"{diag['u_theta'][j]:.6f},"
+                    f"{diag['u_rel'][j]:.6f},"
+                    f"{diag['phi'][j]:.3f},"
+                    f"{diag['alpha'][j]:.3f},"
+                    f"{diag['Re'][j]:.1f},"
+                    f"{diag['CL'][j]:.5f},"
+                    f"{diag['CD'][j]:.5f},"
+                    f"{diag['F_n'][j]:.6f},"
+                    f"{diag['F_theta'][j]:.6f},"
+                    f"{diag['F_L'][j]:.6f},"
+                    f"{diag['F_D'][j]:.6f},"
+                    f"{diag['eps_c'][j]:.4f},"
+                    f"{diag['eps_t'][j]:.4f},"
+                    f"{diag['eps_r'][j]:.4f},"
+                    f"{diag['eps_samp_c'][j]:.4f},"
+                    f"{diag['eps_samp_t'][j]:.4f},"
+                    f"{diag['eps_samp_r'][j]:.4f}\n"
+                )
