@@ -76,11 +76,19 @@ NU_PHYS     = 1.50e-5                               # [m^2/s] mu_Sutherland/rho
 RE_75       = 0.75 * TIP_SPEED * CHORD_PHYS / NU_PHYS    # ~1.32e6
 M_TIP       = TIP_SPEED / C_S_PHYS                       # 0.638
 
-# C81 deck: <repo>/aeromechanics_workshop/references/Z01_data/NACA23012.C81
+# C81 deck. Primary copy lives in data/airfoils/ (the tree that IS deployed
+# to the cluster alongside src/ and configs/ — aeromechanics_workshop/ is
+# not synced, which broke the 2026-07-23 cluster launch). The original
+# references/ location is kept as a local fallback.
 _HERE       = os.path.dirname(os.path.abspath(__file__))
 _REPO       = os.path.abspath(os.path.join(_HERE, "..", ".."))
-C81_PATH    = os.path.join(_REPO, "aeromechanics_workshop", "references",
-                           "Z01_data", "NACA23012.C81")
+_C81_CANDIDATES = [
+    os.path.join(_REPO, "data", "airfoils", "hart2", "NACA23012.C81"),
+    os.path.join(_REPO, "aeromechanics_workshop", "references",
+                 "Z01_data", "NACA23012.C81"),
+]
+C81_PATH    = next((p for p in _C81_CANDIDATES if os.path.exists(p)),
+                   _C81_CANDIDATES[0])
 
 N_RADIAL    = 40                                    # markers per blade
 
@@ -127,6 +135,17 @@ GRID_PRESETS = {
     #            ~21M / ~4.4 GB  / chord_fine 6.8  -- minimal; smaller GPUs
     "full":     (40, [(1.0, 3.0, 1.5), (0.5, 1.5, 1.0), (0.25, 0.5, 0.8)]),
     #            ~136M / ~29 GB  / chord_fine 9.7  -- needs a 32 GB+ GPU
+    # farfield40_mlg4 (2026-07-23): the HVAB farfield40_mlg4 D-relative
+    # geometry transplanted (radial 6R / up 3R / down 10R domain, 4 levels,
+    # ALM on L3, dx_fine = D_PHYS/320 = 12.5 mm, chord_fine 9.7 cells).
+    # Same relative nesting as the validated HVAB campaign grid; ~65M cells,
+    # esoteric 4-rank ~3.4 GB/GPU. A len-3 entry carries a DOMAIN override
+    # (nx/ny/nz in D units + hub_x) replacing the default 8D x 5D x 5D box.
+    "farfield40_mlg4": (40,
+                        [(0.65625, 1.84375, 1.15625),
+                         (0.4,     1.0,     0.84375),
+                         (0.125,   0.25,    0.6875)],
+                        {"nx_D": 6.5, "ny_D": 6.0, "nz_D": 6.0, "hub_x_D": 1.5}),
 }
 DEFAULT_PRESET = "light"   # safe for ~24 GB; switch to "balanced" if it fits
 BYTES_PER_CELL = 213.0     # empirical (D3Q27 f-buffers dominate)
@@ -136,7 +155,12 @@ BYTES_PER_CELL = 213.0     # empirical (D3Q27 f-buffers dominate)
 # S3b. CONFIG BUILDER
 # =============================================================================
 def build_config(collective_deg: float, smoke: bool = False,
-                 smoke_sgs: bool = False, preset: str = None) -> dict:
+                 smoke_sgs: bool = False, preset: str = None,
+                 use_sgs: bool = True, eps_correction=None,
+                 prandtl_loss=True, sampling=None,
+                 radial_truncation: bool = False, n_radial: int = None,
+                 n_rev: int = 18, run_tag: str = "",
+                 marker_distribution: str = "uniform") -> dict:
     """Assemble the full HART-II hover config for a given collective pitch.
 
     Args:
@@ -145,8 +169,23 @@ def build_config(collective_deg: float, smoke: bool = False,
         smoke_sgs:      in smoke mode, also enable the SGS model (verify SGS
                         integration); ignored for production (always on).
         preset:         grid preset name (see GRID_PRESETS); default DEFAULT_PRESET.
+
+    2026-07-23 extension (HVAB-parity kwargs, defaults keep every pre-existing
+    config bit-identical):
+        use_sgs:            False -> SGS off (folder gains "_nosgs")
+        eps_correction:     None|dict — Kleine/Dag smearing correction block,
+                            passed through to actuator_line["eps_correction"]
+        prandtl_loss:       bool|dict — legacy bool, or the full dict form
+                            {"enabled","model","g","tip","root","eps_offset"}
+        sampling:           None|dict — velocity sampler override
+        radial_truncation:  True -> Merabet tip/root truncation+renorm
+        n_radial:           markers/blade override (default N_RADIAL=40)
+        n_rev:              production revolutions (default 18)
+        run_tag:            appended to the result folder name
+        marker_distribution: "uniform" (default) | "cosine"
     """
     # --- grid / MLG resolution -------------------------------------------
+    _DOM = None
     if smoke:
         D          = 16            # cells per diameter on L0 (small, fast CPU)
         EXTENTS    = [(0.5, 1.5, 1.0)]   # 1 fine level around the disk
@@ -154,10 +193,14 @@ def build_config(collective_deg: float, smoke: bool = False,
         N_REV      = 1
         USE_SGS    = smoke_sgs
     else:
-        D, EXTENTS = GRID_PRESETS[preset or DEFAULT_PRESET]
+        _pv = GRID_PRESETS[preset or DEFAULT_PRESET]
+        if len(_pv) == 3:          # (D, EXTENTS, DOMAIN-override)
+            D, EXTENTS, _DOM = _pv
+        else:
+            D, EXTENTS = _pv
         DEVICE     = "gpu"
-        N_REV      = 18
-        USE_SGS    = True
+        N_REV      = n_rev
+        USE_SGS    = use_sgs
     NUM_LEVELS = len(EXTENTS) + 1
 
     U_MAX_LU   = 0.1                                   # convective scaling
@@ -165,10 +208,17 @@ def build_config(collective_deg: float, smoke: bool = False,
     RHO_LU     = 1.0
 
     # --- domain (hover): suction side (-x, up) 3D, wake (+x, down) 5D -----
-    Nx = 8 * D
-    Ny = 5 * D
-    Nz = 5 * D
-    HUB_X = 3 * D                                      # 3D below xmin inlet
+    # A len-3 preset overrides the box with its DOMAIN dict (D units).
+    if _DOM is not None:
+        Nx = int(round(_DOM["nx_D"] * D))
+        Ny = int(round(_DOM["ny_D"] * D))
+        Nz = int(round(_DOM["nz_D"] * D))
+        HUB_X = int(round(_DOM["hub_x_D"] * D))
+    else:
+        Nx = 8 * D
+        Ny = 5 * D
+        Nz = 5 * D
+        HUB_X = 3 * D                                  # 3D below xmin inlet
     HUB_Y = Ny // 2
     HUB_Z = Nz // 2
 
@@ -247,14 +297,24 @@ def build_config(collective_deg: float, smoke: bool = False,
                     for r, c, tw, af, act in _blade_sections(collective_deg)
                 ],
             },
-            "grid": {"n_radial": N_RADIAL},
+            "grid": {"n_radial": N_RADIAL if n_radial is None else int(n_radial),
+                     # loader default is "uniform" (rotor.py) — key omitted
+                     # then, so pre-existing configs stay dict-identical
+                     **({"marker_distribution": marker_distribution}
+                        if marker_distribution != "uniform" else {})},
         },
         "gaussian_cutoff": 3.0,
         "rho_ref":         1.0,
         "coeff_mode":      "rotorcraft",             # C_T, C_P, FM convention
         "ramp_steps":      STEPS_REV,                # ramp forcing over ~1 rev
-        "prandtl_loss":    True,
+        "prandtl_loss":    prandtl_loss,             # bool (legacy) or dict
     }
+    if eps_correction is not None:
+        actuator_line["eps_correction"] = eps_correction
+    if sampling is not None:
+        actuator_line["sampling"] = sampling
+    if radial_truncation:
+        actuator_line["spreading"] = {"radial_truncation": True}
 
     mlg = {
         "enabled":       True,
@@ -283,6 +343,10 @@ def build_config(collective_deg: float, smoke: bool = False,
     force_calculation = {"enabled": False}
 
     tag = "smoke" if smoke else "mlg%d_D%d" % (NUM_LEVELS, D)
+    if not smoke and not USE_SGS:
+        tag += "_nosgs"
+    if run_tag:
+        tag += "_" + run_tag       # keep variant runs out of baseline folders
     folder = "result_hart2_hover_c%04.1f_%s" % (collective_deg, tag)
 
     output = {
