@@ -1,2 +1,0 @@
-start_step,end_step,total_steps,elapsed_sec,updates_per_step,mlups,is_mlg,num_levels
-0,1006,1006,3642.303,118380590,32.70,True,5
