@@ -2,7 +2,12 @@
 
 Ported from the historical main_mpi.py (patch 17 M5) into src/ so the MPI
 driver can never again be missed by an src-only deploy (patch_notes/
-hpc_upgrade/20_mpi_result_csv_nut_vtk.md incident class).
+hpc_upgrade/20_mpi_result_csv_nut_vtk.md incident class). Since stage C5
+the loop runs the FULL OutputManager pipeline via MPIOutputManager
+(src/parallel/mpi_output.py): force_history.csv with the properly
+rescaled fine-level reference, conservation/convergence with a
+rank-invariant 'stop' verdict, VTK/checkpoint/finalize — one output
+source for both entry paths.
 
     mpirun -n <R> python main.py --config <cfg.py> --steps <N> \
         [--axis auto|x|y|z] [--ghost 3] [--cuda-aware 0|1] \
@@ -11,13 +16,13 @@ hpc_upgrade/20_mpi_result_csv_nut_vtk.md incident class).
 One rank per GPU (device = node-local rank). Every rank runs the full
 deterministic production build, keeps its slab, and enters the lockstep
 distributed loop (src/parallel/runner.py). --verify gathers the owned
-assemblies to rank 0 after the run and compares against a fresh single-rank
-production MultiLevelGrid.advance() of the same case.
+assemblies to rank 0 after the run and compares against a fresh
+single-rank production MultiLevelGrid.advance() of the same case.
 
-CUDA-awareness: --cuda-aware 1 passes CuPy buffers to MPI directly (cluster
-OpenMPI 5.0.5 + UCX; requires the serialized thread level set BEFORE mpi4py
-import). --cuda-aware 0 stages through host numpy (any MPI, e.g. local
-MPICH functional smoke). Default: LBM_MPI_CUDA env (0 if unset).
+CUDA-awareness: --cuda-aware 1 passes CuPy buffers to MPI directly
+(cluster OpenMPI 5.0.5 + UCX; requires the serialized thread level set
+BEFORE mpi4py import). --cuda-aware 0 stages through host numpy (any MPI,
+e.g. local MPICH functional smoke). Default: LBM_MPI_CUDA env.
 
 IMPORT RULE: mpi4py is imported only inside run_mpi(), thread_level first
 (OpenMPI 5.x drops the UCX PML otherwise — src/parallel/halo.py). cupy is
@@ -91,18 +96,14 @@ def _build(args, dev: int, with_writers: bool = False,
            use_restart: bool = True, dist_init=None,
            io_role: str = 'writer'):
     """Replicated production build. No sys.argv shim — a Namespace copy of
-    the unified args, so directory/clear flags now reach setup too.
+    the unified args, so directory/clear flags reach setup too.
 
     io_role='silent' (rank != 0): no directories/clear, no writers, no
-    setup_log/CSV headers — kills the historical N-rank concurrent-write
-    races. CheckpointManager still built (restore path)."""
+    setup_log/CSV headers. CheckpointManager still built (restore path)."""
     di = args.dist_init if dist_init is None else dist_init
     os.environ["LBM_DIST_INIT"] = "1" if di else "0"
     bargs = argparse.Namespace(**vars(args))
     bargs.gpu = dev
-    # ForceManager needs full-domain f_post; MPI body forces come from the
-    # esoteric MEM kernel. Scheduled to flip in stage C5 (forces_override).
-    bargs.no_force = True
     bargs.no_vtk = (not with_writers) or args.no_vtk
     if not use_restart:
         bargs.restart = None
@@ -119,7 +120,21 @@ def _build(args, dev: int, with_writers: bool = False,
     return mlg, s
 
 
+def _collect_solid_masks(mlg_obj, n_levels):
+    """Static per-level solid masks (host numpy) for the VTK channel."""
+    masks = []
+    for k in range(n_levels):
+        ob = getattr(mlg_obj.get_level(k), "obstacle_bc", None)
+        sm = getattr(ob, "solid_mask", None) if ob is not None else None
+        if sm is not None and hasattr(sm, "get"):
+            sm = sm.get()
+        masks.append(sm)
+    return masks
+
+
 def _run(args, MPI):
+    import numpy as np
+
     if args.steps is None:
         sys.exit("error: --steps N is required for MPI runs "
                  "(unifies into --max-steps in a later stage)")
@@ -146,20 +161,32 @@ def _run(args, MPI):
         dev = local % ndev
     cp.cuda.Device(dev).use()
 
-    want_out = bool(vtk_every or ckpt_every)
-    if rank != 0:                                 # quiet non-root builds
+    if rank != 0:
+        # permanently quiet: every print in the shared output pipeline is
+        # rank-0-only by silencing the others at the source (stderr kept
+        # for tracebacks)
         sys.stdout = open(os.devnull, "w")
     if args.dist_init and (args.restart or args.restart_latest):
         raise ValueError("--dist-init + restart: restore path loads full "
                          "fields (use replicated build for restarts for now)")
     mlg, setup = _build(args, dev,
-                        with_writers=(rank == 0 and want_out),
+                        with_writers=(rank == 0),
                         io_role=('writer' if rank == 0 else 'silent'))
-    sys.stdout = sys.__stdout__
 
     from src.parallel import MPITransport
     from src.parallel.alm_dist import MPIAllreduce
     from src.parallel.runner import DistributedMLGRunner
+    from src.parallel.mpi_output import MPIOutputManager
+
+    NL = mlg.num_levels
+    level_shapes = [tuple(mlg.get_level(k).domain_shape) for k in range(NL)]
+
+    output = setup.build_output_manager(
+        manager_cls=MPIOutputManager,
+        comm=comm, rank=rank, nr=nr, mpi_mod=MPI,
+        log_every=log_every, vtk_every=vtk_every, ckpt_every=ckpt_every,
+        vtk_fields_last=args.vtk_fields_last,
+        dense_csv_path=args.csv)
 
     axis = None if args.axis == "auto" else "xyz".index(args.axis)
     transport = MPITransport(comm, cuda_aware=str(cuda_aware) == "1")
@@ -167,67 +194,39 @@ def _run(args, MPI):
         mlg, transport, rank, nr, allreduce=MPIAllreduce(comm),
         axis=axis, ghost=args.ghost)
 
-    def _collect_solid_masks(mlg_obj, n_levels):
-        """Static per-level solid masks (host numpy) for the VTK bridge."""
-        masks = []
-        for k in range(n_levels):
-            ob = getattr(mlg_obj.get_level(k), "obstacle_bc", None)
-            sm = getattr(ob, "solid_mask", None) if ob is not None else None
-            if sm is not None and hasattr(sm, "get"):
-                sm = sm.get()
-            masks.append(sm)
-        return masks
+    # rank-invariant body level: the local nt==1 scan can miss on a rank
+    # whose slab holds no solid cells -> mismatched collectives (the old
+    # tier hazard). MAX-allreduce the scan result.
+    if nr > 1:
+        bl = np.array([-1.0 if runner.body_level is None
+                       else float(runner.body_level)])
+        out_bl = np.empty_like(bl)
+        comm.Allreduce(bl, out_bl, op=MPI.MAX)
+        runner.body_level = None if out_bl[0] < 0 else int(out_bl[0])
 
-    # output bridge (production writers) BEFORE freeing the build
-    from src.parallel.output import Rank0OutputBridge
-    bridge = None
-    if want_out:
-        bridge = Rank0OutputBridge(
-            comm, rank, nr,
-            mlg_vtk_writer=(getattr(setup, "_mlg_vtk_writer", None)
-                            if rank == 0 else None),
-            checkpoint_mgr=(getattr(setup, "checkpoint_mgr", None)
-                            if rank == 0 else None),
-            sim_params=(getattr(setup, "sim_params", None)
-                        if rank == 0 else None),
-            tau=float(mlg.get_level(0).tau),
-            marker_vtk_writer=(getattr(setup, "marker_vtk_writer", None)
-                               if rank == 0 else None),
-            alm_marker_origin=(getattr(setup, "_alm_marker_origin", None)
-                               if rank == 0 else None),
-            alm_marker_spacing=(getattr(setup, "_alm_marker_spacing", None)
-                                if rank == 0 else None),
-            solid_masks=(_collect_solid_masks(mlg, runner.NL)
-                         if rank == 0 else None))
+    solid_masks = _collect_solid_masks(mlg, NL) if rank == 0 else None
+    start_step = runner.completed_step + 1
+    output.bind_runner(runner, level_shapes, solid_masks,
+                       dist_init=args.dist_init, start_step=start_step)
 
-    # body-tier normalization source: keep the reference dict from the
-    # ALREADY-PARSED setup.config — re-executing the config module later
-    # would double-run any config side effects.
-    _force_ref = dict(getattr(setup, "config", {})
-                      .get("force_calculation", {}).get("reference", {}))
+    # the MEM link/mask arrays are dead weight on the MPI path (forces come
+    # from eso_mem_force + Allreduce via forces_override)
+    if setup.force_mgr is not None:
+        setup.force_mgr.release_device_state()
 
-    # result-folder rotor CSVs (rank 0): setup wrote the headers; the MPI
-    # loop must append the rows itself (OutputManager.process never runs
-    # here — the 0718/0721 result folders were header-only because of this).
-    perf_csv_path = (getattr(setup, "perf_csv_path", None)
-                     if rank == 0 else None)
-    blade_csv_dir = (getattr(setup, "blade_csv_dir", None)
-                     if rank == 0 else None)
-
-    # free the full build (runner kept slabs + the ALM model)
+    # free the full build (runner kept slabs + the ALM model; the output
+    # manager kept writers/monitors/paths)
     import gc
     del mlg, setup
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
 
-    start_step = runner.completed_step + 1
     if start_step > args.steps:
         if rank == 0:
             print(f"[mpi] nothing to do: restored step {start_step - 1} "
                   f">= --steps {args.steps}", flush=True)
         MPI.Finalize()
         return
-    csv_f = None
     if rank == 0:
         print(f"[mpi] ranks={nr} axis={'xyz'[runner.axis]} "
               f"ghost={args.ghost} cuda_aware={cuda_aware}"
@@ -235,143 +234,22 @@ def _run(args, MPI):
                  if runner.completed_step else ""), flush=True)
         for k, p in enumerate(runner.parts):
             print(f"[mpi]   L{k} rank0 {p}", flush=True)
-        if args.csv:
-            append = runner.completed_step > 0 and os.path.exists(args.csv)
-            csv_f = open(args.csv, "a" if append else "w")
-            if not append:
-                if runner.model is not None:
-                    csv_f.write("step,time_lu,thrust,torque,power,"
-                                "C_T,C_P,FM\n")
-                elif runner.body_level is not None:
-                    csv_f.write("step,Fx,Fy,Fz,CD,CL,CS\n")
-                else:
-                    csv_f.write("step,rho_mean,u_max\n")
-
-    # case tier for the progress line: ALM -> CT/CP/FM; solid body ->
-    # CD/CL/CS from the esoteric MEM-force kernel; plain flow ->
-    # rho_mean / u_max on the finest level.
-    if runner.model is not None:
-        tier = "alm"
-    elif runner.body_level is not None:
-        tier = "body"
-        # normalization: force_calculation.reference in the BODY level's
-        # lattice units (production 3D convention A = char_length * span)
-        _q_rho = float(_force_ref.get("rho", 1.0))
-        _q_u = float(_force_ref.get("velocity", 0.05))
-        _q_A = float(_force_ref.get("char_length", 1.0)) * \
-            float(_force_ref.get("span_length", 1.0))
-        _qA = 0.5 * _q_rho * _q_u * _q_u * _q_A
-    else:
-        tier = "flow"
-
-    def flow_stats():
-        """COLLECTIVE: owned FLUID-cell rho mean + |u| max on the finest
-        level. SOLID cells are masked — the kernel returns before writing
-        rho/u there, so their buffers are UNINITIALIZED."""
-        L = runner.lv[-1]
-        sl = runner.parts[-1].owned_local()
-        fluid = (L.nt.reshape(L.dims)[sl] != 1)
-        rho = L.rho[sl]
-        u = L.u[(slice(None),) + sl]
-        s_loc = float(rho[fluid].sum())
-        n_loc = float(fluid.sum())
-        usq = (u * u).sum(axis=0)
-        usq = cp.where(fluid, usq, 0.0)
-        m_loc = float(cp.sqrt(usq.max()))
-        if nr > 1:
-            import numpy as _np
-            buf = _np.array([s_loc, n_loc, m_loc])
-            out = _np.empty_like(buf)
-            comm.Allreduce(buf[:2], out[:2])           # sum
-            comm.Allreduce(buf[2:], out[2:], op=MPI.MAX)
-            s_loc, n_loc, m_loc = out[0], out[1], out[2]
-        return s_loc / max(n_loc, 1.0), m_loc
-
-    def on_log(s, rn, stats=None):
-        if rank != 0:
-            return
-        line = f"[mpi] step {s}/{args.steps}"
-        if rn.last_interval:
-            sps = rn.last_interval["s_per_step"]
-            eta_h = (args.steps - s) * sps / 3600.0
-            line += f"  {sps:.3f}s/step  ETA {eta_h:.2f}h"
-        if tier == "alm":
-            perf = rn.model.get_rotor_performance()
-            line += (f"  CT={perf['C_T']:.6e}  CP={perf['C_P']:.6e}"
-                     f"  FM={perf['FM']:.4f}")
-            if csv_f:
-                csv_f.write(f"{s},{perf['time']},{perf['thrust']},"
-                            f"{perf['torque']},{perf['power']},"
-                            f"{perf['C_T']},{perf['C_P']},{perf['FM']}\n")
-                csv_f.flush()
-            # result-folder CSVs (same schema/cadence as the single-GPU loop)
-            if perf_csv_path:
-                from src.solver.output_manager import (
-                    log_rotor_performance_row, log_blade_diagnostics_rows)
-                log_rotor_performance_row(rn.model, perf_csv_path, s)
-                if blade_csv_dir:
-                    log_blade_diagnostics_rows(rn.model, blade_csv_dir, s)
-        elif tier == "body" and stats is not None:
-            F = stats
-            cd, cl, cs = F[0] / _qA, F[1] / _qA, F[2] / _qA
-            line += f"  CD={cd:.4f}  CL={cl:.4f}  CS={cs:.4f}"
-            if csv_f:
-                csv_f.write(f"{s},{F[0]},{F[1]},{F[2]},{cd},{cl},{cs}\n")
-                csv_f.flush()
-        elif stats is not None:
-            rho_m, u_max = stats
-            line += f"  rho={rho_m:.6f}  u_max={u_max:.5f}"
-            if csv_f:
-                csv_f.write(f"{s},{rho_m},{u_max}\n")
-                csv_f.flush()
-        print(line, flush=True)
 
     if args.profile:
         runner.profile = {}
-
-    # main loop (collective output cadences need every rank in lockstep)
-    import time as _time
-    t0 = _time.perf_counter()
-    t_last = t0
     runner.last_interval = None
-    n_todo = args.steps - start_step + 1
+
+    # legacy-inclusive step labels (start..steps) until the C8 semantics
+    # unification; OutputManager sees the exclusive end start..steps+1
+    output.start(start_step, args.steps + 1)
     for s_ in range(start_step, args.steps + 1):
         runner.step_coarse()
-        if log_every and s_ % log_every == 0:
-            cp.cuda.runtime.deviceSynchronize()
-            now = _time.perf_counter()
-            runner.last_interval = {
-                "s_per_step": (now - t_last) / log_every,
-                "elapsed_s": now - t0}
-            t_last = now
-            if tier == "body":
-                F_loc = runner.mem_force_local()
-                if nr > 1:
-                    import numpy as _np
-                    F_tot = _np.empty_like(F_loc)
-                    comm.Allreduce(F_loc, F_tot)
-                else:
-                    F_tot = F_loc
-                stats = F_tot
-            elif tier == "flow":
-                stats = flow_stats()
-            else:
-                stats = None
-            on_log(s_, runner, stats)
-        if bridge is not None and vtk_every and s_ % vtk_every == 0:
-            # --vtk-fields-last N: level-field files only for the last N vtk
-            # events (the ~GB/snapshot cost); marker VTPs keep the full
-            # rev-locked history.
-            fields = (args.vtk_fields_last <= 0 or
-                      s_ > args.steps - args.vtk_fields_last * vtk_every)
-            bridge.write_vtk(s_, runner, fields=fields)
-        if bridge is not None and ckpt_every and s_ % ckpt_every == 0:
-            bridge.save_checkpoint(s_, runner)
+        if output.process(s_, runner) == 'stop':
+            break
     cp.cuda.runtime.deviceSynchronize()
-    dt_all = _time.perf_counter() - t0
-    stats = {"steps": n_todo, "wall_s": dt_all,
-             "s_per_step": dt_all / max(n_todo, 1)}
-    comm.Barrier()
+
+    result = output.finalize(runner)
+
     if args.profile:
         prof = comm.gather(runner.profile, root=0)
         if rank == 0:
@@ -381,16 +259,11 @@ def _run(args, MPI):
             for k in keys:
                 vals = " ".join(f"{d.get(k, 0.0):7.2f}" for d in prof)
                 print(f"[profile]   {k:14s} {vals}", flush=True)
-    if rank == 0:
-        print(f"[mpi] done: {stats['steps']} coarse steps, "
-              f"{stats['wall_s']:.2f}s ({stats['s_per_step']:.3f} s/step)",
-              flush=True)
-        if csv_f:
-            csv_f.close()
 
     if args.verify:
         _verify(comm, rank, nr, runner, args)
     MPI.Finalize()
+    return result
 
 
 def _verify(comm, rank, nr, runner, args):

@@ -119,8 +119,14 @@ class CheckpointManager:
                     save_dict[f'extra_{key}'] = np.array(value)
         
         np.savez_compressed(filepath, **save_dict)
+        # re-saving the same step must not leave a duplicate entry —
+        # keep_last_n pruning would otherwise count the path twice and
+        # delete the file it just wrote (seen: emergency + final save at
+        # the same stop step with keep_last_n=1)
+        if filepath in self.saved_files:
+            self.saved_files.remove(filepath)
         self.saved_files.append(filepath)
-        
+
         if self.keep_last_n > 0:
             self._cleanup_old_checkpoints()
         

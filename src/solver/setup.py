@@ -254,13 +254,19 @@ class SimulationSetup:
             sgs_cfg=self._sgs_cfg,
         )
 
-    def build_output_manager(self) -> 'OutputManager':
+    def build_output_manager(self, manager_cls=None,
+                             **extra_kwargs) -> 'OutputManager':
         """Create OutputManager with all I/O components.
+
+        manager_cls/extra_kwargs: the MPI driver passes MPIOutputManager
+        plus its comm/cadence kwargs — same wiring, one pipeline.
 
         Returns:
             OutputManager ready for start() → process() → finalize()
         """
-        return OutputManager(
+        cls = manager_cls or OutputManager
+        return cls(
+            **extra_kwargs,
             xp=self.xp,
             macroscopic=self.macro,
             lattice=self.lattice,

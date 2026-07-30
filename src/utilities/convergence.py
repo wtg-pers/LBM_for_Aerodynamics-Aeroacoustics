@@ -506,7 +506,11 @@ class ConvergenceMonitor:
         self.energy_tracker: Optional[CauchyTracker] = None
         self.Cd_tracker: Optional[CauchyTracker] = None
         self.Cl_tracker: Optional[CauchyTracker] = None
-        self.divergence_detector: DivergenceDetector = DivergenceDetector()
+        _dv = config.get('divergence', {})
+        self.divergence_detector: DivergenceDetector = DivergenceDetector(
+            density_bound=float(_dv.get('density_bound', 0.5)),
+            velocity_bound=float(_dv.get('velocity_bound', 0.577)),
+        )
         
         # CSV
         self._csv_writer = None

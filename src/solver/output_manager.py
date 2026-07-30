@@ -173,6 +173,7 @@ class OutputManager:
         self._last_drift: float = 0.0
         self._last_Cd: float = 0.0
         self._last_Cl: float = 0.0
+        self._last_Cz: float = 0.0
         self._last_ct: float = 0.0
         self._last_cp: float = 0.0
         self._last_thrust_lu: float = 0.0
@@ -230,6 +231,12 @@ class OutputManager:
             'stop'     — convergence/divergence triggered termination
         """
         action = 'continue'
+        # Last step this manager actually processed — finalize labels the
+        # final VTK/checkpoint with THIS, not _end_step-1: on an early
+        # convergence/divergence stop the old label pointed 'end-1' at
+        # state frozen at the stop step (a restart-poisoning mismatch;
+        # with keep_last_n it even pruned the emergency checkpoint).
+        self._last_processed_step = step
 
         # ─── 1. Progress bar ──────────────────────────────────────
         self._update_progress(step, sim)
@@ -289,7 +296,8 @@ class OutputManager:
 
         elapsed = time.perf_counter() - self._start_time
         total_steps = self._end_step - self._start_step
-        final_step = self._end_step - 1
+        final_step = getattr(self, '_last_processed_step',
+                             self._end_step - 1)
 
         # ── Max steps check ──
         if self.conv_monitor is not None and self.conv_monitor.enabled:
@@ -391,8 +399,12 @@ class OutputManager:
             self._write_markers(final_step)
             self.marker_vtk_writer.write_pvd()
 
-        # ── Final checkpoint ──
-        if self.checkpoint_mgr is not None:
+        # ── Final checkpoint ── (skipped when this exact step was already
+        # checkpointed — e.g. the divergence emergency save; a duplicate
+        # save of identical state is wasted IO and, with keep_last_n, once
+        # deleted the file it had just written)
+        if (self.checkpoint_mgr is not None
+                and final_step != getattr(self, '_last_ckpt_step', None)):
             payload = self._checkpoint_payload(sim)
             if payload is not None:
                 self.checkpoint_mgr.save(
@@ -402,12 +414,7 @@ class OutputManager:
                 )
 
         # ── Final conservation ──
-        if self.conservation_mgr is not None:
-            print(f"\n[8] Final Conservation Analysis")
-            self.conservation_mgr.check(
-                rho_final, final_step, verbose=True,
-            )
-            self.conservation_mgr.close()
+        self._final_conservation(rho_final, final_step)
 
         # ── Force summary ──
         if self.force_mgr is not None:
@@ -467,6 +474,7 @@ class OutputManager:
         if force_result:
             self._last_Cd = force_result['Cd']
             self._last_Cl = force_result['Cl']
+            self._last_Cz = force_result.get('Cz', 0.0)
             if self.conv_monitor is not None:
                 self.conv_monitor.feed_force(
                     step, self._last_Cd, self._last_Cl,
@@ -743,13 +751,13 @@ class OutputManager:
         if self.checkpoint_mgr is None:
             return
         payload = self._checkpoint_payload(sim, include_extra=include_extra)
-        if payload is None:
-            return
-        kwargs = dict(step=step, f=payload['f'], rho=sim.rho, u=sim.u,
-                      tau=self.tau, config=self.sim_params)
-        if include_extra:
-            kwargs['extra_data'] = payload['extra']
-        self.checkpoint_mgr.save(**kwargs)
+        if payload is not None:
+            kwargs = dict(step=step, f=payload['f'], rho=sim.rho, u=sim.u,
+                          tau=self.tau, config=self.sim_params)
+            if include_extra:
+                kwargs['extra_data'] = payload['extra']
+            self.checkpoint_mgr.save(**kwargs)
+        self._last_ckpt_step = step
     
     @staticmethod
     def _f_checkpoint_cpu(sim_like):
@@ -833,13 +841,16 @@ class OutputManager:
             pass
 
         payload = self._checkpoint_payload(sim)
-        if payload is None:
-            return
-        self.checkpoint_mgr.save(
-            step=step, f=payload['f'], rho=sim.rho, u=sim.u,
-            tau=self.tau, config=self.sim_params,
-            extra_data=payload['extra'],
-        )
+        if payload is not None:
+            self.checkpoint_mgr.save(
+                step=step, f=payload['f'], rho=sim.rho, u=sim.u,
+                tau=self.tau, config=self.sim_params,
+                extra_data=payload['extra'],
+            )
+        # rank-invariant bookkeeping (cadence + mgr presence are
+        # replicated): finalize skips its final save when this step was
+        # already checkpointed
+        self._last_ckpt_step = step
 
     # =====================================================================
     # Finalize helpers (private)
@@ -904,6 +915,17 @@ class OutputManager:
         verdict on every rank."""
         return bool(self.xp.isnan(rho_final).any()
                     or self.xp.isinf(rho_final).any())
+
+    def _final_conservation(self, rho_final, final_step: int) -> None:
+        """Data seam: the finalize conservation check. MPI override:
+        collective fluid-only CV masses -> check_from_masses."""
+        if self.conservation_mgr is None:
+            return
+        print(f"\n[8] Final Conservation Analysis")
+        self.conservation_mgr.check(
+            rho_final, final_step, verbose=True,
+        )
+        self.conservation_mgr.close()
 
     def _print_rotor_summary(self) -> None:
         """Print final rotor performance (single or multi)."""
