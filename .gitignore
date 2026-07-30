@@ -1,4 +1,4 @@
-# GitHub 푸시 범위 = src/ + configs/ + main.py + main_mpi.py (2026-07-30 결정)
+# GitHub 푸시 범위 = src/ + configs/ + main.py (2026-07-30 결정; main_mpi.py는 통합 후 삭제)
 # docs/, patch_notes/, 실행 스크립트, summarize 도구, 결과물 등은 전부 로컬 전용.
 
 # 1. 모든 파일과 디렉토리를 무시
@@ -10,7 +10,6 @@
 
 # 3. 무시 대상에서 제외할 파일
 !main.py
-!main_mpi.py
 !.gitignore
 
 # 4. 제외된 디렉토리 내부의 모든 파일은 다시 허용
