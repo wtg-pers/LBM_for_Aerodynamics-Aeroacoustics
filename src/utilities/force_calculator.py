@@ -837,23 +837,33 @@ class ForceManager:
             return False
         return step % self.interval == 0
     
-    def compute_and_log(self, step: int, f_post: 'npt.NDArray',
-                        verbose: bool = False) -> Optional[Dict[str, Any]]:
+    def compute_and_log(self, step: int, f_post: Optional['npt.NDArray'],
+                        verbose: bool = False,
+                        forces_override: Optional['npt.NDArray'] = None,
+                        ) -> Optional[Dict[str, Any]]:
         """Compute forces and log to CSV
-        
+
         Args:
             step: Current time step
-            f_post: Post-collision distribution
+            f_post: Post-collision distribution. May be None when
+                forces_override is given (esoteric path: no f_post buffer;
+                the force comes from the eso_mem_force kernel instead).
             verbose: Print results to console
-        
+            forces_override: Precomputed force vector (lattice units) that
+                replaces the MEM computation from f_post. Coefficients,
+                history and CSV logging are unchanged (single code path).
+
         Returns:
             Dictionary with forces and coefficients, or None if skipped
         """
         if not self.should_compute(step):
             return None
-        
+
         # Compute forces
-        forces = self.force_calc.compute(f_post)
+        if forces_override is not None:
+            forces = forces_override
+        else:
+            forces = self.force_calc.compute(f_post)
         
         # Get coefficients
         coeffs = self.force_calc.get_coefficients(
@@ -888,7 +898,7 @@ class ForceManager:
         self.history.append(result)
 
         # Per-link snapshot for surface distribution
-        if self.save_link_forces:
+        if self.save_link_forces and f_post is not None:
             F_link, rho_link = self.force_calc.compute_per_link(f_post)
             self._link_forces_steps.append(int(step))
             self._link_forces_buffer.append(F_link)

@@ -204,6 +204,10 @@ class Simulation:
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
             if isinstance(self.collision, (BGKCollision, CumulantCollision)):
+                # Capability check BEFORE the try/except: a raise inside
+                # _init_esoteric would be swallowed into a warn+fallback,
+                # which is itself a silent downgrade (user asked for eso).
+                self._reject_ibb_on_esoteric()
                 try:
                     self._init_esoteric(f)
                 except Exception as e:
@@ -388,6 +392,35 @@ class Simulation:
         if self._use_esoteric:
             return None
         return self._f_post
+
+    def _reject_ibb_on_esoteric(self) -> None:
+        """Hard error for wall_bc='ibb' on the esoteric path.
+
+        The eso node-type mapping only knows NODE_SOLID (implicit HWBB);
+        an InterpolatedBounceBack obstacle would silently lose its
+        q-fractions and run as HWBB. No-silent-downgrade rule: refuse.
+        (Esoteric IBB is planned in the STL body track.)"""
+        from src.boundary.interpolated_wall import InterpolatedBounceBack
+        if isinstance(self.obstacle_bc, InterpolatedBounceBack):
+            raise ValueError(
+                "wall_bc='ibb' is not supported on the esoteric path "
+                "(LBM_ESOTERIC=1): it would silently degrade to HWBB. "
+                "Use the standard path (unset LBM_ESOTERIC) or "
+                "wall_bc='hwbb'.")
+
+    def eso_body_force(self) -> 'npt.NDArray':
+        """Whole-domain MEM force on the esoteric path (HWBB bodies).
+
+        Same diagnostic-tier kernel the MPI runner uses (eso_mem_force),
+        with the clip set to the full domain. Returns (Fx, Fy, Fz) as
+        host float64 in lattice units of this level."""
+        if not self._use_esoteric:
+            raise RuntimeError("eso_body_force() requires the esoteric path")
+        from src.kernels.esoteric_d3q27 import eso_mem_force
+        cb = [(0, int(d)) for d in self.domain_shape]
+        return eso_mem_force(
+            self.xp, self.f.reshape((27,) + self.domain_shape),
+            self._eso_node_type, self._esoteric_step, cb)
 
     @property
     def physical_f(self) -> Optional['npt.NDArray']:
@@ -631,6 +664,7 @@ class Simulation:
         this is what lifts the 4-GPU capacity from "one GPU's worth" to
         ~4x (replicated build allocated every full field per rank).
         """
+        self._reject_ibb_on_esoteric()
         import numpy as _np
         from src.kernels.esoteric_d3q27 import (
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE)

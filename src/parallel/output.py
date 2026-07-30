@@ -44,14 +44,25 @@ def _gather_level(comm, rank: int, nr: int, runner, arr_local,
     return np.concatenate(pieces, axis=1 + runner.axis)
 
 
+class _MaskCarrier:
+    """Minimal duck for MLGVTKWriter's `obstacle_bc.solid_mask` read."""
+
+    def __init__(self, solid_mask):
+        self.solid_mask = solid_mask
+
+
 class _LevelView:
     """Duck-typed level for MLGVTKWriter (needs .rho/.u/.nu_t/.obstacle_bc)."""
 
-    def __init__(self, rho, u, nu_t=None):
+    def __init__(self, rho, u, nu_t=None, solid_mask=None):
         self.rho = rho
         self.u = u
         self.nu_t = nu_t
-        self.obstacle_bc = None
+        # solid_mask is static -> captured once at bridge construction on
+        # rank 0 (pre-fix this was hardwired None, silently dropping the
+        # solid_mask array from every MPI VTK snapshot).
+        self.obstacle_bc = (None if solid_mask is None
+                            else _MaskCarrier(solid_mask))
 
 
 class _MLGView:
@@ -71,7 +82,8 @@ class Rank0OutputBridge:
                  tau: float = 0.5,
                  marker_vtk_writer=None,
                  alm_marker_origin=None,
-                 alm_marker_spacing=None) -> None:
+                 alm_marker_spacing=None,
+                 solid_masks: Optional[list] = None) -> None:
         self._comm, self._rank, self._nr = comm, rank, nr
         self._vtk = mlg_vtk_writer
         self._ckpt = checkpoint_mgr
@@ -80,6 +92,8 @@ class Rank0OutputBridge:
         self._marker_vtk = marker_vtk_writer
         self._m_origin = alm_marker_origin
         self._m_spacing = alm_marker_spacing
+        # Per-level static solid masks (host numpy or None), rank 0 only.
+        self._solid_masks = solid_masks
 
     # ── VTK: assembled rho/u per level -> MLGVTKWriter.write ─────────
     def write_vtk(self, step: int, runner, fields: bool = True) -> None:
@@ -104,8 +118,12 @@ class Rank0OutputBridge:
                         L.nut.reshape((1,) + tuple(L.dims)), k,
                         tag0=600 + 2 * k)
                 if rank == 0:
+                    sm = (self._solid_masks[k]
+                          if (self._solid_masks is not None
+                              and k < len(self._solid_masks)) else None)
                     views.append(_LevelView(
-                        rho[0], u, nu_t=(None if nut is None else nut[0])))
+                        rho[0], u, nu_t=(None if nut is None else nut[0]),
+                        solid_mask=sm))
             if rank == 0 and self._vtk is not None:
                 self._vtk.write(step, _MLGView(views), time=float(step))
         self._write_markers(step, runner)

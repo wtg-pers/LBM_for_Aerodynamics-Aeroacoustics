@@ -132,6 +132,20 @@ def main():
         mlg, transport, rank, nr, allreduce=MPIAllreduce(comm),
         axis=axis, ghost=args.ghost)
 
+    def _collect_solid_masks(mlg_obj, n_levels):
+        """Static per-level solid masks (host numpy) for the VTK bridge.
+
+        Captured BEFORE the full build is freed; pre-fix the bridge
+        hardwired obstacle_bc=None and MPI VTK silently lost solid_mask."""
+        masks = []
+        for k in range(n_levels):
+            ob = getattr(mlg_obj.get_level(k), "obstacle_bc", None)
+            sm = getattr(ob, "solid_mask", None) if ob is not None else None
+            if sm is not None and hasattr(sm, "get"):
+                sm = sm.get()
+            masks.append(sm)
+        return masks
+
     # output bridge (production writers) BEFORE freeing the build
     from src.parallel.output import Rank0OutputBridge
     bridge = None
@@ -150,7 +164,9 @@ def main():
             alm_marker_origin=(getattr(setup, "_alm_marker_origin", None)
                                if rank == 0 else None),
             alm_marker_spacing=(getattr(setup, "_alm_marker_spacing", None)
-                                if rank == 0 else None))
+                                if rank == 0 else None),
+            solid_masks=(_collect_solid_masks(mlg, runner.NL)
+                         if rank == 0 else None))
 
     # body-tier normalization source (review #3, R3-4.3): keep the reference
     # dict from the ALREADY-PARSED setup.config — re-executing the config

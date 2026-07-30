@@ -478,16 +478,26 @@ class OutputManager:
         if step < self.force_mgr.start_step:
             return
 
-        # Select f_post from the correct level
+        # Select the level carrying the obstacle
         if (self._mlg_force_level is not None
                 and hasattr(sim, 'get_level')):
-            f_post = sim.get_level(self._mlg_force_level).f_post
+            lvl = sim.get_level(self._mlg_force_level)
         else:
-            f_post = sim.f_post
+            lvl = sim
 
-        force_result = self.force_mgr.compute_and_log(
-            step, f_post, verbose=False,
-        )
+        if getattr(lvl, '_use_esoteric', False):
+            # Esoteric path has no f_post buffer (single-buffer in-place);
+            # pre-fix this passed f_post=None into the MEM computation and
+            # crashed. The force comes from the same eso_mem_force kernel
+            # the MPI runner uses; coefficients/CSV stay on the one path.
+            force_result = self.force_mgr.compute_and_log(
+                step, None, verbose=False,
+                forces_override=lvl.eso_body_force(),
+            )
+        else:
+            force_result = self.force_mgr.compute_and_log(
+                step, lvl.f_post, verbose=False,
+            )
         if force_result:
             self._last_Cd = force_result['Cd']
             self._last_Cl = force_result['Cl']
