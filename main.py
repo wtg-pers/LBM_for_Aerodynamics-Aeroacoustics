@@ -1,70 +1,21 @@
 """
-LBM Solver for Aerodynamics & Aeroacoustics
+LBM Solver for Aerodynamics & Aeroacoustics — unified entry point.
 
-Unified entry point for all simulation types:
-  - Channel flow (Poiseuille, lid-driven cavity)
-  - External flow (cylinder, airfoil)
-  - Wind turbine (Actuator Line model)
-
-Usage:
-    python main.py --config configs/input_config.py
-    python main.py --config configs/NTNU_BT1_config.py
+Single-GPU and MPI runs dispatch from the same command:
+    python main.py --config configs/my_config.py            # single GPU
     python main.py --restart-latest --extend 10000
+    mpirun -n 4 python main.py --config cfg.py --steps 2000  # multi GPU
 
-Author: LBM Development Team
+All logic lives in src/ (src/solver/entry.py, src/parallel/driver.py) so an
+src-only deploy can never miss the driver again.
 """
 
-import os, sys
+import os
+import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.io.args_parser import parse_args
-from src.solver.setup import SimulationSetup
-from src.solver.initializer import SolverInitializer
-
-
-def main():
-    args = parse_args()
-
-    # GPU 목록 출력 후 종료
-    if args.list_gpus:
-        from src.utilities.device import print_gpu_info
-        print_gpu_info()
-        return
-
-    print("=" * 70)
-    print(" LBM Solver for Aerodynamics & Aeroacoustics")
-    print("=" * 70)
-
-    # [1] Setup — 시뮬레이션 환경 구성
-    setup = SimulationSetup(args)
-
-    # [2] Build & Initialize — 상세 로그는 파일로
-    setup.start_log_capture()
-    sim    = setup.build_simulation()
-    output = setup.build_output_manager()
-
-    initializer = SolverInitializer(setup)
-    start_step, end_step = initializer.initialize(sim, args)
-    setup.stop_log_capture()
-
-    if start_step >= end_step:
-        return True
-
-    # [3] Execution — 시간 루프
-    print(f"\n[6] Running Simulation")
-    print("=" * 70)
-
-    output.start(start_step, end_step)
-
-    for step in range(start_step, end_step):
-        sim.advance()
-        if output.process(step, sim) == 'stop':
-            break
-
-    # [4] Finalize
-    return output.finalize(sim)
-
+from src.solver.entry import main
 
 if __name__ == "__main__":
     main()

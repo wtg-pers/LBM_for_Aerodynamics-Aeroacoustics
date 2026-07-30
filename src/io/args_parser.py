@@ -9,10 +9,31 @@ Date: 2026-01
 """
 
 import argparse
-from typing import Any
+import os
+from typing import Any, Dict, Optional, Sequence, Tuple
+
+# MPI-only flags: dest -> (flag string, parser default). The entry dispatcher
+# rejects any of these that deviate from its default when world size == 1,
+# instead of silently ignoring them (no-silent rule).
+MPI_ONLY_DESTS: Dict[str, Tuple[str, Any]] = {
+    'steps': ('--steps', None),
+    'devices': ('--devices', None),
+    'axis': ('--axis', 'auto'),
+    'ghost': ('--ghost', 3),
+    'cuda_aware': ('--cuda-aware', None),
+    'csv': ('--csv', None),
+    'log_every': ('--log-every', None),
+    'vtk_every': ('--vtk-every', None),
+    'vtk_fields_last': ('--vtk-fields-last', 0),
+    'ckpt_every': ('--ckpt-every', None),
+    'dist_init': ('--dist-init', False),
+    'verify': ('--verify', False),
+    'strict_bit': ('--strict-bit', False),
+    'profile': ('--profile', False),
+}
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command line arguments
     
     Argument Priority: CLI arguments > config file settings
@@ -139,8 +160,84 @@ Examples:
         '--no-force', action='store_true',
         help='Disable force calculation'
     )
-    
-    return parser.parse_args()
+    output_group.add_argument(
+        '--verbose', action='store_true',
+        help='Echo the captured setup log to the terminal as well'
+    )
+
+    # ==========================================================================
+    # MPI (multi-rank only) — rejected by the dispatcher at world size == 1
+    # ==========================================================================
+    mpi_group = parser.add_argument_group(
+        'MPI (multi-rank only; launch with mpirun -n N>1)')
+
+    mpi_group.add_argument(
+        '--mpi', action='store_true',
+        help='Force the MPI path even if no MPI launcher env is detected '
+             '(escape hatch for exotic launchers)'
+    )
+    mpi_group.add_argument(
+        '--steps', type=int, default=None, metavar='N',
+        help='[MPI] coarse (L0) steps, absolute inclusive (legacy main_mpi '
+             'semantics; will become an alias of --max-steps)'
+    )
+    mpi_group.add_argument(
+        '--axis', default='auto', choices=['auto', 'x', 'y', 'z'],
+        help='[MPI] slab decomposition axis'
+    )
+    mpi_group.add_argument(
+        '--devices', default=None, metavar='LIST',
+        help="[MPI] comma-separated GPU ids per node-local rank, e.g. '0,1' "
+             "(default: local_rank %% ndev)"
+    )
+    mpi_group.add_argument(
+        '--ghost', type=int, default=3,
+        help='[MPI] halo ghost width'
+    )
+    mpi_group.add_argument(
+        '--cuda-aware', default=None, metavar='0|1',
+        help='[MPI] pass CuPy buffers to MPI directly (default: env '
+             'LBM_MPI_CUDA, 0 if unset)'
+    )
+    mpi_group.add_argument(
+        '--csv', default=None, metavar='PATH',
+        help='[MPI] dense timeseries CSV (rank 0)'
+    )
+    mpi_group.add_argument(
+        '--log-every', type=int, default=None, metavar='N',
+        help='[MPI] coarse steps between progress lines (default 8)'
+    )
+    mpi_group.add_argument(
+        '--vtk-every', type=int, default=None, metavar='N',
+        help='[MPI] coarse steps between assembled VTK writes (0=off)'
+    )
+    mpi_group.add_argument(
+        '--vtk-fields-last', type=int, default=0, metavar='N',
+        help='[MPI] write level-field VTK only for the last N vtk events'
+    )
+    mpi_group.add_argument(
+        '--ckpt-every', type=int, default=None, metavar='N',
+        help='[MPI] coarse steps between assembled checkpoints (0=off)'
+    )
+    mpi_group.add_argument(
+        '--dist-init', action='store_true',
+        help='[MPI] slab-scoped initialization: no full-size device fields '
+             'per rank (uniform-IC cases)'
+    )
+    mpi_group.add_argument(
+        '--verify', action='store_true',
+        help='[MPI] compare assembled result vs a fresh 1-rank reference'
+    )
+    mpi_group.add_argument(
+        '--strict-bit', action='store_true',
+        help='[MPI] verify passes ONLY on bit-identity'
+    )
+    mpi_group.add_argument(
+        '--profile', action='store_true',
+        help='[MPI] per-section wall-time attribution'
+    )
+
+    return parser.parse_args(argv)
 
 
 def get_args_summary(args: argparse.Namespace) -> str:
@@ -169,8 +266,8 @@ def get_args_summary(args: argparse.Namespace) -> str:
     if args.max_steps:
         lines.append(f"  Max steps: {args.max_steps}")
     
-    if args.output_dir:
-        lines.append(f"  Output dir: {args.output_dir}")
+    if args.vtk_dir:
+        lines.append(f"  VTK dir: {args.vtk_dir}")
     
     if args.checkpoint_dir:
         lines.append(f"  Checkpoint dir: {args.checkpoint_dir}")
