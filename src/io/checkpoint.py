@@ -37,11 +37,12 @@ class CheckpointManager:
     Supports both 2D and 3D simulations.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  output_dir: str,
                  prefix: str = 'checkpoint',
                  keep_last_n: int = 0,
-                 xp: 'ModuleType' = None) -> None:
+                 xp: 'ModuleType' = None,
+                 create_dir: bool = True) -> None:
         """Initialize checkpoint manager
         
         Args:
@@ -54,8 +55,11 @@ class CheckpointManager:
         self.prefix = prefix
         self.keep_last_n = keep_last_n
         self.xp = xp if xp is not None else np
-        
-        os.makedirs(output_dir, exist_ok=True)
+
+        # create_dir=False: non-IO MPI ranks keep the manager for RESTORE
+        # (reading existing files) without creating directories.
+        if create_dir:
+            os.makedirs(output_dir, exist_ok=True)
         self.saved_files: list = []
     
     def _to_numpy(self, arr: 'npt.NDArray') -> np.ndarray:

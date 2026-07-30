@@ -106,14 +106,23 @@ class SimulationSetup:
         checkpoint_mgr: Checkpoint manager (for initializer to use)
     """
 
-    def __init__(self, args: Any) -> None:
+    def __init__(self, args: Any, io_role: str = 'writer') -> None:
         """Build entire simulation environment from CLI args.
 
         Default: detailed log → file only, compact summary → terminal.
         Use --verbose to also echo detailed log to terminal.
+
+        io_role: 'writer' (default — full file IO, current single-GPU
+        behavior) or 'silent' (MPI rank != 0: build everything but create
+        NO directories and write NO files — kills the N-rank concurrent
+        header/clear races. CheckpointManager is still built: the restore
+        path needs it on every rank).
         """
         self._args = args
         self._verbose = getattr(args, 'verbose', False)
+        assert io_role in ('writer', 'silent'), io_role
+        self.io_role = io_role
+        self.is_io_rank = (io_role == 'writer')
 
         # ── Capture detailed output to buffer ────────────────────
         self._log_buffer = io.StringIO()
@@ -163,12 +172,14 @@ class SimulationSetup:
         finally:
             sys.stdout = self._original_stdout
 
-        # ── Write detailed log to file ───────────────────────────
-        log_dir = getattr(self, '_csv_dir', './results/csv')
-        os.makedirs(log_dir, exist_ok=True)
-        self._log_path = os.path.join(log_dir, 'setup_log.txt')
-        with open(self._log_path, 'w', encoding='utf-8') as f:
-            f.write(self._log_buffer.getvalue())
+        # ── Write detailed log to file (IO rank only) ────────────
+        self._log_path = None
+        if self.is_io_rank:
+            log_dir = getattr(self, '_csv_dir', './results/csv')
+            os.makedirs(log_dir, exist_ok=True)
+            self._log_path = os.path.join(log_dir, 'setup_log.txt')
+            with open(self._log_path, 'w', encoding='utf-8') as f:
+                f.write(self._log_buffer.getvalue())
 
         # ── Print compact summary to terminal ────────────────────
         self._print_summary()
@@ -206,8 +217,9 @@ class SimulationSetup:
     def stop_log_capture(self) -> None:
         """Restore stdout and update log file."""
         sys.stdout = self._original_stdout
-        with open(self._log_path, 'w', encoding='utf-8') as f:
-            f.write(self._log_buffer.getvalue())
+        if self._log_path is not None:
+            with open(self._log_path, 'w', encoding='utf-8') as f:
+                f.write(self._log_buffer.getvalue())
 
     # =====================================================================
     # Public: Build products
@@ -725,23 +737,29 @@ class SimulationSetup:
         print(f"  Checkpoint dir: {self.checkpoint_dir}")
         print(f"  CSV output dir: {self._csv_dir}")
 
-        setup_output_directories(
-            output_dir=output_dir,
-            checkpoint_dir=self.checkpoint_dir,
-            csv_dir=self._csv_dir,
-            clear_previous=clear_previous,
-            is_restart=is_restart,
-        )
+        if self.is_io_rank:
+            setup_output_directories(
+                output_dir=output_dir,
+                checkpoint_dir=self.checkpoint_dir,
+                csv_dir=self._csv_dir,
+                clear_previous=clear_previous,
+                is_restart=is_restart,
+            )
+        else:
+            print("  (io_role=silent: directories/clear/writers owned by "
+                  "the IO rank)")
 
         # ── Geometry outline (one-shot, L0 lu) ──
         gi = getattr(self, '_geom_info', None)
-        if gi is not None and gi.get('type', 'none') != 'none':
+        if (self.is_io_rank and gi is not None
+                and gi.get('type', 'none') != 'none'):
             outline_path = os.path.join(output_dir, 'geometry_outline.vtk')
             write_geometry_outline(gi, outline_path)
 
         # ── VTK Writer ──
         vc = self._vtk_config
-        vtk_enabled = vc.get('enabled', True) and not args.no_vtk
+        vtk_enabled = (vc.get('enabled', True) and not args.no_vtk
+                       and self.is_io_rank)
         if vtk_enabled:
             self.vtk_writer = VTKWriter(
                 output_dir=output_dir,
@@ -775,6 +793,7 @@ class SimulationSetup:
                 prefix='checkpoint',
                 keep_last_n=cc.get('keep_last_n', 3),
                 xp=self.xp,
+                create_dir=self.is_io_rank,
             )
             if self._dimension == 2:
                 est = self.checkpoint_mgr.get_size_estimate(
@@ -805,7 +824,7 @@ class SimulationSetup:
             'F_n,F_theta,F_L,F_D,'
             'eps_c,eps_t,eps_r,eps_samp_c,eps_samp_t,eps_samp_r\n'
         )
-        if self.al_enabled:
+        if self.al_enabled and self.is_io_rank:
             self.perf_csv_path = os.path.join(
                 self._csv_dir, 'rotor_performance.csv',
             )
@@ -904,7 +923,7 @@ class SimulationSetup:
             domain_shape=self.domain_shape,
             config=self._conservation_config,
             solid_mask=self._mask,
-            csv_dir=self._csv_dir,
+            csv_dir=self._csv_dir if self.is_io_rank else None,
         )
         print(f"  {self.conservation_mgr.get_info()}")
 
@@ -977,7 +996,7 @@ class SimulationSetup:
         self.conv_monitor = ConvergenceMonitor(
             config=self._conv_config,
             has_obstacle=has_obstacle,
-            csv_dir=self._csv_dir,
+            csv_dir=self._csv_dir if self.is_io_rank else None,
         )
 
         if self.conv_monitor.enabled:

@@ -634,7 +634,14 @@ class ConvergenceMonitor:
               f"diverged → {self.on_diverged}")
     
     def _init_csv_logger(self) -> None:
-        """Initialize CSV logger for convergence history."""
+        """Initialize CSV logger for convergence history.
+
+        csv_dir=None: non-IO rank — tracker state advances identically but
+        nothing is written."""
+        if self.csv_dir is None:
+            self._csv_file = None
+            self._csv_writer = None
+            return
         os.makedirs(self.csv_dir, exist_ok=True)
         csv_path = os.path.join(self.csv_dir, 'convergence_history.csv')
         self._csv_file = open(csv_path, 'w', newline='')

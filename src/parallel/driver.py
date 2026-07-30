@@ -88,9 +88,14 @@ def _fail_fast_config(setup, mlg) -> None:
 
 
 def _build(args, dev: int, with_writers: bool = False,
-           use_restart: bool = True, dist_init=None):
+           use_restart: bool = True, dist_init=None,
+           io_role: str = 'writer'):
     """Replicated production build. No sys.argv shim — a Namespace copy of
-    the unified args, so directory/clear flags now reach setup too."""
+    the unified args, so directory/clear flags now reach setup too.
+
+    io_role='silent' (rank != 0): no directories/clear, no writers, no
+    setup_log/CSV headers — kills the historical N-rank concurrent-write
+    races. CheckpointManager still built (restore path)."""
     di = args.dist_init if dist_init is None else dist_init
     os.environ["LBM_DIST_INIT"] = "1" if di else "0"
     bargs = argparse.Namespace(**vars(args))
@@ -104,7 +109,7 @@ def _build(args, dev: int, with_writers: bool = False,
         bargs.restart_latest = False
     from src.solver.setup import SimulationSetup
     from src.solver.initializer import SolverInitializer
-    s = SimulationSetup(bargs)
+    s = SimulationSetup(bargs, io_role=io_role)
     s.start_log_capture()
     mlg = s.build_simulation()
     SolverInitializer(s).initialize(mlg, bargs)
@@ -148,7 +153,8 @@ def _run(args, MPI):
         raise ValueError("--dist-init + restart: restore path loads full "
                          "fields (use replicated build for restarts for now)")
     mlg, setup = _build(args, dev,
-                        with_writers=(rank == 0 and want_out))
+                        with_writers=(rank == 0 and want_out),
+                        io_role=('writer' if rank == 0 else 'silent'))
     sys.stdout = sys.__stdout__
 
     from src.parallel import MPITransport

@@ -329,8 +329,9 @@ class ConservationManager:
             M0 = cv.initialize(rho, step)
             print(f"  CV '{cv.name}': M0 = {M0:.6f}, {cv.get_bounds_str()}")
         
-        # Setup CSV logging
-        if self.log_to_csv:
+        # Setup CSV logging (csv_dir=None: non-IO rank — state advances
+        # identically but nothing is written)
+        if self.log_to_csv and self.csv_dir is not None:
             os.makedirs(self.csv_dir, exist_ok=True)
             csv_path = os.path.join(self.csv_dir, 'mass_conservation.csv')
 

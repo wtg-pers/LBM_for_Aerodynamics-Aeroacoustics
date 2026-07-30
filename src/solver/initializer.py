@@ -78,7 +78,10 @@ class SolverInitializer:
             self._setup.conservation_mgr.initialize(rho_init, step=start_step)
 
         # ── Step 4b: Open CSV files (with start_step for restart) ─
-        if self._setup.force_mgr is not None:
+        # (io_role='silent' MPI ranks never open result CSVs; their
+        # perf_csv_path/blade_csv_dir are already None from setup)
+        if (self._setup.force_mgr is not None
+                and getattr(self._setup, 'is_io_rank', True)):
             self._setup.force_mgr.open_csv(start_step=start_step)
 
         # Rotor CSV: open with start_step awareness
