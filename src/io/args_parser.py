@@ -178,8 +178,8 @@ Examples:
     )
     mpi_group.add_argument(
         '--steps', type=int, default=None, metavar='N',
-        help='[MPI] coarse (L0) steps, absolute inclusive (legacy main_mpi '
-             'semantics; will become an alias of --max-steps)'
+        help='[MPI] DEPRECATED alias of --max-steps N (same advance count; '
+             'step labels are 0-based since the C8 unification)'
     )
     mpi_group.add_argument(
         '--axis', default='auto', choices=['auto', 'x', 'y', 'z'],

@@ -106,9 +106,14 @@ class DistributedMLGRunner:
         self.alm_lev = alm_lev
 
         # restart: continue esoteric parity + step numbering from the
-        # restored state (initializer sets L0 step_count = completed+1)
+        # restored state. The initializer sets L0 step_count = start_step
+        # = the number of coarse advances already done (0-based exclusive
+        # step convention, unified in stage C8) — completed_step IS that
+        # count. The old `max(0, sc-1)` belonged to the legacy 1-based
+        # main_mpi labels; under the unified convention it desynced the
+        # esoteric parity t0 for single-GPU-written checkpoints.
         sc = int(getattr(mlg.get_level(0), "step_count", 0) or 0)
-        self.completed_step = max(0, sc - 1) if sc > 0 else 0
+        self.completed_step = sc
 
         # local slabs: extract views level-by-level and RELEASE each source
         # level's device arrays right after its slab is built — keeps the

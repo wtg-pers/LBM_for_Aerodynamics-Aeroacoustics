@@ -422,7 +422,13 @@ class SolverInitializer:
         if al is not None:
             models = al.models if hasattr(al, 'models') else [al]
             sub = 2 ** (mlg.num_levels - 1)      # ALM lives on the finest
-            t_fine = completed_step * sub
+            # Checkpoint 'step' is the 0-based LABEL of the last processed
+            # step -> coarse advances done = label + 1 = start_step. The
+            # historical `completed_step * sub` was one coarse step short
+            # for label-convention checkpoints (it was calibrated to the
+            # pre-unification main_mpi count convention) — azimuth lagged
+            # 2^(NL-1) fine steps on every single-GPU MLG ALM restart.
+            t_fine = start_step * sub
             for m_ in models:
                 for _ in range(t_fine):
                     m_.rotor.advance(1.0)

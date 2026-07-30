@@ -113,11 +113,11 @@ def _build(args, dev: int, with_writers: bool = False,
     s = SimulationSetup(bargs, io_role=io_role)
     s.start_log_capture()
     mlg = s.build_simulation()
-    SolverInitializer(s).initialize(mlg, bargs)
+    start_step, end_step = SolverInitializer(s).initialize(mlg, bargs)
     s.stop_log_capture()
     _fail_fast_config(s, mlg)
     mlg._graph_enabled = False
-    return mlg, s
+    return mlg, s, start_step, end_step
 
 
 def _collect_solid_masks(mlg_obj, n_levels):
@@ -135,9 +135,19 @@ def _collect_solid_masks(mlg_obj, n_levels):
 def _run(args, MPI):
     import numpy as np
 
-    if args.steps is None:
-        sys.exit("error: --steps N is required for MPI runs "
-                 "(unifies into --max-steps in a later stage)")
+    # unified step semantics (C8): 0-based EXCLUSIVE range, exactly like
+    # the single-GPU loop. --max-steps absolute > --extend relative >
+    # config time.max_steps. --steps N is a deprecated alias of
+    # --max-steps N: same advance count, labels shift by -1.
+    if args.steps is not None:
+        if args.max_steps is not None:
+            sys.exit("error: --steps conflicts with --max-steps "
+                     "(--steps is a deprecated alias)")
+        print(f"[mpi] warning: --steps is deprecated — use --max-steps "
+              f"{args.steps} (same advance count; step labels are now "
+              f"0-based)", flush=True)
+        args.max_steps = args.steps
+        args.steps = None
     log_every = 8 if args.log_every is None else args.log_every
     vtk_every = args.vtk_every or 0
     ckpt_every = args.ckpt_every or 0
@@ -169,9 +179,9 @@ def _run(args, MPI):
     if args.dist_init and (args.restart or args.restart_latest):
         raise ValueError("--dist-init + restart: restore path loads full "
                          "fields (use replicated build for restarts for now)")
-    mlg, setup = _build(args, dev,
-                        with_writers=(rank == 0),
-                        io_role=('writer' if rank == 0 else 'silent'))
+    mlg, setup, start_step, end_step = _build(
+        args, dev, with_writers=(rank == 0),
+        io_role=('writer' if rank == 0 else 'silent'))
 
     from src.parallel import MPITransport
     from src.parallel.alm_dist import MPIAllreduce
@@ -205,7 +215,8 @@ def _run(args, MPI):
         runner.body_level = None if out_bl[0] < 0 else int(out_bl[0])
 
     solid_masks = _collect_solid_masks(mlg, NL) if rank == 0 else None
-    start_step = runner.completed_step + 1
+    assert runner.completed_step == start_step, \
+        (runner.completed_step, start_step)
     output.bind_runner(runner, level_shapes, solid_masks,
                        dist_init=args.dist_init, start_step=start_step)
 
@@ -221,17 +232,23 @@ def _run(args, MPI):
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
 
-    if start_step > args.steps:
+    if start_step >= end_step:
         if rank == 0:
-            print(f"[mpi] nothing to do: restored step {start_step - 1} "
-                  f">= --steps {args.steps}", flush=True)
+            print(f"[mpi] nothing to do: {start_step} completed steps >= "
+                  f"end step {end_step}", flush=True)
         MPI.Finalize()
-        return
+        return True
     if rank == 0:
         print(f"[mpi] ranks={nr} axis={'xyz'[runner.axis]} "
               f"ghost={args.ghost} cuda_aware={cuda_aware}"
-              + (f"  RESTART from {runner.completed_step}"
+              + (f"  RESTART: {runner.completed_step} steps done, "
+                 f"resuming at label {start_step}"
                  if runner.completed_step else ""), flush=True)
+        if runner.completed_step:
+            print("[mpi] note: step labels are 0-based (unified). A "
+                  "checkpoint written by the pre-unification main_mpi "
+                  "resumes one step late — convert once with: "
+                  "step -= 1 in the npz (see docs/manual/09).", flush=True)
         for k, p in enumerate(runner.parts):
             print(f"[mpi]   L{k} rank0 {p}", flush=True)
 
@@ -239,12 +256,10 @@ def _run(args, MPI):
         runner.profile = {}
     runner.last_interval = None
 
-    # legacy-inclusive step labels (start..steps) until the C8 semantics
-    # unification; OutputManager sees the exclusive end start..steps+1
-    output.start(start_step, args.steps + 1)
-    for s_ in range(start_step, args.steps + 1):
+    output.start(start_step, end_step)
+    for step in range(start_step, end_step):
         runner.step_coarse()
-        if output.process(s_, runner) == 'stop':
+        if output.process(step, runner) == 'stop':
             break
     cp.cuda.runtime.deviceSynchronize()
 
@@ -261,13 +276,18 @@ def _run(args, MPI):
                 print(f"[profile]   {k:14s} {vals}", flush=True)
 
     if args.verify:
-        _verify(comm, rank, nr, runner, args)
+        _verify(comm, rank, nr, runner, args, n_advances=end_step)
     MPI.Finalize()
     return result
 
 
-def _verify(comm, rank, nr, runner, args):
-    """Gather owned assemblies to rank 0; compare vs fresh 1-rank reference."""
+def _verify(comm, rank, nr, runner, args, n_advances=None):
+    """Gather owned assemblies to rank 0; compare vs fresh 1-rank reference.
+
+    The reference is built with io_role='silent' and restart disabled:
+    no directories are created/cleared and no CSV headers are rewritten,
+    so a config with clear_previous=True can no longer wipe the results
+    the distributed run just wrote (historical hazard)."""
     import cupy as cp
     import numpy as np
     NL = runner.NL
@@ -288,8 +308,10 @@ def _verify(comm, rank, nr, runner, args):
     if rank != 0:
         return
     print("[verify] building 1-rank reference...", flush=True)
-    ref, _ = _build(args, 0, use_restart=False, dist_init=False)
-    for _ in range(args.steps):
+    ref, _s, _a, ref_end = _build(args, 0, use_restart=False,
+                                  dist_init=False, io_role='silent')
+    n_adv = ref_end if n_advances is None else n_advances
+    for _ in range(n_adv):
         ref.advance()
     ok = True
     for k in range(NL):

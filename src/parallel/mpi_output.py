@@ -331,7 +331,10 @@ class MPIOutputManager(OutputManager):
             return None
         extra = None
         if include_extra:
-            extra = {"num_levels": r.NL}
+            # step_convention marker: 'index' = 0-based last-processed
+            # label (C8 unified). Pre-unification main_mpi checkpoints
+            # (step = advance count) lack it — restore prints a note.
+            extra = {"num_levels": r.NL, "step_convention": "index"}
             for k in range(1, r.NL):
                 extra[f"f_level_{k}"] = f_levels[k]
         return {'f': f_levels[0], 'extra': extra,
