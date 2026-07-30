@@ -682,7 +682,14 @@ class Simulation:
 
         Faithful port of 8036317. Periodic faces are absent from
         bc_manager.face_bcs, so a periodic box stays all-FLUID (Phase 1a gate).
-        Full eq/sponge fidelity validated in Phase 1c (HVAB).
+        Eq-face fidelity validated in Phase 1c (HVAB).
+
+        NOTE(2026-07-30): the sponge branch of the original port was dead
+        code from day one — it read `sb._sigma`, which SpongeLayerBC never
+        had — so every esoteric run before this fix silently ran WITHOUT
+        sponges (faces stayed FLUID -> periodic wrap). Fixed to read
+        sigma_slab/_L; gate: patch_notes/entry_unification/gates/
+        eso_sponge_twin_gate.py (manual 06 §6.9-①).
         """
         Nx, Ny, Nz = self.domain_shape
         for face_bc in getattr(self.bc_manager, 'face_bcs', []):
@@ -718,11 +725,27 @@ class Simulation:
 
         for sb in getattr(self.bc_manager, 'sponge_layers', []):
             loc = getattr(getattr(sb, 'location', None), 'value', '')
-            L = int(getattr(sb, 'thickness', 0) or 0)
-            sigma_1d = getattr(sb, '_sigma', None)
-            if L <= 0 or sigma_1d is None:
-                continue
-            sigma_np = sigma_1d.get() if hasattr(sigma_1d, 'get') else sigma_1d
+            # Effective thickness _L (= min(thickness, N//2)) and the slab
+            # damping profile sigma_slab are what SpongeLayerBC actually
+            # stores. A configured sponge that cannot be converted must be a
+            # hard error, not a silent skip (the pre-fix code read a
+            # never-existing `_sigma` attribute and dropped every sponge on
+            # the esoteric path — gate: eso_sponge_twin_gate.py).
+            L = int(getattr(sb, '_L', 0) or 0)
+            sigma_slab = getattr(sb, 'sigma_slab', None)
+            if L <= 0 or sigma_slab is None:
+                raise ValueError(
+                    f"esoteric BC conversion: sponge at '{loc}' has no readable "
+                    f"damping profile (_L={L}, sigma_slab="
+                    f"{'None' if sigma_slab is None else 'ok'})")
+            sigma_np = (sigma_slab.get() if hasattr(sigma_slab, 'get')
+                        else sigma_slab).reshape(-1)
+            # sigma_slab is indexed by slab position along the axis
+            # (min face: index 0 = boundary row; max face: index L-1 =
+            # boundary row). The sl loop below indexes layer_i inward FROM
+            # the boundary face, so flip on max faces.
+            if not bool(getattr(sb.location, 'is_min', False)):
+                sigma_np = sigma_np[::-1]
             rho_inf = float(getattr(sb, 'rho_inf', 1.0))
             u_inf = getattr(sb, 'u_inf', [0.0, 0.0, 0.0])
             u_inf = u_inf.get() if hasattr(u_inf, 'get') else u_inf
