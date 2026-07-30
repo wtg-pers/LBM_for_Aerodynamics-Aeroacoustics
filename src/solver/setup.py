@@ -336,6 +336,43 @@ class SimulationSetup:
         Simulation.nan_trap_enabled = bool(self._numerics_cfg.get('nan_trap', False))
         Simulation.nan_check_every = max(1, int(self._numerics_cfg.get('nan_check_every', 1)))
 
+        # ── numerics.esoteric → LBM_ESOTERIC bridge ──────────────
+        # The streaming memory layout is a numerics choice, so the config
+        # may request it (numerics.esoteric: true/false). The env var stays
+        # the OVERRIDE (A/B twins and gates flip it per process; the MPI
+        # driver setdefaults it to 1 before setup) — config applies only
+        # when the env is unset. Downstream (per-level set_distribution)
+        # keeps reading the env as the single mechanism.
+        eso_cfg = self._numerics_cfg.get('esoteric', None)
+        if eso_cfg is not None:
+            if bool(eso_cfg):
+                # fail fast on preconditions the esoteric path cannot meet
+                # (an explicit config request must never silently degrade;
+                # env-requested keeps the historical warn+fallback)
+                dim = int(self.sim_params.get('dimension', 3))
+                prec = str(self.sim_params.get('precision', 'float64'))
+                dev = str(self.sim_params.get('device_mode', 'gpu'))
+                problems = []
+                if dim != 3:
+                    problems.append(f"dimension={dim} (3D only)")
+                if prec != 'float32':
+                    problems.append(f"precision={prec} (float32 only)")
+                if dev != 'gpu':
+                    problems.append(f"device_mode={dev} (GPU only)")
+                for gname, gcfg in self.config.get(
+                        'internal_geometry', {}).items():
+                    if (isinstance(gcfg, dict) and gcfg.get('enabled')
+                            and gcfg.get('wall_bc', 'hwbb') == 'ibb'):
+                        problems.append(
+                            f"internal_geometry.{gname}.wall_bc='ibb' "
+                            f"(esoteric supports hwbb only)")
+                if problems:
+                    raise ValueError(
+                        "numerics.esoteric=true cannot be satisfied: "
+                        + "; ".join(problems))
+            if "LBM_ESOTERIC" not in os.environ:
+                os.environ["LBM_ESOTERIC"] = "1" if eso_cfg else "0"
+
         self._output_config = self.config.get('output', {})
         self._vtk_config = self._output_config.get('vtk', {})
         self._checkpoint_config = self._output_config.get('checkpoint', {})

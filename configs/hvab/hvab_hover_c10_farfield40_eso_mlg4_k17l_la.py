@@ -41,3 +41,6 @@ config["simulation"]["omega_3"] = 0.0
 config["simulation"]["omega_4"] = 0.0
 config["simulation"]["omega_5"] = 0.0
 config["simulation"]["cumulant_limiter"] = 0.01
+# esoteric streaming via config (env LBM_ESOTERIC no longer required on the
+# command line; env still overrides for A/B). entry_unification note 11.
+config["numerics"]["esoteric"] = True

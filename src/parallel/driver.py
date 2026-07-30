@@ -83,6 +83,11 @@ def _fail_fast_config(setup, mlg) -> None:
             "[mpi] config error: multi-rotor ALM (actuator_line.rotors) is "
             "unsupported under MPI — the distributed sampler binds exactly "
             "one rotor's F_grid (src/parallel/runner.py). Run single-GPU.")
+    if getattr(setup, '_numerics_cfg', {}).get('esoteric', None) is False:
+        raise ValueError(
+            "[mpi] config error: numerics.esoteric=false, but the "
+            "distributed runner operates on esoteric-pull state. Remove "
+            "the key (or set true) for MPI runs, or run single-GPU.")
     lvl0 = mlg.get_level(0)
     if not getattr(lvl0, '_use_esoteric', False):
         raise ValueError(
