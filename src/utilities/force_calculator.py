@@ -863,6 +863,11 @@ class ForceManager:
         if forces_override is not None:
             forces = forces_override
         else:
+            if getattr(self, '_device_released', False):
+                raise RuntimeError(
+                    "ForceManager device state was released "
+                    "(release_device_state) — forces must arrive via "
+                    "forces_override on this path")
             forces = self.force_calc.compute(f_post)
         
         # Get coefficients
@@ -914,9 +919,30 @@ class ForceManager:
 
         return result
     
+    def release_device_state(self) -> None:
+        """Drop the device-side MEM link/mask state, keeping only the
+        scalar coefficient math (get_coefficients is pure arithmetic) +
+        CSV logging.
+
+        For consumers that feed forces via compute_and_log(
+        forces_override=...) — the MPI path: eso_mem_force + Allreduce —
+        the dense needs_bounce / mask arrays are dead weight that would
+        otherwise survive the replicated-build free (27 B/cell at the
+        force level). After this call the f_post compute path raises."""
+        fc = getattr(self, 'force_calc', None)
+        if fc is not None:
+            for attr in ('needs_bounce', 'solid_mask', '_q_fraction',
+                         'wall_bc', '_cuda_kernel'):
+                if hasattr(fc, attr):
+                    setattr(fc, attr, None)
+        for attr in ('solid_mask', 'wall_bc'):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        self._device_released = True
+
     def get_final_statistics(self) -> Dict[str, Any]:
         """Compute final statistics from force history
-        
+
         Returns:
             Dictionary with mean, std, min, max for each coefficient
         """

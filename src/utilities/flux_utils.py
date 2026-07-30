@@ -155,18 +155,26 @@ class ControlVolume:
         
         return float(xp.sum(rho_cv))
     
-    def check(self, rho: 'npt.NDArray', step: int = 0) -> Dict[str, Any]:
-        """Check mass conservation in control volume
-        
-        Args:
-            rho: Current density field  [dimensionless]
-            step: Current step number
-            
-        Returns:
-            Dictionary with conservation metrics
-        """
+    def compute_mass(self, rho: 'npt.NDArray') -> float:
+        """Public alias of the CV mass computation (scalar-API entry: the
+        MPI path sums owned-slab partials and Allreduces them instead)."""
+        return self._compute_cv_mass(rho)
+
+    def initialize_from_mass(self, M: float, step: int = 0) -> float:
+        """Scalar-input variant of initialize() — same state transitions."""
+        self.M_initial = M
+        self.M_prev = M
+        self.step_prev = step
+        self.initialized = True
+        return self.M_initial
+
+    def check_from_mass(self, M_current: float,
+                        step: int = 0) -> Dict[str, Any]:
+        """Scalar-input variant of check(): all drift bookkeeping from a
+        precomputed CV mass. Single source for both paths — check() computes
+        the mass then delegates here."""
         if not self.initialized:
-            self.initialize(rho, step)
+            self.initialize_from_mass(M_current, step)
             return {
                 'name': self.name,
                 'M_current': self.M_initial,
@@ -175,21 +183,19 @@ class ControlVolume:
                 'dM': 0.0,
                 'dM_per_step': 0.0
             }
-        
-        M_current = self._compute_cv_mass(rho)
-        
+
         # Compute metrics
         mass_drift_percent = (M_current - self.M_initial) / self.M_initial * 100 \
                              if abs(self.M_initial) > 1e-10 else 0.0
-        
+
         dM = M_current - self.M_prev
         steps_elapsed = step - self.step_prev if self.step_prev is not None else 1
         dM_per_step = dM / max(steps_elapsed, 1)
-        
+
         # Update tracking
         self.M_prev = M_current
         self.step_prev = step
-        
+
         return {
             'name': self.name,
             'M_current': M_current,
@@ -198,6 +204,18 @@ class ControlVolume:
             'dM': dM,
             'dM_per_step': dM_per_step
         }
+
+    def check(self, rho: 'npt.NDArray', step: int = 0) -> Dict[str, Any]:
+        """Check mass conservation in control volume
+
+        Args:
+            rho: Current density field  [dimensionless]
+            step: Current step number
+
+        Returns:
+            Dictionary with conservation metrics
+        """
+        return self.check_from_mass(self._compute_cv_mass(rho), step)
 
 
 class ConservationManager:
@@ -346,43 +364,65 @@ class ConservationManager:
                 self._csv_file.flush()
                 print(f"  CSV log: {csv_path}")
     
+    def cv_items(self) -> list:
+        """(name, ControlVolume) pairs, domain first — the iteration order
+        of check(); the MPI path uses it to build the same-ordered vector
+        of slab-partial masses for one SUM Allreduce."""
+        items = []
+        if self.domain_cv is not None:
+            items.append(('domain', self.domain_cv))
+        for cv in self.control_volumes:
+            items.append((cv.name, cv))
+        return items
+
     def check(self, rho: 'npt.NDArray', step: int,
               verbose: bool = None) -> Dict[str, Any]:
         """Perform conservation check
-        
+
         Args:
             rho: Current density field
             step: Current step number
             verbose: Override verbosity setting
-            
+
         Returns:
             Dictionary with results for each CV
         """
         if not self.enabled:
             return {}
-        
+        masses = {name: cv.compute_mass(rho) for name, cv in self.cv_items()}
+        return self.check_from_masses(masses, step, verbose=verbose)
+
+    def check_from_masses(self, masses: Dict[str, float], step: int,
+                          verbose: bool = None) -> Dict[str, Any]:
+        """Scalar-input variant of check(): drift bookkeeping + CSV + print
+        from precomputed CV masses (keys = cv_items() names). Single source
+        for both paths."""
+        if not self.enabled:
+            return {}
+
         if verbose is None:
             verbose = self.verbose > 0
-        
+
         results = {}
         csv_row = [step]
         drift_lines = []
-        
+
         # Check domain-wide
         if self.domain_cv is not None:
-            domain_result = self.domain_cv.check(rho, step)
+            domain_result = self.domain_cv.check_from_mass(
+                masses['domain'], step)
             results['domain'] = domain_result
-            
+
             drift = domain_result['mass_drift_percent']
             csv_row.append(drift)
             status = self._get_status(drift)
             drift_lines.append(f"  domain: {drift:+.4f}% {status}")
-        
+
         # Check user-defined CVs
         for cv in self.control_volumes:
-            cv_result = cv.check(rho, step)
+            cv_result = cv.check_from_mass(masses[cv.name], step)
             results[cv.name] = cv_result
-            
+
             drift = cv_result['mass_drift_percent']
             csv_row.append(drift)
             status = self._get_status(drift)

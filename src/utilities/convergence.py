@@ -387,32 +387,63 @@ class DivergenceDetector:
         self.density_bound = density_bound
         self.velocity_bound = velocity_bound
     
-    def check(self, rho: Any, u: Optional[Any] = None) -> Dict[str, Any]:
-        rho_np = rho.get() if hasattr(rho, 'get') else np.asarray(rho)
-        
-        if np.isnan(rho_np).any() or np.isinf(rho_np).any():
+    def check_scalars(self,
+                      rho_nan_inf: bool = False,
+                      rho_dev: float = 0.0,
+                      rho_min: float = float('nan'),
+                      rho_max: float = float('nan'),
+                      nan_count: int = 0,
+                      u_nan_inf: bool = False,
+                      u_max: Optional[float] = None) -> Dict[str, Any]:
+        """Scalar-input variant: the threshold/reason logic single-sourced.
+
+        check() computes the host scalars from full fields then delegates;
+        the MPI path Allreduces the scalars (MAX / LOR) and calls this on
+        every rank so the verdict is rank-invariant. u_max=None means "no
+        velocity check" (mirrors check(rho, u=None))."""
+        if rho_nan_inf:
             return {'diverged': True, 'reason': 'NaN/Inf in density',
-                    'details': {'nan_count': int(np.isnan(rho_np).sum())}}
-        
-        rho_dev = np.max(np.abs(rho_np - 1.0))
+                    'details': {'nan_count': int(nan_count)}}
+
         if rho_dev > self.density_bound:
             return {'diverged': True,
                     'reason': f'Density deviation {rho_dev:.4f} > {self.density_bound}',
-                    'details': {'rho_min': float(rho_np.min()),
-                                'rho_max': float(rho_np.max())}}
-        
-        if u is not None:
-            u_np = u.get() if hasattr(u, 'get') else np.asarray(u)
-            if np.isnan(u_np).any() or np.isinf(u_np).any():
-                return {'diverged': True, 'reason': 'NaN/Inf in velocity',
-                        'details': {}}
-            u_max = float(np.sqrt(np.sum(u_np**2, axis=0)).max())
-            if u_max > self.velocity_bound:
-                return {'diverged': True,
-                        'reason': f'Velocity {u_max:.4f} > {self.velocity_bound}',
-                        'details': {'max_mach': u_max * np.sqrt(3)}}
-        
+                    'details': {'rho_min': float(rho_min),
+                                'rho_max': float(rho_max)}}
+
+        if u_nan_inf:
+            return {'diverged': True, 'reason': 'NaN/Inf in velocity',
+                    'details': {}}
+        if u_max is not None and u_max > self.velocity_bound:
+            return {'diverged': True,
+                    'reason': f'Velocity {u_max:.4f} > {self.velocity_bound}',
+                    'details': {'max_mach': u_max * np.sqrt(3)}}
+
         return {'diverged': False, 'reason': None, 'details': {}}
+
+    def check(self, rho: Any, u: Optional[Any] = None) -> Dict[str, Any]:
+        rho_np = rho.get() if hasattr(rho, 'get') else np.asarray(rho)
+
+        rho_nan_inf = bool(np.isnan(rho_np).any() or np.isinf(rho_np).any())
+        scalars: Dict[str, Any] = {
+            'rho_nan_inf': rho_nan_inf,
+            'nan_count': int(np.isnan(rho_np).sum()) if rho_nan_inf else 0,
+        }
+        if not rho_nan_inf:
+            scalars['rho_dev'] = float(np.max(np.abs(rho_np - 1.0)))
+            scalars['rho_min'] = float(rho_np.min())
+            scalars['rho_max'] = float(rho_np.max())
+
+        if u is not None and not rho_nan_inf and \
+                scalars['rho_dev'] <= self.density_bound:
+            u_np = u.get() if hasattr(u, 'get') else np.asarray(u)
+            u_nan_inf = bool(np.isnan(u_np).any() or np.isinf(u_np).any())
+            scalars['u_nan_inf'] = u_nan_inf
+            if not u_nan_inf:
+                scalars['u_max'] = float(
+                    np.sqrt(np.sum(u_np**2, axis=0)).max())
+
+        return self.check_scalars(**scalars)
 
 
 # =============================================================================
@@ -638,6 +669,14 @@ class ConvergenceMonitor:
             E = float(0.5 * xp.mean(rho * xp.sum(u * u, axis=0)))
         else:
             E = float(0.5 * np.mean(rho * np.sum(u * u, axis=0)))
+        self.feed_energy_value(step, E)
+
+    def feed_energy_value(self, step: int, E: float) -> None:
+        """Scalar-input variant of feed_energy — the MPI path Allreduces
+        (Σ 0.5ρ|u|², n) over owned fluid cells and feeds E on every rank
+        so the tracker state stays rank-invariant."""
+        if not self.enabled or self.energy_tracker is None:
+            return
         self.energy_tracker.push(E)
     
     def feed_force(self, step: int, Cd: float, Cl: float) -> None:
@@ -654,7 +693,22 @@ class ConvergenceMonitor:
         """Check for divergence. Call at check_interval."""
         if not self.enabled:
             return {'diverged': False, 'reason': None, 'details': {}}
-        result = self.divergence_detector.check(rho, u)
+        return self._apply_divergence_result(
+            self.divergence_detector.check(rho, u))
+
+    def feed_divergence_scalars(self, scalars: Dict[str, Any]
+                                ) -> Dict[str, Any]:
+        """Scalar-input variant of feed_divergence_check: `scalars` are
+        DivergenceDetector.check_scalars kwargs, already Allreduced on the
+        MPI path (MAX for rho_dev/u_max, LOR for the NaN flags) so the
+        DIVERGED transition happens on every rank identically."""
+        if not self.enabled:
+            return {'diverged': False, 'reason': None, 'details': {}}
+        return self._apply_divergence_result(
+            self.divergence_detector.check_scalars(**scalars))
+
+    def _apply_divergence_result(self, result: Dict[str, Any]
+                                 ) -> Dict[str, Any]:
         if result['diverged']:
             self._status = ConvergenceStatus.DIVERGED
             self._diverge_reason = result['reason']

@@ -146,6 +146,11 @@ class OutputManager:
             except ImportError:
                 pass
 
+        # File-IO ownership. True on the single-GPU path; the MPI subclass
+        # sets it False on rank != 0 (those ranks still join every collective
+        # data seam but never write files).
+        self._io_rank: bool = True
+
         # ── Intervals ──
         self.output_interval = output_interval
         self.log_interval = log_interval
@@ -299,14 +304,12 @@ class OutputManager:
         # ── MLUPS ──
         # For MLG: each level k advances 2^k times per coarse step.
         # Total lattice updates per coarse step = Σ N_k × 2^k
-        from src.grid.multi_level_grid import MultiLevelGrid
-        if isinstance(sim, MultiLevelGrid):
+        level_counts = self._level_cell_counts(sim)
+        is_mlg = level_counts is not None
+        num_levels = len(level_counts) if is_mlg else 1
+        if is_mlg:
             updates_per_step = 0
-            for k in range(sim.num_levels):
-                level = sim.get_level(k)
-                n_k = 1
-                for d in level.domain_shape:
-                    n_k *= d
+            for k, n_k in enumerate(level_counts):
                 updates_per_step += n_k * (2 ** k)
         elif self.domain_shape is not None:
             updates_per_step = 1
@@ -318,78 +321,55 @@ class OutputManager:
 
         # ── Save performance to CSV ──
         # Determine CSV directory from existing managers
-        _csv_dir = None
-        if self.force_mgr is not None:
-            _csv_dir = getattr(self.force_mgr, 'csv_dir', None)
-        if _csv_dir is None and self.conservation_mgr is not None:
-            _csv_dir = getattr(self.conservation_mgr, 'csv_dir', None)
-        if _csv_dir is None:
-            _csv_dir = './results/csv'
-        perf_path = os.path.join(_csv_dir, 'performance.csv')
-        try:
-            _csv_dir = os.path.dirname(perf_path)
-            if _csv_dir:
-                os.makedirs(_csv_dir, exist_ok=True)
-            with open(perf_path, 'w', newline='') as pf:
-                import csv as _csv
-                pw = _csv.writer(pf)
-                pw.writerow(['start_step', 'end_step', 'total_steps',
-                             'elapsed_sec', 'updates_per_step', 'mlups',
-                             'is_mlg', 'num_levels'])
-                pw.writerow([
-                    self._start_step, self._end_step, total_steps,
-                    f"{elapsed:.3f}", updates_per_step, f"{mlups:.2f}",
-                    isinstance(sim, MultiLevelGrid),
-                    sim.num_levels if isinstance(sim, MultiLevelGrid) else 1,
-                ])
-        except Exception:
-            pass  # non-critical
+        if self._io_rank:
+            _csv_dir = None
+            if self.force_mgr is not None:
+                _csv_dir = getattr(self.force_mgr, 'csv_dir', None)
+            if _csv_dir is None and self.conservation_mgr is not None:
+                _csv_dir = getattr(self.conservation_mgr, 'csv_dir', None)
+            if _csv_dir is None:
+                _csv_dir = './results/csv'
+            perf_path = os.path.join(_csv_dir, 'performance.csv')
+            try:
+                _csv_dir = os.path.dirname(perf_path)
+                if _csv_dir:
+                    os.makedirs(_csv_dir, exist_ok=True)
+                with open(perf_path, 'w', newline='') as pf:
+                    import csv as _csv
+                    pw = _csv.writer(pf)
+                    pw.writerow(['start_step', 'end_step', 'total_steps',
+                                 'elapsed_sec', 'updates_per_step', 'mlups',
+                                 'is_mlg', 'num_levels'])
+                    pw.writerow([
+                        self._start_step, self._end_step, total_steps,
+                        f"{elapsed:.3f}", updates_per_step, f"{mlups:.2f}",
+                        is_mlg, num_levels,
+                    ])
+            except Exception:
+                pass  # non-critical
 
         # ── Summary header ──
         print("\n" + "=" * 70)
         print(f"[7] Summary")
         print(f"  Completed: step {self._start_step} → {final_step}")
         print(f"  Time: {elapsed:.2f}s | MLUPS: {mlups:.2f}")
-        if isinstance(sim, MultiLevelGrid):
+        if is_mlg:
             print(f"  (updates/coarse step: {updates_per_step:,})")
 
         # ── Free WALE pre-pass buffers before heavy post-processing ──
-        # On 3-level MLG these hold ~1 GB; not freeing them can OOM the
-        # following macroscopic.compute() (cupy tensordot upcast intermediate).
-        def _free_wale_buffers(s):
-            for attr in ('_u_buf', '_rho_buf', '_nu_t_in'):
-                if hasattr(s, attr):
-                    setattr(s, attr, None)
-        try:
-            from src.grid.multi_level_grid import MultiLevelGrid
-            if isinstance(sim, MultiLevelGrid):
-                for _level in sim._levels:
-                    _free_wale_buffers(_level)
-            else:
-                _free_wale_buffers(sim)
-        except Exception:
-            pass
-        try:
-            import cupy as _cp
-            _cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        self._free_transient_buffers(sim)
 
-        # ── Final macroscopic recompute ──
-        # Fused kernel already updated sim.rho / sim.u during the last step;
-        # reuse those instead of running tensordot again (saves ~5 GB peak).
-        if (getattr(sim, 'rho', None) is not None
-                and getattr(sim, 'u', None) is not None):
-            rho_final, u_final = sim.rho, sim.u
-        else:
-            rho_final, u_final = self.macroscopic.compute(sim.f)
+        # ── Final macroscopic ──
+        rho_final, u_final = self._final_fields(sim)
 
         # ── Final MLG VTK ──
         if self.mlg_vtk_writer is not None:
             from src.grid.multi_level_grid import MultiLevelGrid
-            if isinstance(sim, MultiLevelGrid):
+            target = self._sim_vtk_target(final_step, sim)
+            if target is not None and (is_mlg
+                                       or isinstance(target, MultiLevelGrid)):
                 self.mlg_vtk_writer.write(
-                    step=final_step, mlg=sim, time=float(final_step))
+                    step=final_step, mlg=target, time=float(final_step))
 
         # ── Final VTK (single grid only) ──
         if self.vtk_writer is not None and self.mlg_vtk_writer is None:
@@ -413,11 +393,13 @@ class OutputManager:
 
         # ── Final checkpoint ──
         if self.checkpoint_mgr is not None:
-            self.checkpoint_mgr.save(
-                step=final_step, f=self._f_checkpoint_cpu(sim), rho=rho_final,
-                u=u_final, tau=self.tau, config=self.sim_params,
-                extra_data=self._build_checkpoint_extra(sim),
-            )
+            payload = self._checkpoint_payload(sim)
+            if payload is not None:
+                self.checkpoint_mgr.save(
+                    step=final_step, f=payload['f'], rho=rho_final,
+                    u=u_final, tau=self.tau, config=self.sim_params,
+                    extra_data=payload['extra'],
+                )
 
         # ── Final conservation ──
         if self.conservation_mgr is not None:
@@ -478,26 +460,10 @@ class OutputManager:
         if step < self.force_mgr.start_step:
             return
 
-        # Select the level carrying the obstacle
-        if (self._mlg_force_level is not None
-                and hasattr(sim, 'get_level')):
-            lvl = sim.get_level(self._mlg_force_level)
-        else:
-            lvl = sim
-
-        if getattr(lvl, '_use_esoteric', False):
-            # Esoteric path has no f_post buffer (single-buffer in-place);
-            # pre-fix this passed f_post=None into the MEM computation and
-            # crashed. The force comes from the same eso_mem_force kernel
-            # the MPI runner uses; coefficients/CSV stay on the one path.
-            force_result = self.force_mgr.compute_and_log(
-                step, None, verbose=False,
-                forces_override=lvl.eso_body_force(),
-            )
-        else:
-            force_result = self.force_mgr.compute_and_log(
-                step, lvl.f_post, verbose=False,
-            )
+        f_post, forces_override = self._force_inputs(step, sim)
+        force_result = self.force_mgr.compute_and_log(
+            step, f_post, verbose=False, forces_override=forces_override,
+        )
         if force_result:
             self._last_Cd = force_result['Cd']
             self._last_Cl = force_result['Cl']
@@ -505,6 +471,25 @@ class OutputManager:
                 self.conv_monitor.feed_force(
                     step, self._last_Cd, self._last_Cl,
                 )
+
+    def _force_inputs(self, step: int, sim: 'Simulation'):
+        """Data seam: (f_post, forces_override) for the MEM force channel.
+
+        Single-GPU: pick the level carrying the obstacle; esoteric levels
+        have no f_post buffer (single-buffer in-place) so the force comes
+        from the same eso_mem_force kernel the MPI runner uses, fed through
+        forces_override (coefficients/CSV stay on the one path).
+        MPI override: Allreduce(mem_force_local) as forces_override.
+        """
+        if (self._mlg_force_level is not None
+                and hasattr(sim, 'get_level')):
+            lvl = sim.get_level(self._mlg_force_level)
+        else:
+            lvl = sim
+
+        if getattr(lvl, '_use_esoteric', False):
+            return None, lvl.eso_body_force()
+        return lvl.f_post, None
 
     def _update_progress(self, step: int, sim: 'Simulation') -> None:
         """Update tqdm progress bar with relevant metrics."""
@@ -550,18 +535,36 @@ class OutputManager:
                 'drift': f"{self._last_drift:+.4f}%",
             })
 
+    def _vtk_due(self, step: int) -> bool:
+        """Cadence seam for the VTK channel. The MPI subclass replaces the
+        writer-presence gate with a replicated flag (rank != 0 has no
+        writer but must still join the collective gathers)."""
+        if self.vtk_writer is None:
+            return False
+        return step % self.output_interval == 0
+
+    def _sim_vtk_target(self, step: int, sim: 'Simulation'):
+        """Data seam: the object the VTK writers read fields from.
+
+        Single-GPU: the sim itself. MPI override: collective per-level
+        gathers -> assembled duck views on rank 0, None elsewhere (skip the
+        write, then meet the barrier)."""
+        return sim
+
     def _write_vtk(self, step: int, sim: 'Simulation') -> None:
         """Write VTK output (domain + markers) at output_interval."""
-        if self.vtk_writer is None:
+        if not self._vtk_due(step):
             return
-        if step % self.output_interval != 0:
+        target = self._sim_vtk_target(step, sim)
+        if target is None:
             return
 
         # ── MLG: write per-level .vti + .vth ───────────────
         if self.mlg_vtk_writer is not None:
             from src.grid.multi_level_grid import MultiLevelGrid
-            if isinstance(sim, MultiLevelGrid):
-                self.mlg_vtk_writer.write(step=step, mlg=sim, time=float(step))
+            if isinstance(target, MultiLevelGrid):
+                self.mlg_vtk_writer.write(step=step, mlg=target,
+                                          time=float(step))
                 # Write ALM markers (before returning)
                 if (self.marker_vtk_writer is not None
                         and self.al_model is not None):
@@ -569,16 +572,16 @@ class OutputManager:
                 return
 
         extra_vectors_vtk = {}
-        if sim.body_force is not None:
-            extra_vectors_vtk['body_force'] = sim.body_force
+        if target.body_force is not None:
+            extra_vectors_vtk['body_force'] = target.body_force
 
         extra_scalars_vtk = {}
         # Eddy viscosity (allocated only when SGS is enabled).
-        if getattr(sim, 'nu_t', None) is not None:
-            extra_scalars_vtk['nu_t'] = sim.nu_t
+        if getattr(target, 'nu_t', None) is not None:
+            extra_scalars_vtk['nu_t'] = target.nu_t
 
         self.vtk_writer.write(
-            step=step, rho=sim.rho, u=sim.u,
+            step=step, rho=target.rho, u=target.u,
             solid_mask=self.solid_mask_np,
             extra_scalars=extra_scalars_vtk if extra_scalars_vtk else None,
             extra_vectors=extra_vectors_vtk if extra_vectors_vtk else None,
@@ -699,37 +702,54 @@ class OutputManager:
         if self.conv_monitor is None or not self.conv_monitor.enabled:
             return 'continue'
 
-        self.conv_monitor.feed_energy(step, sim.rho, sim.u)
-        self.conv_monitor.feed_divergence_check(sim.rho, sim.u)
+        self._feed_convergence(step, sim)
         conv_status = self.conv_monitor.check(step)
 
         if conv_status['diverged']:
             print(f"\n  ⚠ DIVERGENCE at step {step}: "
                   f"{conv_status['diverge_reason']}")
             if self.conv_monitor.on_diverged == 'stop_with_checkpoint':
-                if self.checkpoint_mgr is not None:
-                    self.checkpoint_mgr.save(
-                        step=step, f=self._f_checkpoint_cpu(sim),
-                        rho=sim.rho, u=sim.u,
-                        tau=self.tau, config=self.sim_params,
-                        extra_data=self._build_checkpoint_extra(sim),
-                    )
+                self._emergency_checkpoint(step, sim, include_extra=True)
             return 'stop'
 
         if conv_status['converged']:
             print(f"\n  ✓ CONVERGED at step {step}")
             self.conv_monitor.print_summary()
             if self.conv_monitor.on_converged == 'checkpoint_and_stop':
-                if self.checkpoint_mgr is not None:
-                    self.checkpoint_mgr.save(
-                        step=step, f=self._f_checkpoint_cpu(sim),
-                        rho=sim.rho, u=sim.u,
-                        tau=self.tau, config=self.sim_params,
-                    )
+                # NOTE(behavior-frozen): historically this save omitted
+                # extra_data, so MLG fine-level f is MISSING from
+                # converge-checkpoints (unlike the diverge save). Preserved
+                # as-is here; fix scheduled with the C6 channel work.
+                self._emergency_checkpoint(step, sim, include_extra=False)
             if self.conv_monitor.on_converged != 'continue':
                 return 'stop'
 
         return 'continue'
+
+    def _feed_convergence(self, step: int, sim: 'Simulation') -> None:
+        """Data seam: feed the convergence monitor from full fields.
+
+        MPI override: owned-fluid partial reductions -> Allreduce ->
+        feed_energy_value / feed_divergence_scalars on EVERY rank (the
+        monitor state must advance identically for a rank-invariant
+        'stop' verdict)."""
+        self.conv_monitor.feed_energy(step, sim.rho, sim.u)
+        self.conv_monitor.feed_divergence_check(sim.rho, sim.u)
+
+    def _emergency_checkpoint(self, step: int, sim: 'Simulation',
+                              include_extra: bool = True) -> None:
+        """Diverge/converge stop checkpoint (shared shape of the two
+        historical inline save blocks)."""
+        if self.checkpoint_mgr is None:
+            return
+        payload = self._checkpoint_payload(sim, include_extra=include_extra)
+        if payload is None:
+            return
+        kwargs = dict(step=step, f=payload['f'], rho=sim.rho, u=sim.u,
+                      tau=self.tau, config=self.sim_params)
+        if include_extra:
+            kwargs['extra_data'] = payload['extra']
+        self.checkpoint_mgr.save(**kwargs)
     
     @staticmethod
     def _f_checkpoint_cpu(sim_like):
@@ -784,10 +804,27 @@ class OutputManager:
                     extra[f'f_level_{k}'] = self._f_checkpoint_cpu(sim.get_level(k))
         return extra if extra else None
 
-    def _save_checkpoint(self, step: int, sim: 'Simulation') -> None:
+    def _ckpt_due(self, step: int) -> bool:
+        """Cadence seam for the checkpoint channel (MPI: replicated flag —
+        rank != 0 has no checkpoint writer but joins the gathers)."""
         if self.checkpoint_mgr is None:
-            return
-        if step <= 0 or step % self.checkpoint_interval != 0:
+            return False
+        return step > 0 and step % self.checkpoint_interval == 0
+
+    def _checkpoint_payload(self, sim: 'Simulation',
+                            include_extra: bool = True):
+        """Data seam: host f (+ MLG fine-level extras) for a checkpoint.
+
+        Single-GPU: slab-streamed host gather per level. MPI override:
+        collective owned_f_std gathers -> dict on rank 0, None elsewhere."""
+        return {
+            'f': self._f_checkpoint_cpu(sim),
+            'extra': (self._build_checkpoint_extra(sim)
+                      if include_extra else None),
+        }
+
+    def _save_checkpoint(self, step: int, sim: 'Simulation') -> None:
+        if not self._ckpt_due(step):
             return
         try:
             import cupy
@@ -795,15 +832,78 @@ class OutputManager:
         except Exception:
             pass
 
+        payload = self._checkpoint_payload(sim)
+        if payload is None:
+            return
         self.checkpoint_mgr.save(
-            step=step, f=self._f_checkpoint_cpu(sim), rho=sim.rho, u=sim.u,
+            step=step, f=payload['f'], rho=sim.rho, u=sim.u,
             tau=self.tau, config=self.sim_params,
-            extra_data=self._build_checkpoint_extra(sim),
+            extra_data=payload['extra'],
         )
 
     # =====================================================================
     # Finalize helpers (private)
     # =====================================================================
+
+    def _level_cell_counts(self, sim) -> Optional[list]:
+        """Data seam: per-level GLOBAL cell counts for MLUPS, or None for a
+        single grid. MPI override: products of runner.parts[k] global
+        shapes (no comm needed)."""
+        from src.grid.multi_level_grid import MultiLevelGrid
+        if isinstance(sim, MultiLevelGrid):
+            counts = []
+            for k in range(sim.num_levels):
+                n_k = 1
+                for d in sim.get_level(k).domain_shape:
+                    n_k *= d
+                counts.append(n_k)
+            return counts
+        return None
+
+    def _free_transient_buffers(self, sim) -> None:
+        """Free WALE pre-pass buffers before heavy post-processing.
+
+        On 3-level MLG these hold ~1 GB; not freeing them can OOM the
+        following macroscopic.compute() (cupy tensordot upcast
+        intermediate). MPI override: no-op (the runner already freed the
+        source levels)."""
+        def _free_wale_buffers(s):
+            for attr in ('_u_buf', '_rho_buf', '_nu_t_in'):
+                if hasattr(s, attr):
+                    setattr(s, attr, None)
+        try:
+            from src.grid.multi_level_grid import MultiLevelGrid
+            if isinstance(sim, MultiLevelGrid):
+                for _level in sim._levels:
+                    _free_wale_buffers(_level)
+            else:
+                _free_wale_buffers(sim)
+        except Exception:
+            pass
+        try:
+            import cupy as _cp
+            _cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
+    def _final_fields(self, sim):
+        """Data seam: (rho_final, u_final) for the finalize channels.
+
+        Fused kernels already updated sim.rho / sim.u during the last step;
+        reuse those instead of running tensordot again (saves ~5 GB peak).
+        MPI override: collective L0 gather -> rank 0 arrays, (None, None)
+        elsewhere."""
+        if (getattr(sim, 'rho', None) is not None
+                and getattr(sim, 'u', None) is not None):
+            return sim.rho, sim.u
+        return self.macroscopic.compute(sim.f)
+
+    def _field_nan_flag(self, rho_final) -> bool:
+        """Data seam: NaN/Inf presence in the final density field. MPI
+        override: LOR-allreduced flag so finalize() returns the same
+        verdict on every rank."""
+        return bool(self.xp.isnan(rho_final).any()
+                    or self.xp.isinf(rho_final).any())
 
     def _print_rotor_summary(self) -> None:
         """Print final rotor performance (single or multi)."""
@@ -857,6 +957,8 @@ class OutputManager:
         """Restart + post-processing hints. Called on success paths
         (CONVERGED, normal completion) — skipped on DIVERGED / instability
         because those produce data the user shouldn't trust by default."""
+        if not self._io_rank:
+            return
         if not self.config_path:
             return
         print(f"\nTo continue: python main.py --config {self.config_path} "
@@ -909,8 +1011,7 @@ class OutputManager:
             return False
 
         # No convergence monitor or still running
-        if (self.xp.isnan(rho_final).any()
-                or self.xp.isinf(rho_final).any()):
+        if self._field_nan_flag(rho_final):
             print("\n  ❌ INSTABILITY DETECTED!")
             return False
 
