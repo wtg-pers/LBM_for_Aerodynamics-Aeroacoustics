@@ -826,13 +826,22 @@ class SimulationSetup:
         print(f"  Checkpoint dir: {self.checkpoint_dir}")
         print(f"  CSV output dir: {self._csv_dir}")
 
+        # Only channels that will actually WRITE get their directory
+        # created (empty vtk/checkpoints dirs for disabled channels were
+        # pure noise); clear_previous still sweeps an EXISTING dir of a
+        # disabled channel so stale files can't mix into a later run.
+        vc = self._vtk_config
+        vtk_enabled = (vc.get('enabled', True) and not args.no_vtk
+                       and self.is_io_rank)
+        ckpt_enabled = self._checkpoint_config.get('enabled', True)
         if self.is_io_rank:
             setup_output_directories(
-                output_dir=output_dir,
-                checkpoint_dir=self.checkpoint_dir,
+                output_dir=output_dir if vtk_enabled else None,
+                checkpoint_dir=self.checkpoint_dir if ckpt_enabled else None,
                 csv_dir=self._csv_dir,
                 clear_previous=clear_previous,
                 is_restart=is_restart,
+                sweep_dirs=[output_dir, self.checkpoint_dir],
             )
         else:
             print("  (io_role=silent: directories/clear/writers owned by "
@@ -845,10 +854,7 @@ class SimulationSetup:
             outline_path = os.path.join(output_dir, 'geometry_outline.vtk')
             write_geometry_outline(gi, outline_path)
 
-        # ── VTK Writer ──
-        vc = self._vtk_config
-        vtk_enabled = (vc.get('enabled', True) and not args.no_vtk
-                       and self.is_io_rank)
+        # ── VTK Writer ── (vtk_enabled computed above, before dir setup)
         if vtk_enabled:
             self.vtk_writer = VTKWriter(
                 output_dir=output_dir,

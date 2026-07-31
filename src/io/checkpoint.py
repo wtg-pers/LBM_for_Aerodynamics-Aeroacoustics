@@ -26,6 +26,20 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Optional, Dict, Any, Union, Tuple
 import numpy as np
 
+
+def _say(msg: str) -> None:
+    """Print without corrupting an active tqdm progress bar.
+
+    A plain print() while the run-loop bar is live gets appended to the
+    bar's line (the 'Checkpoint saved' notice stretched it sideways).
+    tqdm.write() prints ABOVE active bars and degrades to a normal print
+    when no bar exists / tqdm is unavailable."""
+    try:
+        from tqdm import tqdm
+        tqdm.write(msg)
+    except Exception:
+        print(msg)
+
 if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
@@ -57,9 +71,10 @@ class CheckpointManager:
         self.xp = xp if xp is not None else np
 
         # create_dir=False: non-IO MPI ranks keep the manager for RESTORE
-        # (reading existing files) without creating directories.
-        if create_dir:
-            os.makedirs(output_dir, exist_ok=True)
+        # (reading existing files) without creating directories. Creation
+        # is LAZY (first save_checkpoint): building the manager alone must
+        # not leave an empty checkpoints/ dir on runs that never save.
+        self._create_dir = bool(create_dir)
         self.saved_files: list = []
     
     def _to_numpy(self, arr: 'npt.NDArray') -> np.ndarray:
@@ -90,9 +105,10 @@ class CheckpointManager:
         Returns:
             Path to saved checkpoint file
         """
+        os.makedirs(self.output_dir, exist_ok=True)  # lazy (see __init__)
         filename = f"{self.prefix}_{step:08d}.npz"
         filepath = os.path.join(self.output_dir, filename)
-        
+
         save_dict = {
             'f': self._to_numpy(f),
             'step': np.array(step),
@@ -131,7 +147,7 @@ class CheckpointManager:
             self._cleanup_old_checkpoints()
         
         file_size_mb = os.path.getsize(filepath) / 1e6
-        print(f"  Checkpoint saved: {filename} ({file_size_mb:.2f} MB)")
+        _say(f"  Checkpoint saved: {filename} ({file_size_mb:.2f} MB)")
         
         return filepath
     
@@ -142,7 +158,7 @@ class CheckpointManager:
             for f in files_to_remove:
                 if os.path.exists(f):
                     os.remove(f)
-                    print(f"  Removed old checkpoint: {os.path.basename(f)}")
+                    _say(f"  Removed old checkpoint: {os.path.basename(f)}")
             self.saved_files = self.saved_files[-self.keep_last_n:]
     
     def load(self, filepath: str) -> Dict[str, Any]:

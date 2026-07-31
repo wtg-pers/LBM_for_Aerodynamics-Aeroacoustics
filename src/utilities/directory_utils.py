@@ -60,70 +60,73 @@ def clear_directory(directory: str, patterns: List[str],
     return removed_count
 
 
-def setup_output_directories(output_dir: str, 
-                              checkpoint_dir: str, 
+def setup_output_directories(output_dir: Optional[str],
+                              checkpoint_dir: Optional[str],
                               csv_dir: Optional[str] = None,
-                              clear_previous: bool = False, 
+                              clear_previous: bool = False,
                               is_restart: bool = False,
-                              verbose: bool = True) -> None:
-    """Create output directories and optionally clear previous results
-    
-    Creates all necessary output directories if they don't exist.
-    Optionally clears previous results (VTK, checkpoints, CSV files).
-    
+                              verbose: bool = True,
+                              sweep_dirs: Optional[list] = None) -> None:
+    """Create output directories for ACTIVE channels; optionally clear.
+
+    A None output_dir / checkpoint_dir means the channel is disabled for
+    this run and its directory is NOT created (unconditionally creating
+    empty vtk/checkpoints dirs was pure noise). clear_previous still
+    sweeps the on-disk locations of DISABLED channels via `sweep_dirs`
+    so stale files cannot mix into a later run of the same folder.
+
     Safety: Never clears files when is_restart=True, regardless of
     clear_previous setting.
-    
+
     Args:
-        output_dir: VTK output directory path
-        checkpoint_dir: Checkpoint directory path
+        output_dir: VTK output directory path, or None (vtk disabled)
+        checkpoint_dir: Checkpoint directory path, or None (disabled)
         csv_dir: CSV output directory path (optional)
         clear_previous: Whether to clear existing files
         is_restart: If True, never clear (safety measure for restart)
         verbose: Print status messages
-        
-    Examples:
-        >>> setup_output_directories(
-        ...     output_dir='./results/vtk',
-        ...     checkpoint_dir='./checkpoints',
-        ...     csv_dir='./results/csv',
-        ...     clear_previous=True,
-        ...     is_restart=False
-        ... )
-        Clearing previous results...
-          Removed 15 VTK files from ./results/vtk
-          Removed 3 checkpoint files from ./checkpoints
-          Removed 1 CSV files from ./results/csv
+        sweep_dirs: optional [vtk_dir, checkpoint_dir] on-disk locations
+            to clear even when the channel is disabled (missing dirs are
+            no-ops; clear_directory tolerates them)
     """
-    # Create directories if they don't exist
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    # Create directories only for channels that will write
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
     if csv_dir:
         os.makedirs(csv_dir, exist_ok=True)
-    
+
     # Safety: Never clear on restart
     if is_restart:
         if verbose and clear_previous:
             print("  Note: clear_previous ignored during restart (safety measure)")
         return
-    
+
     # Clear previous results if requested
     if clear_previous:
         if verbose:
             print(f"  Clearing previous results...")
-        
+
+        vtk_sweep = (sweep_dirs[0] if sweep_dirs else output_dir)
+        ckpt_sweep = (sweep_dirs[1] if sweep_dirs else checkpoint_dir)
+
         # Clear VTK files
-        vtk_patterns = ['*.vti', '*.vtk', '*.pvd']
-        vtk_count = clear_directory(output_dir, vtk_patterns, verbose=False)
-        if verbose and vtk_count > 0:
-            print(f"    Removed {vtk_count} VTK files from {output_dir}")
-        
+        if vtk_sweep:
+            vtk_patterns = ['*.vti', '*.vtk', '*.pvd']
+            vtk_count = clear_directory(vtk_sweep, vtk_patterns, verbose=False)
+            if verbose and vtk_count > 0:
+                print(f"    Removed {vtk_count} VTK files from {vtk_sweep}")
+
         # Clear checkpoint files
-        ckpt_patterns = ['*.npz']
-        ckpt_count = clear_directory(checkpoint_dir, ckpt_patterns, verbose=False)
-        if verbose and ckpt_count > 0:
-            print(f"    Removed {ckpt_count} checkpoint files from {checkpoint_dir}")
-        
+        if ckpt_sweep:
+            ckpt_patterns = ['*.npz']
+            ckpt_count = clear_directory(ckpt_sweep, ckpt_patterns,
+                                         verbose=False)
+            if verbose and ckpt_count > 0:
+                print(f"    Removed {ckpt_count} checkpoint files "
+                      f"from {ckpt_sweep}")
+
         # Clear CSV files
         if csv_dir:
             csv_patterns = ['*.csv']
