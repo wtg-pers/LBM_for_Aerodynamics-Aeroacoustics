@@ -147,13 +147,36 @@ class GridCoupling:
         Nx_f, Ny_f, Nz_f = region.fine_shape
         ow_f = region.overlap_width * region.REFINE_RATIO
 
-        self._fine_bnd_slices = {
+        # ── Flush faces: fine_region touching the domain boundary ───
+        # There the C2F band has width 0 (fine_domain_coarse was clipped
+        # back onto fine_region): the fine face IS a domain face, there is
+        # no coarse-only zone beyond it, and injecting an upsampled strip
+        # would (a) be redundant with F2C-fed coarse data and (b) break
+        # the z-invariance of span-through prism cases (observed: slice
+        # divergence at step 1). Such faces are excluded from every C2F
+        # write path; interior-region configs have no flush faces, so
+        # their spec lists are unchanged (bit-neutral).
+        fr0, fdc0 = region.fine_region, region.fine_domain_coarse
+        self._flush_faces = {
+            'x_min': fr0.x_start == fdc0.x_start,
+            'x_max': fr0.x_end == fdc0.x_end,
+            'y_min': fr0.y_start == fdc0.y_start,
+            'y_max': fr0.y_end == fdc0.y_end,
+            'z_min': fr0.z_start == fdc0.z_start,
+            'z_max': fr0.z_end == fdc0.z_end,
+        }
+
+        _all_bnd_slices = {
             'x_min': (slice(0, ow_f),            slice(None),              slice(None)),
             'x_max': (slice(Nx_f - ow_f, Nx_f),  slice(None),              slice(None)),
             'y_min': (slice(None),                slice(0, ow_f),           slice(None)),
             'y_max': (slice(None),                slice(Ny_f - ow_f, Ny_f), slice(None)),
             'z_min': (slice(None),                slice(None),              slice(0, ow_f)),
             'z_max': (slice(None),                slice(None),              slice(Nz_f - ow_f, Nz_f)),
+        }
+        self._fine_bnd_slices = {
+            k: v for k, v in _all_bnd_slices.items()
+            if not self._flush_faces[k]
         }
 
         # ── F→C target: excised region only (NOT full fine_domain) ─
@@ -210,10 +233,16 @@ class GridCoupling:
                 return ((a, a, c, a), (a, a, w, a), (a, a, r, a))
             return ((a, a, a, c), (a, a, a, w), (a, a, a, r))
 
+        _all_specs = {
+            'x_min': _face(1, 'min', Cx, Nx_fb),
+            'x_max': _face(1, 'max', Cx, Nx_fb),
+            'y_min': _face(2, 'min', Cy, Ny_fb),
+            'y_max': _face(2, 'max', Cy, Ny_fb),
+            'z_min': _face(3, 'min', Cz, Nz_fb),
+            'z_max': _face(3, 'max', Cz, Nz_fb),
+        }
         self._bnd_face_specs = [
-            _face(1, 'min', Cx, Nx_fb), _face(1, 'max', Cx, Nx_fb),
-            _face(2, 'min', Cy, Ny_fb), _face(2, 'max', Cy, Ny_fb),
-            _face(3, 'min', Cz, Nz_fb), _face(3, 'max', Cz, Nz_fb),
+            v for k, v in _all_specs.items() if not self._flush_faces[k]
         ]
 
     # =================================================================
@@ -567,6 +596,32 @@ extern "C" __global__ void feq_fneq(
 
         xp = self._xp
         filtered = f_neq.copy()
+
+        # ── Flush-z (span-through prism) variant ────────────────────
+        # The interior-only filter leaves edge ROWS unfiltered; on a
+        # z-flush region that makes the two z-boundary rows differ from
+        # the interior even for z-INVARIANT f_neq, and fine_to_coarse
+        # then imprints that z-dependence onto the coarse level (observed
+        # as step-1 slice divergence). With both z faces flush the level
+        # is z-periodic by construction, so filter ALL z rows with a
+        # periodic z stencil (x/y edge rows stay unfiltered as before —
+        # they are uniform in z, hence harmless).
+        if self._flush_faces.get('z_min') and self._flush_faces.get('z_max'):
+            if self._filter_level >= 2:
+                raise NotImplementedError(
+                    "filter_level >= 2 with z-flush regions: periodic-z "
+                    "stencil not implemented (use filter_level 1)")
+            c_ = f_neq[:, 1:-1, 1:-1, :]
+            fxm = f_neq[:, :-2, 1:-1, :]
+            fxp = f_neq[:, 2:, 1:-1, :]
+            fym = f_neq[:, 1:-1, :-2, :]
+            fyp = f_neq[:, 1:-1, 2:, :]
+            fzm = xp.roll(f_neq, 1, axis=3)[:, 1:-1, 1:-1, :]
+            fzp = xp.roll(f_neq, -1, axis=3)[:, 1:-1, 1:-1, :]
+            filtered[:, 1:-1, 1:-1, :] = (
+                c_ + fxm + fxp + fym + fyp + fzm + fzp
+            ) / 7.0
+            return filtered
 
         # axes: 1=x, 2=y, 3=z. Interior only.
         center = f_neq[:, 1:-1, 1:-1, 1:-1]

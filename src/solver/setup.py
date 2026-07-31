@@ -778,6 +778,19 @@ class SimulationSetup:
             )
             print(f"  Wall BC: Bouzidi IBB (ray-triangle q from STL, "
                   f"{geom_info.get('n_faces', '?')} faces)")
+            if geom_info.get('span_through_axis'):
+                # z-invariant prism contract: the mask is symmetrized to
+                # the mid-slice section, and q must match — per-link q
+                # from an unstructured side tessellation wobbles by the
+                # chordal sagitta along z, which breaks quasi-2D slice
+                # invariance at the wall (observed ~3e-3 after 24 steps).
+                # Broadcasting the mid-slice q IS the ideal prism's q.
+                nz_q = int(q_fraction.shape[-1])
+                q_fraction = self.xp.broadcast_to(
+                    q_fraction[..., nz_q // 2:nz_q // 2 + 1],
+                    q_fraction.shape).copy()
+                print("  span-through prism: q broadcast from mid slice "
+                      "(z-invariant wall)")
         else:
             print(f"  [warn] wall_bc='ibb' with dim={dim} geom type='{gtype}' "
                   f"has no q-source; using q=0.5 sentinel (≡ HWBB).")

@@ -750,12 +750,18 @@ class Simulation:
             else:
                 continue
             method = str(getattr(cfg, 'method', '') or '')
+            # NEVER overwrite NODE_SOLID: a span-through body has solid
+            # cells ON the face planes; flipping them to a face-BC type
+            # would open the wall there (leak). bc_rho/u writes below stay
+            # unconditional — solid cells never read them.
+            face = node_type[sl]
+            nonsolid = face != NODE_SOLID
             if 'wall' in method or 'bounce' in method:
-                node_type[sl] = NODE_SOLID
+                face[nonsolid] = NODE_SOLID
             elif 'neumann' in method:
-                node_type[sl] = NODE_NEUMANN
+                face[nonsolid] = NODE_NEUMANN
             else:
-                node_type[sl] = NODE_EQ_BC
+                face[nonsolid] = NODE_EQ_BC
                 dens = getattr(cfg, 'density', None)
                 if dens is not None:
                     bc_rho[sl] = float(dens)
@@ -804,7 +810,8 @@ class Simulation:
                     continue
                 # NOTE: bc_uz is reused as sigma -> sponge target w is
                 # implicitly 0 (fine for hover; documented in patch 15).
-                node_type[sl] = NODE_SPONGE
+                row = node_type[sl]
+                row[row != NODE_SOLID] = NODE_SPONGE   # keep body cells solid
                 bc_rho[sl] = rho_inf
                 bc_ux[sl] = float(u_inf[0])
                 bc_uy[sl] = float(u_inf[1]) if len(u_inf) > 1 else 0.0

@@ -380,6 +380,34 @@ def _create_3d_geometry(
             source = config['file']
 
         mask = create_stl_mask(xp, domain_shape, v_lu, faces)
+
+        if config.get('span_through_axis'):
+            # z-invariant prism contract (see validate): every wrapped
+            # esoteric read/write is bit-equal to the true continued wing
+            # ONLY if all z slices are identical. An unstructured side
+            # tessellation of a true prism wobbles by the chordal sagitta,
+            # so borderline surface cells may flip between slices (facet
+            # artifact, not geometry). Enforce the contract by
+            # CONSTRUCTION: broadcast the mid-slice section (the ideal
+            # prism's voxelization) to every z. Large deviations mean the
+            # mesh really tapers/twists inside the box -> hard error.
+            nz_loc = int(mask.shape[2])
+            ref = mask[:, :, nz_loc // 2:nz_loc // 2 + 1]
+            n_bad = int(xp.sum(mask != ref))
+            n_solid = int(xp.sum(mask))
+            if n_bad > 0.05 * max(n_solid, 1):
+                raise ValueError(
+                    "stl: span_through_axis='z' requires a z-invariant "
+                    f"prism; {n_bad} of {n_solid} solid cells differ from "
+                    "the mid-slice section — the mesh tapers/twists inside "
+                    "this level's box (breaks the periodic-wrap "
+                    "correctness contract; facet wobble is < 5%)")
+            if n_bad:
+                mask = xp.broadcast_to(ref, mask.shape).copy()
+                if verbose:
+                    print(f"    span-through prism: symmetrized {n_bad} "
+                          f"facet-wobble cells to the mid-slice section")
+
         bb_min = v_lu.min(axis=0)
         bb_max = v_lu.max(axis=0)
 
@@ -391,6 +419,8 @@ def _create_3d_geometry(
             'solid_nodes': int(xp.sum(mask)),
             'triangles_lu': (v_lu, faces),
         }
+        if config.get('span_through_axis'):
+            info['span_through_axis'] = str(config['span_through_axis'])
 
         if verbose:
             print(f"  Internal Obstacle (STL, 3D):")
@@ -578,6 +608,22 @@ def validate_geometry_config(
         if wall_bc not in ('hwbb', 'ibb'):
             return False, f"stl: wall_bc must be 'hwbb' or 'ibb', got '{wall_bc}'"
 
+        # span_through_axis: wall-piercing prism (infinite-wing quasi-2D).
+        # 'z' only — the column-parity voxelizer casts rays along z and
+        # already clamps out-of-box cap crossings; x/y piercing is
+        # unverified. Correctness contract: the esoteric kernels address
+        # with periodic wrap, so a body through BOTH z faces whose mask is
+        # z-INVARIANT makes every wrapped read/write bit-equal to the true
+        # continued geometry (periodic-z == infinite extrusion). One-sided
+        # piercing breaks that equivalence and is rejected.
+        span_ax = config.get('span_through_axis')
+        if span_ax is not None:
+            if str(span_ax).lower() != 'z':
+                return False, (
+                    "stl: span_through_axis supports only 'z' (voxelizer "
+                    f"casts along z), got {span_ax!r}")
+            span_ax = 2
+
         # Watertight check (cached; the same entry point the builders use).
         try:
             mesh = load_stl_checked(stl_file)
@@ -594,6 +640,8 @@ def validate_geometry_config(
         bb_max = v_lu.max(axis=0)
         margin = 1.0
         for ax, n_ax in enumerate(domain_shape):
+            if ax == span_ax:
+                continue
             if bb_min[ax] < margin or bb_max[ax] > n_ax - 1 - margin:
                 return False, (
                     f"stl: transformed bbox axis {ax} = "
@@ -601,11 +649,25 @@ def validate_geometry_config(
                     f"[{margin}, {n_ax - 1 - margin}] — body must stay off "
                     f"the domain boundary (periodic-wrap link hazard)"
                 )
+        if span_ax == 2:
+            nz = domain_shape[2]
+            if not (bb_min[2] <= -1.0 and bb_max[2] >= float(nz)):
+                return False, (
+                    "stl: span_through_axis='z' requires the body to pierce "
+                    f"BOTH z faces by >= 1 lu (bbox z = [{bb_min[2]:.2f}, "
+                    f"{bb_max[2]:.2f}], need <= -1 and >= {nz}) — one-sided "
+                    "piercing breaks the periodic-wrap consistency of the "
+                    "z-invariant prism contract")
 
         # 0.5 * L_body padding advisory (domain-level; MLG band overlap is
-        # hard-checked per level in setup).
-        l_body = float(np.max(bb_max - bb_min))
+        # hard-checked per level in setup). For a span-through prism the
+        # advisory uses the cross-flow extents only and skips the pierced
+        # axis (its "distance to the boundary" is meaningless by design).
+        _adv_axes = [ax for ax in range(len(domain_shape)) if ax != span_ax]
+        l_body = float(max(bb_max[ax] - bb_min[ax] for ax in _adv_axes))
         for ax, n_ax in enumerate(domain_shape):
+            if ax == span_ax:
+                continue
             dist = min(float(bb_min[ax]), float(n_ax - 1 - bb_max[ax]))
             if dist < 0.5 * l_body:
                 warnings.warn(
@@ -855,6 +917,11 @@ def create_fine_level_geometry_config(
         }
         if 'wall_bc' in active_config:
             new_config['stl']['wall_bc'] = active_config['wall_bc']
+        if 'span_through_axis' in active_config:
+            # fine levels re-check the z-invariant prism contract on their
+            # own localized mask (fine z-extent == full domain z)
+            new_config['stl']['span_through_axis'] = \
+                active_config['span_through_axis']
         if verbose:
             print(f"    Fine obstacle (STL): bbox=[({bb_min[0]:.1f}, "
                   f"{bb_min[1]:.1f}, {bb_min[2]:.1f}) .. ({bb_max[0]:.1f}, "
