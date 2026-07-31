@@ -53,13 +53,19 @@ STL_PATH   = os.path.join(_repo, "input_files", "geom", "naca0012_wing.stl")
 STL_CHORD  = 1000.0                   # file units (measured; x-extent/cos10)
 
 
-def _build(c=100, wall_bc="ibb"):
+def _build(c=100, wall_bc="ibb", nz_frac=0.16):
     """Config dict for chord = c L0 cells. Region bounds are linear in c
     and integer for c in {100, 50}; c=50 is the local-smoke twin (~6.6M
-    cells), c=100 the production case (~52.4M)."""
+    cells), c=100 the production case (~52.4M).
+
+    nz_frac: slab thickness / chord. Under the PROVEN z-slice invariance
+    (<= 7e-7) every Nz gives the same physics; a thin slab (e.g. 0.04 ->
+    Nz=4, ~13M cells) fits the STANDARD path on one GPU — the trusted
+    force measurement while the esoteric force diagnostics are under
+    audit (systematic bias found 2026-08-01, see patch notes)."""
     if c % 50 != 0:
         raise ValueError("chord must keep region bounds integral (50|c)")
-    Nx, Ny, Nz = round(9.6 * c), 6 * c, round(0.16 * c)
+    Nx, Ny, Nz = round(9.6 * c), 6 * c, round(nz_frac * c)
     xc, yc, zc = 3.5 * c, 3 * c, 0.5 * Nz     # rotated-bbox center [L0 lu]
 
     def _r(x0, x1, y0, y1):
