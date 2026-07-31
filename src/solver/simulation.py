@@ -394,20 +394,6 @@ class Simulation:
             return None
         return self._f_post
 
-    def _reject_ibb_on_esoteric(self) -> None:
-        """Hard error for wall_bc='ibb' on the DIST-INIT esoteric path.
-
-        Single-GPU esoteric IBB is supported since S5 (deposit-rewrite
-        pass). The distributed-init path still lacks the link slab
-        filter/rebase (STL track S6), so it keeps refusing — silently
-        running HWBB there would break the no-downgrade rule."""
-        from src.boundary.interpolated_wall import InterpolatedBounceBack
-        if isinstance(self.obstacle_bc, InterpolatedBounceBack):
-            raise ValueError(
-                "wall_bc='ibb' is not supported on the distributed-init "
-                "esoteric path yet (STL track S6: link slab filter + "
-                "rebase). Run single-GPU, or wall_bc='hwbb' under MPI.")
-
     def eso_body_force(self) -> 'npt.NDArray':
         """Whole-domain MEM force on the esoteric path (HWBB bodies).
 
@@ -683,7 +669,12 @@ class Simulation:
         this is what lifts the 4-GPU capacity from "one GPU's worth" to
         ~4x (replicated build allocated every full field per rank).
         """
-        self._reject_ibb_on_esoteric()
+        # wall_bc='ibb' under dist-init: supported since STL track P1 —
+        # setup builds the sparse IBB links regardless of how f is
+        # initialized (link arrays are tiny), and DistributedMLGRunner
+        # slab-filters them via build_slab_ibb (S6) exactly as on the
+        # replicated path. The kernel's implicit HWBB at NODE_SOLID is
+        # rewritten to Bouzidi by the per-step deposit-rewrite pass.
         import numpy as _np
         from src.kernels.esoteric_d3q27 import (
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE)

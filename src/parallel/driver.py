@@ -88,13 +88,19 @@ def _fail_fast_config(setup, mlg) -> None:
             "[mpi] config error: numerics.esoteric=false, but the "
             "distributed runner operates on esoteric-pull state. Remove "
             "the key (or set true) for MPI runs, or run single-GPU.")
-    lvl0 = mlg.get_level(0)
-    if not getattr(lvl0, '_use_esoteric', False):
-        raise ValueError(
-            "[mpi] config error: esoteric-pull could not be enabled for "
-            "this config (requires GPU + 3D + BGK/Cumulant + precision "
-            "float32 — see csv/setup_log.txt for the fallback warning). "
-            "The MPI runner requires it.")
+    # EVERY level must be esoteric — _init_esoteric can fail (e.g. OOM)
+    # and fall back to the standard path PER LEVEL with only a warning;
+    # a level-0-only check let a fine-level fallback slip through to a
+    # broken distributed run (observed: L3 eso-init OOM on a 94M case).
+    for k in range(mlg.num_levels):
+        if not getattr(mlg.get_level(k), '_use_esoteric', False):
+            raise ValueError(
+                f"[mpi] config error: esoteric-pull is not active on level "
+                f"{k} (requires GPU + 3D + BGK/Cumulant + precision "
+                f"float32; an init failure such as OOM also falls back — "
+                f"see csv/setup_log.txt for the warning). The MPI runner "
+                f"requires esoteric state on every level; for large cases "
+                f"use --dist-init to avoid full-domain init allocations.")
     # wall_bc='ibb' under MPI: supported since STL track S6 — the runner
     # builds a slab-filtered esoteric deposit-rewrite pass per level
     # (build_slab_ibb) and routes the MEM force through its scatter.
