@@ -115,6 +115,28 @@ def build_naca4_wing(chord: float = 1.0,
     return mesh
 
 
+def ensure_naca4_selig_dat(path: str,
+                           thickness: float = 0.12,
+                           n_profile: int = 256) -> str:
+    """Generate a Selig .dat (numeric-only, TE->upper->LE->lower, OPEN
+    contour, unit chord) for the 2D airfoil path if missing. Same closed-TE
+    profile as the 3D wing builder -> the 2D twin uses identical geometry.
+    Atomic write (MPI/parallel safe). Returns path."""
+    if os.path.exists(path):
+        return path
+    ring, _, _ = _profile(int(n_profile), float(thickness))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".dat", dir=os.path.dirname(path))
+    os.close(fd)
+    try:
+        np.savetxt(tmp, ring, fmt="%.9f")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return path
+
+
 def ensure_naca4_wing_stl(path: str,
                           chord: float = 1.0,
                           span: float = 0.1,
