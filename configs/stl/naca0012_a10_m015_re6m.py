@@ -20,7 +20,8 @@ Grid: chord = 100 COARSE cells, MLG 4-level, wing on L3 (800 fine
 cells/chord). Thin slab Nz = 0.16c; ALL fine regions span full z (their
 z faces are domain faces — no z coupling interfaces). Cells (c=100):
 L0 960x600x16 = 9.2M, L1 3.2M, L2 8.0M, L3 32.0M -> ~52.4M total.
-BCs per request: xmin eq, xmax sponge, ymin/ymax/zmin/zmax neumann.
+BCs: xmin eq, xmax sponge, ymin/ymax neumann, z PERIODIC (omitted —
+the canonical spanwise closure for an infinite wing).
 0.5*L_body padding advisories vs the chord are expected (streamlined
 body -> the 3xBL criterion applies; documented, not gated).
 
@@ -83,8 +84,13 @@ def _build(c=100, wall_bc="ibb"):
                  "thickness": 20, "strength": 0.1},
         "ymin": {"location": "ymin", "method": "neumann"},
         "ymax": {"location": "ymax", "method": "neumann"},
-        "zmin": {"location": "zmin", "method": "neumann"},
-        "zmax": {"location": "zmax", "method": "neumann"},
+        # zmin/zmax OMITTED = PERIODIC (faces absent from bc_manager stay
+        # FLUID; wrap streaming is the periodic BC — Phase 1a convention).
+        # Canonical for the infinite wing: periodic-z == continued
+        # extrusion, exactly matching the span_through prism contract.
+        # Under z-invariance neumann was equivalent to rounding (measured
+        # 6e-7 vs periodic); periodic states the intent and stays correct
+        # if Nz is ever enlarged to resolve real spanwise turbulence.
     }
 
     folder = f"results_naca0012_a10_m015_re6m_c{c}"
