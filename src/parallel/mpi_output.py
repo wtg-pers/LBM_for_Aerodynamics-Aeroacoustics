@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import os
 import numpy as np
 
 from src.solver.output_manager import OutputManager
@@ -77,18 +78,21 @@ class MPIOutputManager(OutputManager):
         else:
             self._tier = 'flow'
 
-        if self.conservation_mgr is not None:
-            if dist_init:
-                # No full-field baseline exists under --dist-init; refuse
-                # to silently report garbage drift.
-                if self._io_rank:
-                    print("[output] conservation: DISABLED under --dist-init "
-                          "(no full-field baseline)")
-                self.conservation_mgr = None
-            else:
-                masses = self._cv_masses()
-                for name, cv in self.conservation_mgr.cv_items():
-                    cv.initialize_from_mass(masses[name], start_step)
+        if self.conservation_mgr is not None and dist_init:
+            # No full-field baseline exists under --dist-init; refuse
+            # to silently report garbage drift.
+            if self._io_rank:
+                print("[output] conservation: DISABLED under --dist-init "
+                      "(no full-field baseline)")
+            self.conservation_mgr = None
+        # NOTE (S4-C finding, 2026-07-31): do NOT re-baseline M0 from
+        # _cv_masses() here. At bind time no kernel has run yet, so the
+        # slab rho buffers are unwritten (collective "mass" ~1.3% of the
+        # real one) — the re-baseline replaced the initializer's valid
+        # full-field M0 and every later drift read ~7705%. The
+        # initializer's M0 stands (same fluid-only basis); if a CV ever
+        # arrives uninitialized, check_from_mass() self-baselines at the
+        # first check with VALID collective masses.
 
         if self._dense_csv_path:
             import os
