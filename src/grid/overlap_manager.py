@@ -214,6 +214,22 @@ class OverlapRegion:
             self._coarse_bounds
         )
 
+        # ── Flush faces: first-class designed state ──────────────
+        # A face where fine_region sits ON the domain boundary has no
+        # coarse-only zone beyond it: the fine face IS a domain face, the
+        # coupling band there is width 0 BY DESIGN (span-through prism /
+        # boundary-flush regions), and C2F/F2C skip it. Not an accident
+        # to warn about — _validate only warns for PARTIAL clipping.
+        fr_, fd_ = fine_region, self.fine_domain_coarse
+        self.flush_faces: Dict[str, bool] = {
+            'x_min': fr_.x_start == fd_.x_start,
+            'x_max': fr_.x_end == fd_.x_end,
+            'y_min': fr_.y_start == fd_.y_start,
+            'y_max': fr_.y_end == fd_.y_end,
+            'z_min': fr_.z_start == fd_.z_start,
+            'z_max': fr_.z_end == fd_.z_end,
+        }
+
         # ── Fine grid dimensions ─────────────────────────────────
         # Each coarse interval becomes REFINE_RATIO fine intervals
         fdx = self.fine_domain_coarse.x_end - self.fine_domain_coarse.x_start
@@ -499,18 +515,33 @@ class OverlapRegion:
                 f"(0..{Nx_c-1}, 0..{Ny_c-1}, 0..{Nz_c-1})."
             )
 
-        # Fine region with overlap must not extend beyond coarse boundaries
-        # (after clipping, we just warn if it was clipped)
-        expanded = fine_region.expanded(overlap_width)
-        if not (bounds.contains(expanded.x_start, expanded.y_start,
-                                expanded.z_start)
-                and bounds.contains(expanded.x_end, expanded.y_end,
-                                    expanded.z_end)):
+        # Overlap beyond the coarse boundary is clipped. Two distinct cases:
+        #   EXACT FLUSH — the region bound sits ON the domain bound: the
+        #     face is a domain face, the band is 0 by design and coupling
+        #     skips it (span-through prism configs). Silent.
+        #   PARTIAL clip — the region bound is within (0, overlap_width)
+        #     of the boundary: a truncated band still couples there with
+        #     a shortened stencil. Warn (genuine accuracy concern).
+        partial = []
+        for ax, lo_r, hi_r, n_ax in (('x', fine_region.x_start,
+                                      fine_region.x_end, Nx_c),
+                                     ('y', fine_region.y_start,
+                                      fine_region.y_end, Ny_c),
+                                     ('z', fine_region.z_start,
+                                      fine_region.z_end, Nz_c)):
+            if 0 < lo_r < overlap_width:
+                partial.append(f"{ax}_min")
+            if n_ax - 1 - overlap_width < hi_r < n_ax - 1:
+                partial.append(f"{ax}_max")
+        if partial:
             import warnings
             warnings.warn(
-                f"Fine region + overlap extends beyond coarse domain. "
-                f"Overlap will be clipped at domain boundaries. "
-                f"This may reduce interpolation accuracy at those faces.",
+                f"Fine region + overlap is PARTIALLY clipped at the domain "
+                f"boundary on face(s) {partial}: the coupling band there is "
+                f"narrower than overlap_width, which may reduce "
+                f"interpolation accuracy. Either inset the region by "
+                f">= {overlap_width} cells or place it flush on the "
+                f"boundary (flush faces skip coupling by design).",
                 stacklevel=3,
             )
 

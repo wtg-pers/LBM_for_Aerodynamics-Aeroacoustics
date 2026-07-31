@@ -156,15 +156,9 @@ class GridCoupling:
         # divergence at step 1). Such faces are excluded from every C2F
         # write path; interior-region configs have no flush faces, so
         # their spec lists are unchanged (bit-neutral).
-        fr0, fdc0 = region.fine_region, region.fine_domain_coarse
-        self._flush_faces = {
-            'x_min': fr0.x_start == fdc0.x_start,
-            'x_max': fr0.x_end == fdc0.x_end,
-            'y_min': fr0.y_start == fdc0.y_start,
-            'y_max': fr0.y_end == fdc0.y_end,
-            'z_min': fr0.z_start == fdc0.z_start,
-            'z_max': fr0.z_end == fdc0.z_end,
-        }
+        # single source: OverlapRegion computes flush as a first-class
+        # designed state (region bound ON the domain bound -> band 0)
+        self._flush_faces = dict(region.flush_faces)
 
         _all_bnd_slices = {
             'x_min': (slice(0, ow_f),            slice(None),              slice(None)),
