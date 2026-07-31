@@ -1,9 +1,10 @@
-"""Cell-center solid voxelization for STL bodies (STL body track, S2).
+"""Cell-center solid voxelization + ray-triangle q for STL bodies (S2/S3).
 
 Provides:
-    create_stl_mask()      column-parity ray casting -> boolean solid mask
-    stl_bbox_l0lu()        config helper: transformed body bbox in L0 lu
-    suggest_fine_region()  config helper: padded MLG region from the bbox
+    create_stl_mask()               column-parity ray casting -> solid mask
+    compute_q_fraction_triangles()  per-link Moller-Trumbore q (Bouzidi IBB)
+    stl_bbox_l0lu()                 config helper: body bbox in L0 lu
+    suggest_fine_region()           config helper: padded MLG region
 
 Algorithm (create_stl_mask) — column-parity ray casting along +z:
     1. Localize vertices p = (V - origin_lu) / dx so cell centers sit at
@@ -233,6 +234,203 @@ def create_stl_mask(
     parity = (np.cumsum(counts[:, :, :nbz], axis=2) & 1).astype(bool)
     mask_np[bx0:bx1 + 1, by0:by1 + 1, bz0:bz1 + 1] = parity
     return xp.asarray(mask_np)
+
+
+# =============================================================================
+# Ray-triangle q-fraction (Bouzidi IBB, S3)
+# =============================================================================
+
+def compute_q_fraction_triangles(
+    xp: 'ModuleType',
+    lattice,
+    solid_mask: 'npt.NDArray',
+    needs_bounce: 'npt.NDArray',
+    triangles_lu: Tuple['npt.NDArray', 'npt.NDArray'],
+    slack: float = 1e-12,
+    stats: Optional[Dict] = None,
+    verbose: bool = True,
+) -> 'npt.NDArray':
+    """Per-link Moller-Trumbore q against the level-local triangle mesh.
+
+    For every boundary link (direction i, fluid node x_f) the wall point is
+    the FIRST mesh intersection along the segment x_f -> x_f + c_i:
+        q = min t over hit triangles,  t in (1e-10, 1].
+    Winding-independent; watertight mesh + cell-center mask guarantee a
+    crossing on [0, 1], so GENUINE misses are expected to be exactly 0 —
+    any keeps the 0.5 sentinel (== HWBB) and is counted/warned.
+
+    On-surface degenerate case: a fluid node whose center lies EXACTLY on
+    the mesh (exit-side of the half-open parity rule, e.g. an icosphere
+    axis vertex landing on a lattice node) has its only inward crossing at
+    t = 0, which the (1e-10, 1] window rejects. True q -> 0 there, but the
+    0.5 sentinel is kept deliberately — the analytic circle/sphere
+    siblings use the same t-window and behave identically. Counted
+    separately as stats['n_on_surface'] (info, not a warning).
+
+    Acceleration: uniform 1-lu grid whose cells are CENTERED on lattice
+    nodes ([n-0.5, n+0.5) per axis). Link endpoints are cell centers, so a
+    link segment touches at most {node, node+c} per axis = 2x2x2 candidate
+    cells. Triangles are binned to every cell their (slightly expanded)
+    bbox overlaps, sorted by cell key once, then all 26 directions query
+    via searchsorted. Duplicate (link, triangle) pairs from multiple cells
+    are harmless (min is idempotent).
+
+    Numerical policy (host numpy f64, f32 output like the sibling
+    compute_q_fraction_* functions):
+        - barycentric slack +-1e-12: covers roll-off at shared edges
+          (polyline s-tolerance precedent). A center-line hit exactly on a
+          shared edge may be accepted by both neighbors -> same t, min OK.
+        - t window (1e-10, 1]: excludes the fluid node itself, includes a
+          wall exactly at the solid neighbor's center (q = 1).
+
+    Args:
+        xp: Array module for the returned q array.
+        lattice: D3Q27 lattice (dim must be 3).
+        solid_mask: (Nx, Ny, Nz) bool (used for shape only).
+        needs_bounce: (Q, Nx, Ny, Nz) bool from compute_needs_bounce.
+        triangles_lu: (vertices_lu, faces) in THIS level's local frame —
+            the same geom_info['triangles_lu'] the mask was built from
+            (shared source => n_miss = 0).
+        slack: barycentric tolerance.
+        stats: optional dict, filled with {'n_links', 'n_miss',
+            'n_on_surface'} (see the on-surface note above).
+        verbose: print a one-line summary.
+
+    Returns:
+        (Q, Nx, Ny, Nz) float32, 0.5 default, q at boundary links.
+    """
+    if lattice.dim != 3:
+        raise ValueError("compute_q_fraction_triangles is 3D-only.")
+
+    vertices_lu, faces = triangles_lu
+    v = np.asarray(vertices_lu, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    shape = tuple(int(s) for s in solid_mask.shape)
+    nx, ny, nz = shape
+    Q = lattice.Q
+    c_all = lattice.c
+    c_np = (c_all.get() if hasattr(c_all, 'get')
+            else np.asarray(c_all)).astype(np.float64)
+    nb = needs_bounce.get() if hasattr(needs_bounce, 'get') else needs_bounce
+    nb = np.asarray(nb, dtype=bool)
+
+    tri = v[f]
+    v0 = tri[:, 0, :]
+    e1 = tri[:, 1, :] - tri[:, 0, :]
+    e2 = tri[:, 2, :] - tri[:, 0, :]
+
+    # ── Bin triangles into the node-centered uniform grid ────────────
+    # Cell (a,b,c) = [a-0.5, a+0.5) x ...; candidate node cells live in
+    # [-1, N] per axis (fluid node in [0, N-1], neighbor offset +-1).
+    eps = 1e-9
+    lo = np.floor(tri.min(axis=1) + 0.5 - eps).astype(np.int64)
+    hi = np.floor(tri.max(axis=1) + 0.5 + eps).astype(np.int64)
+    lo = np.maximum(lo, -1)
+    hi = np.minimum(hi, np.array([nx, ny, nz], dtype=np.int64))
+    span = hi - lo + 1
+    keep = (span > 0).all(axis=1)
+    lo, span = lo[keep], span[keep]
+    tri_ids = np.nonzero(keep)[0]
+    n_cells = span.prod(axis=1)
+
+    total = int(n_cells.sum())
+    cum = np.concatenate([[0], np.cumsum(n_cells)])
+    rep_tri = np.repeat(np.arange(lo.shape[0]), n_cells)
+    off = np.arange(total, dtype=np.int64) - np.repeat(cum[:-1], n_cells)
+    sy = span[rep_tri, 1]
+    sz = span[rep_tri, 2]
+    cxk = lo[rep_tri, 0] + off // (sy * sz)
+    cyk = lo[rep_tri, 1] + (off // sz) % sy
+    czk = lo[rep_tri, 2] + off % sz
+    key_dim_y, key_dim_z = ny + 2, nz + 2
+    keys = ((cxk + 1) * key_dim_y + (cyk + 1)) * key_dim_z + (czk + 1)
+    order = np.argsort(keys, kind='stable')
+    keys_sorted = keys[order]
+    tris_sorted = tri_ids[rep_tri[order]]
+
+    q_out = np.full((Q,) + shape, 0.5, dtype=np.float32)
+    n_links_total = 0
+    n_miss_total = 0
+    n_on_surface_total = 0
+
+    for i in range(1, Q):
+        idx = np.argwhere(nb[i])  # (n, 3) fluid nodes
+        n = idx.shape[0]
+        if n == 0:
+            continue
+        n_links_total += n
+        d = c_np[:, i]
+        p0 = idx.astype(np.float64)
+        t_min = np.full(n, np.inf)
+        t_zero = np.zeros(n, dtype=bool)  # rejected t ~ 0 crossing seen
+
+        # Candidate cells: {node} or {node, node + c_ax} per axis.
+        ax_offsets = [
+            [0] if d[ax] == 0.0 else [0, int(d[ax])] for ax in range(3)
+        ]
+        for ox in ax_offsets[0]:
+            for oy in ax_offsets[1]:
+                for oz in ax_offsets[2]:
+                    cell = idx + np.array([ox, oy, oz], dtype=np.int64)
+                    qkey = (((cell[:, 0] + 1) * key_dim_y
+                             + (cell[:, 1] + 1)) * key_dim_z
+                            + (cell[:, 2] + 1))
+                    beg = np.searchsorted(keys_sorted, qkey, side='left')
+                    end = np.searchsorted(keys_sorted, qkey, side='right')
+                    cnt = end - beg
+                    tot = int(cnt.sum())
+                    if tot == 0:
+                        continue
+                    link_id = np.repeat(np.arange(n), cnt)
+                    pos = (np.arange(tot, dtype=np.int64)
+                           - np.repeat(np.cumsum(cnt) - cnt, cnt)
+                           + np.repeat(beg, cnt))
+                    tid = tris_sorted[pos]
+
+                    # Moller-Trumbore, direction d (unnormalized: t == q).
+                    e1t, e2t = e1[tid], e2[tid]
+                    h = np.cross(np.broadcast_to(d, e2t.shape), e2t)
+                    a = np.einsum('ij,ij->i', e1t, h)
+                    nonpar = np.abs(a) > 1e-14
+                    inv = np.where(nonpar, 1.0 / np.where(nonpar, a, 1.0), 0.0)
+                    s = p0[link_id] - v0[tid]
+                    u = inv * np.einsum('ij,ij->i', s, h)
+                    qv = np.cross(s, e1t)
+                    w = inv * (qv @ d)
+                    t = inv * np.einsum('ij,ij->i', e2t, qv)
+                    bary = (nonpar
+                            & (u >= -slack) & (w >= -slack)
+                            & (u + w <= 1.0 + slack))
+                    valid = bary & (t > 1e-10) & (t <= 1.0)
+                    if np.any(valid):
+                        np.minimum.at(t_min, link_id[valid], t[valid])
+                    near0 = bary & (t > -1e-10) & (t <= 1e-10)
+                    if np.any(near0):
+                        t_zero[link_id[near0]] = True
+
+        got = np.isfinite(t_min)
+        miss = ~got
+        n_on_surface_total += int((miss & t_zero).sum())
+        n_miss_total += int((miss & ~t_zero).sum())
+        if np.any(got):
+            q_out[i, idx[got, 0], idx[got, 1], idx[got, 2]] = \
+                t_min[got].astype(np.float32)
+
+    if stats is not None:
+        stats['n_links'] = n_links_total
+        stats['n_miss'] = n_miss_total
+        stats['n_on_surface'] = n_on_surface_total
+    if n_miss_total:
+        print(f"  [warn] compute_q_fraction_triangles: {n_miss_total} / "
+              f"{n_links_total} links found NO intersection — 0.5 sentinel "
+              f"(== HWBB) kept. Expected 0 for a watertight mesh sharing "
+              f"the mask's triangles_lu source.")
+    elif verbose:
+        extra = (f", on-surface(q=0.5 kept)={n_on_surface_total}"
+                 if n_on_surface_total else "")
+        print(f"  q from STL mesh: {n_links_total:,} links, "
+              f"{f.shape[0]} triangles, n_miss=0{extra}")
+    return xp.asarray(q_out)
 
 
 # =============================================================================

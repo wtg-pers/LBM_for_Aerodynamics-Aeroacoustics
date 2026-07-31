@@ -51,7 +51,9 @@ from src.boundary.domain_bc_manager import DomainBCManager
 from src.boundary.bc_config import BCType
 from src.boundary.wall import HalfwayBounceBack
 from src.boundary.interpolated_wall import InterpolatedBounceBack
+from src.boundary.stl_geometry import compute_q_fraction_triangles
 from src.boundary.q_fraction import (
+    compute_q_fraction_sphere,
     compute_needs_bounce,
     compute_q_fraction_circle,
     compute_q_fraction_cylinder_axis,
@@ -766,13 +768,20 @@ class SimulationSetup:
             )
             print(f"  Wall BC: Bouzidi IBB (analytic q from cylinder "
                   f"axis='{axis}', 3D)")
-        elif dim == 3 and gtype == 'stl':
-            # Backstop (validate_geometry_config already rejects this):
-            # silently degrading a requested IBB to q=0.5 is forbidden.
-            raise ValueError(
-                "stl + wall_bc='ibb': ray-triangle q-fraction lands in "
-                "track stage S3 — use wall_bc='hwbb' until then."
+        elif dim == 3 and gtype == 'sphere':
+            q_fraction = compute_q_fraction_sphere(
+                self.xp, self.lattice, mask, needs_bounce,
+                center=geom_info['center'],
+                radius=geom_info['radius'],
             )
+            print(f"  Wall BC: Bouzidi IBB (analytic q from sphere, 3D)")
+        elif dim == 3 and gtype == 'stl' and 'triangles_lu' in geom_info:
+            q_fraction = compute_q_fraction_triangles(
+                self.xp, self.lattice, mask, needs_bounce,
+                triangles_lu=geom_info['triangles_lu'],
+            )
+            print(f"  Wall BC: Bouzidi IBB (ray-triangle q from STL, "
+                  f"{geom_info.get('n_faces', '?')} faces)")
         else:
             print(f"  [warn] wall_bc='ibb' with dim={dim} geom type='{gtype}' "
                   f"has no q-source; using q=0.5 sentinel (≡ HWBB).")

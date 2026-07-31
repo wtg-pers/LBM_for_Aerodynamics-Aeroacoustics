@@ -575,10 +575,7 @@ def validate_geometry_config(
             return False, f"stl: 'rotation_deg' must have 3 components, got {rot!r}"
 
         wall_bc = config.get('wall_bc', 'hwbb').lower()
-        if wall_bc == 'ibb':
-            return False, ("stl: wall_bc='ibb' not wired yet — ray-triangle "
-                           "q-fraction lands in track stage S3; use 'hwbb'")
-        if wall_bc != 'hwbb':
+        if wall_bc not in ('hwbb', 'ibb'):
             return False, f"stl: wall_bc must be 'hwbb' or 'ibb', got '{wall_bc}'"
 
         # Watertight check (cached; the same entry point the builders use).

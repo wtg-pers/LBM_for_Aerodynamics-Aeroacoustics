@@ -255,6 +255,79 @@ def compute_q_fraction_cylinder_axis(
     return _to_xp(xp, q_out)
 
 
+def compute_q_fraction_sphere(
+    xp: "ModuleType",
+    lattice,
+    solid_mask: "npt.NDArray",
+    needs_bounce: "npt.NDArray",
+    center: Tuple[float, float, float],
+    radius: float,
+) -> "npt.NDArray":
+    """Analytic q-fraction for a 3D sphere obstacle.
+
+    3D twin of compute_q_fraction_circle: for a boundary link at fluid
+    node x_f with direction c_i, solve |x_f + t c_i - C|^2 = R^2 and take
+    the smallest root t* in (0, 1]; q = t*. Numerical degeneracy keeps the
+    0.5 sentinel (HWBB fallback) for that link.
+
+    Serves as the validation reference for the STL ray-triangle q
+    (icosphere parity, STL track S3) and closes the historical gap where a
+    3D sphere with wall_bc='ibb' fell to the q=0.5 sentinel.
+
+    Args:
+        xp:             Array module (numpy or cupy).
+        lattice:        Lattice model (must have dim == 3).
+        solid_mask:     Boolean solid mask  (Nx, Ny, Nz).
+        needs_bounce:   Link mask (Q, Nx, Ny, Nz) from compute_needs_bounce.
+        center:         (cx, cy, cz) sphere center  [lattice units].
+        radius:         Sphere radius  [lattice units].
+
+    Returns:
+        q_fraction:     (Q, Nx, Ny, Nz) float32, 0.5 default, q_true at links.
+    """
+    if lattice.dim != 3:
+        raise ValueError("compute_q_fraction_sphere is 3D-only.")
+
+    Q = lattice.Q
+    shape = tuple(solid_mask.shape)
+    c = _to_numpy(lattice.c).astype(np.float64)
+    nb_np = _to_numpy(needs_bounce)
+
+    q_out = np.full((Q,) + shape, 0.5, dtype=np.float32)
+    c0 = np.asarray(center, dtype=np.float64)
+    R = float(radius)
+
+    for i in range(1, Q):
+        ci = c[:, i]
+        idx = np.argwhere(nb_np[i])  # (N_links, 3)
+        if idx.size == 0:
+            continue
+
+        d = idx.astype(np.float64) - c0[None, :]
+        a = float(ci @ ci)
+        b = 2.0 * (d @ ci)
+        k = np.einsum('ij,ij->i', d, d) - R * R
+        disc = b * b - 4.0 * a * k
+
+        valid = disc >= 0.0
+        sqrt_disc = np.sqrt(np.where(valid, disc, 0.0))
+        t1 = np.where(valid, (-b - sqrt_disc) / (2.0 * a), np.inf)
+        t2 = np.where(valid, (-b + sqrt_disc) / (2.0 * a), np.inf)
+
+        # Smallest root in (0, 1]
+        t1 = np.where((t1 > 1e-10) & (t1 <= 1.0), t1, np.inf)
+        t2 = np.where((t2 > 1e-10) & (t2 <= 1.0), t2, np.inf)
+        q_i = np.minimum(t1, t2)
+
+        good = np.isfinite(q_i)
+        if not np.any(good):
+            continue
+        q_out[i, idx[good, 0], idx[good, 1], idx[good, 2]] = \
+            q_i[good].astype(np.float32)
+
+    return _to_xp(xp, q_out)
+
+
 def compute_q_fraction_polyline(
     xp: "ModuleType",
     lattice,

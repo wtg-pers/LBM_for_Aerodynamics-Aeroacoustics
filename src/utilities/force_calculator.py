@@ -1029,7 +1029,7 @@ class ForceManager:
         import numpy as _np
         out: Dict[str, Any] = {}
         geom = self._internal_geometry
-        for key in ('airfoil', 'circle', 'cylinder', 'sphere', 'box'):
+        for key in ('airfoil', 'circle', 'cylinder', 'sphere', 'box', 'stl'):
             cfg = geom.get(key)
             if not (isinstance(cfg, dict) and cfg.get('enabled', False)):
                 continue
@@ -1043,6 +1043,19 @@ class ForceManager:
                 out['obstacle_radius'] = _np.float32(cfg['radius'])
             if 'angle_of_attack' in cfg:
                 out['obstacle_aoa_deg'] = _np.float32(cfg['angle_of_attack'])
+            if key == 'stl':
+                # Provenance only — vertices_lu/faces (fine-level configs)
+                # are deliberately NEVER serialized into the NPZ.
+                out['obstacle_stl_file'] = _np.array(str(cfg.get('file', '')))
+                if 'scale_to_lu' in cfg:
+                    out['obstacle_stl_scale_to_lu'] = _np.float32(
+                        cfg['scale_to_lu'])
+                if 'center_lu' in cfg:
+                    out['obstacle_center'] = _np.asarray(
+                        cfg['center_lu'], dtype=_np.float32)
+                if 'rotation_deg' in cfg:
+                    out['obstacle_stl_rotation_deg'] = _np.asarray(
+                        cfg['rotation_deg'], dtype=_np.float32)
             out['obstacle_type'] = _np.array(key)
             break
         return out
