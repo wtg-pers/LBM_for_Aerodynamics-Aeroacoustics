@@ -106,6 +106,33 @@ def _fail_fast_config(setup, mlg) -> None:
                 "wall_bc='hwbb' for MPI runs.")
 
 
+def resolve_local_device(args, local_rank: int, ndev: int,
+                         verbose: bool = False) -> int:
+    """Node-local rank -> GPU id under the unified --gpu flag.
+
+    --gpu ID[,ID,...] is the single interface (rank r -> id[r % len]);
+    --devices is a deprecated alias kept for old scripts. Giving both is
+    an error (no silent precedence). Unset: local_rank % ndev.
+    """
+    ids = list(getattr(args, 'gpu_ids', None) or [])
+    if getattr(args, 'devices', None):
+        if ids:
+            raise ValueError(
+                "--gpu and --devices are the same flag (--devices is a "
+                "deprecated alias) — give only --gpu ID[,ID,...]")
+        if verbose:
+            print("[mpi] warning: --devices is deprecated — use "
+                  "--gpu ID[,ID,...]", flush=True)
+        ids = [int(d) for d in args.devices.split(",")]
+    if ids:
+        dev = ids[local_rank % len(ids)]
+        if dev >= ndev or dev < 0:
+            raise ValueError(f"--gpu/--devices: id {dev} outside visible "
+                             f"device range [0, {ndev - 1}]")
+        return dev
+    return local_rank % ndev
+
+
 def _build(args, dev: int, with_writers: bool = False,
            use_restart: bool = True, dist_init=None,
            io_role: str = 'writer'):
@@ -175,14 +202,7 @@ def _run(args, MPI):
     local = comm.Split_type(MPI.COMM_TYPE_SHARED).Get_rank()
     import cupy as cp
     ndev = cp.cuda.runtime.getDeviceCount()
-    if args.devices:
-        ids = [int(d) for d in args.devices.split(",")]
-        dev = ids[local % len(ids)]
-        if dev >= ndev:
-            raise ValueError(f"--devices {args.devices}: id {dev} >= "
-                             f"visible device count {ndev}")
-    else:
-        dev = local % ndev
+    dev = resolve_local_device(args, local, ndev, verbose=(rank == 0))
     cp.cuda.Device(dev).use()
 
     if rank != 0:

@@ -103,4 +103,9 @@ def main(argv=None):
         return run_mpi(args)
 
     _reject_mpi_only_flags(args)
+    ids = getattr(args, 'gpu_ids', None)
+    if ids and len(ids) > 1:
+        sys.exit(f"error: --gpu {','.join(map(str, ids))}: multiple GPU ids "
+                 f"need an MPI launch — mpirun -n {len(ids)} python main.py "
+                 f"... (a single-process run takes one id)")
     return run_single(args)

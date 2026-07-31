@@ -80,9 +80,13 @@ Examples:
     )
 
     parser.add_argument(
-        '--gpu', type=int, default=None,
-        metavar='ID',
-        help='GPU device ID to use (0, 1, 2, ...). Overrides config file.'
+        '--gpu', type=str, default=None,
+        metavar='ID[,ID,...]',
+        help='GPU device id(s). One id: this process\'s GPU (overrides the '
+             'config file). Several comma-separated ids: MPI runs only — '
+             'per node-local-rank mapping (rank r -> id[r %% len]), e.g. '
+             'mpirun -n 2 ... --gpu 2,3. Unset: config device_id (single) '
+             'or local_rank %% ndev (MPI).'
     )
 
     parser.add_argument(
@@ -187,8 +191,8 @@ Examples:
     )
     mpi_group.add_argument(
         '--devices', default=None, metavar='LIST',
-        help="[MPI] comma-separated GPU ids per node-local rank, e.g. '0,1' "
-             "(default: local_rank %% ndev)"
+        help="[MPI][DEPRECATED] alias of --gpu ID[,ID,...] — use --gpu; "
+             "comma-separated GPU ids per node-local rank"
     )
     mpi_group.add_argument(
         '--ghost', type=int, default=3,
@@ -237,7 +241,25 @@ Examples:
         help='[MPI] per-section wall-time attribution'
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    # ── --gpu normalization (unified single/MPI device flag) ─────────
+    # args.gpu_ids: list[int] when --gpu was given, else None.
+    # args.gpu:     int when exactly ONE id was given (single-process
+    #               device override, historical type), else None — the
+    #               MPI driver maps gpu_ids per node-local rank itself.
+    args.gpu_ids = None
+    if args.gpu is not None:
+        try:
+            ids = [int(t) for t in str(args.gpu).split(',') if t.strip()]
+        except ValueError:
+            parser.error(f"--gpu {args.gpu!r}: expected ID or ID,ID,... "
+                         f"(integers)")
+        if not ids:
+            parser.error(f"--gpu {args.gpu!r}: no device id given")
+        args.gpu_ids = ids
+        args.gpu = ids[0] if len(ids) == 1 else None
+    return args
 
 
 def get_args_summary(args: argparse.Namespace) -> str:
