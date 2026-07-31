@@ -159,6 +159,22 @@ class DistributedMLGRunner:
                 self.body_level = k
                 break
 
+        # esoteric IBB (STL track S6): slab-filtered deposit-rewrite pass
+        # per level, built from the replicated InterpolatedBounceBack links
+        # (obstacle_bc survives the level-array free above; link arrays are
+        # tiny). rewrite runs right after every L.advance().
+        from src.boundary.interpolated_wall import InterpolatedBounceBack
+        from src.kernels.esoteric_ibb_d3q27 import build_slab_ibb
+        self.ibb: List[Optional[object]] = [None] * NL
+        for k in range(NL):
+            ob = getattr(mlg.get_level(k), 'obstacle_bc', None)
+            if isinstance(ob, InterpolatedBounceBack):
+                self.ibb[k] = build_slab_ibb(cp, ob, self.parts[k],
+                                             shapes[k])
+                n_l = self.ibb[k].n_links if self.ibb[k] is not None else 0
+                print(f"[mpi] eso IBB L{k}: {n_l:,} slab links "
+                      f"(rank {rank})", flush=True)
+
     # ── plumbing ─────────────────────────────────────────────────────
     def _tic(self):
         if self.profile is not None:
@@ -222,6 +238,13 @@ class DistributedMLGRunner:
             t0 = self._tic()
             L.advance()
             self._toc("kernel", t0)
+        if self.ibb[k] is not None:
+            # IBB deposit rewrite for the step the kernel just ran
+            # (L.advance incremented t; parity = t - 1). Must precede any
+            # halo post / coupling gather of this level's mem.
+            t0 = self._tic()
+            self.ibb[k].rewrite(L.mem, L.t - 1)
+            self._toc("ibb", t0)
         self._touch(k)
 
     def _advance_fine(self, k: int) -> None:
@@ -300,8 +323,14 @@ class DistributedMLGRunner:
         """OWNED-cell MEM force partial on the body level (lattice units of
         that level); allreduce + normalization happen in the caller.
         Diagnostic tier (atomicAdd accumulation)."""
-        from src.kernels.esoteric_d3q27 import eso_mem_force
         k = self.body_level
+        if self.ibb[k] is not None:
+            # IBB: deposits are already REWRITTEN (Bouzidi values) — the
+            # HWBB whole-domain kernel would read 2*val != f* + val. The
+            # scatter pass accumulated the exact owned-clip MEM force of
+            # the body level's most recent substep.
+            return self.ibb[k].last_force()
+        from src.kernels.esoteric_d3q27 import eso_mem_force
         L = self.lv[k]
         p = self.parts[k]
         cb = [(0, d) for d in L.dims]

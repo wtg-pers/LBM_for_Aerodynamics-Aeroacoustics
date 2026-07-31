@@ -280,3 +280,98 @@ class EsotericIBBD3Q27:
     def last_force(self) -> np.ndarray:
         """MEM force of the most recent rewrite, host float64 (3,)."""
         return self.xp.asnumpy(self._force_out)
+
+
+def build_slab_ibb(
+    xp: 'ModuleType',
+    ibb,
+    part,
+    global_shape: Tuple[int, int, int],
+) -> Optional['EsotericIBBD3Q27']:
+    """Slab-filtered, rebased EsotericIBBD3Q27 for one rank's LocalLevel (S6).
+
+    Filter: links whose FLUID CELL lies at slab-local axis layer
+    rel in [3, local-4] (periodic wrap), which REQUIRES ghost >= 5.
+
+    Dependency-hop accounting (why 3 layers, not 1 — PLAN's "ghost>=2
+    suffices" undercounted this; found by the NR=2 --verify ulp failure):
+      hop 0: after each pre-advance sync the whole slab is owner-truth,
+             but the OUTERMOST layer (rel 0 / local-1) computes garbage
+             (its LOAD wraps around the slab) -> compute-correct cells:
+             rel in [1, local-2];
+      hop 1: a kernel STORE writes slots at writer+-1 -> post-advance
+             slot-correct addresses: rel in [2, local-3];
+      hop 2: the rewrite READS slots at link+-1 -> input-consistent
+             links: rel in [3, local-4]; their rewrites land at [2,...],
+             so post-rewrite owner-consistent slots: rel in [4, local-5];
+      halo:  the v1 band gather reconstructs std f of the owned edge band
+             (width g) and READS slots one cell beyond it — reach
+             [g-1, 2g] — which must sit inside [4, local-5] -> g >= 5.
+    Links outside [3, local-4] are the neighbor's responsibility: their
+    rewritten slots live in ghost layers that every consumer (loads,
+    coupling gathers, band sends — all post-sync in the runner) sees only
+    AFTER the halo refreshed them with the owner's consistent values.
+
+    Ownership clip for the fused MEM force = the OWNED axis range (rank
+    contributions exclusive; Allreduce outside).
+
+    Host-side int64 arithmetic, slab-local int32 cells. Returns None when
+    no link survives the filter (level slab away from the body).
+    """
+    nx, ny, nz = (int(s) for s in global_shape)
+    cell = ibb.link_cell.get() if hasattr(ibb.link_cell, 'get') \
+        else np.asarray(ibb.link_cell)
+    dir_std = ibb.link_dir.get() if hasattr(ibb.link_dir, 'get') \
+        else np.asarray(ibb.link_dir)
+    link_q = ibb.link_q.get() if hasattr(ibb.link_q, 'get') \
+        else np.asarray(ibb.link_q)
+    cell = cell.astype(np.int64)
+
+    gx = cell // (ny * nz)
+    gy = (cell // nz) % ny
+    gz = cell % nz
+    coords = [gx, gy, gz]
+
+    ax = int(part.axis)
+    g = int(part.ghost)
+    n_ax = (nx, ny, nz)[ax]
+    local_dims = tuple(int(d) for d in part.local_shape)
+
+    if g == 0:
+        # NR == 1: the slab IS the domain (no ghosts) — keep everything.
+        keep = np.ones(cell.shape[0], dtype=bool)
+        rel = coords[ax]
+    else:
+        if g < 5:
+            raise ValueError(
+                f"esoteric IBB under MPI needs ghost >= 5 (got {g}): the "
+                f"deposit rewrite adds a dependency hop on top of the "
+                f"kernel store, so the halo band gather's [g-1, 2g] reach "
+                f"only sees rewrite-consistent slots from g = 5 up "
+                f"(see build_slab_ibb docstring).")
+        local_ax = int(part.own_count) + 2 * g
+        rel = (coords[ax] - (int(part.own_start) - g)) % n_ax
+        keep = (rel >= 3) & (rel <= local_ax - 4)
+
+    if not np.any(keep):
+        return None
+
+    lc = [coords[0][keep], coords[1][keep], coords[2][keep]]
+    lc[ax] = rel[keep]
+    ly, lz = local_dims[1], local_dims[2]
+    local_flat = (lc[0] * ly + lc[1]) * lz + lc[2]
+    assert local_flat.max() < np.prod(local_dims)
+
+    lut = np.asarray(STD_TO_ESO_MAP, dtype=np.int8)
+    dir_eso = lut[dir_std.astype(np.int64)[keep]]
+
+    clip = [(0, d) for d in local_dims]
+    clip[ax] = (g, g + int(part.own_count))
+    return EsotericIBBD3Q27(
+        xp,
+        xp.asarray(local_flat.astype(np.int32)),
+        xp.asarray(dir_eso),
+        xp.asarray(link_q[keep]),
+        local_dims,
+        clip_bounds=clip,
+    )

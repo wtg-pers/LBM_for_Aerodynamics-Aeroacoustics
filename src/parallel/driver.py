@@ -95,15 +95,9 @@ def _fail_fast_config(setup, mlg) -> None:
             "this config (requires GPU + 3D + BGK/Cumulant + precision "
             "float32 — see csv/setup_log.txt for the fallback warning). "
             "The MPI runner requires it.")
-    from src.boundary.interpolated_wall import InterpolatedBounceBack
-    for k in range(mlg.num_levels):
-        if isinstance(getattr(mlg.get_level(k), 'obstacle_bc', None),
-                      InterpolatedBounceBack):
-            raise ValueError(
-                "[mpi] config error: wall_bc='ibb' under MPI lands in STL "
-                "track stage S6 (link slab filter + rebase). Run single-GPU "
-                "(esoteric IBB is supported there since S5) or use "
-                "wall_bc='hwbb' for MPI runs.")
+    # wall_bc='ibb' under MPI: supported since STL track S6 — the runner
+    # builds a slab-filtered esoteric deposit-rewrite pass per level
+    # (build_slab_ibb) and routes the MEM force through its scatter.
 
 
 def resolve_local_device(args, local_rank: int, ndev: int,
@@ -234,9 +228,23 @@ def _run(args, MPI):
 
     axis = None if args.axis == "auto" else "xyz".index(args.axis)
     transport = MPITransport(comm, cuda_aware=str(cuda_aware) == "1")
+
+    # esoteric IBB needs ghost >= 5 (deposit rewrite adds a dependency hop
+    # on top of the kernel store — see build_slab_ibb). Auto-bump so
+    # wall_bc='ibb' configs run correctly with the default --ghost 3.
+    ghost = args.ghost
+    from src.boundary.interpolated_wall import InterpolatedBounceBack
+    if any(isinstance(getattr(mlg.get_level(k), 'obstacle_bc', None),
+                      InterpolatedBounceBack) for k in range(mlg.num_levels)):
+        if ghost < 5:
+            if rank == 0:
+                print(f"[mpi] esoteric IBB: ghost {ghost} -> 5 "
+                      f"(rewrite dependency-hop requirement)", flush=True)
+            ghost = 5
+
     runner = DistributedMLGRunner(
         mlg, transport, rank, nr, allreduce=MPIAllreduce(comm),
-        axis=axis, ghost=args.ghost)
+        axis=axis, ghost=ghost)
 
     # rank-invariant body level: the local nt==1 scan can miss on a rank
     # whose slab holds no solid cells -> mismatched collectives (the old
