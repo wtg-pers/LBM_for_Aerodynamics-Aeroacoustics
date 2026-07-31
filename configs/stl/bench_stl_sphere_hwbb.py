@@ -33,6 +33,37 @@ config["internal_geometry"] = {
     },
 }
 
+# ── S4 fix: BC velocities are PHYSICAL [m/s] in the current schema ──────
+# (setup._setup_boundaries converts via phys_to_lu_velocity = * dt/dx).
+# The parent bench_sphere_hwbb predates the acoustic-scaling migration and
+# feeds LATTICE 0.05 into that field -> u_bc = 2.2e-5 lu: six near-wall
+# faces around a 0.05-lu uniform IC, i.e. a domain-wide deceleration
+# compression wave from step 1 (observed in the first VTK). The parent is
+# an HPC bit-anchor (gu1 baselines) and stays untouched; the S4 flow
+# clones override with proper physical values. U_PHYS is derived through
+# the SAME UnitConverter recipe setup uses (rotor tip speed sets dx/dt
+# even with ALM disabled), so it round-trips to exactly 0.05 lu.
+import sys as _sys
+if _repo not in _sys.path:
+    _sys.path.insert(0, _repo)
+from src.solver.unit_converter import UnitConverter as _UC
+
+U_LU = 0.05
+_g = config["grid"]
+_gc = {"Nx": _g["Nx"], "Ny": _g["Ny"], "resolution":
+       (config.get("numerics", {}).get("resolution") or _g.get("resolution"))}
+if _g.get("Nz") is not None:
+    _gc["Nz"] = _g["Nz"]
+_uc = _UC(
+    physics=config["physics"], grid=_gc, numerics=config.get("numerics", {}),
+    actuator_line=(config["actuator_line"]
+                   if config.get("actuator_line", {}).get("rotor") else None),
+)
+U_PHYS = float(_uc.lu_to_phys_velocity(U_LU))   # 110.5975 m/s for bench5
+for _face, _bc in config["boundaries"].items():
+    _bc["velocity"] = [U_PHYS, 0.0, 0.0]
+config["physics"]["initial_flow_velocity"] = [U_LU, 0.0, 0.0]  # [lu]
+
 _folder = "results_bench_stl_sphere_hwbb"
 config["output"] = dict(
     config["output"],
