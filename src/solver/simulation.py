@@ -153,6 +153,7 @@ class Simulation:
         self._esoteric_is_cumulant: bool = False
         self._esoteric_step: int = 0
         self._esoteric_f_already_set: bool = False
+        self._eso_ibb = None   # EsotericIBBD3Q27 (deposit-rewrite IBB, S5)
 
         # ── WALE pre-pass kernels (lazy init for sgs_model="wale") ──
         # The WALE eddy-viscosity needs u globally before collision so the
@@ -204,10 +205,10 @@ class Simulation:
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
             if isinstance(self.collision, (BGKCollision, CumulantCollision)):
-                # Capability check BEFORE the try/except: a raise inside
-                # _init_esoteric would be swallowed into a warn+fallback,
-                # which is itself a silent downgrade (user asked for eso).
-                self._reject_ibb_on_esoteric()
+                # IBB is supported on the single-GPU esoteric path since S5
+                # (two-phase deposit-rewrite pass built in _init_esoteric).
+                # A failure inside falls back to the standard path, which
+                # still honors IBB — no silent wall-BC downgrade either way.
                 try:
                     self._init_esoteric(f)
                 except Exception as e:
@@ -394,19 +395,18 @@ class Simulation:
         return self._f_post
 
     def _reject_ibb_on_esoteric(self) -> None:
-        """Hard error for wall_bc='ibb' on the esoteric path.
+        """Hard error for wall_bc='ibb' on the DIST-INIT esoteric path.
 
-        The eso node-type mapping only knows NODE_SOLID (implicit HWBB);
-        an InterpolatedBounceBack obstacle would silently lose its
-        q-fractions and run as HWBB. No-silent-downgrade rule: refuse.
-        (Esoteric IBB is planned in the STL body track.)"""
+        Single-GPU esoteric IBB is supported since S5 (deposit-rewrite
+        pass). The distributed-init path still lacks the link slab
+        filter/rebase (STL track S6), so it keeps refusing — silently
+        running HWBB there would break the no-downgrade rule."""
         from src.boundary.interpolated_wall import InterpolatedBounceBack
         if isinstance(self.obstacle_bc, InterpolatedBounceBack):
             raise ValueError(
-                "wall_bc='ibb' is not supported on the esoteric path "
-                "(LBM_ESOTERIC=1): it would silently degrade to HWBB. "
-                "Use the standard path (unset LBM_ESOTERIC) or "
-                "wall_bc='hwbb'.")
+                "wall_bc='ibb' is not supported on the distributed-init "
+                "esoteric path yet (STL track S6: link slab filter + "
+                "rebase). Run single-GPU, or wall_bc='hwbb' under MPI.")
 
     def eso_body_force(self) -> 'npt.NDArray':
         """Whole-domain MEM force on the esoteric path (HWBB bodies).
@@ -416,6 +416,11 @@ class Simulation:
         host float64 in lattice units of this level."""
         if not self._use_esoteric:
             raise RuntimeError("eso_body_force() requires the esoteric path")
+        if self._eso_ibb is not None:
+            # IBB: the HWBB-formula whole-domain kernel would read the
+            # REWRITTEN deposits (2*val != f* + val). The scatter pass
+            # already accumulated the exact Bouzidi MEM force (f64).
+            return self._eso_ibb.last_force()
         from src.kernels.esoteric_d3q27 import eso_mem_force
         cb = [(0, int(d)) for d in self.domain_shape]
         return eso_mem_force(
@@ -598,10 +603,24 @@ class Simulation:
         self.rho = xp.empty(self.domain_shape, dtype=xp.float32)
         self.u = xp.empty((3,) + self.domain_shape, dtype=xp.float32)
 
-        # MEM force (optional): needs_bounce -> Esoteric ordering + accumulator.
+        # Obstacle wall BC on the esoteric path:
+        #   HWBB — implicit (SOLID skip + parity-swapped LOAD); optional
+        #          in-kernel MEM force via needs_bounce (BGK diagnostics).
+        #   IBB  — two-phase deposit-rewrite pass after every fused launch
+        #          (S5). Its scatter fuses the MEM force, so the in-kernel
+        #          HWBB-formula force MUST stay off for IBB.
+        from src.boundary.interpolated_wall import InterpolatedBounceBack
         self._eso_needs_bounce = None
         self._eso_force_out = None
-        if self.obstacle_bc is not None and hasattr(self.obstacle_bc, 'needs_bounce'):
+        self._eso_ibb = None
+        if isinstance(self.obstacle_bc, InterpolatedBounceBack):
+            from src.kernels.esoteric_ibb_d3q27 import EsotericIBBD3Q27
+            self._eso_ibb = EsotericIBBD3Q27.from_interpolated_bc(
+                xp, self.obstacle_bc, self.domain_shape)
+            print(f"  [esoteric] IBB deposit-rewrite pass: "
+                  f"{self._eso_ibb.n_links:,} links")
+        elif self.obstacle_bc is not None and \
+                hasattr(self.obstacle_bc, 'needs_bounce'):
             nb_std = self.obstacle_bc.needs_bounce
             nb_eso = xp.empty_like(nb_std)
             for eso_q in range(27):
@@ -887,6 +906,10 @@ class Simulation:
                 needs_bounce=self._eso_needs_bounce,
                 force_out=force_out,
             )
+        # IBB (S5): overwrite toward-solid deposits of the step just run
+        # with Bouzidi values (2-phase pass; parity = this step's index).
+        if self._eso_ibb is not None:
+            self._eso_ibb.rewrite(self.f, self._esoteric_step)
         self.body_force = None
         self._esoteric_step += 1
         self.step_count += 1

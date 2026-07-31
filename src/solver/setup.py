@@ -361,13 +361,9 @@ class SimulationSetup:
                     problems.append(f"precision={prec} (float32 only)")
                 if dev != 'gpu':
                     problems.append(f"device_mode={dev} (GPU only)")
-                for gname, gcfg in self.config.get(
-                        'internal_geometry', {}).items():
-                    if (isinstance(gcfg, dict) and gcfg.get('enabled')
-                            and gcfg.get('wall_bc', 'hwbb') == 'ibb'):
-                        problems.append(
-                            f"internal_geometry.{gname}.wall_bc='ibb' "
-                            f"(esoteric supports hwbb only)")
+                # wall_bc='ibb' + esoteric is supported since STL track S5
+                # (single-GPU deposit-rewrite pass); MPI still rejects it
+                # in the driver's fail-fast until S6.
                 if problems:
                     raise ValueError(
                         "numerics.esoteric=true cannot be satisfied: "

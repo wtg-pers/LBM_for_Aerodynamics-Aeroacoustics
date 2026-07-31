@@ -95,6 +95,15 @@ def _fail_fast_config(setup, mlg) -> None:
             "this config (requires GPU + 3D + BGK/Cumulant + precision "
             "float32 — see csv/setup_log.txt for the fallback warning). "
             "The MPI runner requires it.")
+    from src.boundary.interpolated_wall import InterpolatedBounceBack
+    for k in range(mlg.num_levels):
+        if isinstance(getattr(mlg.get_level(k), 'obstacle_bc', None),
+                      InterpolatedBounceBack):
+            raise ValueError(
+                "[mpi] config error: wall_bc='ibb' under MPI lands in STL "
+                "track stage S6 (link slab filter + rebase). Run single-GPU "
+                "(esoteric IBB is supported there since S5) or use "
+                "wall_bc='hwbb' for MPI runs.")
 
 
 def _build(args, dev: int, with_writers: bool = False,
