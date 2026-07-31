@@ -19,9 +19,17 @@ Date: 2026-02
 from typing import TYPE_CHECKING, Tuple, Dict, Any, Optional
 import warnings
 
+import numpy as np
+
 if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
+
+from src.boundary.stl_mesh import (
+    load_stl_checked,
+    transform_vertices_to_l0lu,
+)
+from src.boundary.stl_geometry import create_stl_mask
 
 # Import geometry functions from src.boundary.geometry
 from src.boundary.geometry import (
@@ -106,8 +114,8 @@ def create_geometry_mask(
         # 2D: Check airfoil > circle > cylinder > box
         geometry_types = ['airfoil', 'circle', 'cylinder', 'box']
     else:
-        # 3D: Check cylinder > sphere > box
-        geometry_types = ['cylinder', 'sphere', 'box', 'airfoil']
+        # 3D: Check stl > cylinder > sphere > box
+        geometry_types = ['stl', 'cylinder', 'sphere', 'box', 'airfoil']
     
     # Find first enabled geometry
     selected_type = None
@@ -344,8 +352,55 @@ def _create_3d_geometry(
         (mask, info): Mask and geometry info dictionary
     """
     Nx, Ny, Nz = domain_shape
-    
-    if geom_type == 'cylinder':
+
+    if geom_type == 'stl':
+        # STL body. Two entry modes:
+        #   L0 mode  — config carries {file, scale_to_lu, center_lu,
+        #              rotation_deg?}: vertices derived here via the single
+        #              canonical raw -> L0lu path.
+        #   fine mode — config carries pre-localized {vertices_lu, faces}
+        #              built by create_fine_level_geometry_config (level-
+        #              local lu; presence of 'vertices_lu' selects this).
+        # Either way geom_info['triangles_lu'] = (vertices_lu, faces) in
+        # THIS level's local frame is the single source both the mask
+        # (above) and the S3 q-fraction builder consume -> n_miss = 0.
+        if 'vertices_lu' in config:
+            v_lu = np.asarray(config['vertices_lu'], dtype=np.float64)
+            faces = np.asarray(config['faces'], dtype=np.int64)
+            source = config.get('file', '<pre-transformed>')
+        else:
+            mesh = load_stl_checked(config['file'])
+            v_lu = transform_vertices_to_l0lu(
+                mesh,
+                scale_to_lu=config['scale_to_lu'],
+                center_lu=config['center_lu'],
+                rotation_deg=config.get('rotation_deg'),
+            )
+            faces = mesh.faces
+            source = config['file']
+
+        mask = create_stl_mask(xp, domain_shape, v_lu, faces)
+        bb_min = v_lu.min(axis=0)
+        bb_max = v_lu.max(axis=0)
+
+        info = {
+            'type': 'stl',
+            'file': source,
+            'n_faces': int(faces.shape[0]),
+            'bbox_lu': (tuple(bb_min), tuple(bb_max)),
+            'solid_nodes': int(xp.sum(mask)),
+            'triangles_lu': (v_lu, faces),
+        }
+
+        if verbose:
+            print(f"  Internal Obstacle (STL, 3D):")
+            print(f"    source={source}, {info['n_faces']} faces")
+            print(f"    bbox=[({bb_min[0]:.2f}, {bb_min[1]:.2f}, "
+                  f"{bb_min[2]:.2f}) .. ({bb_max[0]:.2f}, {bb_max[1]:.2f}, "
+                  f"{bb_max[2]:.2f})] [lattice units]")
+            print(f"    {info['solid_nodes']} solid nodes")
+
+    elif geom_type == 'cylinder':
         # Cylinder
         center = config.get('center', (Nx//5, Ny//2))
         radius = config.get('radius', char_length//2)
@@ -490,9 +545,80 @@ def validate_geometry_config(
     
     geom_type = enabled_geoms[0]
     config = geometry_config[geom_type]
-    
+
     # Type-specific validation
-    if geom_type in ['circle', 'cylinder', 'sphere']:
+    if geom_type == 'stl':
+        # NOTE: the generic loop above passes unknown types unchecked, so
+        # every stl precondition must be enforced in this branch.
+        if lattice_dim != 3:
+            return False, "stl: 3D only (STL is a triangle mesh; 2D uses the polygon path)"
+
+        stl_file = config.get('file')
+        if not stl_file:
+            return False, "stl: 'file' is required"
+        import os as _os
+        if not _os.path.exists(stl_file):
+            return False, f"stl: file not found: {stl_file}"
+
+        if 'scale_to_lu' not in config:
+            return False, ("stl: 'scale_to_lu' is required (STL carries no "
+                           "units — a silent default of 1.0 is forbidden)")
+        scale = config['scale_to_lu']
+        if not (np.isfinite(scale) and scale > 0):
+            return False, f"stl: scale_to_lu must be finite and > 0, got {scale}"
+
+        center_lu = config.get('center_lu')
+        if center_lu is None or len(center_lu) != 3:
+            return False, f"stl: 'center_lu' must have 3 components, got {center_lu!r}"
+        rot = config.get('rotation_deg')
+        if rot is not None and len(rot) != 3:
+            return False, f"stl: 'rotation_deg' must have 3 components, got {rot!r}"
+
+        wall_bc = config.get('wall_bc', 'hwbb').lower()
+        if wall_bc == 'ibb':
+            return False, ("stl: wall_bc='ibb' not wired yet — ray-triangle "
+                           "q-fraction lands in track stage S3; use 'hwbb'")
+        if wall_bc != 'hwbb':
+            return False, f"stl: wall_bc must be 'hwbb' or 'ibb', got '{wall_bc}'"
+
+        # Watertight check (cached; the same entry point the builders use).
+        try:
+            mesh = load_stl_checked(stl_file)
+        except (ValueError, OSError) as exc:
+            return False, f"stl: {exc}"
+
+        # Transformed bbox strictly inside the domain — solid cells at the
+        # domain edge would wrap through xp.roll in compute_needs_bounce
+        # and create spurious links on the opposite face.
+        v_lu = transform_vertices_to_l0lu(
+            mesh, scale_to_lu=scale, center_lu=center_lu, rotation_deg=rot,
+        )
+        bb_min = v_lu.min(axis=0)
+        bb_max = v_lu.max(axis=0)
+        margin = 1.0
+        for ax, n_ax in enumerate(domain_shape):
+            if bb_min[ax] < margin or bb_max[ax] > n_ax - 1 - margin:
+                return False, (
+                    f"stl: transformed bbox axis {ax} = "
+                    f"[{bb_min[ax]:.2f}, {bb_max[ax]:.2f}] not inside "
+                    f"[{margin}, {n_ax - 1 - margin}] — body must stay off "
+                    f"the domain boundary (periodic-wrap link hazard)"
+                )
+
+        # 0.5 * L_body padding advisory (domain-level; MLG band overlap is
+        # hard-checked per level in setup).
+        l_body = float(np.max(bb_max - bb_min))
+        for ax, n_ax in enumerate(domain_shape):
+            dist = min(float(bb_min[ax]), float(n_ax - 1 - bb_max[ax]))
+            if dist < 0.5 * l_body:
+                warnings.warn(
+                    f"stl: body surface is {dist:.1f} lu from the domain "
+                    f"boundary on axis {ax} (< 0.5*L_body = "
+                    f"{0.5 * l_body:.1f} lu) — expect blockage/BC artifacts",
+                    UserWarning,
+                )
+
+    elif geom_type in ['circle', 'cylinder', 'sphere']:
         radius = config.get('radius', 0)
         if radius <= 0:
             return False, f"{geom_type}: radius must be positive"
@@ -680,7 +806,7 @@ def create_fine_level_geometry_config(
         >>> cfg['sphere']['radius']   # 20.0
     """
     # ── Find active geometry type ──────────────────────────────
-    geometry_types_3d = ['cylinder', 'sphere', 'box']
+    geometry_types_3d = ['stl', 'cylinder', 'sphere', 'box']
     active_type = None
     active_config = None
 
@@ -699,8 +825,47 @@ def create_fine_level_geometry_config(
     Nx_f, Ny_f, Nz_f = fine_shape
     new_config: Dict[str, Any] = {}
 
+    # ── STL ────────────────────────────────────────────────────
+    if active_type == 'stl':
+        # Re-derive the level-local frame from the raw file every time via
+        # the single canonical path (raw -> L0lu -> one localization step).
+        # Never chain lu -> lu transforms between levels.
+        mesh = load_stl_checked(active_config['file'])
+        v_l0 = transform_vertices_to_l0lu(
+            mesh,
+            scale_to_lu=active_config['scale_to_lu'],
+            center_lu=active_config['center_lu'],
+            rotation_deg=active_config.get('rotation_deg'),
+        )
+        v_local = (v_l0 - np.array([ox, oy, oz], dtype=np.float64)) / dx_fine
+
+        bb_min = v_local.min(axis=0)
+        bb_max = v_local.max(axis=0)
+        if (bb_max[0] < 0 or bb_min[0] > Nx_f - 1 or
+                bb_max[1] < 0 or bb_min[1] > Ny_f - 1 or
+                bb_max[2] < 0 or bb_min[2] > Nz_f - 1):
+            if verbose:
+                print(f"    STL body does not intersect fine domain — skipped")
+            return {}
+
+        new_config = {
+            'stl': {
+                'enabled': True,
+                'file': active_config['file'],   # provenance only
+                'vertices_lu': v_local,          # level-local frame
+                'faces': mesh.faces,
+            }
+        }
+        if 'wall_bc' in active_config:
+            new_config['stl']['wall_bc'] = active_config['wall_bc']
+        if verbose:
+            print(f"    Fine obstacle (STL): bbox=[({bb_min[0]:.1f}, "
+                  f"{bb_min[1]:.1f}, {bb_min[2]:.1f}) .. ({bb_max[0]:.1f}, "
+                  f"{bb_max[1]:.1f}, {bb_max[2]:.1f})], "
+                  f"{mesh.n_faces} faces [fine lu]")
+
     # ── Sphere ─────────────────────────────────────────────────
-    if active_type == 'sphere':
+    elif active_type == 'sphere':
         cx, cy, cz = active_config['center']
         radius = active_config['radius']
 

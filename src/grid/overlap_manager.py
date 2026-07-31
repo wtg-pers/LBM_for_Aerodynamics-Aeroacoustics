@@ -45,6 +45,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class IndexBox:
@@ -609,3 +611,76 @@ class OverlapManager:
             lines.append(region.summary())
             lines.append("")
         return "\n".join(lines)
+
+# =============================================================================
+# Body vs. coupling-band diagnosis (STL track S2; S0 carryover)
+# =============================================================================
+
+def body_coupling_band_report(solid_mask_np, region) -> Dict[str, list]:
+    """Diagnose an obstacle mask against a fine level's C2F/F2C band.
+
+    The outer band of a fine level — between the fine-domain edge and the
+    user's fine_region edge (overlap_width coarse cells = 2*overlap_width
+    fine cells per face, 0 on faces clipped at the domain boundary) — hosts
+    the C2F/F2C coupling stencils. Solid cells inside it corrupt the
+    interpolation (coupling reads/writes through the body): hard error.
+    Additionally, body surface closer than 0.5*L_body to the fine_region
+    edge couples the interface into the boundary layer and shifts Cd
+    non-physically (MLG region padding record): warning.
+
+    Args:
+        solid_mask_np: fine-level solid mask, HOST numpy bool array
+            (2D or 3D, matching the region's dimensionality).
+        region: OverlapRegion / OverlapRegion2D of the pair (k-1, k).
+
+    Returns:
+        {'violations': [(face, n_solid_cells), ...],
+         'padding_warnings': [(face, distance_cells, min_required), ...]}
+        Both empty == clean. Faces are 'x_low', 'x_high', 'y_low', ...
+    """
+    ratio = int(getattr(region, 'REFINE_RATIO', 2))
+    fd, fr = region.fine_domain_coarse, region.fine_region
+    axes = ['x', 'y']
+    if solid_mask_np.ndim == 3:
+        axes.append('z')
+
+    violations: list = []
+    pad_warns: list = []
+    solid_any = bool(solid_mask_np.any())
+    if not solid_any:
+        return {'violations': violations, 'padding_warnings': pad_warns}
+
+    # Body bbox (fine-local cells) and size for the 0.5*L_body rule.
+    idx = np.nonzero(solid_mask_np)
+    bb_lo = [int(a.min()) for a in idx]
+    bb_hi = [int(a.max()) for a in idx]
+    l_body = max(hi - lo + 1 for lo, hi in zip(bb_lo, bb_hi))
+
+    for ax_i, ax in enumerate(axes):
+        w_lo = (getattr(fr, f'{ax}_start') - getattr(fd, f'{ax}_start')) * ratio
+        w_hi = (getattr(fd, f'{ax}_end') - getattr(fr, f'{ax}_end')) * ratio
+        n_ax = solid_mask_np.shape[ax_i]
+
+        sl_all = [slice(None)] * solid_mask_np.ndim
+        if w_lo > 0:
+            sl = list(sl_all)
+            sl[ax_i] = slice(0, w_lo)
+            n_bad = int(solid_mask_np[tuple(sl)].sum())
+            if n_bad:
+                violations.append((f'{ax}_low', n_bad))
+            else:
+                dist = bb_lo[ax_i] - w_lo  # cells from fine_region edge
+                if dist < 0.5 * l_body:
+                    pad_warns.append((f'{ax}_low', dist, 0.5 * l_body))
+        if w_hi > 0:
+            sl = list(sl_all)
+            sl[ax_i] = slice(n_ax - w_hi, n_ax)
+            n_bad = int(solid_mask_np[tuple(sl)].sum())
+            if n_bad:
+                violations.append((f'{ax}_high', n_bad))
+            else:
+                dist = (n_ax - 1 - w_hi) - bb_hi[ax_i]
+                if dist < 0.5 * l_body:
+                    pad_warns.append((f'{ax}_high', dist, 0.5 * l_body))
+
+    return {'violations': violations, 'padding_warnings': pad_warns}

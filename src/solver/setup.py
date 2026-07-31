@@ -651,6 +651,40 @@ class SimulationSetup:
             self._mask.get() if hasattr(self._mask, 'get') else self._mask
         )
 
+    def _check_body_vs_coupling_band(self, k, region, fine_mask) -> None:
+        """Body vs. C2F/F2C band on MLG fine level k (0.5*L_body rule).
+
+        Solid cells inside the coupling band (fine-domain edge ..
+        fine_region edge) corrupt the C2F/F2C stencils -> hard error.
+        Body surface closer than 0.5*L_body to the fine_region edge
+        couples the interface into the boundary layer (non-physical Cd
+        shift) -> warning. STL track S0 carryover.
+        """
+        import numpy as _np
+        from src.grid.overlap_manager import body_coupling_band_report
+
+        solid_np = fine_mask.get() if hasattr(fine_mask, 'get') else fine_mask
+        report = body_coupling_band_report(
+            _np.asarray(solid_np, dtype=bool), region,
+        )
+        if report['violations']:
+            faces = ', '.join(
+                f"{face} ({n} solid cells)"
+                for face, n in report['violations']
+            )
+            raise ValueError(
+                f"Level {k}: obstacle intersects the C2F/F2C coupling band "
+                f"on face(s): {faces}. Coupling interpolation would read/"
+                f"write through the body. Enlarge mlg.levels[{k}].region so "
+                f"the fine region encloses the body with >= 0.5*L_body "
+                f"padding (MLG region padding rule)."
+            )
+        for face, dist, need in report['padding_warnings']:
+            print(f"    [warn] Level {k}: body surface only {dist} fine "
+                  f"cells from fine_region edge '{face}' "
+                  f"(< 0.5*L_body = {need:.1f}) — interface couples into "
+                  f"the boundary layer, Cd may shift non-physically")
+
     def _build_obstacle_wall_bc(
         self,
         internal_geom: dict,
@@ -732,6 +766,13 @@ class SimulationSetup:
             )
             print(f"  Wall BC: Bouzidi IBB (analytic q from cylinder "
                   f"axis='{axis}', 3D)")
+        elif dim == 3 and gtype == 'stl':
+            # Backstop (validate_geometry_config already rejects this):
+            # silently degrading a requested IBB to q=0.5 is forbidden.
+            raise ValueError(
+                "stl + wall_bc='ibb': ray-triangle q-fraction lands in "
+                "track stage S3 — use wall_bc='hwbb' until then."
+            )
         else:
             print(f"  [warn] wall_bc='ibb' with dim={dim} geom type='{gtype}' "
                   f"has no q-source; using q=0.5 sentinel (≡ HWBB).")
@@ -1447,6 +1488,7 @@ class SimulationSetup:
                     )
                     n_solid = int(xp.sum(fine_mask))
                     if fine_geom_info['type'] != 'none' and n_solid > 0:
+                        self._check_body_vs_coupling_band(k, region, fine_mask)
                         # Honor wall_bc (hwbb / ibb) on this MLG fine level too —
                         # NOT hardcoded HWBB. Without this, IBB requested in the
                         # config silently downgrades to HWBB on every level.
@@ -1744,6 +1786,7 @@ class SimulationSetup:
                     )
                     n_solid = int(xp.sum(fine_mask))
                     if fine_geom_info['type'] != 'none' and n_solid > 0:
+                        self._check_body_vs_coupling_band(k, region, fine_mask)
                         # Honor wall_bc (hwbb / ibb) on this MLG fine level too.
                         print(f"    Level {k}: building obstacle BC "
                               f"({n_solid:,} solid nodes)")

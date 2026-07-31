@@ -11,8 +11,10 @@ Supported geometry types:
     circle / cylinder (2D)  → closed polyline sampled around the circle
     airfoil                 → polygon_lu polyline closed
     box (2D)                → 4-corner rectangle
+    stl (3D)                → triangle surface as POLYGONS (true geometry
+                              overlay on the staircased mask)
 
-3D obstacles are skipped with a warning (silhouette of curved 3D
+Other 3D obstacles are skipped with a warning (silhouette of curved 3D
 surfaces is non-trivial; ParaView is fine with raw mask there).
 """
 
@@ -85,6 +87,36 @@ def _airfoil_polyline(
     return pts, indices
 
 
+def _format_polydata_triangles(
+    vertices,
+    faces,
+    title: str = "Geometry surface",
+) -> str:
+    """Legacy VTK PolyData ASCII with POLYGONS (triangle surface).
+
+    vertices: (n_v, 3) array-like, L0 lu. faces: (n_f, 3) int indices.
+    """
+    n_pts = len(vertices)
+    n_tri = len(faces)
+    lines: List[str] = [
+        "# vtk DataFile Version 3.0",
+        title,
+        "ASCII",
+        "DATASET POLYDATA",
+        f"POINTS {n_pts} float",
+    ]
+    lines.extend(
+        f"{float(v[0]):.6f} {float(v[1]):.6f} {float(v[2]):.6f}"
+        for v in vertices
+    )
+    lines.append("")
+    lines.append(f"POLYGONS {n_tri} {4 * n_tri}")
+    lines.extend(
+        f"3 {int(f[0])} {int(f[1])} {int(f[2])}" for f in faces
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _box_polyline(
     corner_min: Tuple[float, float],
     corner_max: Tuple[float, float],
@@ -140,6 +172,19 @@ def write_geometry_outline(
             return False
         pts, idx = _box_polyline(cmin, cmax)
         title = "Geometry outline (box)"
+
+    elif gtype == "stl" and "triangles_lu" in geom_info:
+        vertices_lu, faces = geom_info["triangles_lu"]
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        body = _format_polydata_triangles(
+            vertices_lu, faces, title="Geometry surface (stl)"
+        )
+        with open(output_path, "w") as f:
+            f.write(body)
+        if verbose:
+            print(f"  [outline] wrote {len(faces)}-triangle stl surface "
+                  f"→ {output_path}")
+        return True
 
     else:
         if verbose:
