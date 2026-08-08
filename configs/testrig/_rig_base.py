@@ -21,7 +21,10 @@ Layout (L0 lattice units, D_rotor = 16 cells):
 Variants, chosen so each new capability gets a test the moment it lands:
     mlg="off"     uniform  — the reference every other variant is judged against
     mlg="single"  one fine box over sphere+rotors (multi-rotor fine-level ALM)
-    mlg="blocks"  one fine block PER ROTOR at L2 (multi-block levels)
+    mlg="blocks"  one fine block PER ROTOR at L2 (several blocks under ONE L1)
+    mlg="nested"  one L1 PER ROTOR, each holding its own L2 (several blocks at
+                  BOTH levels — the topology where a fine block's parent is
+                  itself one of several)
 
 The two rotors spin opposite ways on purpose: their torques cancel, so the
 sphere sees no net swirl and any asymmetry in the answer is a bug, not physics.
@@ -83,6 +86,24 @@ def build(mlg: str = "off", wall_bc: str = "hwbb", n_rev: float = 0.5,
     if mlg == "single":
         levels = [{}, {"regions": [dict(L1_BOX, name="rig")]}]
         num_levels = 2
+    elif mlg == "nested":
+        # L1 split per rotor, each with its own L2 child. fine_domain_coarse
+        # of the two L1 boxes must stay disjoint: [18,42] vs [46,70].
+        levels = [{},
+                  {"regions": [
+                      {"name": "armA", "x_min": 28, "x_max": 52,
+                       "y_min": 20, "y_max": 40, "z_min": 42, "z_max": 62},
+                      {"name": "armB", "x_min": 28, "x_max": 52,
+                       "y_min": 48, "y_max": 68, "z_min": 42, "z_max": 62}]},
+                  {"regions": [
+                      # must CONTAIN the rotor disk (hub +- R = 8), else the
+                      # rotor stays on L1 and L2 excises part of it — the
+                      # placement guard rejects exactly that.
+                      {"name": "rotorA", "x_min": 32, "x_max": 48,
+                       "y_min": 22, "y_max": 38, "z_min": 46, "z_max": 58},
+                      {"name": "rotorB", "x_min": 32, "x_max": 48,
+                       "y_min": 50, "y_max": 66, "z_min": 46, "z_max": 58}]}]
+        num_levels = 3
     elif mlg == "blocks":
         levels = [{}, {"regions": [dict(L1_BOX, name="rig")]},
                   {"regions": [dict(b) for b in L2_BOXES]}]
