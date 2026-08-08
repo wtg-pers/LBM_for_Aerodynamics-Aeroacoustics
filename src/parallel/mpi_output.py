@@ -237,7 +237,29 @@ class MPIOutputManager(OutputManager):
         line += f"  {sps:.3f}s/step  ETA {eta_h:.2f}h"
         row = None
         if self._tier == 'alm' and self.al_model is not None:
-            perf = self.al_model.get_rotor_performance()
+            # A multi-rotor manager returns {name: perf}; report the ROTOR SUM
+            # for thrust/torque/power and the mean coefficient, so the live
+            # line means the same thing for one rotor or eight.
+            _models = getattr(self.al_model, 'models', None)
+            if _models:
+                _ps = [m.get_rotor_performance() for m in _models]
+                _ps = [p for p in _ps if 'C_T' in p]
+                if not _ps:
+                    return
+                _n = len(_ps)
+                perf = {
+                    'time': _ps[0].get('time', 0.0),
+                    'thrust': sum(p['thrust'] for p in _ps),
+                    'torque': sum(p['torque'] for p in _ps),
+                    'power': sum(p['power'] for p in _ps),
+                    'C_T': sum(p['C_T'] for p in _ps) / _n,
+                    'C_P': sum(p['C_P'] for p in _ps) / _n,
+                    'FM': sum(p.get('FM', 0.0) for p in _ps) / _n,
+                }
+            else:
+                perf = self.al_model.get_rotor_performance()
+                if 'C_T' not in perf:
+                    return
             line += (f"  CT={perf['C_T']:.6e}  CP={perf['C_P']:.6e}"
                      f"  FM={perf['FM']:.4f}")
             row = (f"{step},{perf['time']},{perf['thrust']},"

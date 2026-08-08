@@ -78,11 +78,24 @@ def _fail_fast_config(setup, mlg) -> None:
             f"[mpi] config error: MPI runs support 3D (D3Q27) only; "
             f"{cfg} is 2D. Run it single-GPU: python main.py")
     al = getattr(setup, 'al_model', None)
-    if al is not None and type(al).__name__ == 'MultiRotorManager':
+    # Multi-rotor IS supported now: the runner binds every model's own
+    # rank-local F_grid/offset/sampler, and MultiRotorManager superposes them.
+    # What is still out of reach is rotors spread over SEPARATE blocks.
+    if al is not None and type(al).__name__ == 'MultiRotorView':
         raise ValueError(
-            "[mpi] config error: multi-rotor ALM (actuator_line.rotors) is "
-            "unsupported under MPI — the distributed sampler binds exactly "
-            "one rotor's F_grid (src/parallel/runner.py). Run single-GPU.")
+            "[mpi] config error: rotors are spread across several refinement "
+            "blocks (MultiRotorView). The distributed runner derives one "
+            "partition per level, so every rotor must share one grid — use a "
+            "single fine box covering all rotors, or run single-GPU.")
+    if getattr(mlg, 'is_multiblock', False):
+        _mb = [(k, mlg.num_blocks_at(k)) for k in range(mlg.num_levels)
+               if mlg.num_blocks_at(k) > 1]
+        raise ValueError(
+            f"[mpi] config error: level(s) {_mb} host multiple refinement "
+            f"blocks. partition.balance_cuts() places every cut inside the "
+            f"single innermost box and mlg_coupling.py rejects any fine "
+            f"partition not derived from that chain, so the decomposition has "
+            f"no meaning here yet. Run single-GPU: python main.py")
     if getattr(setup, '_numerics_cfg', {}).get('esoteric', None) is False:
         raise ValueError(
             "[mpi] config error: numerics.esoteric=false, but the "

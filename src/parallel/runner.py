@@ -87,21 +87,35 @@ class DistributedMLGRunner:
         # slab loop so the model's GLOBAL-shape f64 F_grid (2.5GB at 400M
         # scale) is replaced and freed before slabs start accumulating
         self.model = None
-        alm_lev = NL - 1
-        if getattr(mlg.get_level(alm_lev), "al_model", None) is not None:
+        # The level the ALM actually sits on. Reading it back beats assuming
+        # the finest: setup places a rotor on the finest level that CONTAINS
+        # its disk, which can be coarser than NL-1.
+        alm_lev = next((k for k in range(NL - 1, -1, -1)
+                        if getattr(mlg.get_level(k), "al_model", None)
+                        is not None), NL - 1)
+        _al = getattr(mlg.get_level(alm_lev), "al_model", None)
+        if _al is not None:
             if allreduce is None:
                 raise ValueError("ALM case needs an allreduce adapter")
-            m = mlg.get_level(alm_lev).al_model
             p = self.parts[alm_lev]
             off = np.zeros(3)
             off[self.axis] = p.own_start - p.ghost
-            m._global_domain_shape = tuple(shapes[alm_lev])
-            m.domain_shape = tuple(p.local_shape)
-            m._F_grid = cp.zeros((3,) + tuple(p.local_shape), cp.float64)
-            m._grid_offset = off
-            m._velocity_sampler = make_distributed_sampler(
-                allreduce, rank, p, cp)
-            self.model = m
+            _loc = tuple(p.local_shape)
+            # Bind EVERY rotor, not just the first: MultiRotorManager.step
+            # superposes each model's OWN _F_grid, so every model needs its
+            # own rank-local buffer, offset and sampler. Every rank runs every
+            # rotor's sampler, so the allreduces stay in lockstep.
+            for _m in (getattr(_al, 'models', None) or [_al]):
+                _m._global_domain_shape = tuple(shapes[alm_lev])
+                _m.domain_shape = _loc
+                _m._F_grid = cp.zeros((3,) + _loc, cp.float64)
+                _m._grid_offset = off
+                _m._velocity_sampler = make_distributed_sampler(
+                    allreduce, rank, p, cp)
+            if getattr(_al, '_F_total', None) is not None:
+                _al.domain_shape = _loc
+                _al._F_total = cp.zeros((3,) + _loc, cp.float64)
+            self.model = _al
             cp.get_default_memory_pool().free_all_blocks()
         self.alm_lev = alm_lev
 
