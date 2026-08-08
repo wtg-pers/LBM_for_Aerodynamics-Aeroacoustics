@@ -77,25 +77,12 @@ def _fail_fast_config(setup, mlg) -> None:
         raise ValueError(
             f"[mpi] config error: MPI runs support 3D (D3Q27) only; "
             f"{cfg} is 2D. Run it single-GPU: python main.py")
-    al = getattr(setup, 'al_model', None)
-    # Multi-rotor IS supported now: the runner binds every model's own
-    # rank-local F_grid/offset/sampler, and MultiRotorManager superposes them.
-    # What is still out of reach is rotors spread over SEPARATE blocks.
-    if al is not None and type(al).__name__ == 'MultiRotorView':
-        raise ValueError(
-            "[mpi] config error: rotors are spread across several refinement "
-            "blocks (MultiRotorView). The distributed runner derives one "
-            "partition per level, so every rotor must share one grid — use a "
-            "single fine box covering all rotors, or run single-GPU.")
-    if getattr(mlg, 'is_multiblock', False):
-        _mb = [(k, mlg.num_blocks_at(k)) for k in range(mlg.num_levels)
-               if mlg.num_blocks_at(k) > 1]
-        raise ValueError(
-            f"[mpi] config error: level(s) {_mb} host multiple refinement "
-            f"blocks. partition.balance_cuts() places every cut inside the "
-            f"single innermost box and mlg_coupling.py rejects any fine "
-            f"partition not derived from that chain, so the decomposition has "
-            f"no meaning here yet. Run single-GPU: python main.py")
+    # Multi-rotor and multi-block are both supported since patch 18: the
+    # runner indexes every per-grid list by BLOCK uid, derives each block's
+    # partition from its PARENT BLOCK's, lets a rank own zero cells of a
+    # block (skipping it with its subtree), and gives each ALM block its own
+    # sub-communicator. A MultiRotorView reaching here is therefore fine —
+    # each block's own manager does the stepping, the view only reports.
     if getattr(setup, '_numerics_cfg', {}).get('esoteric', None) is False:
         raise ValueError(
             "[mpi] config error: numerics.esoteric=false, but the "
@@ -105,11 +92,11 @@ def _fail_fast_config(setup, mlg) -> None:
     # and fall back to the standard path PER LEVEL with only a warning;
     # a level-0-only check let a fine-level fallback slip through to a
     # broken distributed run (observed: L3 eso-init OOM on a 94M case).
-    for k in range(mlg.num_levels):
-        if not getattr(mlg.get_level(k), '_use_esoteric', False):
+    for b in mlg.iter_blocks():
+        if not getattr(b.sim, '_use_esoteric', False):
             raise ValueError(
-                f"[mpi] config error: esoteric-pull is not active on level "
-                f"{k} (requires GPU + 3D + BGK/Cumulant + precision "
+                f"[mpi] config error: esoteric-pull is not active on "
+                f"{b.label} (requires GPU + 3D + BGK/Cumulant + precision "
                 f"float32; an init failure such as OOM also falls back — "
                 f"see csv/setup_log.txt for the warning). The MPI runner "
                 f"requires esoteric state on every level; for large cases "
@@ -174,11 +161,12 @@ def _build(args, dev: int, with_writers: bool = False,
     return mlg, s, start_step, end_step
 
 
-def _collect_solid_masks(mlg_obj, n_levels):
-    """Static per-level solid masks (host numpy) for the VTK channel."""
+def _collect_solid_masks(mlg_obj):
+    """Static per-BLOCK solid masks (host numpy) for the VTK channel,
+    level-major so the index is the block uid."""
     masks = []
-    for k in range(n_levels):
-        ob = getattr(mlg_obj.get_level(k), "obstacle_bc", None)
+    for b in mlg_obj.iter_blocks():
+        ob = getattr(b.sim, "obstacle_bc", None)
         sm = getattr(ob, "solid_mask", None) if ob is not None else None
         if sm is not None and hasattr(sm, "get"):
             sm = sm.get()
@@ -235,8 +223,8 @@ def _run(args, MPI):
     from src.parallel.runner import DistributedMLGRunner
     from src.parallel.mpi_output import MPIOutputManager
 
-    NL = mlg.num_levels
-    level_shapes = [tuple(mlg.get_level(k).domain_shape) for k in range(NL)]
+    # per-BLOCK shapes, level-major (index == block uid)
+    block_shapes = [tuple(b.sim.domain_shape) for b in mlg.iter_blocks()]
 
     output = setup.build_output_manager(
         manager_cls=MPIOutputManager,
@@ -253,8 +241,8 @@ def _run(args, MPI):
     # wall_bc='ibb' configs run correctly with the default --ghost 3.
     ghost = args.ghost
     from src.boundary.interpolated_wall import InterpolatedBounceBack
-    if any(isinstance(getattr(mlg.get_level(k), 'obstacle_bc', None),
-                      InterpolatedBounceBack) for k in range(mlg.num_levels)):
+    if any(isinstance(getattr(b.sim, 'obstacle_bc', None),
+                      InterpolatedBounceBack) for b in mlg.iter_blocks()):
         if ghost < 5:
             if rank == 0:
                 print(f"[mpi] esoteric IBB: ghost {ghost} -> 5 "
@@ -263,22 +251,24 @@ def _run(args, MPI):
 
     runner = DistributedMLGRunner(
         mlg, transport, rank, nr, allreduce=MPIAllreduce(comm),
-        axis=axis, ghost=ghost)
+        axis=axis, ghost=ghost, comm=comm,
+        cut_policy=getattr(args, 'cut_policy', 'balanced'))
 
-    # rank-invariant body level: the local nt==1 scan can miss on a rank
-    # whose slab holds no solid cells -> mismatched collectives (the old
-    # tier hazard). MAX-allreduce the scan result.
+    # rank-invariant body BLOCK: the local nt==1 scan can miss on a rank
+    # whose slab holds no solid cells (or that owns none of the body block
+    # at all) -> mismatched collectives (the old tier hazard). MAX-allreduce
+    # the scan result; uids are level-major so MAX picks the finest.
     if nr > 1:
-        bl = np.array([-1.0 if runner.body_level is None
-                       else float(runner.body_level)])
+        bl = np.array([-1.0 if runner.body_block is None
+                       else float(runner.body_block)])
         out_bl = np.empty_like(bl)
         comm.Allreduce(bl, out_bl, op=MPI.MAX)
-        runner.body_level = None if out_bl[0] < 0 else int(out_bl[0])
+        runner.body_block = None if out_bl[0] < 0 else int(out_bl[0])
 
-    solid_masks = _collect_solid_masks(mlg, NL) if rank == 0 else None
+    solid_masks = _collect_solid_masks(mlg) if rank == 0 else None
     assert runner.completed_step == start_step, \
         (runner.completed_step, start_step)
-    output.bind_runner(runner, level_shapes, solid_masks,
+    output.bind_runner(runner, block_shapes, solid_masks,
                        dist_init=args.dist_init, start_step=start_step)
 
     # the MEM link/mask arrays are dead weight on the MPI path (forces come
@@ -310,8 +300,9 @@ def _run(args, MPI):
                   "checkpoint written by the pre-unification main_mpi "
                   "resumes one step late — convert once with: "
                   "step -= 1 in the npz (see docs/manual/09).", flush=True)
-        for k, p in enumerate(runner.parts):
-            print(f"[mpi]   L{k} rank0 {p}", flush=True)
+        for b, p in zip(runner.blocks, runner.parts):
+            print(f"[mpi]   {b.label} rank0 {p}"
+                  + ("" if p.own_count else "  (owns nothing)"), flush=True)
 
     if args.profile:
         runner.profile = {}
@@ -351,21 +342,15 @@ def _verify(comm, rank, nr, runner, args, n_advances=None):
     the distributed run just wrote (historical hazard)."""
     import cupy as cp
     import numpy as np
-    NL = runner.NL
-    for k in range(NL):
-        mine = cp.asnumpy(runner.owned_f_std(k))
-        if rank == 0:
-            pieces = [mine]
-            for r in range(1, nr):
-                meta = comm.recv(source=r, tag=100 + k)
-                buf = np.empty(meta[0], np.float32)
-                comm.Recv(buf, source=r, tag=200 + k)
-                pieces.append(buf.reshape(meta[1]))
-            setattr(runner, f"_asm{k}",
-                    np.concatenate(pieces, axis=1 + runner.axis))
-        else:
-            comm.send((mine.size, mine.shape), dest=0, tag=100 + k)
-            comm.Send(np.ascontiguousarray(mine), dest=0, tag=200 + k)
+    from src.parallel.output import _gather_block
+    from src.parallel.runner import TAG_VERIFY
+    asm = {}
+    for uid in range(len(runner.blocks)):
+        own = runner.owned_f_std_block(uid)
+        asm[uid] = _gather_block(
+            comm, rank, nr, runner.parts[uid],
+            None if own is None else cp.asnumpy(own),
+            TAG_VERIFY + 4 * uid, runner.n_pop, pre_sliced=True)
     if rank != 0:
         return
     print("[verify] building 1-rank reference...", flush=True)
@@ -375,13 +360,13 @@ def _verify(comm, rank, nr, runner, args, n_advances=None):
     for _ in range(n_adv):
         ref.advance()
     ok = True
-    for k in range(NL):
-        rf = cp.asnumpy(ref.get_level(k).physical_f)
-        d = np.abs(getattr(runner, f"_asm{k}") - rf)
+    for uid, rb in enumerate(ref.iter_blocks()):
+        rf = cp.asnumpy(rb.sim.physical_f)
+        d = np.abs(asm[uid] - rf)
         df = float(d.max())
         bit = bool(df == 0.0)
         ok = ok and (bit if args.strict_bit else df < 1e-4)
-        print(f"[verify] L{k}: max|df|={df:.3e}  bit={bit}", flush=True)
+        print(f"[verify] {rb.label}: max|df|={df:.3e}  bit={bit}", flush=True)
         if not bit:
             # localize: owning rank per diff y tells devices apart; x range
             # tells sponge (high x) from bulk; count tells isolated vs band

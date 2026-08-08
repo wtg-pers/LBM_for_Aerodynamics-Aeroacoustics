@@ -482,29 +482,43 @@ class SolverInitializer:
         # EXACTLY (same fp accumulation as the uninterrupted run).
         al = setup.al_model
         if al is not None:
-            models = al.models if hasattr(al, 'models') else [al]
-            # Sub-steps per coarse step at the level the ALM actually sits on.
-            # Reading it back from the built grid keeps this correct when the
-            # rotor lands on an intermediate level; hardcoding num_levels-1
-            # silently desynced the azimuth by 2^(NL-1-alm_lev) fine steps.
-            alm_lev = next((k for k in range(mlg.num_levels)
-                            if getattr(mlg.get_level(k), 'al_model', None)
-                            is not None), 0)
-            sub = 2 ** alm_lev
+            # Sub-steps per coarse step = 2^level of the block each rotor
+            # actually sits on. Walking BLOCKS rather than levels is what makes
+            # this right in two ways: hardcoding num_levels-1 desynced the
+            # azimuth by 2^(NL-1-alm_lev) fine steps when a rotor landed on an
+            # intermediate level, and reading it back with get_level(k) raised
+            # outright once a level hosted several blocks. Rotors on blocks of
+            # DIFFERENT levels now each get their own rate — one shared
+            # alm_lev would have silently desynced all but one of them.
+            pairs = []                       # (model, level)
+            if hasattr(mlg, 'iter_blocks'):
+                for _b in mlg.iter_blocks():
+                    _m = getattr(_b.sim, 'al_model', None)
+                    if _m is None:
+                        continue
+                    for _mm in (getattr(_m, 'models', None) or [_m]):
+                        pairs.append((_mm, _b.level))
+            if not pairs:
+                pairs = [(m, 0) for m in
+                         (al.models if hasattr(al, 'models') else [al])]
             # Checkpoint 'step' is the 0-based LABEL of the last processed
             # step -> coarse advances done = label + 1 = start_step. The
             # historical `completed_step * sub` was one coarse step short
             # for label-convention checkpoints (it was calibrated to the
             # pre-unification main_mpi count convention) — azimuth lagged
             # 2^(NL-1) fine steps on every single-GPU MLG ALM restart.
-            t_fine = start_step * sub
-            for m_ in models:
+            for m_, lev_ in pairs:
+                t_fine = start_step * (2 ** lev_)
                 for _ in range(t_fine):
                     m_.rotor.advance(1.0)
                 m_._step_count = t_fine
-            print(f"  ALM: rotor fast-forwarded {t_fine} fine steps @L{alm_lev} "
-                  f"(theta[0]={models[0].rotor.theta[0]:.4f} rad, "
-                  f"ramp done={t_fine >= models[0].ramp_steps})")
+            m0, lev0 = pairs[0]
+            _levs = sorted({lv for _, lv in pairs})
+            print(f"  ALM: {len(pairs)} rotor(s) fast-forwarded "
+                  f"{start_step * (2 ** lev0)} fine steps @L{lev0}"
+                  + (f" (levels present: {_levs})" if len(_levs) > 1 else "")
+                  + f" (theta[0]={m0.rotor.theta[0]:.4f} rad, "
+                  f"ramp done={start_step * (2 ** lev0) >= m0.ramp_steps})")
 
         print(f"  Resuming from step {start_step}")
         return start_step

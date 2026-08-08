@@ -3,34 +3,53 @@
 VTK and checkpoints reuse the PRODUCTION writers byte-for-byte: rank 0 keeps
 the setup's MLGVTKWriter and CheckpointManager (built during its own full
 build), every rank sends its owned slabs (host-staged numpy), and rank 0
-assembles the global per-level arrays and calls the same write()/save() the
+assembles the global per-BLOCK arrays and calls the same write()/save() the
 single-GPU loop calls. Checkpoints are therefore restartable by BOTH the
 single-GPU path and the MPI runner (each rank restores the global state
 through the normal initializer, then slab-extracts as always).
 
 All entry points are COLLECTIVE — every rank must call them at the same
 coarse step (non-root ranks only send).
+
+Block trees (patch 18): the unit of assembly is a BLOCK, not a level, and a
+rank may own zero cells of one. Such a rank still joins every gather; it
+contributes a zero-length piece, which concatenates away. Skipping the call
+instead would make the collective rank-dependent.
+
+(The old Rank0OutputBridge lived here as a second, unreferenced assembly path
+duplicating MPIOutputManager. It was removed with the block refactor rather
+than block-ified blind: an untested duplicate that silently disagrees with the
+live path is the failure class this track exists to remove.)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List
 
 import numpy as np
 import cupy as cp
 
 
-def _gather_level(comm, rank: int, nr: int, runner, arr_local,
-                  k: int, tag0: int, pre_sliced: bool = False):
+def _gather_block(comm, rank: int, nr: int, part, arr_local, tag0: int,
+                  n_chan: int, pre_sliced: bool = False,
+                  dtype=np.float32):
     """Assemble owned slabs of a (C, x, y, z) LOCAL array on rank 0.
 
-    pre_sliced=True when the caller already passes OWNED-only data
-    (e.g. runner.owned_f_std) — slicing twice drops 2*ghost rows per
-    rank (caught by the bench5 npz shape check)."""
-    part = runner.parts[k]
-    own = (arr_local if pre_sliced
-           else arr_local[(slice(None),) + part.owned_local()])
-    own = cp.asnumpy(own) if hasattr(own, "get") else np.asarray(own)
+    part:       this rank's Partition1D for the block being gathered.
+    arr_local:  None when this rank owns nothing of the block (a zero-length
+                piece is sent so the collective stays rank-independent).
+    pre_sliced: the caller already passes OWNED-only data (e.g.
+                runner.owned_f_std_block) — slicing twice drops 2*ghost rows
+                per rank (caught by the bench5 npz shape check).
+    """
+    if arr_local is None:
+        shp = list(part.global_shape)
+        shp[part.axis] = 0
+        own = np.empty((n_chan,) + tuple(shp), dtype)
+    else:
+        own = (arr_local if pre_sliced
+               else arr_local[(slice(None),) + part.owned_local()])
+        own = cp.asnumpy(own) if hasattr(own, "get") else np.asarray(own)
     if rank != 0:
         comm.send((own.shape, own.dtype.str), dest=0, tag=tag0)
         comm.Send(np.ascontiguousarray(own), dest=0, tag=tag0 + 1)
@@ -39,9 +58,9 @@ def _gather_level(comm, rank: int, nr: int, runner, arr_local,
     for r in range(1, nr):
         shape, dt = comm.recv(source=r, tag=tag0)
         buf = np.empty(shape, dtype=np.dtype(dt))
-        comm.Recv(buf, source=r, tag=tag0 + 1)
+        comm.Recv(buf, source=r, tag=tag0 + 1)      # count 0 is a legal Recv
         pieces.append(buf)
-    return np.concatenate(pieces, axis=1 + runner.axis)
+    return np.concatenate(pieces, axis=1 + part.axis)
 
 
 class _MaskCarrier:
@@ -52,7 +71,7 @@ class _MaskCarrier:
 
 
 class _LevelView:
-    """Duck-typed level for MLGVTKWriter (needs .rho/.u/.nu_t/.obstacle_bc)."""
+    """Duck-typed grid for MLGVTKWriter (needs .rho/.u/.nu_t/.obstacle_bc)."""
 
     def __init__(self, rho, u, nu_t=None, solid_mask=None):
         self.rho = rho
@@ -65,103 +84,40 @@ class _LevelView:
                             else _MaskCarrier(solid_mask))
 
 
+class _BlockView:
+    """Duck-typed GridBlock: what MLGVTKWriter reads off the tree."""
+
+    __slots__ = ("level", "index", "uid", "sim")
+
+    def __init__(self, level: int, index: int, uid: int, sim):
+        self.level = level
+        self.index = index
+        self.uid = uid
+        self.sim = sim
+
+
 class _MLGView:
-    def __init__(self, levels):
-        self._levels = levels
+    """Duck-typed MultiLevelGrid over the assembled per-block fields.
 
-    def get_level(self, k):
-        return self._levels[k]
+    Exposes iter_blocks() so the writer takes its block-tree path: with the
+    level-only duck it zipped block metadata against `get_level(k)` and wrote
+    the SAME grid into every block of a multi-block level.
+    """
 
+    def __init__(self, blocks: List[_BlockView]):
+        self._blocks = list(blocks)
 
-class Rank0OutputBridge:
-    """Collective VTK / checkpoint output through the production writers."""
+    def iter_blocks(self):
+        return iter(self._blocks)
 
-    def __init__(self, comm, rank: int, nr: int,
-                 mlg_vtk_writer=None, checkpoint_mgr=None,
-                 sim_params: Optional[dict] = None,
-                 tau: float = 0.5,
-                 marker_vtk_writer=None,
-                 alm_marker_origin=None,
-                 alm_marker_spacing=None,
-                 solid_masks: Optional[list] = None) -> None:
-        self._comm, self._rank, self._nr = comm, rank, nr
-        self._vtk = mlg_vtk_writer
-        self._ckpt = checkpoint_mgr
-        self._sim_params = sim_params or {}
-        self._tau = tau
-        self._marker_vtk = marker_vtk_writer
-        self._m_origin = alm_marker_origin
-        self._m_spacing = alm_marker_spacing
-        # Per-level static solid masks (host numpy or None), rank 0 only.
-        self._solid_masks = solid_masks
+    @property
+    def num_levels(self) -> int:
+        return max((b.level for b in self._blocks), default=0) + 1
 
-    # ── VTK: assembled rho/u per level -> MLGVTKWriter.write ─────────
-    def write_vtk(self, step: int, runner, fields: bool = True) -> None:
-        """fields=False skips the level gathers + field files (the per-
-        snapshot GB cost) but still writes the marker VTPs. The flag must be
-        computed identically on every rank (the gathers are collective)."""
-        comm, rank, nr = self._comm, self._rank, self._nr
-        if fields:
-            views = []
-            for k in range(runner.NL):
-                L = runner.lv[k]
-                rho = _gather_level(comm, rank, nr, runner,
-                                    L.rho[None], k, tag0=300 + 4 * k)
-                u = _gather_level(comm, rank, nr, runner,
-                                  L.u, k, tag0=302 + 4 * k)
-                # SGS eddy viscosity (dyn_smag levels allocate .nut, flat N —
-                # config-uniform across ranks, so the gather stays collective)
-                nut = None
-                if getattr(L, "nut", None) is not None:
-                    nut = _gather_level(
-                        comm, rank, nr, runner,
-                        L.nut.reshape((1,) + tuple(L.dims)), k,
-                        tag0=600 + 2 * k)
-                if rank == 0:
-                    sm = (self._solid_masks[k]
-                          if (self._solid_masks is not None
-                              and k < len(self._solid_masks)) else None)
-                    views.append(_LevelView(
-                        rho[0], u, nu_t=(None if nut is None else nut[0]),
-                        solid_mask=sm))
-            if rank == 0 and self._vtk is not None:
-                self._vtk.write(step, _MLGView(views), time=float(step))
-        self._write_markers(step, runner)
-        comm.Barrier()
-
-    def _write_markers(self, step: int, runner) -> None:
-        """ALM marker VTP from rank 0's REPLICATED model — no comms needed:
-        the M3 hooks keep positions/_last_positions in GLOBAL fine coords on
-        every rank, so rank 0's copy is the exact production state. Same
-        fine->L0 transform as OutputManager._write_markers — which now lives in
-        the writer, so neither path mutates the model."""
-        if self._rank != 0 or self._marker_vtk is None or \
-                runner.model is None:
-            return
-        self._marker_vtk.write_from_al_model(
-            step=step, al_model=runner.model, time=float(step),
-            origin=self._m_origin,
-            spacing=(self._m_spacing if self._m_origin is not None else 1.0))
-
-    # ── Checkpoint: assembled std f -> CheckpointManager.save ────────
-    def save_checkpoint(self, step: int, runner) -> None:
-        comm, rank, nr = self._comm, self._rank, self._nr
-        f_levels = []
-        for k in range(runner.NL):
-            fk = _gather_level(comm, rank, nr, runner,
-                               runner.owned_f_std(k), k, tag0=400 + 2 * k,
-                               pre_sliced=True)
-            f_levels.append(fk)                      # None on non-root
-            cp.get_default_memory_pool().free_all_blocks()
-        rho0 = _gather_level(comm, rank, nr, runner,
-                             runner.lv[0].rho[None], 0, tag0=460)
-        u0 = _gather_level(comm, rank, nr, runner,
-                           runner.lv[0].u, 0, tag0=462)
-        if rank == 0 and self._ckpt is not None:
-            extra = {"num_levels": runner.NL}
-            for k in range(1, runner.NL):
-                extra[f"f_level_{k}"] = f_levels[k]
-            self._ckpt.save(step=step, f=f_levels[0], rho=rho0[0], u=u0,
-                            tau=self._tau, config=self._sim_params,
-                            extra_data=extra)
-        comm.Barrier()
+    def get_level(self, k: int):
+        hits = [b for b in self._blocks if b.level == k]
+        if len(hits) != 1:
+            raise ValueError(
+                f"get_level({k}) is ambiguous: level {k} holds {len(hits)} "
+                f"blocks — iterate iter_blocks() instead")
+        return hits[0].sim

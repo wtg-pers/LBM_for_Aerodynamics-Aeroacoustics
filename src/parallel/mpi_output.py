@@ -32,7 +32,9 @@ import os
 import numpy as np
 
 from src.solver.output_manager import OutputManager
-from src.parallel.output import _gather_level, _LevelView, _MLGView
+from src.parallel.output import (
+    _gather_block, _BlockView, _LevelView, _MLGView)
+from src.parallel.runner import TAG_FIELD, TAG_CKPT, TAG_MACRO
 
 
 class MPIOutputManager(OutputManager):
@@ -71,9 +73,9 @@ class MPIOutputManager(OutputManager):
         self._runner = runner
         self._level_shapes = [tuple(s) for s in level_shapes]
         self._solid_masks = solid_masks
-        if runner.model is not None:
+        if runner.has_alm:
             self._tier = 'alm'
-        elif runner.body_level is not None:
+        elif runner.body_block is not None:
             self._tier = 'body'
         else:
             self._tier = 'flow'
@@ -155,23 +157,31 @@ class MPIOutputManager(OutputManager):
         return dict(zip(names, out.tolist()))
 
     def _flow_stats(self):
-        """COLLECTIVE: owned FLUID-cell rho mean + |u| max on the finest
-        level (solid slab buffers are uninitialized — masked)."""
+        """COLLECTIVE: owned FLUID-cell rho mean + |u| max over the finest
+        level (solid slab buffers are uninitialized — masked).
+
+        Summed over every block of that level this rank owns: with several
+        blocks per level, reading only the last one would silently report a
+        fraction of the domain."""
         r = self._runner
-        L = r.lv[-1]
-        sl = r.parts[-1].owned_local()
-        fluid = (L.nt.reshape(L.dims)[sl] != 1)
-        rho = L.rho[sl]
-        u = L.u[(slice(None),) + sl]
-        s_loc = float(rho[fluid].sum())
-        n_loc = float(fluid.sum())
-        usq = (u * u).sum(axis=0)
-        try:
-            import cupy as cp
-            usq = cp.where(fluid, usq, 0.0)
-        except Exception:
-            usq = np.where(fluid, usq, 0.0)
-        m_loc = float(usq.max()) ** 0.5
+        s_loc = n_loc = m_loc = 0.0
+        for uid in r.blocks_at(r.NL - 1):
+            if not r.owns[uid]:
+                continue
+            L = r.lv[uid]
+            sl = r.parts[uid].owned_local()
+            fluid = (L.nt.reshape(L.dims)[sl] != 1)
+            rho = L.rho[sl]
+            u = L.u[(slice(None),) + sl]
+            s_loc += float(rho[fluid].sum())
+            n_loc += float(fluid.sum())
+            usq = (u * u).sum(axis=0)
+            try:
+                import cupy as cp
+                usq = cp.where(fluid, usq, 0.0)
+            except Exception:
+                usq = np.where(fluid, usq, 0.0)
+            m_loc = max(m_loc, float(usq.max()) ** 0.5)
         sums = self._allreduce(np.array([s_loc, n_loc], dtype=np.float64))
         mx = self._allreduce(np.array([m_loc], dtype=np.float64),
                              op=self._MPI.MAX if self._nr > 1 else None)
@@ -202,6 +212,10 @@ class MPIOutputManager(OutputManager):
         log_due = bool(self.log_interval) and step % self.log_interval == 0
         if self._tier == 'flow' and log_due:
             self._flow_cache = self._flow_stats()
+        # Rotor CSV + progress line fire at log_interval, marker VTP at the
+        # VTK cadence; every one of them reads a model this rank may not own.
+        if self._tier == 'alm' and (log_due or self._vtk_due(step)):
+            self._runner.sync_alm_reporting()
         action = super().process(step, sim)
         # progress line + dense CSV AFTER the base channels so the force
         # caches (_last_F/_last_Cd) are from THIS step's force interval,
@@ -288,26 +302,35 @@ class MPIOutputManager(OutputManager):
         return bool(self._vtk_every) and step % self._vtk_every == 0
 
     def _gather_views(self):
-        """COLLECTIVE per-level rho/u/nut gathers -> rank0 _MLGView."""
+        """COLLECTIVE per-BLOCK rho/u/nut gathers -> rank0 _MLGView.
+
+        Every rank joins every block's gather (a rank owning nothing of a
+        block contributes a zero-length piece) and the nu_t presence flag is
+        read off the replicated build, not off this rank's slab — otherwise
+        the collective would depend on who owns what."""
         comm, rank, nr, r = self._comm, self._rank, self._nr, self._runner
         views = []
-        for k in range(r.NL):
-            L = r.lv[k]
-            rho = _gather_level(comm, rank, nr, r, L.rho[None], k,
-                                tag0=300 + 4 * k)
-            u = _gather_level(comm, rank, nr, r, L.u, k, tag0=302 + 4 * k)
+        for uid, b in enumerate(r.blocks):
+            L = r.lv[uid] if r.owns[uid] else None
+            part = r.parts[uid]
+            tag = TAG_FIELD + 8 * uid
+            rho = _gather_block(comm, rank, nr, part,
+                                None if L is None else L.rho[None], tag, 1)
+            u = _gather_block(comm, rank, nr, part,
+                              None if L is None else L.u, tag + 2, 3)
             nut = None
-            if getattr(L, "nut", None) is not None:
-                nut = _gather_level(
-                    comm, rank, nr, r,
-                    L.nut.reshape((1,) + tuple(L.dims)), k, tag0=600 + 2 * k)
+            if r.has_nut[uid]:
+                nut = _gather_block(
+                    comm, rank, nr, part,
+                    None if L is None
+                    else L.nut.reshape((1,) + tuple(L.dims)), tag + 4, 1)
             if rank == 0:
-                sm = (self._solid_masks[k]
+                sm = (self._solid_masks[uid]
                       if (self._solid_masks is not None
-                          and k < len(self._solid_masks)) else None)
-                views.append(_LevelView(
+                          and uid < len(self._solid_masks)) else None)
+                views.append(_BlockView(b.level, b.index, uid, _LevelView(
                     rho[0], u, nu_t=(None if nut is None else nut[0]),
-                    solid_mask=sm))
+                    solid_mask=sm)))
         return _MLGView(views) if rank == 0 else None
 
     def _sim_vtk_target(self, step, sim):
@@ -338,21 +361,27 @@ class MPIOutputManager(OutputManager):
                 and step % self._ckpt_every == 0)
 
     def _checkpoint_payload(self, sim, include_extra: bool = True):
-        """COLLECTIVE owned_f_std gathers -> rank0 payload dict / None."""
+        """COLLECTIVE per-block owned_f_std gathers -> rank0 payload / None.
+
+        Key rule mirrors the single-GPU writer exactly: no block suffix when
+        the level holds one block, so a chain writes the SAME key set as
+        before and either reader loads either file."""
         comm, rank, nr, r = self._comm, self._rank, self._nr, self._runner
-        f_levels = []
-        for k in range(r.NL):
-            fk = _gather_level(comm, rank, nr, r, r.owned_f_std(k), k,
-                               tag0=400 + 2 * k, pre_sliced=True)
-            f_levels.append(fk)
+        f_blocks = []
+        for uid in range(len(r.blocks)):
+            fk = _gather_block(comm, rank, nr, r.parts[uid],
+                               r.owned_f_std_block(uid), TAG_CKPT + 4 * uid,
+                               r.n_pop, pre_sliced=True)
+            f_blocks.append(fk)
             try:
                 import cupy as cp
                 cp.get_default_memory_pool().free_all_blocks()
             except Exception:
                 pass
-        rho0 = _gather_level(comm, rank, nr, r, r.lv[0].rho[None], 0,
-                             tag0=460)
-        u0 = _gather_level(comm, rank, nr, r, r.lv[0].u, 0, tag0=462)
+        rho0 = _gather_block(comm, rank, nr, r.parts[0],
+                             r.lv[0].rho[None], TAG_MACRO, 1)
+        u0 = _gather_block(comm, rank, nr, r.parts[0], r.lv[0].u,
+                           TAG_MACRO + 2, 3)
         if rank != 0:
             return None
         extra = None
@@ -361,9 +390,18 @@ class MPIOutputManager(OutputManager):
             # label (C8 unified). Pre-unification main_mpi checkpoints
             # (step = advance count) lack it — restore prints a note.
             extra = {"num_levels": r.NL, "step_convention": "index"}
-            for k in range(1, r.NL):
-                extra[f"f_level_{k}"] = f_levels[k]
-        return {'f': f_levels[0], 'extra': extra,
+            per = {}
+            for b in r.blocks:
+                per[b.level] = per.get(b.level, 0) + 1
+            if len(r.blocks) > r.NL:
+                extra["num_blocks"] = len(r.blocks)
+                extra["block_levels"] = [b.level for b in r.blocks]
+            for uid, b in enumerate(r.blocks):
+                if b.level == 0:
+                    continue
+                sfx = "" if per[b.level] <= 1 else f"_b{b.index}"
+                extra[f"f_level_{b.level}{sfx}"] = f_blocks[uid]
+        return {'f': f_blocks[0], 'extra': extra,
                 'rho': rho0[0], 'u': u0}
 
     def _save_checkpoint(self, step, sim) -> None:
@@ -439,12 +477,16 @@ class MPIOutputManager(OutputManager):
     # ── seam overrides: finalize ────────────────────────────────────
 
     def _level_cell_counts(self, sim):
-        counts = []
-        for shape in self._level_shapes:
+        # One entry per LEVEL, summed over that level's blocks: the caller
+        # uses the list index as the 2^k sub-step exponent, so it must stay
+        # level-indexed even when a level holds several grids.
+        r = self._runner
+        counts = [0] * r.NL
+        for uid, b in enumerate(r.blocks):
             n = 1
-            for d in shape:
+            for d in r.parts[uid].global_shape:
                 n *= int(d)
-            counts.append(n)
+            counts[b.level] += n
         return counts
 
     def _free_transient_buffers(self, sim) -> None:
@@ -456,9 +498,10 @@ class MPIOutputManager(OutputManager):
 
     def _final_fields(self, sim):
         comm, rank, nr, r = self._comm, self._rank, self._nr, self._runner
-        rho0 = _gather_level(comm, rank, nr, r, r.lv[0].rho[None], 0,
-                             tag0=460)
-        u0 = _gather_level(comm, rank, nr, r, r.lv[0].u, 0, tag0=462)
+        rho0 = _gather_block(comm, rank, nr, r.parts[0],
+                             r.lv[0].rho[None], TAG_MACRO, 1)
+        u0 = _gather_block(comm, rank, nr, r.parts[0], r.lv[0].u,
+                           TAG_MACRO + 2, 3)
         if rank != 0:
             return None, None
         return rho0[0], u0
@@ -482,6 +525,8 @@ class MPIOutputManager(OutputManager):
         self.conservation_mgr.close()
 
     def finalize(self, sim):
+        if self._tier == 'alm':
+            self._runner.sync_alm_reporting()
         result = super().finalize(sim)
         if self._dense_csv is not None:
             self._dense_csv.close()

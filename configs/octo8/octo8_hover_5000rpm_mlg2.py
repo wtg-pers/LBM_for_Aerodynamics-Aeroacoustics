@@ -14,9 +14,13 @@ and a body crossing the coupling band is rejected by _check_body_vs_coupling_ban
 
 ⚠ 로컬 실행 금지 — 본 런은 클러스터에서. 여기서는 빌드 검증과 초소형 스모크만.
 
-Run (single GPU; multi-rotor ALM is not MPI-capable yet):
+Run (single GPU):
     LBM_ESOTERIC=1 python main.py \\
         --config configs/octo8/octo8_hover_5000rpm_mlg2.py --gpu 2
+
+Run (multi-GPU; multi-rotor ALM is MPI-capable since patch 17 M5/80abeca):
+    LBM_ESOTERIC=1 mpirun -n 4 python main.py \\
+        --config configs/octo8/octo8_hover_5000rpm_mlg2.py --gpu 0,1,2,3
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -33,8 +37,13 @@ config["mlg"] = {
     "interpolation": "cubic", "filter_level": 1,
     "levels": [
         {},
+        # x_max 264 -> 270: at 264 the FRONT rotors' Gaussian support reached
+        # 2.6 fine cells past the excised boundary, so part of what they
+        # deposit would have been restricted out. The placement guard only
+        # warns about support (it decides levels on the DISK alone), so this
+        # has to be set here.
         {"regions": [{"name": "vehicle",
-                      "x_min": 78, "x_max": 264,
+                      "x_min": 78, "x_max": 270,
                       "y_min": 78, "y_max": 418,
                       "z_min": 57, "z_max": 118}]},
     ],

@@ -199,6 +199,12 @@ Examples:
         help='[MPI] halo ghost width'
     )
     mpi_group.add_argument(
+        '--cut-policy', default='balanced', choices=['balanced', 'aligned'],
+        help='[MPI] multi-block cut placement: balanced = weighted cell '
+             'balance (default); aligned = keep every ALM-carrying block '
+             'inside one rank (no halo/allreduce for it, worse balance)'
+    )
+    mpi_group.add_argument(
         '--cuda-aware', default=None, metavar='0|1',
         help='[MPI] pass CuPy buffers to MPI directly (default: env '
              'LBM_MPI_CUDA, 0 if unset)'
