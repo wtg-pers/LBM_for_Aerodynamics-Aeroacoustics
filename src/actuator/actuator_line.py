@@ -2502,6 +2502,40 @@ def create_actuator_line_from_config(
     return model
 
 
+class MultiRotorView(MultiRotorManager):
+    """Reporting aggregate over rotors that live on DIFFERENT grids.
+
+    When each rotor sits on its own refinement block, no single array can hold
+    their combined force — each block's own MultiRotorManager does the stepping.
+    What still has to be presented as one thing is the OUTPUT: one performance
+    CSV, one marker VTP, one rotor count. That is all this does.
+
+    It deliberately does not allocate `_F_total` and never steps: a view that
+    could be stepped would invite exactly the bug this whole effort is about
+    (force deposited somewhere the fluid never reads).
+    """
+
+    def __init__(self, xp=None) -> None:
+        self.domain_shape = None
+        self.xp = xp if xp is not None else np
+        self.models: List['ActuatorLineModel'] = []
+        self.names: List[str] = []
+        self._F_total = None
+
+    def attach(self, model, name, frame_origin=None, frame_spacing=1.0):
+        """Register a rotor together with the frame its markers live in."""
+        model.frame_origin = frame_origin
+        model.frame_spacing = frame_spacing
+        self.models.append(model)
+        self.names.append(name)
+
+    def step(self, *a, **k):
+        raise RuntimeError(
+            "MultiRotorView is a reporting aggregate — its rotors are stepped "
+            "by their own blocks' models. Stepping it would deposit force on a "
+            "grid nobody reads.")
+
+
 def create_multi_rotor_from_config(
     config: dict,
     domain_shape: Tuple[int, int, int],

@@ -391,7 +391,12 @@ class MarkerVTPWriter:
             n_per = rotor.markers_per_blade
             n_total = rotor.total_markers   # n_blades × n_per
 
-            all_positions.append(model._last_positions)
+            # A rotor that lives on its own refinement block carries its own
+            # frame; fall back to the caller's when it does not.
+            all_positions.append(_apply_frame(
+                model._last_positions,
+                getattr(model, 'frame_origin', None) or origin,
+                getattr(model, 'frame_spacing', None) or spacing))
 
             # ── rotor_id: 이 로터의 모든 마커에 동일한 ri ──
             all_scalars['rotor_id'].append(
@@ -432,7 +437,10 @@ class MarkerVTPWriter:
             return None
 
         # ── Concatenate ──
-        positions = _apply_frame(np.vstack(all_positions), origin, spacing)
+        # Per-model frame when the rotors live on different blocks; the
+        # caller default otherwise. Applied per model BEFORE the vstack,
+        # because two rotors on different blocks have different frames.
+        positions = np.vstack(all_positions)
         
         scalars: Dict[str, np.ndarray] = {}
         for key, arrays in all_scalars.items():

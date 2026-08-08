@@ -372,6 +372,7 @@ class SimulationSetup:
             config_path=self._args.config,
             mlg_vtk_writer=self._mlg_vtk_writer if self._mlg_enabled else None,
             mlg_force_level=getattr(self, '_mlg_force_level', None),
+            mlg_force_block=getattr(self, '_mlg_force_block', None),
             alm_marker_origin=getattr(self, '_alm_marker_origin', None),
             alm_marker_spacing=getattr(self, '_alm_marker_spacing', None),
         )
@@ -1585,17 +1586,8 @@ class SimulationSetup:
             len([b for b in blocks if b.level == k]) > 1
             for k in range(num_levels))
         if self._mlg_is_multiblock:
-            # The grid itself is block-aware; these two consumers are not yet.
-            # Fail loudly here rather than let them mis-index a level.
-            _todo = []
-            if self.al_enabled:
-                _todo.append("ALM placement (needs per-block rotor binding)")
-            _todo.append("MLG VTK writer (one .vti/amr_box per LEVEL)")
-            raise NotImplementedError(
-                "multi-block MLG levels are built, but these consumers still "
-                "assume one grid per level: " + "; ".join(_todo) + ".\n"
-                "  Land the block-aware output/ALM path before using "
-                "mlg.levels[k].regions with more than one entry.")
+            print(f"  MLG: multi-block levels active "
+                  f"({', '.join(b.name for b in blocks if b.level > 0)})")
 
         self._mlg_blocks = blocks
         self._mlg_root = root
@@ -1627,6 +1619,7 @@ class SimulationSetup:
             scaler=self._mlg_scaler,
             num_levels=num_levels,
             precision=self._vtk_config.get('precision', 'float32'),
+            blocks=self._mlg_blocks,
         )
         print(f"  {self._mlg_vtk_writer.get_info()}")
 
@@ -1644,16 +1637,16 @@ class SimulationSetup:
         the 190-config parity evidence behind it.
         """
         self._alm_rotor_levels = []
+        self._alm_rotor_blocks = []
         self._alm_target_level = 0
         if self.al_model is None or num_levels < 2:
             return
 
         from src.grid.alm_placement import (
-            band_report, excision_conflicts, level_boxes_l0, rotor_extent,
+            band_report, block_boxes_l0, excision_conflicts, rotor_extent,
             select_level)
 
-        boxes = level_boxes_l0(self._mlg_overlap_mgr, self._mlg_level_origins,
-                               self._mlg_level_spacings, num_levels)
+        boxes = block_boxes_l0(self._mlg_blocks)
         models = getattr(self.al_model, 'models', None) or [self.al_model]
         names = getattr(self.al_model, 'names', None) or ['rotor']
         policy = str(self._mlg_config.get('alm_band_policy', 'warn')).lower()
@@ -1666,8 +1659,9 @@ class SimulationSetup:
             exts.append(ext)
             reports.append(rep)
             self._alm_rotor_levels.append(rep.level)
+            self._alm_rotor_blocks.append(rep.uid)
 
-        # ── Stage 1: all rotors must land on one level ──────────
+        # ── All rotors must land on one LEVEL (blocks may differ) ──
         distinct = sorted(set(self._alm_rotor_levels))
         if len(distinct) > 1:
             lines = [f"    rotor {i} '{r.rotor}' hub="
@@ -1701,9 +1695,10 @@ class SimulationSetup:
                     f"of the rotor.")
 
         # ── Check B: support spilling into the band / past the domain ──
+        _by_uid = {b.uid: b for b in boxes}
         if self._alm_target_level > 0:
-            box = boxes[self._alm_target_level]
-            for ext in exts:
+            for _i, ext in enumerate(exts):
+                box = _by_uid[self._alm_rotor_blocks[_i]]
                 rep = band_report(ext, box)
                 if not (rep.band_overshoot or rep.domain_overshoot):
                     continue
@@ -1767,6 +1762,7 @@ class SimulationSetup:
         simulations.append(sim_0)
 
         # ── Fine levels ──────────────────────────────────────────
+        _blk_alms = []
         for _blk in self._mlg_blocks[1:]:
             k = _blk.level
             region = _blk.region
@@ -1854,8 +1850,12 @@ class SimulationSetup:
 
             # ── Fine-level ALM (if this is the target level) ─────
             fine_al_k = None
-            if k == alm_target_level and self.al_model is not None:
-                fine_al_k = self._create_fine_level_alm(k, fine_shape)
+            _rot_idx = [i for i, u in enumerate(
+                getattr(self, '_alm_rotor_blocks', [])) if u == _blk.uid]
+            if _rot_idx and self.al_model is not None:
+                fine_al_k = self._create_fine_level_alm(
+                    k, fine_shape, block=_blk, rotor_indices=_rot_idx)
+                _blk_alms.append((_blk, fine_al_k, _rot_idx))
 
             # Fine level simulation
             sim_k = Simulation(
@@ -1892,11 +1892,30 @@ class SimulationSetup:
         print(f"  {mlg.summary()}")
 
         # ── Update al_model to fine-level for OutputManager ──────
-        if alm_target_level > 0:
-            self.al_model = simulations[alm_target_level].al_model
+        if len(_blk_alms) == 1:
+            _b, _m, _ = _blk_alms[0]
+            self.al_model = _m
             # Marker coordinate transform: fine local → global (L0 units)
-            self._alm_marker_origin = self._mlg_level_origins[alm_target_level]
-            self._alm_marker_spacing = self._mlg_level_spacings[alm_target_level][0]
+            self._alm_marker_origin = _b.origin
+            self._alm_marker_spacing = _b.spacing
+        elif len(_blk_alms) > 1:
+            # Rotors landed on different blocks. Each block's own manager does
+            # the stepping; this aggregate exists only so output stays one
+            # performance CSV and one marker VTP.
+            from src.actuator.actuator_line import MultiRotorView
+            _view = MultiRotorView(xp=xp)
+            for _b, _m, _idx in _blk_alms:
+                _sub = getattr(_m, 'models', None) or [_m]
+                _nm = getattr(_m, 'names', None) or [f'rotor_{i}' for i in _idx]
+                for _j, _mm in enumerate(_sub):
+                    _view.attach(_mm, _nm[_j] if _j < len(_nm) else f'r{_j}',
+                                 frame_origin=_b.origin, frame_spacing=_b.spacing)
+            self.al_model = _view
+            self._alm_marker_origin = None      # frames live on the models
+            self._alm_marker_spacing = 1.0
+            print(f"\n  ALM: {len(_view.models)} rotors across "
+                  f"{len(_blk_alms)} blocks "
+                  f"({', '.join(b.name for b, _, _ in _blk_alms)})")
 
         # ── MLG force: measure on finest level with obstacle ─────
         # Physical reason: the finest level has the most accurate
@@ -2244,7 +2263,8 @@ class SimulationSetup:
 
         return mlg
 
-    def _create_fine_level_alm(self, level_k: int, fine_shape):
+    def _create_fine_level_alm(self, level_k: int, fine_shape,
+                               block=None, rotor_indices=None):
         """Create ALM instance for a fine MLG level.
 
         Coordinate Transform:
@@ -2273,7 +2293,10 @@ class SimulationSetup:
         import math
 
         lu_k = self._mlg_scaler.get_level_units(level_k)
-        origin_L0 = self._mlg_level_origins[level_k]
+        # Origin of the BLOCK the rotors were assigned to; the
+        # per-level list only exists for single-block grids.
+        origin_L0 = (block.origin if block is not None
+                     else self._mlg_level_origins[level_k])
 
         # Fine level physical scales
         dx_fine = self.dx_phys * lu_k.dx   # dx_phys / 2^k
@@ -2291,6 +2314,10 @@ class SimulationSetup:
         origin_m = [o * self.dx_phys for o in origin_L0]
 
         if 'rotors' in al_cfg:
+            # Only the rotors assigned to this block; the others are built by
+            # their own blocks.
+            if rotor_indices is not None:
+                al_cfg['rotors'] = [al_cfg['rotors'][i] for i in rotor_indices]
             rotor_cfgs = [e.get('rotor', e) for e in al_cfg['rotors']]
         else:
             rotor_cfgs = [al_cfg['rotor']]
@@ -2346,7 +2373,8 @@ class SimulationSetup:
                 _m.ramp_steps = ramp * (2 ** level_k)
 
         # ── Print info ───────────────────────────────────────────
-        print(f"\n  Fine-level ALM (Level {level_k}):")
+        _btag = f" block '{block.name}'" if block is not None else ""
+        print(f"\n  Fine-level ALM (Level {level_k}{_btag}):")
         _fine_models = getattr(fine_al, 'models', None) or [fine_al]
         _names = getattr(fine_al, 'names', None) or ['rotor']
         for _i, _m in enumerate(_fine_models):
@@ -2445,14 +2473,19 @@ class SimulationSetup:
                         shape = (self.Nx, self.Ny, self.Nz)
                     tau_k = self.tau
                 else:
-                    region = self._mlg_overlap_mgr.get_region(k - 1)
-                    shape = region.fine_shape
+                    # Sum over every block on this level — get_region(k-1)
+                    # refuses to guess when there is more than one.
+                    _rs = self._mlg_overlap_mgr.regions_at(k - 1)
+                    shape = _rs[0].fine_shape
                     tau_k = self._mlg_scaler.get_level_units(k).tau
 
                 # Works for any dimensionality
-                nodes = 1
-                for s in shape:
-                    nodes *= s
+                nodes = 0
+                for _r in ([None] if k == 0 else _rs):
+                    _n = 1
+                    for s in (shape if k == 0 else _r.fine_shape):
+                        _n *= s
+                    nodes += _n
                 steps = 2 ** k
                 updates = nodes * steps
                 mem = nodes * Q * 8 / (1024 * 1024)

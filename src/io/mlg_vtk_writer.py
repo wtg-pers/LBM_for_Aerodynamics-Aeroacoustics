@@ -52,11 +52,13 @@ class MLGVTKWriter:
         scaler: 'LevelScaler',
         num_levels: int,
         precision: str = 'float32',
+        blocks: Optional[List] = None,
     ) -> None:
         self.output_dir = output_dir
         self._num_levels = num_levels
         self._overlap_mgr = overlap_mgr
         self._scaler = scaler
+        self._blocks = blocks
         self._precision = precision
         self._dtype = np.float32 if precision == 'float32' else np.float64
         self._vtk_type = 'Float32' if precision == 'float32' else 'Float64'
@@ -74,56 +76,64 @@ class MLGVTKWriter:
         self._vth_dir = os.path.join(output_dir, 'vth')
         os.makedirs(self._vth_dir, exist_ok=True)
 
-        # ── Per-level metadata ───────────────────────────────────
-        self._level_info: List[Dict] = []
-
-        # Level 0
-        Nx, Ny, Nz = coarse_shape
-        self._level_info.append({
-            'shape': (Nx, Ny, Nz),
-            'origin': (0.0, 0.0, 0.0),
-            'spacing': (1.0, 1.0, 1.0),
-            'amr_box': (0, Nx - 2, 0, Ny - 2, 0, Nz - 2),
-        })
-
-        # Fine levels — origin computed from parent's origin + spacing
-        for k in range(1, num_levels):
-            region = overlap_mgr.get_region(k - 1)
-            lu = scaler.get_level_units(k)
-            dx_k = lu.dx  # this level's spacing
-
-            fdc = region.fine_domain_coarse
-            Nx_f, Ny_f, Nz_f = region.fine_shape
-
-            # Parent level's physical origin and spacing
-            parent = self._level_info[k - 1]
-            px, py, pz = parent['origin']
-            pdx, pdy, pdz = parent['spacing']
-
-            # Physical origin = parent_origin + fdc_start × parent_spacing
-            origin = (
-                px + fdc.x_start * pdx,
-                py + fdc.y_start * pdy,
-                pz + fdc.z_start * pdz,
-            )
-
-            # AMR box in global cell indices at this level's resolution
-            # Global position = origin / dx_k (convert physical to this level's cells)
-            amr_lo_x = round(origin[0] / dx_k)
-            amr_lo_y = round(origin[1] / dx_k)
-            amr_lo_z = round(origin[2] / dx_k)
-            amr_box = (
-                amr_lo_x, amr_lo_x + Nx_f - 2,
-                amr_lo_y, amr_lo_y + Ny_f - 2,
-                amr_lo_z, amr_lo_z + Nz_f - 2,
-            )
-
-            self._level_info.append({
-                'shape': (Nx_f, Ny_f, Nz_f),
-                'origin': origin,
-                'spacing': (dx_k, dx_k, dx_k),
-                'amr_box': amr_box,
+        # ── Per-BLOCK metadata, level-major ──────────────────────
+        # Taken straight from the block tree when one is supplied: setup has
+        # already computed every origin, and re-deriving them here was a second
+        # source of truth. The legacy chain path keeps the old derivation so
+        # callers that predate the tree still work.
+        self._block_info: List[Dict] = []
+        if blocks is not None:
+            for b in blocks:
+                Nx_f, Ny_f, Nz_f = b.shape
+                lo = [int(round(o / b.spacing)) for o in b.origin]
+                self._block_info.append({
+                    'level': b.level, 'index': b.index, 'name': b.name,
+                    'shape': (Nx_f, Ny_f, Nz_f),
+                    'origin': tuple(float(o) for o in b.origin),
+                    'spacing': (b.spacing,) * 3,
+                    'amr_box': (lo[0], lo[0] + Nx_f - 2,
+                                lo[1], lo[1] + Ny_f - 2,
+                                lo[2], lo[2] + Nz_f - 2),
+                })
+        else:
+            Nx, Ny, Nz = coarse_shape
+            self._block_info.append({
+                'level': 0, 'index': 0, 'name': 'L0',
+                'shape': (Nx, Ny, Nz),
+                'origin': (0.0, 0.0, 0.0),
+                'spacing': (1.0, 1.0, 1.0),
+                'amr_box': (0, Nx - 2, 0, Ny - 2, 0, Nz - 2),
             })
+            for k in range(1, num_levels):
+                region = overlap_mgr.get_region(k - 1)
+                dx_k = scaler.get_level_units(k).dx
+                fdc = region.fine_domain_coarse
+                Nx_f, Ny_f, Nz_f = region.fine_shape
+                parent = self._block_info[k - 1]
+                px, py, pz = parent['origin']
+                pdx, pdy, pdz = parent['spacing']
+                origin = (px + fdc.x_start * pdx,
+                          py + fdc.y_start * pdy,
+                          pz + fdc.z_start * pdz)
+                lo = [round(origin[d] / dx_k) for d in range(3)]
+                self._block_info.append({
+                    'level': k, 'index': 0, 'name': f'L{k}',
+                    'shape': (Nx_f, Ny_f, Nz_f),
+                    'origin': origin,
+                    'spacing': (dx_k, dx_k, dx_k),
+                    'amr_box': (lo[0], lo[0] + Nx_f - 2,
+                                lo[1], lo[1] + Ny_f - 2,
+                                lo[2], lo[2] + Nz_f - 2),
+                })
+
+        # How many blocks share each level — decides whether filenames need a
+        # block suffix (they must NOT get one for chains: byte-identical output)
+        self._per_level = [0] * num_levels
+        for info in self._block_info:
+            self._per_level[info['level']] += 1
+
+        # Back-compat alias (read-only users indexed this by level)
+        self._level_info = self._block_info
 
         # ── Time-series tracking ─────────────────────────────────
         self.time_steps: List[Tuple[float, str]] = []
@@ -157,12 +167,20 @@ class MLGVTKWriter:
         if time is None:
             time = float(step)
 
-        vti_relative_paths = []
+        vti_relative_paths = []      # parallel to the blocks actually written
+        written_info = []
 
-        # ── Write per-level .vti files ───────────────────────────
-        for k in range(self._num_levels):
-            level_sim = mlg.get_level(k)
-            info = self._level_info[k]
+        # ── Write per-BLOCK .vti files ───────────────────────────
+        # Enumerate the grid's own blocks when it has a tree; otherwise fall
+        # back to one grid per level (duck-typed MPI views take this path).
+        if hasattr(mlg, 'iter_blocks') and self._blocks is not None:
+            _pairs = [(b.sim, info) for b, info
+                      in zip(mlg.iter_blocks(), self._block_info)]
+        else:
+            _pairs = [(mlg.get_level(i['level']), i) for i in self._block_info]
+
+        for level_sim, info in _pairs:
+            k = info['level']
 
             rho = level_sim.rho
             u = level_sim.u
@@ -180,8 +198,10 @@ class MLGVTKWriter:
             if getattr(level_sim, 'nu_t', None) is not None:
                 extras['nu_t'] = level_sim.nu_t
 
-            # File in level subdirectory
-            vti_filename = f"{prefix}_{step:08d}_level{k}.vti"
+            # File in level subdirectory. No block suffix when the level has
+            # only one block, so chain runs keep byte-identical filenames.
+            _sfx = "" if self._per_level[k] <= 1 else f"_b{info['index']}"
+            vti_filename = f"{prefix}_{step:08d}_level{k}{_sfx}.vti"
             vti_filepath = os.path.join(self._level_dirs[k], vti_filename)
 
             self._write_vti(
@@ -197,11 +217,13 @@ class MLGVTKWriter:
 
             # Relative path from .vth location (vtk/vth/) to .vti (vtk/level{k}/)
             vti_relative_paths.append(f"../level{k}/{vti_filename}")
+            written_info.append(info)
 
         # ── Write .vth AMR meta-file in vth/ subdir ──────────────
         vth_filename = f"{prefix}_{step:08d}.vth"
         vth_filepath = os.path.join(self._vth_dir, vth_filename)
-        self._write_vth(vth_filepath, vti_relative_paths, step)
+        self._write_vth(vth_filepath, vti_relative_paths, step,
+                        written_info)
 
         # ── Track time-series ────────────────────────────────────
         self.time_steps = [
@@ -338,6 +360,7 @@ class MLGVTKWriter:
         filepath: str,
         vti_relative_paths: List[str],
         step: int,
+        infos: Optional[List[Dict]] = None,
     ) -> None:
         """Write vtkHierarchicalBoxDataSet (.vth) meta-file.
 
@@ -353,20 +376,28 @@ class MLGVTKWriter:
             'grid_description="XYZ">',
         ]
 
-        for k, (info, rel_path) in enumerate(
-            zip(self._level_info, vti_relative_paths)
-        ):
-            sx, sy, sz = info['spacing']
-            bx0, bx1, by0, by1, bz0, bz1 = info['amr_box']
+        # vtkHierarchicalBoxDataSet groups DataSets under one <Block> per
+        # LEVEL, indexed within that level — exactly what a level with several
+        # refinement blocks needs. A chain emits one index="0" per Block, so
+        # its .vth bytes are unchanged.
+        _infos = self._block_info if infos is None else infos
+        by_level: Dict[int, List] = {}
+        for info, rel_path in zip(_infos, vti_relative_paths):
+            by_level.setdefault(info['level'], []).append((info, rel_path))
 
+        for k in sorted(by_level):
+            entries = by_level[k]
+            sx, sy, sz = entries[0][0]['spacing']
             lines.append(
                 f'    <Block level="{k}" spacing="{sx} {sy} {sz}">'
             )
-            lines.append(
-                f'      <DataSet index="0" '
-                f'amr_box="{bx0} {bx1} {by0} {by1} {bz0} {bz1}" '
-                f'file="{rel_path}"/>'
-            )
+            for j, (info, rel_path) in enumerate(entries):
+                bx0, bx1, by0, by1, bz0, bz1 = info['amr_box']
+                lines.append(
+                    f'      <DataSet index="{j}" '
+                    f'amr_box="{bx0} {bx1} {by0} {by1} {bz0} {bz1}" '
+                    f'file="{rel_path}"/>'
+                )
             lines.append('    </Block>')
 
         lines.extend([
@@ -395,13 +426,18 @@ class MLGVTKWriter:
 
     def get_info(self) -> str:
         """Return human-readable info."""
-        lines = [f"MLGVTKWriter: {self._num_levels} levels"]
-        for k, info in enumerate(self._level_info):
+        nb = len(self._block_info)
+        lines = [f"MLGVTKWriter: {self._num_levels} levels"
+                 + ("" if nb == self._num_levels else f", {nb} blocks")]
+        for info in self._block_info:
             Nx, Ny, Nz = info['shape']
             sx, sy, sz = info['spacing']
             ox, oy, oz = info['origin']
+            k = info['level']
+            tag = (f"Level {k}" if self._per_level[k] <= 1
+                   else f"Level {k}.b{info['index']} '{info['name']}'")
             lines.append(
-                f"  Level {k}: {Nx}×{Ny}×{Nz}, "
+                f"  {tag}: {Nx}×{Ny}×{Nz}, "
                 f"dx={sx}, origin=({ox},{oy},{oz})"
             )
         return '\n'.join(lines)

@@ -23,6 +23,17 @@ if TYPE_CHECKING:
     from src.grid.multi_level_grid import MultiLevelGrid
 
 
+def _iter_grids(mlg):
+    """(level, Simulation, block) for every grid, level-major.
+
+    A level may hold several refinement blocks, so iterating levels and calling
+    get_level(k) is no longer well defined — that accessor now refuses to guess.
+    """
+    if hasattr(mlg, 'iter_blocks'):
+        return [(b.level, b.sim, b) for b in mlg.iter_blocks()]
+    return [(k, mlg.get_level(k), None) for k in range(mlg.num_levels)]
+
+
 class SolverInitializer:
     """Initialize solver physical state (distribution function f).
 
@@ -245,7 +256,7 @@ class SolverInitializer:
         print(f"  Initial total mass: {float(xp.sum(f)):.6f}")
         return f, 0
 
-    def _apply_perturbation(self, f, level) -> None:
+    def _apply_perturbation(self, f, level, block=None) -> None:
         """Seed-discrimination arm (patch 58): solenoidal IC perturbation.
 
         Config block `initial_perturbation` (top level; absent/disabled =
@@ -308,8 +319,7 @@ class SolverInitializer:
             # makes slab f a broadcast of ONE equilibrium vector — computed
             # by the runner per slab, bit-equal to the full elementwise
             # equilibrium (same per-cell math).
-            for k in range(mlg.num_levels):
-                level_sim = mlg.get_level(k)
+            for k, level_sim, _blk in _iter_grids(mlg):
                 level_sim.init_esoteric_metadata_host()
                 level_sim._dist_init_ic = (1.0, list(flow_vel)
                                            if isinstance(flow_vel,
@@ -319,8 +329,7 @@ class SolverInitializer:
                       f"tau={level_sim.tau:.6f}")
             return 0
 
-        for k in range(mlg.num_levels):
-            level_sim = mlg.get_level(k)
+        for k, level_sim, _blk in _iter_grids(mlg):
             shape = level_sim.domain_shape
 
             rho_0 = xp.ones(shape, dtype=dtype)
@@ -333,7 +342,7 @@ class SolverInitializer:
 
             f_k = self._equilibrium_lowmem(level_sim, rho_0, u_0, dtype)
             del rho_0, u_0
-            self._apply_perturbation(f_k, k)
+            self._apply_perturbation(f_k, k, block=_blk)
             level_sim.set_distribution(f_k)
             mem_mb = f_k.nbytes / (1024 * 1024)
             del f_k
@@ -349,8 +358,8 @@ class SolverInitializer:
                   f"f size={mem_mb:.1f} MB")
 
         total_nodes = sum(
-            mlg.get_level(k).f.size // setup.lattice.Q
-            for k in range(mlg.num_levels)
+            sim_k.f.size // setup.lattice.Q
+            for _, sim_k, _ in _iter_grids(mlg)
         )
         print(f"  Total nodes across all levels: {total_nodes:,}")
         return 0
@@ -427,10 +436,20 @@ class SolverInitializer:
         print(f"  Level 0: restored from checkpoint")
 
         # ── Restore fine levels ──────────────────────────────────
-        for k in range(1, mlg.num_levels):
-            level_sim = mlg.get_level(k)
-            key = f'f_level_{k}'
+        _blks = list(mlg.iter_blocks()) if hasattr(mlg, 'iter_blocks') else None
+        if _blks is not None:
+            _per = {}
+            for _b in _blks:
+                _per[_b.level] = _per.get(_b.level, 0) + 1
+            _targets = [(b.level, b.sim,
+                         f"f_level_{b.level}"
+                         + ("" if _per[b.level] <= 1 else f"_b{b.index}"))
+                        for b in _blks if b.level > 0]
+        else:
+            _targets = [(k, mlg.get_level(k), f'f_level_{k}')
+                        for k in range(1, mlg.num_levels)]
 
+        for k, level_sim, key in _targets:
             if key in state:
                 f_k = xp.asarray(state[key])
                 level_sim.set_distribution(f_k)

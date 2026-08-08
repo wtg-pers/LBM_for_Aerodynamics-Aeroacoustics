@@ -42,7 +42,7 @@ import numpy as np
 
 __all__ = [
     "LevelBox", "RotorExtent", "PlacementReport",
-    "level_boxes_l0", "rotor_extent", "select_level",
+    "level_boxes_l0", "block_boxes_l0", "rotor_extent", "select_level",
     "excision_conflicts", "band_report",
 ]
 
@@ -70,6 +70,8 @@ class LevelBox:
     domain_hi: np.ndarray
     band: Dict[str, float]
     dx: float
+    uid: int = 0            # block uid; 0 on the whole-level legacy path
+    name: str = ""
 
     def contains_box(self, lo: np.ndarray, hi: np.ndarray,
                      *, excised: bool = True) -> bool:
@@ -101,6 +103,21 @@ class RotorExtent:
     disk_hi: np.ndarray
     support_lo: np.ndarray
     support_hi: np.ndarray
+    # Per-marker pieces, so the support can be re-evaluated at the dx of
+    # whichever level the rotor ends up on. epsilon has a 2*dx floor, so an
+    # L0-derived support is a large over-estimate for a fine level (4x at L2)
+    # and would raise false band warnings.
+    reach: np.ndarray = None        # (N,3) per-marker per-axis swept reach
+    eps_chord: np.ndarray = None    # (N,) factor*chord, WITHOUT the 2dx floor
+    n_cut_aniso: float = 3.0
+
+    def support_at(self, dx: float):
+        """(lo, hi) of the Gaussian support if this rotor sits on a dx grid."""
+        if self.reach is None or self.eps_chord is None:
+            return self.support_lo, self.support_hi
+        eps = np.maximum(self.eps_chord, 2.0 * float(dx))
+        half = (self.reach + self.n_cut_aniso * eps[:, None]).max(axis=0)
+        return self.hub - half, self.hub + half
 
 
 @dataclass
@@ -108,6 +125,7 @@ class PlacementReport:
     """Outcome of resolving one rotor onto a level."""
     rotor: str
     level: int
+    uid: int = 0
     reason: str = ""
     band_overshoot: Dict[str, float] = field(default_factory=dict)
     domain_overshoot: Dict[str, float] = field(default_factory=dict)
@@ -165,6 +183,41 @@ def level_boxes_l0(overlap_mgr, level_origins: Sequence[Sequence[float]],
     return boxes
 
 
+def block_boxes_l0(blocks) -> List[LevelBox]:
+    """Same thing, one box per BLOCK — the multi-block form of level_boxes_l0.
+
+    A rotor is owned by the finest BLOCK that contains it, not merely by the
+    finest level: with several blocks on a level, only one of them excises the
+    rotor, and the others are irrelevant to it.
+    """
+    boxes: List[LevelBox] = []
+    for b in blocks:
+        if b.parent is None or b.region is None:
+            boxes.append(LevelBox(
+                level=b.level, uid=b.uid, name=b.name,
+                excised_lo=np.full(3, -np.inf), excised_hi=np.full(3, np.inf),
+                domain_lo=np.full(3, -np.inf), domain_hi=np.full(3, np.inf),
+                band={f: 0.0 for f in _FACES}, dx=b.spacing))
+            continue
+        po = np.asarray(b.parent.origin, dtype=np.float64)
+        pd = float(b.parent.spacing)
+        fr, fd = b.region.fine_region, b.region.fine_domain_coarse
+        ex_lo = po + np.array([fr.x_start, fr.y_start, fr.z_start]) * pd
+        ex_hi = po + np.array([fr.x_end, fr.y_end, fr.z_end]) * pd
+        dm_lo = po + np.array([fd.x_start, fd.y_start, fd.z_start]) * pd
+        dm_hi = po + np.array([fd.x_end, fd.y_end, fd.z_end]) * pd
+        flush = getattr(b.region, "flush_faces", {}) or {}
+        band = {}
+        for d, ax in enumerate(_AXES):
+            band[f"{ax}_min"] = 0.0 if flush.get(f"{ax}_min") else float(ex_lo[d] - dm_lo[d])
+            band[f"{ax}_max"] = 0.0 if flush.get(f"{ax}_max") else float(dm_hi[d] - ex_hi[d])
+        boxes.append(LevelBox(level=b.level, uid=b.uid, name=b.name,
+                              excised_lo=ex_lo, excised_hi=ex_hi,
+                              domain_lo=dm_lo, domain_hi=dm_hi,
+                              band=band, dx=float(b.spacing)))
+    return boxes
+
+
 # =============================================================================
 # Rotor geometry
 # =============================================================================
@@ -216,12 +269,21 @@ def rotor_extent(model, name: str = "rotor",
             a_fac = max(1.0, max(vals))
     support_half = (reach + (n_cut * a_fac) * eps[:, None]).max(axis=0)
 
+    # epsilon without the 2*dx floor, so support_at() can re-apply the floor
+    # of whichever level the rotor is placed on.
+    blade0 = rotor.blades[0]
+    fac = float(getattr(blade0, 'epsilon_chord_factor', 0.25))
+    chord = np.asarray(getattr(blade0, 'marker_chord', []), dtype=np.float64)
+    eps_c = (np.tile(fac * chord, rotor.n_blades) if chord.size
+             else np.zeros_like(eps))
+
     s = float(dx_model_to_l0)
     hub_l0 = hub * s
     return RotorExtent(
         name=name, hub=hub_l0,
         disk_lo=hub_l0 - disk_half * s, disk_hi=hub_l0 + disk_half * s,
-        support_lo=hub_l0 - support_half * s, support_hi=hub_l0 + support_half * s)
+        support_lo=hub_l0 - support_half * s, support_hi=hub_l0 + support_half * s,
+        reach=reach * s, eps_chord=eps_c * s, n_cut_aniso=n_cut * a_fac)
 
 
 # =============================================================================
@@ -238,6 +300,7 @@ def select_level(ext: RotorExtent, boxes: Sequence[LevelBox]) -> PlacementReport
             continue
         if box.contains_box(ext.disk_lo, ext.disk_hi, excised=True):
             return PlacementReport(rotor=ext.name, level=box.level,
+                                   uid=box.uid,
                                    reason="disk inside excised box")
     tight = min((b for b in boxes if b.level > 0),
                 key=lambda b: min(b.margins(ext.disk_lo, ext.disk_hi).values()),
@@ -285,8 +348,11 @@ def band_report(ext: RotorExtent, box: LevelBox) -> PlacementReport:
     if box.level == 0:
         return rep
     dx = box.dx if box.dx > 0 else 1.0
-    m_ex = box.margins(ext.support_lo, ext.support_hi, excised=True)
-    m_dm = box.margins(ext.support_lo, ext.support_hi, excised=False)
+    # Evaluate the support with the epsilon this rotor will actually have on
+    # THIS level, not the L0 one.
+    _lo, _hi = ext.support_at(dx)
+    m_ex = box.margins(_lo, _hi, excised=True)
+    m_dm = box.margins(_lo, _hi, excised=False)
     for face in _FACES:
         if m_ex[face] < 0.0 and box.band.get(face, 0.0) > 0.0:
             rep.band_overshoot[face] = float(-m_ex[face] / dx)

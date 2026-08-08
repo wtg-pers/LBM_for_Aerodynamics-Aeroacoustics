@@ -91,6 +91,7 @@ class OutputManager:
         config_path: Optional[str] = None,
         mlg_vtk_writer: Optional[object] = None,
         mlg_force_level: Optional[int] = None,
+        mlg_force_block: Optional[int] = None,
         alm_marker_origin: Optional[tuple] = None,
         alm_marker_spacing: Optional[float] = None,
     ) -> None:
@@ -168,6 +169,7 @@ class OutputManager:
         self.config_path = config_path
         self.mlg_vtk_writer = mlg_vtk_writer
         self._mlg_force_level = mlg_force_level
+        self._mlg_force_block = mlg_force_block
 
         # ── Progress tracking state ──
         self._last_drift: float = 0.0
@@ -494,7 +496,10 @@ class OutputManager:
             # num_levels=1): resolve to the LEVEL, not the MLG wrapper —
             # the wrapper lacks _use_esoteric/eso_body_force, so an eso L0
             # would fall through to f_post=None and crash the MEM channel.
-            lvl = sim.get_level(self._mlg_force_level or 0)
+            _fb = getattr(self, '_mlg_force_block', None)
+            lvl = (sim.block_by_uid(_fb).sim
+                   if _fb is not None and hasattr(sim, 'block_by_uid')
+                   else sim.get_level(self._mlg_force_level or 0))
         else:
             lvl = sim
 
@@ -590,14 +595,26 @@ class OutputManager:
                 # (coord_origin/spacing bound in setup), so the file
                 # overlays the .vth volume output.
                 import os as _os
-                for _k in range(target.num_levels - 1, -1, -1):
-                    _ob = getattr(target.get_level(_k), 'obstacle_bc',
-                                  None)
-                    if getattr(_ob, 'kind', None) == 'surfel':
-                        _ob.write_surface(_os.path.join(
+                # Finest block carrying a surfel BC. Several blocks on a level
+                # may each have one, so the file name gets a block tag when
+                # that happens (a chain keeps the original name).
+                _grids = (list(target.iter_blocks())
+                          if hasattr(target, 'iter_blocks')
+                          else [(None, target.get_level(_k))
+                                for _k in range(target.num_levels)])
+                _surf = [b for b in reversed(_grids)
+                         if getattr(getattr(b.sim if hasattr(b, 'sim') else b[1],
+                                            'obstacle_bc', None),
+                                    'kind', None) == 'surfel'] \
+                    if hasattr(target, 'iter_blocks') else []
+                if _surf:
+                    _top = max(b.level for b in _surf)
+                    _sel = [b for b in _surf if b.level == _top]
+                    for _b in _sel:
+                        _tag = "" if len(_sel) == 1 else f"_b{_b.index}"
+                        _b.sim.obstacle_bc.write_surface(_os.path.join(
                             self.mlg_vtk_writer.output_dir,
-                            f"surface_{step:08d}.vtk"))
-                        break
+                            f"surface{_tag}_{step:08d}.vtk"))
                 # Write ALM markers (before returning)
                 if (self.marker_vtk_writer is not None
                         and self.al_model is not None):
@@ -829,7 +846,24 @@ class OutputManager:
             from src.grid.multi_level_grid import MultiLevelGrid
             if isinstance(sim, MultiLevelGrid):
                 extra['num_levels'] = sim.num_levels
-                for k in range(1, sim.num_levels):
+                _blks = list(sim.iter_blocks()) if hasattr(sim, 'iter_blocks') \
+                    else None
+                if _blks is not None:
+                    # Key rule: no block suffix when the level holds one block,
+                    # so a chain writes the SAME key set as before and old
+                    # readers still load new files.
+                    _per = {}
+                    for _b in _blks:
+                        _per[_b.level] = _per.get(_b.level, 0) + 1
+                    extra['num_blocks'] = len(_blks)
+                    extra['block_levels'] = [b.level for b in _blks]
+                    for _b in _blks:
+                        if _b.level == 0:
+                            continue
+                        _sfx = "" if _per[_b.level] <= 1 else f"_b{_b.index}"
+                        extra[f'f_level_{_b.level}{_sfx}'] = \
+                            self._f_checkpoint_cpu(_b.sim)
+                for k in ([] if _blks is not None else range(1, sim.num_levels)):
                     # Host-immediate per level: keeps the GPU transient bounded to ONE
                     # level's gather instead of retaining every level's physical copy
                     # until save() (OOM'd the D40 checkpoint on a 24GB card).
@@ -886,12 +920,19 @@ class OutputManager:
         shapes (no comm needed)."""
         from src.grid.multi_level_grid import MultiLevelGrid
         if isinstance(sim, MultiLevelGrid):
-            counts = []
-            for k in range(sim.num_levels):
+            # One entry per LEVEL, summed over that level's blocks: the
+            # caller uses the list index as the 2^k sub-step exponent, so it
+            # must stay level-indexed even when a level holds several grids.
+            counts = [0] * sim.num_levels
+            _grids = ([(b.level, b.sim) for b in sim.iter_blocks()]
+                      if hasattr(sim, 'iter_blocks')
+                      else [(k, sim.get_level(k))
+                            for k in range(sim.num_levels)])
+            for k, sim_k in _grids:
                 n_k = 1
-                for d in sim.get_level(k).domain_shape:
+                for d in sim_k.domain_shape:
                     n_k *= d
-                counts.append(n_k)
+                counts[k] += n_k
             return counts
         return None
 
