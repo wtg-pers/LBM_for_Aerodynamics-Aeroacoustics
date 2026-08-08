@@ -120,6 +120,12 @@ class IndexBox:
             z_end=self.z_end + width,
         )
 
+    def intersects(self, other: 'IndexBox') -> bool:
+        """Do the two inclusive boxes share at least one cell?"""
+        return (self.x_start <= other.x_end and other.x_start <= self.x_end
+                and self.y_start <= other.y_end and other.y_start <= self.y_end
+                and self.z_start <= other.z_end and other.z_start <= self.z_end)
+
     def shrunk(self, width: int) -> 'IndexBox':
         """Return a new box shrunk by `width` cells on every face."""
         return self.expanded(-width)
@@ -254,6 +260,9 @@ class OverlapRegion:
             self.fine_domain_coarse.y_start,
             self.fine_domain_coarse.z_start,
         )
+
+        # Display label only; set by OverlapManager.add_region.
+        self.name: str = f"L{self.level_fine}"
 
     # =================================================================
     # Index Mapping: Coarse ↔ Fine
@@ -579,8 +588,33 @@ class OverlapManager:
 
     @property
     def num_pairs(self) -> int:
-        """Number of registered level pairs."""
+        """Number of registered regions (== level pairs for a chain)."""
         return len(self._regions)
+
+    def add_region(
+        self,
+        coarse_shape: Tuple[int, int, int],
+        fine_region: IndexBox,
+        level_coarse: int,
+        overlap_width: int = 2,
+        name: str = "",
+    ) -> OverlapRegion:
+        """Register one refinement block's coupling geometry.
+
+        `level_coarse` is EXPLICIT. Deriving it from the list position (as
+        add_level_pair does) silently conflates "how many regions exist" with
+        "which level this one belongs to", which stops being true the moment a
+        level hosts more than one block.
+        """
+        region = OverlapRegion(
+            level_coarse=level_coarse,
+            coarse_shape=coarse_shape,
+            fine_region=fine_region,
+            overlap_width=overlap_width,
+        )
+        region.name = name or f"L{level_coarse + 1}"
+        self._regions.append(region)
+        return region
 
     def add_level_pair(
         self,
@@ -588,12 +622,16 @@ class OverlapManager:
         fine_region: IndexBox,
         overlap_width: int = 2,
     ) -> OverlapRegion:
-        """Register a new adjacent level pair.
+        """Register the next adjacent level pair — CHAIN ONLY.
 
         Level pairs must be added in order: (0,1), then (1,2), etc.
         The coarse_shape for pair (k, k+1) should be the fine_shape
         of pair (k-1, k) — i.e., each fine grid becomes the coarse
         grid for the next finer level.
+
+        Kept for the single-block path and existing callers; it derives the
+        level from the number of regions already registered, so it cannot be
+        mixed with multi-block levels. Use add_region(level_coarse=...) there.
 
         Args:
             coarse_shape: Dimensions of the coarse grid (Nx, Ny, Nz).
@@ -603,18 +641,23 @@ class OverlapManager:
         Returns:
             The created OverlapRegion.
         """
-        level_coarse = len(self._regions)
-        region = OverlapRegion(
-            level_coarse=level_coarse,
-            coarse_shape=coarse_shape,
-            fine_region=fine_region,
-            overlap_width=overlap_width,
-        )
-        self._regions.append(region)
-        return region
+        levels = [r.level_coarse for r in self._regions]
+        if len(set(levels)) != len(levels):
+            raise ValueError(
+                "add_level_pair() derives the level from the region count, so "
+                "it is chain-only; this manager already has more than one "
+                "region on some level. Use add_region(level_coarse=...).")
+        return self.add_region(coarse_shape=coarse_shape,
+                               fine_region=fine_region,
+                               level_coarse=len(self._regions),
+                               overlap_width=overlap_width)
+
+    def regions_at(self, level_coarse: int) -> List[OverlapRegion]:
+        """Every region whose coarse side is `level_coarse` (config order)."""
+        return [r for r in self._regions if r.level_coarse == level_coarse]
 
     def get_region(self, level_coarse: int) -> OverlapRegion:
-        """Get the OverlapRegion for a specific level pair.
+        """Get THE OverlapRegion for a level pair — single-block only.
 
         Args:
             level_coarse: Index of the coarse level in the pair.
@@ -624,13 +667,21 @@ class OverlapManager:
 
         Raises:
             IndexError: If level_coarse is out of range.
+            ValueError: If that level hosts several blocks — callers must then
+                use regions_at() and handle each, since picking the first would
+                silently ignore the rest.
         """
-        if not 0 <= level_coarse < len(self._regions):
+        found = self.regions_at(level_coarse)
+        if not found:
+            n = max((r.level_coarse for r in self._regions), default=-1)
             raise IndexError(
-                f"Level pair {level_coarse} not found. "
-                f"Available: [0, {len(self._regions) - 1}]"
-            )
-        return self._regions[level_coarse]
+                f"Level pair {level_coarse} not found. Available: [0, {n}]")
+        if len(found) > 1:
+            raise ValueError(
+                f"get_region({level_coarse}) is ambiguous: that level hosts "
+                f"{len(found)} blocks ({', '.join(r.name for r in found)}). "
+                f"Use regions_at({level_coarse}).")
+        return found[0]
 
     def summary(self) -> str:
         """Human-readable summary of all overlap regions."""

@@ -79,6 +79,84 @@ from src.solver.output_manager import OutputManager
 from src.grid.multi_level_grid import MultiLevelGrid
 from src.grid.coupling import GridCoupling
 from src.grid.overlap_manager import OverlapManager, IndexBox
+
+
+def _mlg_regions_of(level_cfg: dict, k: int) -> list:
+    """The refinement boxes configured for level k.
+
+    `region: {...}` is sugar for `regions: [{...}]`. Supplying both is an error
+    rather than a precedence rule — silently honouring one would hide the other.
+    """
+    has_one = 'region' in level_cfg
+    has_many = 'regions' in level_cfg
+    if has_one and has_many:
+        raise ValueError(
+            f"mlg.levels[{k}] sets BOTH 'region' and 'regions'. Use 'regions' "
+            f"(a list) for several blocks, or 'region' for one.")
+    if has_many:
+        regions = level_cfg['regions']
+        if not isinstance(regions, (list, tuple)) or not regions:
+            raise ValueError(
+                f"mlg.levels[{k}].regions must be a non-empty list of boxes.")
+        return list(regions)
+    if has_one:
+        return [level_cfg['region']]
+    raise ValueError(
+        f"mlg.levels[{k}] has no refinement box: set 'region' (one) or "
+        f"'regions' (several).")
+
+
+def _mlg_resolve_parent(blocks: list, parent_level: int, box, explicit, name):
+    """The block at `parent_level` that contains this box (L0 coordinates).
+
+    Resolution is by CONTAINMENT rather than an explicit index. The containment
+    check has to run anyway (a block must nest in its parent), and sibling
+    blocks are validated disjoint, so at most one candidate can ever match —
+    the mapping is a well-defined partial function, not a heuristic. An index
+    would be a second source of truth that drifts when the list is reordered.
+
+    `parent:` is still accepted, as an ASSERTION against the resolved answer.
+    """
+    x0, x1, y0, y1, z0, z1 = box
+    candidates = [b for b in blocks if b.level == parent_level]
+    if parent_level == 0:
+        hits = candidates                        # the root covers everything
+    else:
+        hits = []
+        for b in candidates:
+            r = b.region
+            # fine_region / fine_domain_coarse are in the GRANDPARENT's index
+            # space, so the offset scales by the grandparent's spacing — not by
+            # this block's own, which is half of it.
+            gp = b.parent.spacing if b.parent is not None else 1.0
+            lo = (b.origin[0] + (r.fine_region.x_start - r.fine_domain_coarse.x_start) * gp,
+                  b.origin[1] + (r.fine_region.y_start - r.fine_domain_coarse.y_start) * gp,
+                  b.origin[2] + (r.fine_region.z_start - r.fine_domain_coarse.z_start) * gp)
+            hi = (b.origin[0] + (r.fine_region.x_end - r.fine_domain_coarse.x_start) * gp,
+                  b.origin[1] + (r.fine_region.y_end - r.fine_domain_coarse.y_start) * gp,
+                  b.origin[2] + (r.fine_region.z_end - r.fine_domain_coarse.z_start) * gp)
+            if (lo[0] <= x0 and x1 <= hi[0] and lo[1] <= y0 and y1 <= hi[1]
+                    and lo[2] <= z0 and z1 <= hi[2]):
+                hits.append(b)
+
+    if len(hits) != 1:
+        avail = ", ".join(f"'{b.name}'" for b in candidates) or "(none)"
+        raise ValueError(
+            f"MLG block '{name}' x[{x0},{x1}] y[{y0},{y1}] z[{z0},{z1}] is "
+            f"contained in {len(hits)} level-{parent_level} block(s); it must "
+            f"be exactly 1. Level-{parent_level} blocks: {avail}.\n"
+            f"  Widen the parent so it fully contains this box, or move this "
+            f"box inside one parent — a block straddling two parents has no "
+            f"well-defined coupling.")
+    resolved = hits[0]
+    if explicit is not None:
+        want = (resolved.name == explicit if isinstance(explicit, str)
+                else resolved.index == int(explicit))
+        if not want:
+            raise ValueError(
+                f"MLG block '{name}' declares parent={explicit!r} but its box "
+                f"lies inside '{resolved.name}'. Fix the box or the declaration.")
+    return resolved
 from src.grid.level_scaling import LevelScaler
 from src.grid.interpolation import CubicInterpolation, CompactSecondOrderInterpolation
 # ── 2D MLG imports (parallel to 3D, used when lattice.dim == 2) ──
@@ -1423,61 +1501,114 @@ class SimulationSetup:
         self._mlg_level_origins = [(0.0, 0.0, 0.0)]   # Level 0 origin
         self._mlg_level_spacings = [(1.0, 1.0, 1.0)]  # Level 0 spacing
 
+        from src.grid.block_tree import GridBlock, validate_block_tree
+        root = GridBlock(level=0, index=0, uid=0, name='L0',
+                         shape=coarse_shape, origin=(0.0, 0.0, 0.0),
+                         spacing=1.0)
+        blocks = [root]
+
         for k in range(1, num_levels):
             level_cfg = levels_config[k] if k < len(levels_config) else {}
-            region_cfg = level_cfg.get('region', {})
+            for j, region_cfg in enumerate(_mlg_regions_of(level_cfg, k)):
+                name = region_cfg.get('name') or (
+                    f"L{k}" if j == 0 and len(_mlg_regions_of(level_cfg, k)) == 1
+                    else f"L{k}b{j}")
 
-            # Config values are in L0 physical coordinates
-            x_min_phys = region_cfg['x_min']
-            x_max_phys = region_cfg['x_max']
-            y_min_phys = region_cfg['y_min']
-            y_max_phys = region_cfg['y_max']
-            z_min_phys = region_cfg['z_min']
-            z_max_phys = region_cfg['z_max']
+                # Config values are in L0 physical coordinates
+                x_min_phys = region_cfg['x_min']
+                x_max_phys = region_cfg['x_max']
+                y_min_phys = region_cfg['y_min']
+                y_max_phys = region_cfg['y_max']
+                z_min_phys = region_cfg['z_min']
+                z_max_phys = region_cfg['z_max']
 
-            # Convert to parent (Level k-1) local coordinates
-            po = self._mlg_level_origins[k - 1]     # parent origin in physical coords
-            pd = self._mlg_level_spacings[k - 1]    # parent spacing
+                parent = _mlg_resolve_parent(
+                    blocks, k - 1,
+                    (x_min_phys, x_max_phys, y_min_phys,
+                     y_max_phys, z_min_phys, z_max_phys),
+                    region_cfg.get('parent'), name)
 
-            local_x_min = round((x_min_phys - po[0]) / pd[0])
-            local_x_max = round((x_max_phys - po[0]) / pd[0])
-            local_y_min = round((y_min_phys - po[1]) / pd[1])
-            local_y_max = round((y_max_phys - po[1]) / pd[1])
-            local_z_min = round((z_min_phys - po[2]) / pd[2])
-            local_z_max = round((z_max_phys - po[2]) / pd[2])
+                # Convert to parent-local coordinates
+                po = parent.origin           # parent origin, L0 units
+                pd = (parent.spacing,) * 3   # parent spacing, L0 units
 
-            fine_region = IndexBox(
-                x_start=local_x_min, x_end=local_x_max,
-                y_start=local_y_min, y_end=local_y_max,
-                z_start=local_z_min, z_end=local_z_max,
-            )
+                local_x_min = round((x_min_phys - po[0]) / pd[0])
+                local_x_max = round((x_max_phys - po[0]) / pd[0])
+                local_y_min = round((y_min_phys - po[1]) / pd[1])
+                local_y_max = round((y_max_phys - po[1]) / pd[1])
+                local_z_min = round((z_min_phys - po[2]) / pd[2])
+                local_z_max = round((z_max_phys - po[2]) / pd[2])
 
-            overlap_region = self._mlg_overlap_mgr.add_level_pair(
-                coarse_shape=coarse_shape,
-                fine_region=fine_region,
-                overlap_width=overlap_width,
-            )
+                fine_region = IndexBox(
+                    x_start=local_x_min, x_end=local_x_max,
+                    y_start=local_y_min, y_end=local_y_max,
+                    z_start=local_z_min, z_end=local_z_max,
+                )
 
-            # Compute this level's physical origin and spacing
-            fdc = overlap_region.fine_domain_coarse
-            lu_k = self._mlg_scaler.get_level_units(k)
-            new_origin = (
-                po[0] + fdc.x_start * pd[0],
-                po[1] + fdc.y_start * pd[1],
-                po[2] + fdc.z_start * pd[2],
-            )
-            new_spacing = (lu_k.dx, lu_k.dx, lu_k.dx)
-            self._mlg_level_origins.append(new_origin)
-            self._mlg_level_spacings.append(new_spacing)
+                overlap_region = self._mlg_overlap_mgr.add_region(
+                    coarse_shape=parent.shape,
+                    fine_region=fine_region,
+                    level_coarse=k - 1,
+                    overlap_width=overlap_width,
+                    name=name,
+                )
 
-            print(f"  Level {k}: phys region x[{x_min_phys},{x_max_phys}] "
-                  f"y[{y_min_phys},{y_max_phys}] z[{z_min_phys},{z_max_phys}]")
-            print(f"            fine shape = {overlap_region.fine_shape}, "
-                  f"excised = {overlap_region.excised.num_nodes:,} nodes, "
-                  f"origin = ({new_origin[0]:.1f}, {new_origin[1]:.1f}, {new_origin[2]:.1f})")
+                # Compute this block's physical origin and spacing
+                fdc = overlap_region.fine_domain_coarse
+                lu_k = self._mlg_scaler.get_level_units(k)
+                new_origin = (
+                    po[0] + fdc.x_start * pd[0],
+                    po[1] + fdc.y_start * pd[1],
+                    po[2] + fdc.z_start * pd[2],
+                )
+                blk = GridBlock(level=k, index=j, uid=len(blocks), name=name,
+                                shape=overlap_region.fine_shape,
+                                origin=new_origin, spacing=lu_k.dx,
+                                region=overlap_region, parent=parent)
+                parent.children.append(blk)
+                blocks.append(blk)
 
-            # Next iteration: fine shape becomes the coarse shape
-            coarse_shape = overlap_region.fine_shape
+                _tag = f"Level {k}" if blk.index == 0 else \
+                    f"Level {k}.b{j} '{name}'"
+                print(f"  {_tag}: phys region x[{x_min_phys},{x_max_phys}] "
+                      f"y[{y_min_phys},{y_max_phys}] z[{z_min_phys},{z_max_phys}]"
+                      + (f"  parent={parent.name}" if k > 1 else ""))
+                print(f"            fine shape = {overlap_region.fine_shape}, "
+                      f"excised = {overlap_region.excised.num_nodes:,} nodes, "
+                      f"origin = ({new_origin[0]:.1f}, {new_origin[1]:.1f}, "
+                      f"{new_origin[2]:.1f})")
+
+        for _w in validate_block_tree(root, overlap_width):
+            print(f"  [warn] MLG blocks: {_w}")
+
+        self._mlg_is_multiblock = any(
+            len([b for b in blocks if b.level == k]) > 1
+            for k in range(num_levels))
+        if self._mlg_is_multiblock:
+            # The grid itself is block-aware; these two consumers are not yet.
+            # Fail loudly here rather than let them mis-index a level.
+            _todo = []
+            if self.al_enabled:
+                _todo.append("ALM placement (needs per-block rotor binding)")
+            _todo.append("MLG VTK writer (one .vti/amr_box per LEVEL)")
+            raise NotImplementedError(
+                "multi-block MLG levels are built, but these consumers still "
+                "assume one grid per level: " + "; ".join(_todo) + ".\n"
+                "  Land the block-aware output/ALM path before using "
+                "mlg.levels[k].regions with more than one entry.")
+
+        self._mlg_blocks = blocks
+        self._mlg_root = root
+        # Per-level origin/spacing stay available for the single-block path;
+        # multi-block callers must read block.origin instead.
+        if all(len([b for b in blocks if b.level == k]) == 1
+               for k in range(num_levels)):
+            self._mlg_level_origins = [
+                next(b.origin for b in blocks if b.level == k)
+                for k in range(num_levels)]
+            self._mlg_level_spacings = [
+                (next(b.spacing for b in blocks if b.level == k),) * 3
+                for k in range(num_levels)]
 
         self._mlg_filter_level = filter_level
 
@@ -1636,8 +1767,9 @@ class SimulationSetup:
         simulations.append(sim_0)
 
         # ── Fine levels ──────────────────────────────────────────
-        for k in range(1, num_levels):
-            region = self._mlg_overlap_mgr.get_region(k - 1)
+        for _blk in self._mlg_blocks[1:]:
+            k = _blk.level
+            region = _blk.region
             lu = self._mlg_scaler.get_level_units(k)
             fine_shape = region.fine_shape  # (Nx_f, Ny_f, Nz_f)
 
@@ -1670,7 +1802,7 @@ class SimulationSetup:
             fine_obstacle_bc = None
             internal_geom = self.config.get('internal_geometry', {})
             if internal_geom:
-                fine_origin = self._mlg_level_origins[k]
+                fine_origin = _blk.origin
                 fine_geom_config = create_fine_level_geometry_config(
                     geometry_config=internal_geom,
                     fine_origin_phys=fine_origin,
@@ -1686,7 +1818,7 @@ class SimulationSetup:
                 if fine_geom_config:
                     if not hasattr(self, '_mlg_fine_geom_configs'):
                         self._mlg_fine_geom_configs = {}
-                    self._mlg_fine_geom_configs[k] = fine_geom_config
+                    self._mlg_fine_geom_configs[_blk.uid] = fine_geom_config
 
                 if fine_geom_config:
                     fine_mask, fine_geom_info = create_geometry_mask(
@@ -1739,6 +1871,7 @@ class SimulationSetup:
                 sgs_cfg=self._sgs_cfg,
             )
             simulations.append(sim_k)
+            _blk.sim = sim_k
 
             # ── Coupling engine for pair (k-1, k) ────────────────
             coupling_k = GridCoupling(
@@ -1750,9 +1883,11 @@ class SimulationSetup:
                 filter_level=self._mlg_filter_level,
             )
             couplings.append(coupling_k)
+            _blk.coupling = coupling_k
 
         # ── Assemble MultiLevelGrid ──────────────────────────────
-        mlg = MultiLevelGrid(levels=simulations, couplings=couplings)
+        self._mlg_root.sim = simulations[0]
+        mlg = MultiLevelGrid.from_tree(self._mlg_root)
         print(f"\n  MultiLevelGrid assembled:")
         print(f"  {mlg.summary()}")
 
@@ -1769,9 +1904,26 @@ class SimulationSetup:
         # L0 f_post is captured before F→C coupling, so it does not
         # reflect the fine-grid solution.
         self._mlg_force_level: Optional[int] = None
+        self._mlg_force_block: Optional[int] = None
         if self.force_mgr is not None:
-            for k in range(num_levels - 1, -1, -1):
-                if simulations[k].obstacle_bc is not None and k > 0:
+            # Finest block that carries an obstacle. Scanning blocks (not
+            # levels) keeps this right when a level hosts several: if more
+            # than one candidate shares the finest level we refuse rather
+            # than pick, since one ForceManager measures one body.
+            _cands = [b for b in reversed(self._mlg_blocks)
+                      if b.level > 0 and b.sim.obstacle_bc is not None]
+            if _cands:
+                _top = max(b.level for b in _cands)
+                _same = [b for b in _cands if b.level == _top]
+                if len(_same) > 1:
+                    raise ValueError(
+                        "force_calculation: level %d has %d blocks carrying an "
+                        "obstacle (%s). One ForceManager measures one body — "
+                        "split the run or restrict the geometry to one block."
+                        % (_top, len(_same), ", ".join(b.name for b in _same)))
+            for _fb in _cands[:1]:
+                k = _fb.level
+                if True:
                     lu_k = self._mlg_scaler.get_level_units(k)
                     scale = 1.0 / lu_k.dx   # = 2^k
 
@@ -1798,19 +1950,20 @@ class SimulationSetup:
                     self.force_mgr.close()
                     fine_geom_for_force = getattr(
                         self, '_mlg_fine_geom_configs', {}
-                    ).get(k, self.config.get('internal_geometry', {}))
+                    ).get(_fb.uid, self.config.get('internal_geometry', {}))
                     self.force_mgr = ForceManager(
                         xp=xp,
                         lattice=self.lattice,
-                        solid_mask=simulations[k].obstacle_bc.solid_mask,
+                        solid_mask=_fb.sim.obstacle_bc.solid_mask,
                         config=fine_force_config,
-                        wall_bc=simulations[k].obstacle_bc,
+                        wall_bc=_fb.sim.obstacle_bc,
                         csv_dir=self._csv_dir,
                         internal_geometry=fine_geom_for_force,
                     )
                     self.force_mgr.initialize()
                     self._mlg_force_level = k
-                    print(f"\n  Force measurement: Level {k} "
+                    self._mlg_force_block = _fb.uid
+                    print(f"\n  Force measurement: {_fb.label} "
                           f"(D_fine={self.force_mgr.char_length:.0f} "
                           f"[fine lu])")
                     break

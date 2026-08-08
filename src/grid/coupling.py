@@ -246,6 +246,15 @@ class GridCoupling:
     # ── Scoped-access geometry (Phase e2: esoteric region bridge) ──
 
     @property
+    def region(self):
+        """The OverlapRegion this coupling was built from.
+
+        Public because the block tree and the rank-local MPI coupling both need
+        it; they used to reach into `_region`.
+        """
+        return self._region
+
+    @property
     def coarse_sub_spatial_slices(self) -> tuple:
         """Spatial (x, y, z) slices of the coarse sub-volume C2F reads."""
         return self._coarse_sub_slices[1:]

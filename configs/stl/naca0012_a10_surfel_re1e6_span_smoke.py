@@ -33,8 +33,12 @@ _spec = importlib.util.spec_from_file_location(
 _m = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_m)
 
+# frac 0.18 at c=50 == Nz 9 == the production slab thickness in L0 lu.
+# (Passing the production 0.09 would give Nz=4 — the old 57/59 slab, which
+#  previews nothing; see build_span's docstring.)
 config = _m.build_span(
-    c=50, steps=300, folder="results_naca0012_a10_surfel_re1e6_span_smoke")
+    c=50, steps=300, frac=2.0 * _m.SPAN_FRAC,
+    folder="results_naca0012_a10_surfel_re1e6_span_smoke")
 
 config["time"] = dict(config["time"], output_interval=300,
                       checkpoint_interval=10**9,

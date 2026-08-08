@@ -107,25 +107,21 @@ class MultiLevelGrid:
                 f"levels, got {len(couplings)}."
             )
 
-        self._levels = levels
-        self._couplings = couplings
-        self._num_levels = len(levels)
+        # A chain is the degenerate tree (one child per node). Routing the
+        # legacy arguments through build_chain keeps every existing caller
+        # working AND makes the traversal order identical to the old list
+        # order — which is what keeps this refactor bit-identical.
+        from src.grid.block_tree import build_chain
+        self._bind_tree(build_chain(levels, couplings))
         self._step_count = 0
 
         # ── f_prev buffers (allocated lazily on first advance()) ─
-        # Each level (except the finest) needs f_prev for C→F half-step.
-        # Cannot allocate here because f may not be set yet (Layer 1→2).
-        self._f_prev: List[Optional['npt.NDArray']] = [
-            None for _ in range(len(levels))
-        ]
+        # Each block except the root needs its parent's pre-step f over its own
+        # coarse sub-volume, for the C→F half-step. Cannot allocate here
+        # because f may not be set yet (Layer 1→2). Lives on the block: with
+        # several children per parent, each needs its own window.
         self._f_prev_initialized: bool = False
-
-        # ── Precomputed profiler section names (Phase 0; see step_profiler) ─
-        # Built once so the disabled hot path never formats a string.
-        self._pn_adv = tuple(f"L{k}.advance" for k in range(self._num_levels))
-        self._pn_c2f = tuple(f"C2F.L{k}" for k in range(self._num_levels))
-        self._pn_f2c = tuple(f"F2C.L{k}" for k in range(self._num_levels))
-        self._pn_fprev = tuple(f"fprev.L{k}" for k in range(self._num_levels))
+        # (profiler section names are set by _bind_tree)
 
         # ── Phase 1c — CUDA Graphs (S1: pure-LBM whole coarse-step) ──────
         # advance() = ~2^M-1 sim.advance() + coupling → 150-300 kernel launches
@@ -144,6 +140,91 @@ class MultiLevelGrid:
         # JIT-compile every RawKernel, and stabilise memory-pool pointers so the
         # captured graph binds fixed device addresses.
         self._GRAPH_WARMUP = int(os.environ.get("MLG_CUDA_GRAPH_WARMUP", "3"))
+
+    # =================================================================
+    # Block tree
+    # =================================================================
+
+    @classmethod
+    def from_tree(cls, root) -> 'MultiLevelGrid':
+        """Build from an explicit block tree (levels may hold several blocks)."""
+        obj = cls.__new__(cls)
+        obj._bind_tree(root)
+        obj._step_count = 0
+        obj._f_prev_initialized = False
+        obj._graph_enabled = os.environ.get("MLG_CUDA_GRAPH", "0") == "1"
+        obj._graph = None
+        obj._graph_stream = None
+        obj._graph_warmup = 0
+        obj._graph_failed = False
+        obj._graph_ok = None
+        obj._GRAPH_WARMUP = int(os.environ.get("MLG_CUDA_GRAPH_WARMUP", "3"))
+        return obj
+
+    def _bind_tree(self, root) -> None:
+        from src.grid.block_tree import depth, iter_blocks
+        self._root = root
+        self._blocks = list(iter_blocks(root))          # level-major
+        self._num_levels = depth(root)
+        # Profiler sections stay LEVEL-indexed: step_profiler accumulates by
+        # name, so sibling blocks sum into one section — which is what the
+        # launch-bound vs bandwidth attribution wants.
+        self._pn_adv = tuple(f"L{k}.advance" for k in range(self._num_levels))
+        self._pn_c2f = tuple(f"C2F.L{k}" for k in range(self._num_levels))
+        self._pn_f2c = tuple(f"F2C.L{k}" for k in range(self._num_levels))
+        self._pn_fprev = tuple(f"fprev.L{k}" for k in range(self._num_levels))
+
+    @property
+    def root(self):
+        return self._root
+
+    def iter_blocks(self):
+        return iter(self._blocks)
+
+    def blocks_at(self, level: int) -> list:
+        return [b for b in self._blocks if b.level == level]
+
+    def num_blocks_at(self, level: int) -> int:
+        return sum(1 for b in self._blocks if b.level == level)
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self._blocks)
+
+    @property
+    def is_multiblock(self) -> bool:
+        return any(self.num_blocks_at(k) > 1 for k in range(self._num_levels))
+
+    def block_by_uid(self, uid: int):
+        return self._blocks[uid]
+
+    @property
+    def _levels(self) -> list:
+        """Flat list of Simulations, level-major. Compatibility shim."""
+        return [b.sim for b in self._blocks]
+
+    @property
+    def _couplings(self) -> list:
+        """Flat list of GridCouplings, level-major (root has none)."""
+        return [b.coupling for b in self._blocks[1:]]
+
+    def _one_block(self, level: int, what: str):
+        """The single block at `level`, or a pointed error."""
+        blocks = self.blocks_at(level)
+        if not 0 <= level < self._num_levels:
+            raise IndexError(
+                f"Level {level} out of range [0, {self._num_levels - 1}]")
+        if len(blocks) != 1:
+            raise ValueError(
+                f"{what}({level}) is ambiguous: level {level} hosts "
+                f"{len(blocks)} blocks ({', '.join(b.name for b in blocks)}). "
+                f"Use blocks_at({level}) / get_block({level}, j) and handle "
+                f"each block explicitly — returning block 0 would silently "
+                f"drop the rest.")
+        return blocks[0]
+
+    def get_block(self, level: int, index: int = 0):
+        return self.blocks_at(level)[index]
 
     # =================================================================
     # Simulation-compatible interface
@@ -203,14 +284,16 @@ class MultiLevelGrid:
         """3D coupling with the region-scoped API (2D coupling = legacy)."""
         return hasattr(coupling, 'coarse_sub_spatial_slices')
 
-    def _f_prev_sub_src(self, k: int) -> 'npt.NDArray':
-        """Sub-volume of level k's physical f read by C2F(k -> k+1).
+    def _f_prev_src(self, block) -> 'npt.NDArray':
+        """Sub-volume of `block`'s PARENT physical f that block's C2F reads.
 
-        2D (legacy) couplings lack the scoped API -> full-field f_prev
-        exactly as before (esoteric is 3D-only, so no gather needed).
+        Scoped by the block's own coupling, so siblings read disjoint windows
+        of the same parent. Esoteric levels gather through the region kernel
+        (parity = the next LOAD's view); 2D legacy couplings lack the scoped
+        API and take the full field exactly as before.
         """
-        lev = self._levels[k]
-        cpl = self._couplings[k]
+        lev = block.parent.sim
+        cpl = block.coupling
         if not self._scoped(cpl):
             return lev.f
         sp = cpl.coarse_sub_spatial_slices
@@ -314,36 +397,39 @@ class MultiLevelGrid:
     def _advance_eager(self) -> None:
         """Eager (non-graph) coarse timestep: the nested-stepping recursion."""
         # ── Lazy initialization of f_prev buffers ────────────────
-        # Deferred from __init__ because f is set by Initializer (Layer 2)
+        # Deferred from __init__ because f is set by Initializer (Layer 2).
+        # Level-major order, so for a chain the allocation SEQUENCE (sizes and
+        # order) is byte-for-byte the old one — memory-pool layout and hence
+        # CUDA-graph pointer stability are preserved.
         if not self._f_prev_initialized:
-            for i, lev in enumerate(self._levels):
-                if not lev.is_ready:
+            for b in self._blocks:
+                if not b.sim.is_ready:
                     raise RuntimeError(
-                        f"Level {i} Simulation is not ready. "
+                        f"Level {b.level} Simulation is not ready. "
                         f"Call set_distribution() on all levels first."
                     )
-                if i < self._num_levels - 1:
-                    self._f_prev[i] = lev.xp.ascontiguousarray(
-                        self._f_prev_sub_src(i))
+            for b in self._blocks:
+                if b.parent is not None:
+                    b.f_prev = b.sim.xp.ascontiguousarray(self._f_prev_src(b))
             self._f_prev_initialized = True
 
-        coarse = self._levels[0]
+        root = self._root
 
-        # ── Save f_prev for level 0 (temporal interpolation) ─────
-        # Only needed for C->F temporal interp; single-level has no coupling
-        # (and _f_prev[0] is then never allocated -> None).
-        xp = coarse.xp
-        if self._num_levels > 1:
+        # ── Snapshot the root for each of its children ───────────
+        # Taken BEFORE the root advances: this is the t-level state the
+        # half-step C2F interpolates against.
+        xp = root.sim.xp
+        for ch in root.children:
             with _prof(self._pn_fprev[0]):
-                xp.copyto(self._f_prev[0], self._f_prev_sub_src(0))
+                xp.copyto(ch.f_prev, self._f_prev_src(ch))
 
         # ── Advance coarse level (full domain) ───────────────────
         with _prof(self._pn_adv[0]):
-            coarse.advance()
+            root.sim.advance()
 
-        # ── Recursively advance all finer levels ─────────────────
-        if self._num_levels > 1:
-            self._advance_fine(level_k=1)
+        # ── Recursively advance all finer blocks ─────────────────
+        for ch in root.children:
+            self._advance_block(ch)
 
         self._step_count += 1
         _prof_step()
@@ -383,20 +469,21 @@ class MultiLevelGrid:
             CPU-in-loop BEM and reallocates rho/u each step (08 §1) → the whole
             coarse step is not a fixed pure-GPU sequence.
         """
-        if self._levels[0].xp.__name__ != "cupy":
+        if self._root.sim.xp.__name__ != "cupy":
             return False, "numpy backend (CPU)"
         if "MLG_PROFILE" in os.environ or os.environ.get("MLG_NVTX") == "1":
             return False, "MLG_PROFILE/MLG_NVTX active (per-section sync)"
-        for k, lev in enumerate(self._levels):
+        for _b in self._blocks:
+            k, lev = _b.label, _b.sim
             if getattr(lev, "al_model", None) is not None:
-                return False, f"L{k} has ALM (S1 is pure-LBM only; see S2)"
+                return False, f"{k} has ALM (S1 is pure-LBM only; see S2)"
             if getattr(lev, "nan_trap_enabled", False):
-                return False, f"L{k} nan_trap enabled (host sync per step)"
+                return False, f"{k} nan_trap enabled (host sync per step)"
             if getattr(lev, "_use_esoteric", False):
-                return False, (f"L{k} esoteric (parity alternates per step; "
+                return False, (f"{k} esoteric (parity alternates per step; "
                                "whole-step capture unsupported)")
             if getattr(lev, "_use_surfel", False):
-                return False, (f"L{k} surfel (facet force readback is a "
+                return False, (f"{k} surfel (facet force readback is a "
                                "host sync every apply — breaks capture)")
         return True, "ok"
 
@@ -446,8 +533,8 @@ class MultiLevelGrid:
         step counters (incremented inside the record run, not the replay) must
         be advanced manually. Level k performs 2^k sub-steps per coarse step.
         """
-        for k, lev in enumerate(self._levels):
-            lev.step_count += (1 << k)
+        for b in self._blocks:
+            b.sim.step_count += (1 << b.level)
         self._step_count += 1
         _prof_step()
 
@@ -475,65 +562,50 @@ class MultiLevelGrid:
         Args:
             level_k: Fine level index (1, 2, ..., M-1).
         """
-        coupling = self._couplings[level_k - 1]
-        sim_coarse = self._levels[level_k - 1]
-        sim_fine = self._levels[level_k]
-        has_finer = (level_k + 1 < self._num_levels)
+        self._advance_block(self._one_block(level_k, "_advance_fine"))
+
+    def _advance_block(self, b) -> None:
+        """Two sub-steps of block `b`, then ONE F→C into its parent.
+
+        Identical algorithm to the old per-level version (see _advance_fine's
+        docstring); the only change is that a parent may now have several
+        children, so the single statements become one-iteration loops. With one
+        child per level the emitted GPU call sequence is unchanged.
+
+        Sibling ORDER is numerically irrelevant by construction: a sibling's
+        only write into the parent is its own `excised` box and its only read
+        is its own `fine_domain_coarse`, and the block-tree validator keeps
+        those disjoint across siblings.
+        """
+        cpl, parent, lv = b.coupling, b.parent, b.level
+        xp = b.sim.xp
+
+        for is_half in (True, False):
+            # Snapshot MY state for each of MY children, pre-advance
+            for g in b.children:
+                with _prof(self._pn_fprev[lv]):
+                    xp.copyto(g.f_prev, self._f_prev_src(g))
+
+            # Advance (collide + stream)
+            with _prof(self._pn_adv[lv]):
+                b.sim.advance()
+
+            # C→F AFTER advance: it acts as the boundary condition.
+            # half-step -> temporal interpolation against the parent snapshot;
+            # full-step -> the parent's current state, no interpolation.
+            with _prof(self._pn_c2f[lv]):
+                self._coupling_c2f(cpl, parent.sim, b.sim,
+                                   is_half_step=is_half,
+                                   f_prev=(b.f_prev if is_half else None))
+
+            for g in b.children:
+                self._advance_block(g)
 
         # ═════════════════════════════════════════════════════════
-        # Fine step #1: t → t + δt_f  (half of coarse step)
+        # F→C feedback: overwrite parent's excised region with fine data
         # ═════════════════════════════════════════════════════════
-
-        # Save f_prev for this level (if even finer levels exist)
-        if has_finer:
-            xp = sim_fine.xp
-            with _prof(self._pn_fprev[level_k]):
-                xp.copyto(self._f_prev[level_k],
-                          self._f_prev_sub_src(level_k))
-
-        # Advance fine level (collide + stream)
-        with _prof(self._pn_adv[level_k]):
-            sim_fine.advance()
-
-        # C→F AFTER advance: fix boundary at t+δt_f (half-step interp)
-        with _prof(self._pn_c2f[level_k]):
-            self._coupling_c2f(coupling, sim_coarse, sim_fine,
-                               is_half_step=True,
-                               f_prev=self._f_prev[level_k - 1])
-
-        # Recurse into finer levels
-        if has_finer:
-            self._advance_fine(level_k + 1)
-
-        # ═════════════════════════════════════════════════════════
-        # Fine step #2: t + δt_f → t + δt_c  (second half)
-        # ═════════════════════════════════════════════════════════
-
-        # Save f_prev for this level (if even finer levels exist)
-        if has_finer:
-            xp = sim_fine.xp
-            with _prof(self._pn_fprev[level_k]):
-                xp.copyto(self._f_prev[level_k],
-                          self._f_prev_sub_src(level_k))
-
-        # Advance fine level (collide + stream)
-        with _prof(self._pn_adv[level_k]):
-            sim_fine.advance()
-
-        # C→F AFTER advance: fix boundary at t+δt_c (full-step)
-        with _prof(self._pn_c2f[level_k]):
-            self._coupling_c2f(coupling, sim_coarse, sim_fine,
-                               is_half_step=False, f_prev=None)
-
-        # Recurse into finer levels
-        if has_finer:
-            self._advance_fine(level_k + 1)
-
-        # ═════════════════════════════════════════════════════════
-        # F→C feedback: overwrite coarse excised region with fine data
-        # ═════════════════════════════════════════════════════════
-        with _prof(self._pn_f2c[level_k]):
-            self._coupling_f2c(coupling, sim_fine, sim_coarse)
+        with _prof(self._pn_f2c[lv]):
+            self._coupling_f2c(cpl, b.sim, parent.sim)
 
     # =================================================================
     # Properties (delegate to Level 0 for Simulation compatibility)
@@ -547,27 +619,27 @@ class MultiLevelGrid:
         For multi-level VTK output (Phase E), each level's rho
         will be accessed separately via get_level().
         """
-        return self._levels[0].rho
+        return self._root.sim.rho
 
     @property
     def u(self) -> Optional['npt.NDArray']:
         """Velocity field from the coarsest level (Level 0)."""
-        return self._levels[0].u
+        return self._root.sim.u
 
     @property
     def f(self) -> Optional['npt.NDArray']:
         """Distribution function from the coarsest level (Level 0)."""
-        return self._levels[0].f
+        return self._root.sim.f
 
     @property
     def f_post(self) -> Optional['npt.NDArray']:
         """Post-collision distribution from Level 0."""
-        return self._levels[0].f_post
+        return self._root.sim.f_post
 
     @property
     def body_force(self) -> Optional['npt.NDArray']:
         """Body force from Level 0 (for ALM compatibility)."""
-        return self._levels[0].body_force
+        return self._root.sim.body_force
 
     @property
     def step_count(self) -> int:
@@ -577,22 +649,22 @@ class MultiLevelGrid:
     @property
     def is_ready(self) -> bool:
         """Whether all levels have distributions set."""
-        return all(lev.is_ready for lev in self._levels)
+        return all(b.sim.is_ready for b in self._blocks)
 
     @property
     def physical_f(self) -> Optional['npt.NDArray']:
         """Level-0 f in standard ordering/layout (checkpoint/IO safe)."""
-        return self._levels[0].physical_f
+        return self._root.sim.physical_f
 
     @property
     def tau(self) -> float:
         """Relaxation time of Level 0."""
-        return self._levels[0].tau
+        return self._root.sim.tau
 
     @property
     def domain_shape(self) -> Tuple[int, ...]:
         """Domain shape of Level 0."""
-        return self._levels[0].domain_shape
+        return self._root.sim.domain_shape
 
     # =================================================================
     # Level access (for multi-level output, diagnostics)
@@ -615,11 +687,7 @@ class MultiLevelGrid:
         Returns:
             Simulation object for that level.
         """
-        if not 0 <= k < self._num_levels:
-            raise IndexError(
-                f"Level {k} out of range [0, {self._num_levels - 1}]"
-            )
-        return self._levels[k]
+        return self._one_block(k, "get_level").sim
 
     def get_coupling(self, k: int) -> 'GridCoupling':
         """Get the GridCoupling for level pair (k, k+1).
@@ -634,7 +702,7 @@ class MultiLevelGrid:
             raise IndexError(
                 f"Coupling {k} out of range [0, {self._num_levels - 2}]"
             )
-        return self._couplings[k]
+        return self._one_block(k + 1, "get_coupling").coupling
 
     # =================================================================
     # Diagnostics
@@ -648,12 +716,11 @@ class MultiLevelGrid:
             f"  Sub-steps per coarse step: {2**self._num_levels - 1}",
             "",
         ]
-        for i, lev in enumerate(self._levels):
-            sub_steps = 2 ** i
+        for b in self._blocks:
             lines.append(
-                f"  Level {i}: shape={lev.domain_shape}, "
-                f"tau={lev.tau:.4f}, "
-                f"steps_per_coarse={sub_steps}"
+                f"  {b.label}: shape={b.sim.domain_shape}, "
+                f"tau={b.sim.tau:.4f}, "
+                f"steps_per_coarse={2 ** b.level}"
             )
         return "\n".join(lines)
 
