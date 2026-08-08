@@ -279,16 +279,38 @@ class Partition1D:
         return self._ax(slice(g + n, 2 * g + n))
 
     def neighbor(self, side: int) -> Optional[int]:
-        """Rank on `side` (0=low, 1=high); None at a non-periodic boundary."""
-        r = self.rank + (1 if side == 1 else -1)
+        """Rank on `side` (0=low, 1=high); None at a non-periodic boundary.
+
+        Ranks holding ZERO cells of this grid are skipped over. A refinement
+        block that covers only part of the domain is owned by a contiguous
+        subset of ranks, and the ones outside it have no array to exchange
+        with — posting a halo band to them would leave the send unmatched.
+        With every rank owning cells (the single-block chain) this is exactly
+        rank +- 1 as before.
+        """
+        step = 1 if side == 1 else -1
+        counts = self._counts
         if self.periodic:
-            return r % self.n_ranks
-        return r if 0 <= r < self.n_ranks else None
+            r = (self.rank + step) % self.n_ranks
+            for _ in range(self.n_ranks):
+                if r == self.rank:
+                    return None          # sole owner: no partner
+                if counts[r] != 0:
+                    return r
+                r = (r + step) % self.n_ranks
+            return None
+        r = self.rank + step
+        while 0 <= r < self.n_ranks:
+            if counts[r] != 0:
+                return r
+            r += step
+        return None
 
     @classmethod
     def from_range(cls, global_shape: Tuple[int, int, int], n_ranks: int,
                    rank: int, axis: int, own_start: int, own_count: int,
-                   ghost: int = 2, periodic: bool = True) -> "Partition1D":
+                   ghost: int = 2, periodic: bool = True,
+                   all_counts: Optional[Sequence[int]] = None) -> "Partition1D":
         """Partition with an EXPLICIT owned range (MLG coarse-aligned cuts).
 
         Fine-level partitions are DERIVED from the coarse cuts (fine index =
@@ -301,6 +323,14 @@ class Partition1D:
         ls = list(p.global_shape)
         ls[axis] = p.own_count + 2 * p.ghost
         p.local_shape = tuple(ls)
+        # Owned counts for EVERY rank. __init__ filled an even split, which is
+        # wrong for a derived range; neighbor() needs the real ones to know
+        # which ranks hold nothing of this grid. Every rank can compute all of
+        # them locally from the shared cuts, so this costs no communication.
+        if all_counts is not None:
+            p._counts = [int(c) for c in all_counts]
+        else:
+            p._counts[rank] = p.own_count
         return p
 
     def __repr__(self) -> str:
