@@ -133,26 +133,15 @@ class Rank0OutputBridge:
         """ALM marker VTP from rank 0's REPLICATED model — no comms needed:
         the M3 hooks keep positions/_last_positions in GLOBAL fine coords on
         every rank, so rank 0's copy is the exact production state. Same
-        fine->L0 transform as OutputManager._write_markers."""
+        fine->L0 transform as OutputManager._write_markers — which now lives in
+        the writer, so neither path mutates the model."""
         if self._rank != 0 or self._marker_vtk is None or \
                 runner.model is None:
             return
-        model = runner.model
-        orig = model._last_positions
-        if self._m_origin is not None and orig is not None:
-            ox, oy, oz = self._m_origin
-            dxs = self._m_spacing
-            t = orig.copy()
-            t[:, 0] = ox + orig[:, 0] * dxs
-            t[:, 1] = oy + orig[:, 1] * dxs
-            t[:, 2] = oz + orig[:, 2] * dxs
-            model._last_positions = t
-        try:
-            self._marker_vtk.write_from_al_model(
-                step=step, al_model=model, time=float(step))
-        finally:
-            if self._m_origin is not None and orig is not None:
-                model._last_positions = orig
+        self._marker_vtk.write_from_al_model(
+            step=step, al_model=runner.model, time=float(step),
+            origin=self._m_origin,
+            spacing=(self._m_spacing if self._m_origin is not None else 1.0))
 
     # ── Checkpoint: assembled std f -> CheckpointManager.save ────────
     def save_checkpoint(self, step: int, runner) -> None:

@@ -489,9 +489,12 @@ class OutputManager:
         forces_override (coefficients/CSV stay on the one path).
         MPI override: Allreduce(mem_force_local) as forces_override.
         """
-        if (self._mlg_force_level is not None
-                and hasattr(sim, 'get_level')):
-            lvl = sim.get_level(self._mlg_force_level)
+        if hasattr(sim, 'get_level'):
+            # _mlg_force_level is None when the obstacle sits on L0 (e.g.
+            # num_levels=1): resolve to the LEVEL, not the MLG wrapper —
+            # the wrapper lacks _use_esoteric/eso_body_force, so an eso L0
+            # would fall through to f_post=None and crash the MEM channel.
+            lvl = sim.get_level(self._mlg_force_level or 0)
         else:
             lvl = sim
 
@@ -567,12 +570,34 @@ class OutputManager:
         if target is None:
             return
 
+        # Field suppression window (output.vtk.fields_start_step): markers
+        # only until the start step — see setup.build_output_manager.
+        if step < getattr(self, 'vtk_fields_start_step', 0):
+            if (self.marker_vtk_writer is not None
+                    and self.al_model is not None):
+                self._write_markers(step)
+            return
+
         # ── MLG: write per-level .vti + .vth ───────────────
         if self.mlg_vtk_writer is not None:
             from src.grid.multi_level_grid import MultiLevelGrid
             if isinstance(target, MultiLevelGrid):
                 self.mlg_vtk_writer.write(step=step, mlg=target,
                                           time=float(step))
+                # Surfel surface loads (S8a-2): from the FINEST level
+                # carrying the surfel BC (facet accounting = wing level).
+                # The adapter transforms verts to the global L0-lu frame
+                # (coord_origin/spacing bound in setup), so the file
+                # overlays the .vth volume output.
+                import os as _os
+                for _k in range(target.num_levels - 1, -1, -1):
+                    _ob = getattr(target.get_level(_k), 'obstacle_bc',
+                                  None)
+                    if getattr(_ob, 'kind', None) == 'surfel':
+                        _ob.write_surface(_os.path.join(
+                            self.mlg_vtk_writer.output_dir,
+                            f"surface_{step:08d}.vtk"))
+                        break
                 # Write ALM markers (before returning)
                 if (self.marker_vtk_writer is not None
                         and self.al_model is not None):
@@ -596,6 +621,15 @@ class OutputManager:
             time=float(step),
         )
 
+        # ── Surfel wall boundary: surface loads on the STL triangles ──
+        # (S8a single-GPU path only — the MLG branch returned above.)
+        _ob = getattr(target, 'obstacle_bc', None)
+        if getattr(_ob, 'kind', None) == 'surfel':
+            import os as _os
+            _p = _os.path.join(self.vtk_writer.output_dir,
+                               f"surface_{step:08d}.vtk")
+            _ob.write_surface(_p)
+
         if (self.marker_vtk_writer is not None
                 and self.al_model is not None):
             self.marker_vtk_writer.write_from_al_model(
@@ -604,27 +638,17 @@ class OutputManager:
 
     def _write_markers(self, step: int) -> None:
         """Write ALM marker VTP, transforming coords for MLG fine level."""
-        import numpy as np
-
-        # Transform marker positions from fine local to global coords
-        if self._alm_marker_origin is not None:
-            orig_positions = self.al_model._last_positions
-            if orig_positions is not None:
-                ox, oy, oz = self._alm_marker_origin
-                dx = self._alm_marker_spacing
-                transformed = orig_positions.copy()
-                transformed[:, 0] = ox + orig_positions[:, 0] * dx
-                transformed[:, 1] = oy + orig_positions[:, 1] * dx
-                transformed[:, 2] = oz + orig_positions[:, 2] * dx
-                self.al_model._last_positions = transformed
-
+        # The fine-local → global L0 transform lives in the writer now. Doing
+        # it here meant assigning to al_model._last_positions, which is a
+        # read-only property on MultiRotorManager (it vstacks its models'
+        # arrays) — that path raised AttributeError the moment a multi-rotor
+        # ALM sat on a fine level.
         self.marker_vtk_writer.write_from_al_model(
             step=step, al_model=self.al_model, time=float(step),
+            origin=self._alm_marker_origin,
+            spacing=(self._alm_marker_spacing
+                     if self._alm_marker_origin is not None else 1.0),
         )
-
-        # Restore original positions (ALM needs local coords for next step)
-        if self._alm_marker_origin is not None and orig_positions is not None:
-            self.al_model._last_positions = orig_positions
 
         # Correction wake filaments (Kleine free / Dağ prescribed helix) → ParaView.
         # No-op for the straight kernel (no stored wake). Uses the same fine→global

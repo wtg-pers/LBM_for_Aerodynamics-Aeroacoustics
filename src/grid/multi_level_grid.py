@@ -245,9 +245,13 @@ class MultiLevelGrid:
                 f_coarse_is_sub=c_is_sub, f_coarse_prev_is_sub=True,
                 strips_out=strips)
             for sp_sl, vals in strips:
+                # skip_solid_nt: coupling writes carry FOREIGN values — at
+                # solid cells they would land on live bounce-deposit slots
+                # (patch 12 root cause; f1d proof).
                 esoteric_scatter_std_region(
                     sim_fine.xp, sim_fine.f, vals,
-                    sim_fine._esoteric_step, sp_sl)
+                    sim_fine._esoteric_step, sp_sl,
+                    skip_solid_nt=sim_fine._eso_node_type)
         else:
             coupling.coarse_to_fine(
                 f_c, sim_fine.f, is_half_step=is_half_step,
@@ -272,9 +276,37 @@ class MultiLevelGrid:
             from src.kernels.esoteric_d3q27 import esoteric_scatter_std_region
             block = coupling.fine_to_coarse(
                 f_f, None, f_fine_is_at_coarse=f_is_at, return_excised=True)
+            # skip_solid_nt: the excised region CONTAINS the body on coarse
+            # levels; without the skip, the restriction's solid-cell values
+            # overwrite the fluid neighbours' live deposits and the coarse
+            # wall bounces garbage every cycle (patch 12 root cause).
             esoteric_scatter_std_region(
                 sim_coarse.xp, sim_coarse.f, block,
-                sim_coarse._esoteric_step, coupling.excised_spatial_slices)
+                sim_coarse._esoteric_step, coupling.excised_spatial_slices,
+                skip_solid_nt=sim_coarse._eso_node_type)
+        elif getattr(sim_coarse, '_use_surfel', False):
+            # Surfel coarse level: the std restriction has no solid skip
+            # and writes THROUGH the body. Fine dead cells hold rho = 0,
+            # so the rescale is NaN wherever its stencil touches the fine
+            # body — on coarse DEAD cells (harmless, advect re-zeroes)
+            # but also on the coarse LIVE cut-cell shell whose fine
+            # co-located neighborhood is dead (measured: stationary NaN
+            # shell, patch 50 §4; same family as the esoteric
+            # skip_solid_nt above — patch 12 root cause; hwbb was blind
+            # to it only because its solid cells keep nonzero f).
+            # Fix at the write: accept the fine feedback where it is
+            # finite, keep the coarse level's OWN surfel-advanced state
+            # where the restriction touched the body. Then re-zero dead
+            # cells by assignment (mask-multiply would keep NaN).
+            xp = sim_coarse.xp
+            block = coupling.fine_to_coarse(
+                f_f, None, f_fine_is_at_coarse=f_is_at,
+                return_excised=True)
+            view = sim_coarse.f[
+                (slice(None),) + coupling.excised_spatial_slices]
+            xp.copyto(view, block.astype(view.dtype, copy=False),
+                      where=~xp.isnan(block))
+            sim_coarse.obstacle_bc.zero_dead(sim_coarse.f)
         else:
             coupling.fine_to_coarse(
                 f_f, sim_coarse.f, f_fine_is_at_coarse=f_is_at)
@@ -363,6 +395,9 @@ class MultiLevelGrid:
             if getattr(lev, "_use_esoteric", False):
                 return False, (f"L{k} esoteric (parity alternates per step; "
                                "whole-step capture unsupported)")
+            if getattr(lev, "_use_surfel", False):
+                return False, (f"L{k} surfel (facet force readback is a "
+                               "host sync every apply — breaks capture)")
         return True, "ok"
 
     def _graph_capture_and_launch(self) -> None:

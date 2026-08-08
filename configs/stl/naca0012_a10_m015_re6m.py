@@ -60,9 +60,10 @@ def _build(c=100, wall_bc="ibb", nz_frac=0.16):
 
     nz_frac: slab thickness / chord. Under the PROVEN z-slice invariance
     (<= 7e-7) every Nz gives the same physics; a thin slab (e.g. 0.04 ->
-    Nz=4, ~13M cells) fits the STANDARD path on one GPU — the trusted
-    force measurement while the esoteric force diagnostics are under
-    audit (systematic bias found 2026-08-01, see patch notes)."""
+    Nz=4, ~13M cells) fits the STANDARD path on one GPU. (The 2026-08-01
+    esoteric force bias was root-caused to SGS wall pathologies and fixed
+    — patch_notes/stl_body/12; the std nz4 run now serves as the
+    cross-check twin for the repaired esoteric path.)"""
     if c % 50 != 0:
         raise ValueError("chord must keep region bounds integral (50|c)")
     Nx, Ny, Nz = round(9.6 * c), 6 * c, round(nz_frac * c)

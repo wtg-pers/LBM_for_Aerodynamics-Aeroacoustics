@@ -2233,6 +2233,17 @@ class MultiRotorManager:
         return self.models[0].u_inf_lu if self.models else None
 
     @property
+    def polar_query(self) -> Optional[Callable]:
+        """Shared airfoil polar query.
+
+        create_multi_rotor_from_config hands the SAME query to every rotor, so
+        models[0]'s is the set's. Rebuilding it instead would re-generate the
+        airfoil tables and hand the models a different polar manager than the
+        one the coarse level uses — table sharing is load-bearing.
+        """
+        return self.models[0].polar_query if self.models else None
+
+    @property
     def _last_positions(self) -> Optional[np.ndarray]:
         """Concatenated positions from all rotors (for VTK)"""
         positions = []
@@ -2573,6 +2584,12 @@ def create_multi_rotor_from_config(
         'epsilon_taper_start': config.get('epsilon_taper_start', 0.7),
         'sampling': config.get('sampling', None),
         'kernel': config.get('kernel', None),      # G-beta0 family
+        # Formulation keys — same contract as the single-rotor path
+        # (previously silently dropped for 'rotors' configs).
+        'eps_correction': config.get('eps_correction', None),
+        'spreading': config.get('spreading', None),
+        'prandtl_loss': config.get('prandtl_loss', False),
+        'ramp_steps': config.get('ramp_steps', 0),
     }
 
     # ── Create each rotor ──
@@ -2602,6 +2619,14 @@ def create_multi_rotor_from_config(
             ),
             'sampling': rotor_entry.get('sampling', shared_defaults['sampling']),
             'kernel': rotor_entry.get('kernel', shared_defaults['kernel']),
+            'eps_correction': rotor_entry.get(
+                'eps_correction', shared_defaults['eps_correction']),
+            'spreading': rotor_entry.get(
+                'spreading', shared_defaults['spreading']) or {},
+            'prandtl_loss': rotor_entry.get(
+                'prandtl_loss', shared_defaults['prandtl_loss']),
+            'ramp_steps': rotor_entry.get(
+                'ramp_steps', shared_defaults['ramp_steps']),
         }
 
         # Per-rotor u_inf override

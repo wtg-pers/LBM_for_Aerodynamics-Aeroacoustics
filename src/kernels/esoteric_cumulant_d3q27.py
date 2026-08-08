@@ -345,17 +345,15 @@ void esoteric_cumulant_d3q27(
         }
         // ==== end verbatim ====
 
-        // Step 9: scatter K -> fhn (+ Guo source term)
+        // Step 9: scatter K -> fhn
+        // NO Guo source (patch wall_model/02): half-shift + Step 7b
+        // sign-flip IS the complete cumulant forcing (Geier Eqs. 85-87);
+        // the former S_i double-counted the force by (1 - 1/(2 tau))
+        // (W1b gate measurement; see cumulant_d3q27.py Step 9 note).
         if (force != NULL) {
-            float pf = 1.0f - 0.5f * omega_1;
             for (int q = 0; q < 27; q++) {
                 int i = cx[q]+1, j = cy[q]+1, k = cz[q]+1;
-                float cxq = (float)cx[q], cyq = (float)cy[q], czq = (float)cz[q];
-                float ci_F = cxq*Fx + cyq*Fy + czq*Fz;
-                float ci_u = cxq*ux + cyq*uy + czq*uz;
-                float u_F  = ux*Fx + uy*Fy + uz*Fz;
-                float Si = pf * w[q] * ((ci_F - u_F)*3.0f + ci_u*ci_F*9.0f);
-                fhn[q] = K[i][j][k] + Si;
+                fhn[q] = K[i][j][k];
             }
         } else {
             for (int q = 0; q < 27; q++)
@@ -415,7 +413,11 @@ def _build_eso_cumulant_kernel(sgs_model: str) -> str:
         sgs_param = ""
         sgs_block = _SGS_BLOCK_OFF
     elif sgs_model == "smagorinsky":
-        sgs_param = ",\n    const float Cs,\n    float* __restrict__ nu_t_out"
+        # nut_scale: shared _SGS_BLOCK_SMAG reads it (near-wall
+        # reconstruction, wall_model W3c). The esoteric path always
+        # passes NULL for now -> bit-unchanged; wiring is W5.
+        sgs_param = (",\n    const float Cs,\n    float* __restrict__ nu_t_out"
+                     ",\n    const float* __restrict__ nut_scale")
         sgs_block = _SGS_BLOCK_SMAG
     elif sgs_model == "wale":
         sgs_param = (",\n    const float* __restrict__ nu_t_in_buf"
@@ -488,7 +490,9 @@ class EsotericCumulantKernelD3Q27:
         )
         if self._sgs_model == "smagorinsky":
             nu_t_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
-            args = base_args + (cp.float32(Cs), nu_t_arg)
+            # nut_scale = NULL: near-wall reconstruction is std-path only
+            # until W5 wires it into the esoteric path.
+            args = base_args + (cp.float32(Cs), nu_t_arg, cp.int32(0))
         elif self._sgs_model == "wale":
             nu_t_in_arg = nu_t_in if nu_t_in is not None else cp.int32(0)
             nu_t_out_arg = nu_t_out if nu_t_out is not None else cp.int32(0)

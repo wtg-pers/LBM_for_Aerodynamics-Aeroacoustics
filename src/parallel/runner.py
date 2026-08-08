@@ -263,7 +263,8 @@ class DistributedMLGRunner:
         self.rlc[k - 1].c2f(self.lv[k - 1].mem, self.lv[k].mem,
                             self.lv[k - 1].t, self.lv[k].t,
                             is_half_step=True,
-                            f_prev_sub_loc=self._fprev[k - 1])
+                            f_prev_sub_loc=self._fprev[k - 1],
+                            nt_f=self.lv[k].nt)
         self._toc("coupling", t0)
         self._touch(k)                # c2f wrote our strips
         if has_finer:
@@ -276,7 +277,7 @@ class DistributedMLGRunner:
         t0 = self._tic()
         self.rlc[k - 1].c2f(self.lv[k - 1].mem, self.lv[k].mem,
                             self.lv[k - 1].t, self.lv[k].t,
-                            is_half_step=False)
+                            is_half_step=False, nt_f=self.lv[k].nt)
         self._toc("coupling", t0)
         self._touch(k)
         if has_finer:
@@ -285,7 +286,8 @@ class DistributedMLGRunner:
         self._sync(k)
         t0 = self._tic()
         self.rlc[k - 1].f2c(self.lv[k].mem, self.lv[k - 1].mem,
-                            self.lv[k].t, self.lv[k - 1].t)
+                            self.lv[k].t, self.lv[k - 1].t,
+                            nt_c=self.lv[k - 1].nt)
         self._toc("coupling", t0)
         self._touch(k - 1)            # f2c wrote the coarse excised rows
 

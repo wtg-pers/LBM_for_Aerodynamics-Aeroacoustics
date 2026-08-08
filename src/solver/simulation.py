@@ -145,6 +145,19 @@ class Simulation:
         self._use_fused: bool = False
         self._fused_is_cumulant: bool = False
 
+        # ── Surfel wall boundary (S8a, patch_notes/surfel/46-47) ──
+        # Detected by the adapter's `kind` tag: the surfel scheme REPLACES
+        # streaming, so it owns a dedicated advance path instead of the
+        # post-stream apply_with_reset hook — an unknown obstacle type
+        # must never silently fall through to the HWBB-style hook.
+        self._use_surfel: bool = (
+            getattr(obstacle_bc, 'kind', None) == 'surfel')
+        # fused-collide surfel path (patch 55) — lazy init/eligibility
+        self._surfel_ck = None
+        self._sck_rho = None
+        self._sck_u = None
+        self._surfel_ck_ok: Optional[bool] = None
+
         # ── Esoteric Pull path (opt-in via env LBM_ESOTERIC; lazy init) ──
         # Single-buffer in-place streaming+collision+BC (Lehmann 2022).
         # Resurrected from commit 8036317. See patch_notes/hpc_upgrade/15.
@@ -170,6 +183,15 @@ class Simulation:
         # Only one of _hwbb_kernel / _ibb_kernel is set at a time, depending
         # on isinstance(obstacle_bc, ...). Both None → Python path.
         self._ibb_kernel = None
+
+        # ── Wall-Function Bounce (WFB, opt-in via attach_wfb) ──
+        # Sparse post-pass right after the obstacle bounce; None (default)
+        # leaves every existing path bit-identical. Std path only in W2;
+        # the esoteric deposit-rewrite integration is W5.
+        self._wfb = None
+        # Near-wall SGS reconstruction (CAMWA Eq.39, W3c) — rescales the
+        # SGS nu_t band before collision. None (default) = no-op.
+        self._nw_sgs = None
 
     # =====================================================================
     # Public Interface
@@ -376,6 +398,33 @@ class Simulation:
         """Whether set_distribution() has been called."""
         return self._is_ready
 
+    def attach_wfb(self, wfb) -> None:
+        """Attach a WallFunctionBounce pass (wall-model track W2, opt-in).
+
+        Runs right after the obstacle bounce each step; requires the
+        standard path (the esoteric deposit-rewrite integration is W5).
+        """
+        if self._use_esoteric:
+            raise RuntimeError(
+                "WFB on the esoteric path is not integrated yet (W5); "
+                "run the standard path (LBM_ESOTERIC=0).")
+        self._wfb = wfb
+
+    def attach_near_wall_sgs(self, nw_sgs) -> None:
+        """Attach a NearWallEddyViscosity reconstruction (W3c, opt-in).
+
+        Runs in the SGS pre-pass, after the plain SGS field is built and
+        REPLACING the blanket sgs.wall_damp_cells zeroing inside its
+        band (the two are alternative treatments of the same wall-layer
+        nu_t pathology; the reconstruction is the wall-model-consistent
+        one). Requires an SGS model that fills nu_t_in.
+        """
+        if self._sgs_cfg["model"] not in ("wale", "dyn_smag", "smagorinsky"):
+            raise RuntimeError(
+                "near-wall SGS reconstruction needs an SGS model "
+                f"(got model={self._sgs_cfg['model']!r})")
+        self._nw_sgs = nw_sgs
+
     @property
     def f_post(self) -> Optional['npt.NDArray']:
         """Post-collision distribution (read-only).
@@ -510,7 +559,19 @@ class Simulation:
                 "Simulation not ready: call set_distribution() first"
             )
 
-        if self._use_esoteric and self.al_model is None:
+        if self._use_surfel:
+            # surfel replaces streaming (volumetric advect) — it has its
+            # own path and composes with nothing else in S8a
+            # (patch_notes/surfel/46 sec. 1; guards raised in setup).
+            if self._use_esoteric:
+                raise RuntimeError(
+                    "wall_bc='surfel' does not support esoteric streaming "
+                    "(re-evaluated after S8c — patch_notes/surfel/46)")
+            if self._surfel_use_kernel():
+                self._advance_surfel_kernel()
+            else:
+                self._advance_surfel()
+        elif self._use_esoteric and self.al_model is None:
             self._advance_esoteric()
         elif self._use_esoteric:
             self._advance_esoteric_with_alm()
@@ -824,8 +885,9 @@ class Simulation:
         Esoteric LOAD replica (the pre-collision state of THIS step)."""
         Nx, Ny, Nz = self.domain_shape
         self._eso_macro_kernel.launch(
-            self.f, self._rho_buf, self._u_buf, Nx, Ny, Nz,
-            self._esoteric_step)
+            self.f, self._eso_node_type, self._rho_buf, self._u_buf,
+            Nx, Ny, Nz, self._esoteric_step)
+        self._sgs_mask_solid_u()
         if self._sgs_cfg["model"] == "wale":
             self._wale_kernel.launch(
                 self._u_buf[0], self._u_buf[1], self._u_buf[2],
@@ -838,6 +900,7 @@ class Simulation:
                 dx=1.0,
                 Cs_max=float(self._sgs_cfg["Cs_max"]),
                 alpha_sq=float(self._sgs_cfg["alpha_sq"]))
+        self._sgs_wall_damp()
 
     def _advance_esoteric_with_alm(self) -> None:
         """Esoteric ALM 2-pass (mirrors _advance_fused_with_alm):
@@ -853,8 +916,8 @@ class Simulation:
             self._eso_macro_kernel = EsotericMacroKernelD3Q27()
         # Pass 1: rho/u views share memory with the 3D-shaped arrays.
         self._eso_macro_kernel.launch(
-            self.f, self.rho.ravel(), self.u.reshape(3, -1),
-            Nx, Ny, Nz, self._esoteric_step)
+            self.f, self._eso_node_type, self.rho.ravel(),
+            self.u.reshape(3, -1), Nx, Ny, Nz, self._esoteric_step)
         self._check_nan("esoteric+alm:post-macro")
         body_force = self._compute_body_force(self.u, self.rho)
         if body_force is not None and body_force.dtype != xp.float32:
@@ -940,6 +1003,137 @@ class Simulation:
         self.bc_manager.apply_all(self.f, self._f_post)
         if self.obstacle_bc is not None:
             self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+            if self._wfb is not None:
+                self._wfb.apply(self.f, self._f_post, self.u, self.rho,
+                                nu_t=self.nu_t)
+
+        self.step_count += 1
+
+    def _advance_surfel(self) -> None:
+        """Surfel wall-boundary path (S8a): collide → facet apply → advect.
+
+        Mirrors the validated testbed order exactly
+        (patch_notes/surfel/channel_wmles_surfel.py step(); parity gate
+        s13): the volumetric advect REPLACES streaming, and the facet
+        exchange must run on the post-collision field BEFORE transport
+        (inject→apply ordering family, patch_notes/surfel/27). Domain BCs
+        run after transport, as in the default path.
+
+        S8a limits (guarded in setup): no ALM, no MLG, no tau-model band,
+        standard (non-fused, non-esoteric) operators only.
+        """
+        sb = self.obstacle_bc
+
+        # 1. macroscopics on the raw field. Solid cells hold f = 0 →
+        #    rho = 0 → the division writes NaN there; sanitize with
+        #    where() (never mask-multiply: NaN * 0 = NaN — measured,
+        #    testbed comment).
+        self.rho, self.u = self.macroscopic.compute(self.f)
+
+        if self.al_model is not None:
+            raise RuntimeError("wall_bc='surfel' + ALM is S8b+ scope "
+                               "(patch_notes/surfel/46)")
+
+        rho_s, u_s = sb.sanitize_macro(self.rho, self.u)
+
+        # 2. collision on the benign-solid state, then zero non-live
+        #    populations (cut-cell hygiene before transport).
+        #    SGS (S8b-2): constant-Cs moment-based Smagorinsky, the exact
+        #    testbed configuration every campaign table was measured with
+        #    (setup guards any other model). Per-cell tau field — the
+        #    production CumulantCollision accepts it (testbed-validated).
+        tau_arg = self.tau
+        if self._sgs_cfg["enabled"]:
+            tau_arg = sb.tau_sgs(self.f, self.rho, self.u, self.tau,
+                                 self._sgs_cfg["Cs"])
+        self.collision.collide(
+            self.f, self._f_post, rho_s, u_s, tau_arg, None
+        )
+        sb.mask_post(self._f_post)
+
+        self._surfel_post_collide(sb)
+
+    def _surfel_use_kernel(self) -> bool:
+        """Eligibility of the fused-collide surfel path (cached).
+
+        Falls back to the host chain — never silently changes physics:
+        s10 pins kernel==host, and the adapter's `collide` knob selects
+        explicitly (gates pass 'host' to pin the reference chain).
+        """
+        if self._surfel_ck_ok is None:
+            from src.collision.cumulant import CumulantCollision
+            sb = self.obstacle_bc
+            self._surfel_ck_ok = bool(
+                getattr(sb, 'collide_path', 'host') == 'kernel'
+                and self.xp.__name__ == 'cupy'
+                and isinstance(self.collision, CumulantCollision)
+                and self.f is not None
+                and self.f.dtype == self.xp.float32)
+        return self._surfel_ck_ok
+
+    def _advance_surfel_kernel(self) -> None:
+        """Fused-collide surfel path (patch 55): macro + SGS + collide in
+        ONE launch (CumulantCollideKernelD3Q27, gate s10 — the same
+        kernel the testbed's --collide kernel path validated).
+
+        The host collide chain was measured at ~87% of the surfel step
+        (testbed note); this branch removes it. Differences from the
+        host branch, all testbed-mirrored:
+          - the kernel computes macro itself (f32 rho/u out — no f64
+            promotion, no separate Macroscopic pass, no sanitize: the
+            kernel leaves NaN u / garbage f_post on DEAD cells, so the
+            post-collision zeroing must be zero_dead (assignment,
+            NaN-safe) — NEVER mask_post's multiply (NaN * 0 = NaN);
+          - SGS runs in-kernel from Cs (Stiebler — same math as
+            sb.tau_sgs; gate s10 pins host==kernel).
+        """
+        sb = self.obstacle_bc
+        xp = self.xp
+        if self._surfel_ck is None:
+            from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
+            self._surfel_ck = CumulantCollideKernelD3Q27(
+                sgs_model=('smagorinsky' if self._sgs_cfg["enabled"]
+                           else 'off'))
+            n = 1
+            for d in self.domain_shape:
+                n *= d
+            self._sck_rho = xp.zeros(n, dtype=xp.float32)
+            self._sck_u = xp.zeros((3, n), dtype=xp.float32)
+
+        n = self._sck_rho.size
+        q = self.f.shape[0]
+        self._surfel_ck.launch(
+            self.f.reshape(q, -1), self._f_post.reshape(q, -1),
+            self._sck_rho, self._sck_u, None,
+            1.0 / self.tau,
+            float(self.collision.omega_bulk),
+            float(self.collision.omega_3),
+            n, Cs=float(self._sgs_cfg["Cs"]))
+        self.rho = self._sck_rho.reshape(self.domain_shape)
+        self.u = self._sck_u.reshape((3,) + self.domain_shape)
+        sb.zero_dead(self._f_post)
+
+        self._surfel_post_collide(sb)
+
+    def _surfel_post_collide(self, sb) -> None:
+        """Shared surfel tail: band injection -> facet apply -> advect ->
+        domain BCs (order per patch 27)."""
+
+        # 2b. tau-model band injection (S8b): post-collision, BEFORE the
+        #     facet apply — the order is load-bearing (patch 27: apply-
+        #     first drains the injected flux outside the facet force
+        #     accounting; inject-first closes at 1.000). Band cells are
+        #     live FULL cells, so the raw u is finite there.
+        if getattr(sb, 'tau_model_on', False):
+            sb.inject_tau_model(self._f_post, self.u, self.tau)
+
+        # 3. facet exchange + volumetric transport (writes new field
+        #    into self.f). RAW rho/u by design — the wall-law sampler
+        #    masks live cells itself (testbed order).
+        sb.apply_and_advect(self._f_post, self.f, self.rho, self.u)
+
+        # 4. domain boundary conditions on the post-transport field
+        self.bc_manager.apply_all(self.f, self._f_post)
 
         self.step_count += 1
 
@@ -994,6 +1188,7 @@ class Simulation:
                     Cs=self._sgs_cfg["Cs"],
                     nu_t_out=self.nu_t,
                     nu_t_in=self._nu_t_in,
+                    nut_scale=self._nut_scale_arg(),
                 )
         else:
             self._fused_kernel.launch(
@@ -1030,6 +1225,7 @@ class Simulation:
                 self.f, self._rho_buf,
                 self._u_buf[0], self._u_buf[1], N,
             )
+            self._sgs_mask_solid_u()
             if model == "wale":
                 self._wale_kernel.launch(
                     self._u_buf[0], self._u_buf[1], self._nu_t_in,
@@ -1049,6 +1245,7 @@ class Simulation:
                 self.f, self._rho_buf,
                 self._u_buf[0], self._u_buf[1], self._u_buf[2], N,
             )
+            self._sgs_mask_solid_u()
             if model == "wale":
                 self._wale_kernel.launch(
                     self._u_buf[0], self._u_buf[1], self._u_buf[2],
@@ -1064,6 +1261,73 @@ class Simulation:
                     Cs_max=float(self._sgs_cfg["Cs_max"]),
                     alpha_sq=float(self._sgs_cfg["alpha_sq"]),
                 )
+        if self._nw_sgs is not None and self._wfb is not None:
+            # Wall-model-consistent reconstruction REPLACES the blanket
+            # wall_damp zeroing inside its band (W3c).
+            self._nw_sgs.apply(self._nu_t_in, self._wfb.mean_utau(),
+                               self._wfb.nu)
+        else:
+            self._sgs_wall_damp()
+
+    def _sgs_mask_solid_u(self) -> None:
+        """No-slip the SGS input velocity at SOLID cells (patch 12, F1e).
+
+        The WALE/dyn_smag gradient (and dyn_smag test-filter) stencils read
+        u at every neighbour with NO solid awareness. Without this mask the
+        two paths feed them different garbage — std: moments of the
+        populations streamed into the wall this step; esoteric: moments of
+        deposit + stale fossil slots — giving an O(1) systematic wall-layer
+        nu_t difference from step 1 (f1e gate; the eso Cd-bias driver).
+        u = 0 is the physical wall value; both paths now see identical,
+        correct stencil input. rho at solid is not read by these kernels.
+        """
+        if self.obstacle_bc is None or \
+                not hasattr(self.obstacle_bc, 'solid_mask'):
+            return
+        idx = getattr(self, '_sgs_solid_idx', None)
+        if idx is None:
+            idx = self.xp.where(self.obstacle_bc.solid_mask.ravel())[0]
+            self._sgs_solid_idx = idx
+        if idx.size:
+            self._u_buf[:, idx] = 0.0
+
+    def _nut_scale_arg(self) -> Optional['npt.NDArray']:
+        """Per-cell nu_t multiplier for the in-kernel smagorinsky branch.
+
+        None whenever the near-wall reconstruction is not attached or the
+        wall model has not yet produced a u_tau — then the kernel runs
+        bit-unchanged. u_tau is the previous step's mean (the one-step
+        lag is intentional; see NearWallEddyViscosity.apply)."""
+        if self._nw_sgs is None or self._wfb is None:
+            return None
+        N = 1
+        for d in self.domain_shape:
+            N *= int(d)
+        return self._nw_sgs.scale_field(
+            N, self._wfb.mean_utau(), self._wfb.nu)
+
+    def _sgs_wall_damp(self) -> None:
+        """Zero nu_t_in within sgs.wall_damp_cells of a SOLID body.
+
+        See parse_sgs_config: the staircase velocity jump at the wall is a
+        discretisation artifact the SGS operators mistake for resolved
+        strain (f1g probe: O(100-1000) x nu_mol in the wall shell at
+        alpha=10). Hard van-Driest-style damping over the stencil reach.
+        No-op when wall_damp_cells == 0 (default) or no body.
+        """
+        n = int(self._sgs_cfg.get("wall_damp_cells", 0))
+        if n <= 0 or self.obstacle_bc is None or \
+                not hasattr(self.obstacle_bc, 'solid_mask'):
+            return
+        idx = getattr(self, '_sgs_damp_idx', None)
+        if idx is None:
+            from cupyx.scipy import ndimage
+            shell = ndimage.binary_dilation(
+                self.obstacle_bc.solid_mask, iterations=n, brute_force=True)
+            idx = self.xp.where(shell.ravel())[0]
+            self._sgs_damp_idx = idx
+        if idx.size:
+            self._nu_t_in[idx] = 0.0
 
     def _apply_obstacle_bc(self) -> None:
         """Dispatch obstacle BC application across HWBB / IBB / Python paths."""
@@ -1103,6 +1367,11 @@ class Simulation:
             )
         else:
             self.obstacle_bc.apply_with_reset(self.f, self._f_post)
+
+        # WFB (W2): correct the just-bounced slots from the wall model.
+        if self._wfb is not None:
+            self._wfb.apply(self.f, self._f_post, self.u, self.rho,
+                            nu_t=self.nu_t)
 
     def _advance_fused_with_alm(self) -> None:
         """Fused path with ALM: macro → ALM → fused collision."""
@@ -1164,6 +1433,7 @@ class Simulation:
                     N=N,
                     Cs=self._sgs_cfg["Cs"],
                     nu_t_out=self.nu_t,
+                    nut_scale=self._nut_scale_arg(),
                 )
         else:
             self._fused_kernel.launch(

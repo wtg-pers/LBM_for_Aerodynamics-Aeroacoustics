@@ -605,8 +605,9 @@ def validate_geometry_config(
             return False, f"stl: 'rotation_deg' must have 3 components, got {rot!r}"
 
         wall_bc = config.get('wall_bc', 'hwbb').lower()
-        if wall_bc not in ('hwbb', 'ibb'):
-            return False, f"stl: wall_bc must be 'hwbb' or 'ibb', got '{wall_bc}'"
+        if wall_bc not in ('hwbb', 'ibb', 'surfel'):
+            return False, (f"stl: wall_bc must be 'hwbb', 'ibb' or "
+                           f"'surfel', got '{wall_bc}'")
 
         # span_through_axis: wall-piercing prism (infinite-wing quasi-2D).
         # 'z' only — the column-parity voxelizer casts rays along z and

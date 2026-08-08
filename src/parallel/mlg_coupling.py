@@ -104,8 +104,12 @@ class RankLocalCouplingV1:
 
     # =================================================================
     def c2f(self, mem_c, mem_f, t_c: int, t_f: int, *, is_half_step: bool,
-            f_prev_sub_loc=None) -> None:
-        """Rank-local coarse->fine: strips ∩ owned-fine written in place."""
+            f_prev_sub_loc=None, nt_f=None) -> None:
+        """Rank-local coarse->fine: strips ∩ owned-fine written in place.
+
+        nt_f: fine slab node-type (raveled int8) — coupling writes carry
+        FOREIGN values, which at SOLID cells land on live bounce-deposit
+        slots (patch 12); pass it so those entries are skipped."""
         if self._pf.own_count == 0:
             return
         gc, xp, a = self._gc, self._xp, self._a
@@ -173,11 +177,16 @@ class RankLocalCouplingV1:
             strip[a] = slice(lo, hi)
             dst = list(strip)
             dst[a] = slice(self._l_f(lo), self._l_f(hi))
-            esoteric_scatter_std_region(xp, mem_f, vals, t_f, tuple(dst))
+            esoteric_scatter_std_region(xp, mem_f, vals, t_f, tuple(dst),
+                                        skip_solid_nt=nt_f)
 
     # =================================================================
-    def f2c(self, mem_f, mem_c, t_f: int, t_c: int) -> None:
-        """Rank-local fine->coarse: excised ∩ owned-coarse written in place."""
+    def f2c(self, mem_f, mem_c, t_f: int, t_c: int, nt_c=None) -> None:
+        """Rank-local fine->coarse: excised ∩ owned-coarse written in place.
+
+        nt_c: coarse slab node-type — the excised region contains the body
+        on coarse levels; without the skip the restriction's solid-cell
+        values overwrite live bounce deposits (patch 12 root cause)."""
         gc, xp, a = self._gc, self._xp, self._a
         r = gc._region
         R = r.REFINE_RATIO
@@ -212,4 +221,5 @@ class RankLocalCouplingV1:
         block = recon[(slice(None),) + tuple(exl)]
         dst = list(ex)
         dst[a] = slice(self._l_c(w_lo), self._l_c(w_hi))
-        esoteric_scatter_std_region(xp, mem_c, block, t_c, tuple(dst))
+        esoteric_scatter_std_region(xp, mem_c, block, t_c, tuple(dst),
+                                    skip_solid_nt=nt_c)

@@ -107,13 +107,18 @@ class MomentumExchangeForce:
         self.shape = solid_mask.shape
 
         # Reuse boundary link info from wall BC if provided
-        if wall_bc is not None and hasattr(wall_bc, 'needs_bounce'):
+        if getattr(wall_bc, 'kind', None) == 'surfel':
+            # Facet-ledger force (compute() returns wall_bc.last_force()):
+            # link enumeration is never entered, so skip the (Q,)+shape
+            # needs_bounce allocation (~27 B/cell at the force level).
+            self.needs_bounce = None
+            self.n_boundary_links = 0
+        elif wall_bc is not None and hasattr(wall_bc, 'needs_bounce'):
             self.needs_bounce = wall_bc.needs_bounce
+            self.n_boundary_links = int(xp.sum(self.needs_bounce))
         else:
             self._precompute_boundary_links()
-
-        # Count boundary links for info
-        self.n_boundary_links = int(xp.sum(self.needs_bounce))
+            self.n_boundary_links = int(xp.sum(self.needs_bounce))
 
         # ── IBB-aware force formula (when wall_bc is InterpolatedBounceBack) ──
         # Bouzidi MEM (Caiazzo-Junk, Kruger Ch. 11):
@@ -258,6 +263,15 @@ class MomentumExchangeForce:
         Returns:
             (Fx, Fy) for 2D or (Fx, Fy, Fz) for 3D  [lattice units]
         """
+        if getattr(self._wall_bc_ref, 'kind', None) == 'surfel':
+            # Surfel boundary: the facet exchange already accounted the
+            # wall force during this step's apply() — the momentum-exchange
+            # link formulas below do not apply to the volumetric scheme
+            # (patch_notes/surfel/47). last_force() is the facet-summed
+            # G_in - G_out of the LAST apply call.
+            F = self._wall_bc_ref.last_force()
+            return tuple(float(F[d]) for d in range(self.dim))
+
         if self._ibb_aware:
             return self._compute_ibb(f_post)
 

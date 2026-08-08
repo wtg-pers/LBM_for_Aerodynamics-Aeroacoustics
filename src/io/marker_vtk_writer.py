@@ -26,9 +26,22 @@ Date: 2026-02
 
 import os
 import struct
-from typing import TYPE_CHECKING, Optional, Dict, List, Tuple
+from typing import TYPE_CHECKING, Optional, Dict, List, Sequence, Tuple
 
 import numpy as np
+
+
+def _apply_frame(pos: np.ndarray, origin: Optional[Sequence[float]],
+                 spacing: float) -> np.ndarray:
+    """Marker positions: level-local lattice units → global L0 lattice units.
+
+    `origin=None` is the identity (the ALM already lives on L0). Returns a new
+    array; never writes through to the model, whose `_last_positions` may be a
+    read-only property (MultiRotorManager vstacks its models' arrays).
+    """
+    if origin is None:
+        return pos
+    return np.asarray(origin, dtype=pos.dtype)[None, :] + pos * pos.dtype.type(spacing)
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -247,16 +260,26 @@ class MarkerVTPWriter:
         al_model,  # ActuatorLineModel 또는 MultiRotorManager
         time: Optional[float] = None,
         prefix: str = 'markers',
+        origin: Optional[Sequence[float]] = None,
+        spacing: float = 1.0,
     ) -> Optional[str]:
-        """Convenience method: extract all data from AL model(s)"""
-        
+        """Convenience method: extract all data from AL model(s)
+
+        origin/spacing: frame of the level the ALM lives on, in L0 lattice
+        units. When set, marker positions are mapped fine-local → global L0
+        so the VTP overlays the flow field. The transform happens HERE, on the
+        assembled array — callers must not mutate the model, because a
+        MultiRotorManager's `_last_positions` is a read-only vstack view.
+        """
         # ── Import here to avoid circular dependency ──
         from src.actuator.actuator_line import MultiRotorManager
-        
+
         if isinstance(al_model, MultiRotorManager):
-            return self._write_multi_rotor(step, al_model, time, prefix)
+            return self._write_multi_rotor(step, al_model, time, prefix,
+                                           origin, spacing)
         else:
-            return self._write_single_rotor(step, al_model, time, prefix)
+            return self._write_single_rotor(step, al_model, time, prefix,
+                                            origin, spacing)
 
 
     def _write_single_rotor(
@@ -265,12 +288,14 @@ class MarkerVTPWriter:
         al_model: 'ActuatorLineModel',
         time: Optional[float] = None,
         prefix: str = 'markers',
+        origin: Optional[Sequence[float]] = None,
+        spacing: float = 1.0,
     ) -> Optional[str]:
         """기존 로직 그대로 — 단일 로터"""
         if al_model._last_positions is None:
             return None
 
-        positions = al_model._last_positions  # (N_total, 3) [lu]
+        positions = _apply_frame(al_model._last_positions, origin, spacing)
         rotor = al_model.rotor
 
         scalars: Dict[str, np.ndarray] = {}
@@ -337,6 +362,8 @@ class MarkerVTPWriter:
         manager: 'MultiRotorManager',
         time: Optional[float] = None,
         prefix: str = 'markers',
+        origin: Optional[Sequence[float]] = None,
+        spacing: float = 1.0,
     ) -> Optional[str]:
         """Multi-rotor: 각 로터의 데이터를 올바르게 concatenate"""
         
@@ -405,7 +432,7 @@ class MarkerVTPWriter:
             return None
 
         # ── Concatenate ──
-        positions = np.vstack(all_positions)        # (N_total_all, 3)
+        positions = _apply_frame(np.vstack(all_positions), origin, spacing)
         
         scalars: Dict[str, np.ndarray] = {}
         for key, arrays in all_scalars.items():

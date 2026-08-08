@@ -383,24 +383,21 @@ void {{KERNEL_NAME}}(
     // Now K[i][j][k] = f*_{ijk} (post-collision)
 
     // ==========================================================
-    // Step 9: Write f_post (ijk -> flat) + Guo source term
+    // Step 9: Write f_post (ijk -> flat)
+    //
+    // NO Guo source term here (patch wall_model/02, 2026-08-01): the
+    // half-shift (Step 2) + first-moment sign-flip (Step 7b, Geier 2015
+    // Eqs. 85-87) is the COMPLETE second-order cumulant forcing -- the
+    // backward transform reconstructs f with momentum rho*u + F already.
+    // The former additional Guo S_i made the injected momentum
+    // (1 + (1 - 1/(2 tau))) F per step (measured exactly across tau by
+    // the W1b channel gate; ~2e-5 relative at production tau -> 0.5,
+    // up to 1.5x at tau = 1). BGK kernels KEEP their Guo source: BGK's
+    // partial relaxation needs it (omega F/2 + (1 - omega/2) F = F).
     // ==========================================================
-    if (force != NULL) {
-        float pf = 1.0f - 0.5f * omega_1;  // Guo prefactor
-        for (int q = 0; q < 27; q++) {
-            int i = cx[q]+1, j = cy[q]+1, k = cz[q]+1;
-            float cxq = (float)cx[q], cyq = (float)cy[q], czq = (float)cz[q];
-            float ci_F = cxq*Fx + cyq*Fy + czq*Fz;
-            float ci_u = cxq*ux + cyq*uy + czq*uz;
-            float u_F  = ux*Fx + uy*Fy + uz*Fz;
-            float Si = pf * w[q] * ((ci_F - u_F)*3.0f + ci_u*ci_F*9.0f);
-            f_post[q * N + idx] = K[i][j][k] + Si;
-        }
-    } else {
-        for (int q = 0; q < 27; q++) {
-            int i = cx[q]+1, j = cy[q]+1, k = cz[q]+1;
-            f_post[q * N + idx] = K[i][j][k];
-        }
+    for (int q = 0; q < 27; q++) {
+        int i = cx[q]+1, j = cy[q]+1, k = cz[q]+1;
+        f_post[q * N + idx] = K[i][j][k];
     }
 }
 '''
@@ -456,6 +453,12 @@ _SGS_BLOCK_SMAG = r'''
         float tau0_sgs = 1.0f / omega_1;
         float tau_t_sgs = 0.5f * (tau0_sgs
                           + sqrtf(tau0_sgs * tau0_sgs + 18.0f * Cs * Cs * Q_sgs));
+        // Optional per-cell nu_t rescale (near-wall reconstruction,
+        // wall_model W3c). tau_total is linear in nu_t about tau_0, so
+        // scaling the excess scales nu_t exactly. NULL -> bit-unchanged.
+        if (nut_scale != NULL) {
+            tau_t_sgs = tau0_sgs + nut_scale[idx] * (tau_t_sgs - tau0_sgs);
+        }
         w1 = 1.0f / tau_t_sgs;
         if (nu_t_out != NULL) {
             nu_t_out[idx] = (tau_t_sgs - tau0_sgs) * (1.0f / 3.0f);
@@ -480,7 +483,8 @@ def _build_kernel_d3q27(sgs_model: str) -> tuple[str, str]:
         name = "cumulant_collide_d3q27_smag"
         # Two extra params on top of the SGS-off signature: Cs and the
         # optional nu_t output buffer (NULL -> skip writing).
-        sgs_param = ",\n    const float Cs,\n    float* __restrict__ nu_t_out"
+        sgs_param = (",\n    const float Cs,\n    float* __restrict__ nu_t_out"
+                     ",\n    const float* __restrict__ nut_scale")
         sgs_block = _SGS_BLOCK_SMAG
     elif sgs_model == "wale":
         name = "cumulant_collide_d3q27_wale"
@@ -652,6 +656,7 @@ class CumulantCollideKernelD3Q27:
         Cs: float = 0.0,
         nu_t_out: Optional['npt.NDArray'] = None,
         nu_t_in: Optional['npt.NDArray'] = None,
+        nut_scale: Optional['npt.NDArray'] = None,
     ) -> None:
         """Launch the fused cumulant collision kernel.
 
@@ -661,6 +666,9 @@ class CumulantCollideKernelD3Q27:
                       Smag and WALE paths; None -> skip writing.
             nu_t_in: Pre-computed nu_t from WALE pre-pass (N,) [lu^2/lt].
                      Required when sgs_model == "wale" (None -> nu_t treated as 0).
+            nut_scale: Optional per-cell nu_t multiplier (N,) float32,
+                     smagorinsky path (near-wall reconstruction, W3c).
+                     None -> bit-unchanged.
         """
         if self._kernel is None:
             self._compile()
@@ -680,7 +688,8 @@ class CumulantCollideKernelD3Q27:
         )
         if self._sgs_model == "smagorinsky":
             nu_t_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
-            args = base_args + (cp.float32(Cs), nu_t_arg)
+            scale_arg = nut_scale if nut_scale is not None else cp.int32(0)
+            args = base_args + (cp.float32(Cs), nu_t_arg, scale_arg)
         elif self._sgs_model == "wale":
             nu_t_in_arg  = nu_t_in  if nu_t_in  is not None else cp.int32(0)
             nu_t_out_arg = nu_t_out if nu_t_out is not None else cp.int32(0)

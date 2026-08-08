@@ -98,9 +98,23 @@ class UnitConverter:
         self.chord_ref:  float = 0.0       # chord at r/R = 0.75
         self._has_alm = False
 
-        if actuator_line is not None and actuator_line.get('rotor'):
-            rotor_cfg = actuator_line['rotor']
-            rpm = rotor_cfg.get('rpm', 0)
+        # Single rotor: 'rotor'. Multi rotor: 'rotors' list — anchor the
+        # scaling on the fastest tip (max rpm*radius) so u_max caps the
+        # true maximum blade speed.
+        rotor_cfg = None
+        if actuator_line is not None:
+            if actuator_line.get('rotor'):
+                rotor_cfg = actuator_line['rotor']
+            elif actuator_line.get('rotors'):
+                entries = [e.get('rotor', e) for e in actuator_line['rotors']]
+                rotor_cfg = max(
+                    entries,
+                    key=lambda rc: abs(rc.get('rpm', 0.0))
+                    * rc.get('radius', 0.0))
+        if rotor_cfg is not None:
+            # abs: negative rpm encodes counter-rotation (rotation_sign in
+            # Rotor.project_blade_forces); the scaling anchor is a speed.
+            rpm = abs(rotor_cfg.get('rpm', 0))
             self.omega_phys = rpm * 2.0 * np.pi / 60.0
             self.R_phys = rotor_cfg.get('radius', 0.0)
             self.tip_speed = self.omega_phys * self.R_phys

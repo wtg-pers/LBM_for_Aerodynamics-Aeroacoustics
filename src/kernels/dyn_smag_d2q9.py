@@ -36,7 +36,7 @@ void dyn_smag_d2q9(
     const int Nx, const int Ny,
     const float dx,
     const float Cs_max_sq,    // (Cs_max)^2 clipping
-    const float alpha_sq,     // (Δ̂/Δ)^2
+    const float alpha_sq,     // (Dhat/D)^2
     const float eps
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -59,7 +59,7 @@ void dyn_smag_d2q9(
         }
     }
 
-    // |S| at center (for ν_t = Cs² Δ² |S|)
+    // |S| at center (for nu_t = Cs^2 D^2 |S|)
     float gxx_c = 0.5f * (ux[3][2] - ux[1][2]);
     float gxy_c = 0.5f * (ux[2][3] - ux[2][1]);
     float gyx_c = 0.5f * (uy[3][2] - uy[1][2]);
@@ -69,7 +69,7 @@ void dyn_smag_d2q9(
     float s_mag_c = sqrtf(2.0f * s_dd_c);
 
     // Compute S_ij, |S|, |S|*S_ij at all 3x3 box cells around center
-    // Box index (bi, bj) ∈ [0..2] maps to 5x5 index (bi+1, bj+1) ∈ [1..3].
+    // Box index (bi, bj) in [0..2] maps to 5x5 index (bi+1, bj+1) in [1..3].
     float SS_xx_hat = 0.f, SS_yy_hat = 0.f, SS_xy_hat = 0.f;
     float S_xx_hat = 0.f, S_yy_hat = 0.f, S_xy_hat = 0.f;
     float ux_hat = 0.f, uy_hat = 0.f;
@@ -102,7 +102,7 @@ void dyn_smag_d2q9(
     ux_hat *= inv9;    uy_hat *= inv9;
     uu_xx *= inv9;     uu_yy *= inv9;     uu_xy *= inv9;
 
-    // |Ŝ| from test-filtered S
+    // |Shat| from test-filtered S
     float S_hat_dd = S_xx_hat*S_xx_hat + S_yy_hat*S_yy_hat
                     + 2.0f*S_xy_hat*S_xy_hat;
     float S_mag_hat = sqrtf(2.0f * S_hat_dd);
@@ -116,7 +116,7 @@ void dyn_smag_d2q9(
     float Ld_xx = L_xx - 0.5f * Lkk;
     float Ld_yy = L_yy - 0.5f * Lkk;
 
-    // M_ij = 2 [ (|S|S_ij)_hat - alpha^2 |Ŝ| Ŝ_ij ]
+    // M_ij = 2 [ (|S|S_ij)_hat - alpha^2 |Shat| Shat_ij ]
     float M_xx = 2.0f * (SS_xx_hat - alpha_sq * S_mag_hat * S_xx_hat);
     float M_yy = 2.0f * (SS_yy_hat - alpha_sq * S_mag_hat * S_yy_hat);
     float M_xy = 2.0f * (SS_xy_hat - alpha_sq * S_mag_hat * S_xy_hat);

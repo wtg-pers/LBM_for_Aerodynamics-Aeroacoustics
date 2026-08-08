@@ -83,9 +83,21 @@ def parse_sgs_config(config: dict) -> dict:
             f"(got Cs_max={Cs_max}, alpha_sq={alpha_sq})"
         )
 
+    # wall_damp_cells (patch 12 follow-up): zero nu_t within N cells of a
+    # SOLID body before it enters collision. The gradient/test-filter
+    # stencils read the raw staircase velocity jump at wall-adjacent
+    # cells; |S| ~ u/dx there is a discretisation artifact, not resolved
+    # turbulence, and drives nu_t to O(100-1000) x nu_mol at tau -> 0.5
+    # (f1g probe: alpha=10 wing, L3 shell p95 = 66x, max = 891x ->
+    # hyper-viscous wall layer, lift collapse). 0 = off (default).
+    wall_damp_cells = int(raw.get("wall_damp_cells", 0))
+    if wall_damp_cells < 0:
+        raise ValueError(f"sgs.wall_damp_cells must be >= 0, got {wall_damp_cells}")
+
     return {"enabled": enabled, "model": model,
             "Cs": Cs, "Cw": Cw,
-            "Cs_max": Cs_max, "alpha_sq": alpha_sq}
+            "Cs_max": Cs_max, "alpha_sq": alpha_sq,
+            "wall_damp_cells": wall_damp_cells}
 
 
 # ---- Smagorinsky --------------------------------------------------------

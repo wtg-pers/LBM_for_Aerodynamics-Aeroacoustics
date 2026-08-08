@@ -241,8 +241,42 @@ class SolverInitializer:
             print(f"  Initial velocity: {flow_vel} [Δx/Δt] (x-dir)")
 
         f = setup.collision.compute_equilibrium(rho0, u0)
+        self._apply_perturbation(f, level=None)
         print(f"  Initial total mass: {float(xp.sum(f)):.6f}")
         return f, 0
+
+    def _apply_perturbation(self, f, level) -> None:
+        """Seed-discrimination arm (patch 58): solenoidal IC perturbation.
+
+        Config block `initial_perturbation` (top level; absent/disabled =
+        bit-identical init). Fresh starts only — restarts keep their
+        checkpointed state. Defined in GLOBAL L0-lu coordinates, so every
+        MLG level evaluates the same physical field in its own frame.
+        """
+        setup = self._setup
+        pcfg = setup.config.get('initial_perturbation', {})
+        if not (isinstance(pcfg, dict) and pcfg.get('enabled', False)):
+            return
+        if setup.lattice.dim != 3:
+            raise NotImplementedError("initial_perturbation is 3D-only")
+        from src.utilities.initial_perturbation import apply_to_level
+        cfg = dict(pcfg)
+        cfg.setdefault('span_z_lu', float(setup.Nz))
+        cfg.setdefault('taper_lu', 2.0)
+        if level is None or level == 0:
+            origin, dx = (0.0, 0.0, 0.0), 1.0
+        else:
+            origin = tuple(float(o)
+                           for o in setup._mlg_level_origins[level])
+            dx = float(setup._mlg_scaler.get_level_units(level).dx)
+        flow = setup._physics_config.get('initial_flow_velocity',
+                                         [0.0, 0.0, 0.0])
+        n = apply_to_level(self.xp, f, setup.collision, cfg,
+                          origin=origin, dx=dx, rho0=1.0, u0=list(flow))
+        tag = 'L0' if level in (None, 0) else f'L{level}'
+        print(f"  [perturbation] {tag}: {n:,} cells seeded "
+              f"(sigma_u={cfg['sigma_u']:g}, seed={cfg['seed']}, "
+              f"modes={cfg['n_modes']})")
 
     # =====================================================================
     # Multi-Level Grid
@@ -261,6 +295,14 @@ class SolverInitializer:
         dtype = setup.compute_dtype
 
         if os.environ.get("LBM_DIST_INIT", "0") == "1":
+            _p = setup.config.get('initial_perturbation', {})
+            if isinstance(_p, dict) and _p.get('enabled', False):
+                # dist-init broadcasts ONE equilibrium vector per slab —
+                # a spatial perturbation cannot ride it; failing loudly
+                # beats silently un-seeded science (patch 58).
+                raise NotImplementedError(
+                    "initial_perturbation + LBM_DIST_INIT is unsupported "
+                    "(dist-init broadcasts a uniform IC)")
             # Distributed init (patch 17 backlog #4): host metadata only,
             # no device fields. The uniform IC (rho=1, u=flow_vel const)
             # makes slab f a broadcast of ONE equilibrium vector — computed
@@ -291,6 +333,7 @@ class SolverInitializer:
 
             f_k = self._equilibrium_lowmem(level_sim, rho_0, u_0, dtype)
             del rho_0, u_0
+            self._apply_perturbation(f_k, k)
             level_sim.set_distribution(f_k)
             mem_mb = f_k.nbytes / (1024 * 1024)
             del f_k
@@ -421,7 +464,14 @@ class SolverInitializer:
         al = setup.al_model
         if al is not None:
             models = al.models if hasattr(al, 'models') else [al]
-            sub = 2 ** (mlg.num_levels - 1)      # ALM lives on the finest
+            # Sub-steps per coarse step at the level the ALM actually sits on.
+            # Reading it back from the built grid keeps this correct when the
+            # rotor lands on an intermediate level; hardcoding num_levels-1
+            # silently desynced the azimuth by 2^(NL-1-alm_lev) fine steps.
+            alm_lev = next((k for k in range(mlg.num_levels)
+                            if getattr(mlg.get_level(k), 'al_model', None)
+                            is not None), 0)
+            sub = 2 ** alm_lev
             # Checkpoint 'step' is the 0-based LABEL of the last processed
             # step -> coarse advances done = label + 1 = start_step. The
             # historical `completed_step * sub` was one coarse step short
@@ -433,7 +483,7 @@ class SolverInitializer:
                 for _ in range(t_fine):
                     m_.rotor.advance(1.0)
                 m_._step_count = t_fine
-            print(f"  ALM: rotor fast-forwarded {t_fine} fine steps "
+            print(f"  ALM: rotor fast-forwarded {t_fine} fine steps @L{alm_lev} "
                   f"(theta[0]={models[0].rotor.theta[0]:.4f} rad, "
                   f"ramp done={t_fine >= models[0].ramp_steps})")
 

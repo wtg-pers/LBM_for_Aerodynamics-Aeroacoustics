@@ -184,18 +184,53 @@ class LocalLevel:
     def macro_pre_pass(self) -> None:
         """LOAD-only rho/u into self.rho/self.u (ALM sampling input)."""
         nx, ny, nz = self.dims
-        self.mk.launch(self.mem, self.rho.ravel(), self.u.reshape(3, -1),
-                       nx, ny, nz, self.t)
+        self.mk.launch(self.mem, self.nt, self.rho.ravel(),
+                       self.u.reshape(3, -1), nx, ny, nz, self.t)
+
+    def _sgs_mask_solid_u(self) -> None:
+        """No-slip the SGS input u at SOLID cells (patch 12 F1e — same
+        rationale as Simulation._sgs_mask_solid_u: the gradient/test-filter
+        stencils read u at solid neighbours; u=0 is the physical value)."""
+        idx = getattr(self, '_sgs_solid_idx', None)
+        if idx is None:
+            import cupy as cp
+            idx = cp.where(self.nt == 1)[0]
+            self._sgs_solid_idx = idx
+        if idx.size:
+            self.u_b[:, idx] = 0.0
+
+    def _sgs_wall_damp(self) -> None:
+        """Zero nu_t_in within sgs.wall_damp_cells of the body (patch 12
+        follow-up; same rationale as Simulation._sgs_wall_damp — the
+        staircase wall jump is not resolved strain). Slab-local dilation is
+        correct in the owned interior: ghosts (>=5) exceed the damp radius."""
+        n = int(self.sgs.get("wall_damp_cells", 0))
+        if n <= 0:
+            return
+        idx = getattr(self, '_sgs_damp_idx', None)
+        if idx is None:
+            import cupy as cp
+            from cupyx.scipy import ndimage
+            solid3 = (self.nt == 1).reshape(self.dims)
+            shell = ndimage.binary_dilation(
+                solid3, iterations=n, brute_force=True)
+            idx = cp.where(shell.ravel())[0]
+            self._sgs_damp_idx = idx
+        if idx.size:
+            self.nut_in[idx] = 0.0
 
     def advance(self, force=None) -> None:
         nx, ny, nz = self.dims
         kw = {}
         if self.sgs["model"] == "dyn_smag":
-            self.mk.launch(self.mem, self.rho_b, self.u_b, nx, ny, nz, self.t)
+            self.mk.launch(self.mem, self.nt, self.rho_b, self.u_b,
+                           nx, ny, nz, self.t)
+            self._sgs_mask_solid_u()
             self.dk.launch(self.u_b[0], self.u_b[1], self.u_b[2],
                            self.nut_in, nx, ny, nz, dx=1.0,
                            Cs_max=float(self.sgs["Cs_max"]),
                            alpha_sq=float(self.sgs["alpha_sq"]))
+            self._sgs_wall_damp()
             kw = dict(nu_t_in=self.nut_in, nu_t_out=self.nut)
         if self.is_bgk:
             self.ker.launch(self.mem, self.rho, self.u, self.nt, self.b_r,

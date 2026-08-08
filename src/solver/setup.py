@@ -267,7 +267,7 @@ class SimulationSetup:
             OutputManager ready for start() → process() → finalize()
         """
         cls = manager_cls or OutputManager
-        return cls(
+        mgr = cls(
             **extra_kwargs,
             xp=self.xp,
             macroscopic=self.macro,
@@ -297,6 +297,13 @@ class SimulationSetup:
             alm_marker_origin=getattr(self, '_alm_marker_origin', None),
             alm_marker_spacing=getattr(self, '_alm_marker_spacing', None),
         )
+        # output.vtk.fields_start_step: suppress DOMAIN-field VTK before this
+        # step; ALM marker VTP keeps the full output_interval cadence.
+        # Single-GPU analogue of the MPI driver's --vtk-fields-last.
+        mgr.vtk_fields_start_step = int(
+            self.config.get('output', {}).get('vtk', {})
+            .get('fields_start_step', 0))
+        return mgr
 
     # =====================================================================
     # Private: Setup steps [0]–[5.4] (existing, unchanged)
@@ -561,7 +568,9 @@ class SimulationSetup:
         # broke pure-LBM diagnostics (ALM disabled → tip_speed=0 → "U_max_phys ~ 0").
         # The ALM *running* is still gated by al_enabled elsewhere (al_model=None).
         _uc_al = self._al_cfg if (isinstance(self._al_cfg, dict)
-                                  and self._al_cfg.get('rotor')) else None
+                                  and (self._al_cfg.get('rotor')
+                                       or self._al_cfg.get('rotors'))) \
+            else None
         uc = UnitConverter(
             physics=pc,
             grid=grid_cfg,
@@ -688,6 +697,7 @@ class SimulationSetup:
         internal_geom: dict,
         geom_info: dict,
         mask=None,
+        level_ctx: Optional[dict] = None,
     ):
         """Pick HWBB or IBB based on internal_geometry.<type>.wall_bc.
 
@@ -707,6 +717,10 @@ class SimulationSetup:
                 (single-grid run). For MLG fine levels, pass the
                 level-local fine mask so the obstacle BC operates on the
                 correct grid resolution.
+            level_ctx: MLG fine-level context (surfel path, S8a-2) —
+                {'level': k, 'nu_lu': lu.nu, 'region': OverlapRegion}.
+                None on L0 / single grid. HWBB/IBB ignore it (their
+                inputs are the mask and geom_info alone).
         """
         if mask is None:
             mask = self._mask
@@ -724,10 +738,99 @@ class SimulationSetup:
             print(f"  Wall BC: half-way bounce-back (HWBB)")
             return HalfwayBounceBack(self.xp, self.lattice, mask)
 
+        if wall_bc_type == 'surfel':
+            # Scope guards (patch_notes/surfel/46 sec. 1): STL, standard
+            # path, D3Q27, no ALM/SGS. Each violation is an explicit
+            # error — never a silent fallback. MLG fine levels are
+            # supported since S8a-2 (level_ctx carries the level-local
+            # viscosity and the coupling region for the band guards).
+            import os as _os
+            if geom_info.get('type') != 'stl' \
+                    or geom_info.get('triangles_lu') is None:
+                raise ValueError(
+                    "wall_bc='surfel' needs STL geometry with triangles_lu "
+                    f"(got type='{geom_info.get('type')}')")
+            if self.lattice.dim != 3:
+                raise ValueError("wall_bc='surfel' is D3Q27-only")
+            if _os.environ.get('LBM_ESOTERIC', '0') == '1':
+                raise RuntimeError(
+                    "wall_bc='surfel' + esoteric streaming is deferred to "
+                    "after S8c (patch_notes/surfel/46 sec. 3)")
+            from src.solver.entry import detect_world_size
+            if detect_world_size() > 1:
+                raise NotImplementedError(
+                    "wall_bc='surfel' + MPI is unsupported: the surfel "
+                    "advect REPLACES streaming, and halo exchange is wired "
+                    "to the streaming step — single GPU only in S8a "
+                    "(patch_notes/surfel/48)")
+            alm_cfg = self.config.get('actuator_line', {})
+            if isinstance(alm_cfg, dict) and alm_cfg.get('enabled', False):
+                raise NotImplementedError(
+                    "wall_bc='surfel' + ALM is S8b+ scope "
+                    "(patch_notes/surfel/46)")
+            if self._sgs_cfg.get('enabled', False) \
+                    and self._sgs_cfg.get('model') != 'smagorinsky':
+                raise NotImplementedError(
+                    "wall_bc='surfel' + SGS supports constant-Cs "
+                    "'smagorinsky' only (S8b-2: the moment-based Stiebler "
+                    "route the wall-model campaign was measured with — "
+                    "patch_notes/surfel/54). wale/dyn_smag live in the "
+                    "fused-kernel pre-pass the surfel path does not run.")
+            from src.boundary.surfel_boundary import (
+                SurfelBoundary, check_level_coupling_bands,
+            )
+            ctx = level_ctx or {}
+            scfg = dict(enabled_cfg.get('surfel', {}))
+            # Production STL default: dv_min = 1e-2, NOT the adapter's
+            # 1e-6 (patch 50 sec. 4c/4e). The advect amplifies any state
+            # imbalance by 1/dV at a sliver cell, and for arbitrary STL
+            # geometry the cut fraction lands arbitrarily close above
+            # the floor. Measured ladder (c=50/c=100 wing):
+            #   1e-6 -> dV=1.038e-6 sliver, IC imbalance x1e6, inf in
+            #          2 substeps (immediate);
+            #   1e-3 -> dV=1.28e-3 sliver AT THE LEADING EDGE survived
+            #          the start-up but diverged at coarse step 93 once
+            #          the LE suction developed (gain 780 x flow
+            #          fluctuation);
+            #   1e-2 -> gain <= 100, 8x margin on the measured event —
+            #          re-verified on the exact c=100 failure case.
+            # The 1e-6 testbed floor was measured on PLANAR channel
+            # walls whose dV is quantized far from it. This floor is a
+            # REGULARIZATION, not physics: the wall force is facet-
+            # accounted (unaffected); dropped slivers are a volume-
+            # bookkeeping stairstep reported as `dropped dV`. The
+            # structural fix (cut-cell merging) is the registered
+            # follow-up. Config may still override.
+            scfg.setdefault('dv_min', 1e-2)
+            sb = SurfelBoundary(
+                self.xp, tuple(int(s) for s in mask.shape),
+                geom_info['triangles_lu'],
+                nu_lu=float(ctx.get('nu_lu', self.nu_lu)),
+                cfg=scfg,
+            )
+            if ctx.get('region') is not None:
+                # S8a-2 hard guards: span-through prism needs boundary-
+                # flush z faces; no surfel stencil may touch the C2F/F2C
+                # coupling band (see check_level_coupling_bands).
+                check_level_coupling_bands(
+                    sb, ctx['region'],
+                    span_through_axis=geom_info.get('span_through_axis'),
+                    level=ctx.get('level'),
+                )
+            # Cp/Cf reference for the surface writer (lattice units):
+            # q_inf = 0.5 rho0 U_lu^2 from the configured freestream
+            import numpy as _np
+            _u0 = self.config.get('physics', {}).get(
+                'initial_flow_velocity', (0.0, 0.0, 0.0))
+            _umag = float(_np.linalg.norm(_np.asarray(_u0, dtype=float)))
+            sb.q_inf = 0.5 * _umag ** 2 if _umag > 0.0 else None
+            print(f"  Wall BC: {sb.summary()}")
+            return sb
+
         if wall_bc_type != 'ibb':
             raise ValueError(
                 f"Unknown wall_bc='{wall_bc_type}'. "
-                f"Expected 'hwbb' or 'ibb'."
+                f"Expected 'hwbb', 'ibb' or 'surfel'."
             )
 
         # Compute q-fraction from geometry info (2D and 3D paths)
@@ -1160,13 +1263,20 @@ class SimulationSetup:
         import copy, math
         al_cfg = copy.deepcopy(self._al_cfg)
         dx = self._unit_converter.dx_phys
-        if 'rotor' in al_cfg:
-            rotor_cfg = al_cfg['rotor']
+
+        def _rotor_lu_to_phys(rotor_cfg):
+            # hub_center is L0 lattice units in config (single AND multi —
+            # one contract); rpm -> omega [rad/s] when omega absent.
             if 'hub_center' in rotor_cfg:
                 hc = rotor_cfg['hub_center']
                 rotor_cfg['hub_center'] = [h * dx for h in hc]
             if 'rpm' in rotor_cfg and 'omega' not in rotor_cfg:
                 rotor_cfg['omega'] = rotor_cfg['rpm'] * 2.0 * math.pi / 60.0
+
+        if 'rotor' in al_cfg:
+            _rotor_lu_to_phys(al_cfg['rotor'])
+        for entry in al_cfg.get('rotors', []):
+            _rotor_lu_to_phys(entry['rotor'] if 'rotor' in entry else entry)
 
         # ── Detect single vs multi rotor ──
         if 'rotors' in al_cfg:
@@ -1229,10 +1339,14 @@ class SimulationSetup:
                     f"{_t.tolist()} (|cos|={_cos:.4f}). u_n and wake corrections "
                     f"reference n̂_a=−thrust_axis; a non-parallel shaft is a config error.")
 
-        # Force ramp-up
+        # Force ramp-up. Set per MODEL: only ActuatorLineModel.step reads
+        # ramp_steps, so assigning it to a MultiRotorManager was inert — every
+        # multi-rotor run started at full thrust regardless of the config.
         ramp = al_cfg.get('ramp_steps', 0)
         if ramp > 0 and self.al_model is not None:
-            self.al_model.ramp_steps = ramp
+            for _m in (getattr(self.al_model, 'models', None)
+                       or [self.al_model]):
+                _m.ramp_steps = ramp
             print(f"    Force ramp: {ramp} steps")
 
         # Kernel family echo — the D40 case-4' debug showed the log carried no
@@ -1367,6 +1481,9 @@ class SimulationSetup:
 
         self._mlg_filter_level = filter_level
 
+        # ── Which level owns each rotor (correctness, not convenience) ──
+        self._resolve_alm_levels(num_levels)
+
         # ── MLG VTK writer ───────────────────────────────────────
         from src.io.mlg_vtk_writer import MLGVTKWriter
         vtk_out_dir = './results/vtk'
@@ -1381,6 +1498,104 @@ class SimulationSetup:
             precision=self._vtk_config.get('precision', 'float32'),
         )
         print(f"  {self._mlg_vtk_writer.get_info()}")
+
+    def _resolve_alm_levels(self, num_levels: int) -> None:
+        """Decide which MLG level receives each rotor's body force.
+
+        Sets `self._alm_rotor_levels` (one level per rotor, config order) and
+        `self._alm_target_level` (the common level; Stage 1 requires agreement).
+
+        This is a correctness gate, not a convenience: F2C overwrites a coarse
+        level's excised region with fine-level data every coarse step, so a
+        rotor forced on a level that a finer level excises has its momentum
+        deleted silently — no error, and thrust reads HIGH because the induced
+        downwash never develops. See src/grid/alm_placement for the rule and
+        the 190-config parity evidence behind it.
+        """
+        self._alm_rotor_levels = []
+        self._alm_target_level = 0
+        if self.al_model is None or num_levels < 2:
+            return
+
+        from src.grid.alm_placement import (
+            band_report, excision_conflicts, level_boxes_l0, rotor_extent,
+            select_level)
+
+        boxes = level_boxes_l0(self._mlg_overlap_mgr, self._mlg_level_origins,
+                               self._mlg_level_spacings, num_levels)
+        models = getattr(self.al_model, 'models', None) or [self.al_model]
+        names = getattr(self.al_model, 'names', None) or ['rotor']
+        policy = str(self._mlg_config.get('alm_band_policy', 'warn')).lower()
+
+        reports, exts = [], []
+        for i, m in enumerate(models):
+            nm = names[i] if i < len(names) else f'rotor_{i}'
+            ext = rotor_extent(m, name=nm)
+            rep = select_level(ext, boxes)
+            exts.append(ext)
+            reports.append(rep)
+            self._alm_rotor_levels.append(rep.level)
+
+        # ── Stage 1: all rotors must land on one level ──────────
+        distinct = sorted(set(self._alm_rotor_levels))
+        if len(distinct) > 1:
+            lines = [f"    rotor {i} '{r.rotor}' hub="
+                     f"({exts[i].hub[0]:.1f},{exts[i].hub[1]:.1f},"
+                     f"{exts[i].hub[2]:.1f}) lu -> L{r.level}"
+                     + (f"   ({r.reason})" if r.level == 0 else "")
+                     for i, r in enumerate(reports)]
+            raise ValueError(
+                "ALM rotor/level split — rotors do not all resolve to one MLG "
+                "level:\n" + "\n".join(lines) + "\n"
+                "  All rotors must sit inside ONE fine level's region. Enlarge "
+                "that level's mlg.levels[k].region to cover every rotor disk, "
+                "or move the outliers.")
+        self._alm_target_level = distinct[0]
+
+        # ── Check A: a finer level would erase this rotor (hard) ──
+        for i, ext in enumerate(exts):
+            conflicts = excision_conflicts(ext, self._alm_target_level, boxes)
+            if conflicts:
+                lv, ov = conflicts[0]
+                raise ValueError(
+                    f"ALM force would be silently erased: rotor '{ext.name}' is "
+                    f"assigned to L{self._alm_target_level}, but L{lv}'s excised "
+                    f"region overlaps its Gaussian support by "
+                    f"({ov['x']:.2f}, {ov['y']:.2f}, {ov['z']:.2f}) L0 lu.\n"
+                    f"  F2C overwrites the coarse excised region with fine data "
+                    f"every step, and the fine level carries no ALM, so that "
+                    f"momentum never reaches the fluid.\n"
+                    f"  Fix: enlarge mlg.levels[{lv}].region so it CONTAINS the "
+                    f"rotor disk (then the ALM moves there), or shrink it clear "
+                    f"of the rotor.")
+
+        # ── Check B: support spilling into the band / past the domain ──
+        if self._alm_target_level > 0:
+            box = boxes[self._alm_target_level]
+            for ext in exts:
+                rep = band_report(ext, box)
+                if not (rep.band_overshoot or rep.domain_overshoot):
+                    continue
+                msg = (f"ALM rotor '{ext.name}' on L{box.level}: Gaussian support "
+                       f"extends past the excised region — ")
+                if rep.band_overshoot:
+                    msg += "into the coupling band on " + ", ".join(
+                        f"{f} by {v:.1f} fine cells"
+                        for f, v in rep.band_overshoot.items())
+                if rep.domain_overshoot:
+                    msg += ("; OUTSIDE the fine domain on " + ", ".join(
+                        f"{f} by {v:.1f} fine cells"
+                        for f, v in rep.domain_overshoot.items())
+                        + " (that force is lost)")
+                if policy == 'error':
+                    raise ValueError(msg)
+                print(f"  [warn] {msg}")
+
+        if self._alm_target_level > 0:
+            print(f"\n  ALM target: Level {self._alm_target_level} "
+                  f"(finest level containing every rotor disk)")
+        else:
+            print(f"\n  ALM target: Level 0 ({reports[0].reason})")
 
     def _build_mlg_simulation(self):
         """Build a MultiLevelGrid with M Simulation objects.
@@ -1402,38 +1617,8 @@ class SimulationSetup:
         simulations = []
         couplings = []
 
-        # ── Determine which level gets the ALM ──────────────────
-        alm_target_level = 0  # default: coarsest level
-        if self.al_model is not None and num_levels > 1:
-            from src.actuator.actuator_line import MultiRotorManager
-            if isinstance(self.al_model, MultiRotorManager):
-                print(f"\n  ALM: Level 0 "
-                      f"(multi-rotor fine-level not yet supported)")
-            else:
-                hub_L0 = self.al_model.rotor.hub_center  # L0 lattice units
-                # Check from finest to coarsest
-                for k in range(num_levels - 1, 0, -1):
-                    region = self._mlg_overlap_mgr.get_region(k - 1)
-                    origin = self._mlg_level_origins[k]
-                    spacing = self._mlg_level_spacings[k]
-                    fs = region.fine_shape
-                    # Hub in fine-level local lattice units
-                    hub_loc = tuple(
-                        (hub_L0[d] - origin[d]) / spacing[d]
-                        for d in range(3)
-                    )
-                    margin = 5.0
-                    if all(margin <= hub_loc[d] <= fs[d] - margin
-                           for d in range(3)):
-                        alm_target_level = k
-                        break
-
-                if alm_target_level > 0:
-                    print(f"\n  ALM target: Level {alm_target_level} "
-                          f"(finest level containing rotor hub)")
-                else:
-                    print(f"\n  ALM target: Level 0 "
-                          f"(hub not inside any fine region)")
+        # ── Which level gets the ALM (decided in _resolve_alm_levels) ──
+        alm_target_level = getattr(self, '_alm_target_level', 0)
 
         # ── Level 0: use existing setup ──────────────────────────
         sim_0 = Simulation(
@@ -1513,16 +1698,27 @@ class SimulationSetup:
                     n_solid = int(xp.sum(fine_mask))
                     if fine_geom_info['type'] != 'none' and n_solid > 0:
                         self._check_body_vs_coupling_band(k, region, fine_mask)
-                        # Honor wall_bc (hwbb / ibb) on this MLG fine level too —
-                        # NOT hardcoded HWBB. Without this, IBB requested in the
-                        # config silently downgrades to HWBB on every level.
+                        # Honor wall_bc (hwbb / ibb / surfel) on this MLG fine
+                        # level too — NOT hardcoded HWBB. Without this, the BC
+                        # requested in the config silently downgrades to HWBB
+                        # on every level.
                         print(f"    Level {k}: building obstacle BC "
                               f"({n_solid:,} solid nodes)")
                         fine_obstacle_bc = self._build_obstacle_wall_bc(
                             internal_geom=internal_geom,
                             geom_info=fine_geom_info,
                             mask=fine_mask,
+                            # surfel (S8a-2): level-local viscosity + the
+                            # coupling region for the band guards
+                            level_ctx={'level': k, 'nu_lu': lu.nu,
+                                       'region': region},
                         )
+                        if getattr(fine_obstacle_bc, 'kind', None) \
+                                == 'surfel':
+                            # surface VTK in the global (L0 lu) frame
+                            fine_obstacle_bc.coord_origin = tuple(
+                                float(o) for o in fine_origin)
+                            fine_obstacle_bc.coord_spacing = float(lu.dx)
 
             # ── Fine-level ALM (if this is the target level) ─────
             fine_al_k = None
@@ -1934,22 +2130,30 @@ class SimulationSetup:
         nu_fine = (1.0 / 3.0) * (lu_k.tau - 0.5)
 
         # ── Prepare AL config with fine-level hub_center ─────────
+        # Handles BOTH shapes: 'rotor' (single) and 'rotors' (multi). Every
+        # rotor takes the same two steps — config L0 lu -> global [m], then
+        # minus this level's origin -> level-local [m].
         al_cfg = copy.deepcopy(self._al_cfg)
-        rotor_cfg = al_cfg.get('rotor', {})
-
-        # hub_center in config is L0 lattice units; convert to [m].
         dx_uc = self._unit_converter.dx_phys
-        if 'hub_center' in rotor_cfg:
-            hc = rotor_cfg['hub_center']
-            rotor_cfg['hub_center'] = [h * dx_uc for h in hc]
-        if 'rpm' in rotor_cfg and 'omega' not in rotor_cfg:
-            rotor_cfg['omega'] = rotor_cfg['rpm'] * 2.0 * math.pi / 60.0
-
-        # Convert hub to fine-level local [m]
-        hub_m = rotor_cfg['hub_center']          # global [m]
         origin_m = [o * self.dx_phys for o in origin_L0]
-        hub_local_m = [h - o for h, o in zip(hub_m, origin_m)]
-        rotor_cfg['hub_center'] = hub_local_m
+
+        if 'rotors' in al_cfg:
+            rotor_cfgs = [e.get('rotor', e) for e in al_cfg['rotors']]
+        else:
+            rotor_cfgs = [al_cfg['rotor']]
+
+        hub_locals = []
+        for rotor_cfg in rotor_cfgs:
+            if 'hub_center' in rotor_cfg:
+                hc = rotor_cfg['hub_center']
+                rotor_cfg['hub_center'] = [h * dx_uc for h in hc]
+            if 'rpm' in rotor_cfg and 'omega' not in rotor_cfg:
+                rotor_cfg['omega'] = rotor_cfg['rpm'] * 2.0 * math.pi / 60.0
+            hub_local_m = [h - o for h, o
+                           in zip(rotor_cfg['hub_center'], origin_m)]
+            rotor_cfg['hub_center'] = hub_local_m
+            hub_locals.append(hub_local_m)
+        hub_local_m = hub_locals[0]
 
         # ── u_inf (same in lattice units across all levels) ──────
         pc = self._physics_config
@@ -1958,9 +2162,16 @@ class SimulationSetup:
                     if U_inf_phys > 0 else None)
 
         # ── Create fine-level ALM ────────────────────────────────
-        from src.actuator.actuator_line import create_actuator_line_from_config
+        # Single-rotor keeps the exact original call (same factory, same
+        # argument list) so existing configs stay bit-identical; multi-rotor
+        # goes to the multi factory, which returns a MultiRotorManager sized
+        # to the fine grid.
+        from src.actuator.actuator_line import (
+            create_actuator_line_from_config, create_multi_rotor_from_config)
 
-        fine_al = create_actuator_line_from_config(
+        _factory = (create_multi_rotor_from_config if 'rotors' in al_cfg
+                    else create_actuator_line_from_config)
+        fine_al = _factory(
             config=al_cfg,
             domain_shape=fine_shape,
             nu_lattice=nu_fine,
@@ -1973,31 +2184,34 @@ class SimulationSetup:
             sound_speed=self.c_s_phys,
         )
 
-        # Ramp steps (scale to fine timesteps for same physical duration)
+        # Ramp steps (scale to fine timesteps for same physical duration).
+        # Set per MODEL: on a MultiRotorManager the attribute is inert because
+        # step() never reads it — only ActuatorLineModel.step does.
         ramp = al_cfg.get('ramp_steps', 0)
         if ramp > 0:
-            fine_al.ramp_steps = ramp * (2 ** level_k)
+            for _m in (getattr(fine_al, 'models', None) or [fine_al]):
+                _m.ramp_steps = ramp * (2 ** level_k)
 
         # ── Print info ───────────────────────────────────────────
         print(f"\n  Fine-level ALM (Level {level_k}):")
-        print(f"    hub_local [m] = "
-              f"[{hub_local_m[0]:.4f}, "
-              f"{hub_local_m[1]:.4f}, "
-              f"{hub_local_m[2]:.4f}]")
-        print(f"    hub_local [lu] = "
-              f"({fine_al.rotor.hub_center[0]:.1f}, "
-              f"{fine_al.rotor.hub_center[1]:.1f}, "
-              f"{fine_al.rotor.hub_center[2]:.1f})")
-        print(f"    R = {fine_al.rotor.radius:.1f} fine lu, "
-              f"markers = {fine_al.rotor.total_markers}")
-        print(f"    omega = {fine_al.rotor.omega:.6f} rad/lt_fine")
+        _fine_models = getattr(fine_al, 'models', None) or [fine_al]
+        _names = getattr(fine_al, 'names', None) or ['rotor']
+        for _i, _m in enumerate(_fine_models):
+            _r = _m.rotor
+            _nm = _names[_i] if _i < len(_names) else f'rotor_{_i}'
+            _hl = hub_locals[_i] if _i < len(hub_locals) else hub_local_m
+            print(f"    [{_i}] {_nm}: hub_local [m] = "
+                  f"[{_hl[0]:.4f}, {_hl[1]:.4f}, {_hl[2]:.4f}]"
+                  f"  [lu] = ({_r.hub_center[0]:.1f}, "
+                  f"{_r.hub_center[1]:.1f}, {_r.hub_center[2]:.1f})")
+            print(f"         R = {_r.radius:.1f} fine lu, "
+                  f"markers = {_r.total_markers}, "
+                  f"omega = {_r.omega:.6f} rad/lt_fine, "
+                  f"ramp = {_m.ramp_steps}")
         print(f"    dx = {dx_fine*1000:.4f} mm, "
               f"dt = {dt_fine*1e6:.4f} us")
         print(f"    nu = {nu_fine:.6e}, "
               f"tau = {lu_k.tau:.6f}")
-        if ramp > 0:
-            print(f"    ramp = {fine_al.ramp_steps} fine steps "
-                  f"({ramp} coarse)")
 
         return fine_al
 
@@ -2210,13 +2424,15 @@ class SimulationSetup:
             _is_multi = hasattr(_model, 'models')
             _models = _model.models if _is_multi else [_model]
 
-            # MLG fine-level scaling factor
+            # MLG fine-level scaling factor. Must follow the level the ALM
+            # actually lands on (_resolve_alm_levels) — assuming the finest
+            # level printed "@L3, R=16 lu" for a rotor sitting on L0.
             _mlg_scale = 1
             _level_tag = ""
             if self._mlg_enabled:
-                _nlev = self._mlg_config.get('num_levels', 1)
-                _mlg_scale = 2 ** (_nlev - 1)
-                _level_tag = f" @L{_nlev - 1}"
+                _alv = getattr(self, '_alm_target_level', 0)
+                _mlg_scale = 2 ** _alv
+                _level_tag = f" @L{_alv}"
 
             for _i, _m in enumerate(_models):
                 _r = _m.rotor

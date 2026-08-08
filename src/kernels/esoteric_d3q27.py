@@ -821,7 +821,32 @@ extern "C" __global__ void eso_scatter_region(
     }
 }
 """)
-    return gather + scatter
+    # skip-solid variant (repair track patch 12): a SOLID cell's std-ordered
+    # population entries alias the LIVE implicit-HWBB deposit slots of its
+    # fluid neighbours (proven by f1d_scatter_alias_proof), so a coupling
+    # write of FOREIGN values (F2C restriction / C2F interpolation) at solid
+    # cells bounces garbage off the wall on the next step. Faithful
+    # same-state transfers (MPI halo bands) must keep writing them — the
+    # deposits are real payload there — hence a separate kernel, opt-in.
+    scatter_ns = ("""
+extern "C" __global__ void eso_scatter_region_ns(
+    float* __restrict__ f, const float* __restrict__ vals,
+    const signed char* __restrict__ nt,""" + args + "{"
+        + tables + head + """
+    if (nt[b0] == 1) return;
+    f[b0] = vals[idx];
+""" + loop_pre + """
+        if (is_odd) {
+            f[(long long)i * N + b0]        = vals[o_i];
+            f[(long long)(i + 1) * N + bs]  = vals[o_ip];
+        } else {
+            f[(long long)(i + 1) * N + b0]  = vals[o_i];
+            f[(long long)i * N + bs]        = vals[o_ip];
+        }
+    }
+}
+""")
+    return gather + scatter + scatter_ns
 
 
 def _get_region_kernels(cp):
@@ -829,8 +854,10 @@ def _get_region_kernels(cp):
         src = _region_kernel_source()
         assert all(ord(ch) < 128 for ch in src)
         mod = cp.RawModule(code=src)
-        _REGION_KERNEL_CACHE["k"] = (mod.get_function("eso_gather_region"),
-                                     mod.get_function("eso_scatter_region"))
+        _REGION_KERNEL_CACHE["k"] = (
+            mod.get_function("eso_gather_region"),
+            mod.get_function("eso_scatter_region"),
+            mod.get_function("eso_scatter_region_ns"))
     return _REGION_KERNEL_CACHE["k"]
 
 
@@ -863,7 +890,7 @@ def esoteric_gather_std_region(xp, f_mem: 'npt.NDArray', t_step: int,
         ps = _region_kernel_params(region, shape)
         if ps is not None:
             import numpy as _np
-            gk, _ = _get_region_kernels(xp)
+            gk, _, _ = _get_region_kernels(xp)
             out = xp.empty((27, ps[2], ps[5], ps[8]), xp.float32)
             M = int(ps[2]) * int(ps[5]) * int(ps[8])
             if M:
@@ -895,12 +922,23 @@ def esoteric_gather_std_region(xp, f_mem: 'npt.NDArray', t_step: int,
 
 def esoteric_scatter_std_region(xp, f_mem: 'npt.NDArray',
                                 values: 'npt.NDArray', t_step: int,
-                                region) -> None:
+                                region, skip_solid_nt=None) -> None:
     """Scatter physical values (STANDARD ordering, region-shaped) into the
     Esoteric memory IN PLACE, so the next LOAD at `t_step` reads them.
 
     Inverse of esoteric_gather_std_region on the same region: writes the
     local slot at region and the paired slot at region+c_i (wrapped).
+
+    skip_solid_nt (patch 12): raveled int8 node-type of the FULL domain.
+    When given, entries belonging to SOLID region cells are NOT written.
+    A solid cell's std-ordered population entries alias the LIVE
+    implicit-HWBB deposit slots of its fluid neighbours (the deposit IS
+    the population streamed into the wall cell — f1d proof), so coupling
+    writes of FOREIGN values (F2C restriction, C2F interpolation) at
+    solid cells put garbage on the wall bounce. Pass it from every
+    coupling scatter. Do NOT pass it for faithful same-parity transfers
+    of an identical wall state (MPI halo bands): there the solid entries
+    carry the real deposits and must be written.
     """
     shape = f_mem.shape[1:]
     if xp.__name__ == 'cupy' and f_mem.dtype == xp.float32 \
@@ -908,45 +946,67 @@ def esoteric_scatter_std_region(xp, f_mem: 'npt.NDArray',
         ps = _region_kernel_params(region, shape)
         if ps is not None:
             import numpy as _np
-            _, sk = _get_region_kernels(xp)
+            _, sk, skns = _get_region_kernels(xp)
             vals = xp.ascontiguousarray(values)
             M = int(ps[2]) * int(ps[5]) * int(ps[8])
             if M:
                 bs_ = 256
-                sk(((M + bs_ - 1) // bs_,), (bs_,),
-                   (f_mem, vals,
-                    _np.int32(shape[0]), _np.int32(shape[1]),
-                    _np.int32(shape[2]),
-                    *(_np.int32(v) for v in ps), _np.int32(t_step & 1)))
+                dims = (_np.int32(shape[0]), _np.int32(shape[1]),
+                        _np.int32(shape[2]))
+                tail = (*(_np.int32(v) for v in ps), _np.int32(t_step & 1))
+                if skip_solid_nt is None:
+                    sk(((M + bs_ - 1) // bs_,), (bs_,),
+                       (f_mem, vals, *dims, *tail))
+                else:
+                    nt = xp.ascontiguousarray(
+                        skip_solid_nt.ravel().astype(xp.int8, copy=False))
+                    skns(((M + bs_ - 1) // bs_,), (bs_,),
+                         (f_mem, vals, nt, *dims, *tail))
             return
     ix0, iy0, iz0 = _region_ix(xp, shape, region)
     even = (t_step % 2 == 0)
-    f_mem[0][ix0, iy0, iz0] = values[_STD_TO_ESO[0]]
+    keep = None
+    if skip_solid_nt is not None:
+        nt3 = skip_solid_nt.reshape(shape)
+        keep = nt3[ix0, iy0, iz0] != 1          # broadcast to region shape
+
+    def _put(dst, sl, src):
+        if keep is None:
+            dst[sl] = src
+        else:
+            dst[sl] = xp.where(keep, src, dst[sl])
+
+    _put(f_mem[0], (ix0, iy0, iz0), values[_STD_TO_ESO[0]])
     for p in range(13):
         i = 2 * p + 1
         ci = (CX_ESO[i], CY_ESO[i], CZ_ESO[i])
         ixs, iys, izs = _region_ix(xp, shape, region, shift=ci)
         std_i, std_ip1 = _STD_TO_ESO[i], _STD_TO_ESO[i + 1]
         if even:
-            f_mem[i + 1][ix0, iy0, iz0] = values[std_i]
-            f_mem[i][ixs, iys, izs] = values[std_ip1]
+            _put(f_mem[i + 1], (ix0, iy0, iz0), values[std_i])
+            _put(f_mem[i], (ixs, iys, izs), values[std_ip1])
         else:
-            f_mem[i][ix0, iy0, iz0] = values[std_i]
-            f_mem[i + 1][ixs, iys, izs] = values[std_ip1]
+            _put(f_mem[i], (ix0, iy0, iz0), values[std_i])
+            _put(f_mem[i + 1], (ixs, iys, izs), values[std_ip1])
 
 
 # ============================================================
 # Esoteric macro pre-pass kernel: LOAD + (rho, u), no collide/store.
 # Used by the WALE/dyn_smag pre-pass and the ALM 2-pass, which need
 # the current-step macroscopic fields BEFORE the collision launch.
-# NOTE: computes on every node incl. solids (garbage there) -- same
-# as the standard MacroKernel pre-pass; ALM/rotor cases have no solids.
+# LOAD replica includes the implicit-HWBB bounce branches (patch 12,
+# f1e gate): without node_type the wall-adjacent bounced populations
+# came from the parity-dead slot (one substep STALE), giving the SGS
+# pre-pass a systematically wrong wall-layer u on the esoteric path
+# only. Solid cells still produce garbage (consumers mask) -- same
+# as the standard MacroKernel pre-pass.
 # ============================================================
 
 _ESOTERIC_MACRO_KERNEL = r'''
 extern "C" __global__
 void esoteric_macro_d3q27(
     const float* __restrict__ f,        // (27, N) Esoteric memory
+    const char*  __restrict__ node_type, // (N,) 1 = SOLID
     float*       __restrict__ rho_out,  // (N,)
     float*       __restrict__ u_out,    // (3, N)
     const int Nx, const int Ny, const int Nz,
@@ -975,12 +1035,19 @@ void esoteric_macro_d3q27(
         long long ny = (iy + cy[i] + Ny) % Ny;
         long long nz = (iz + cz[i] + Nz) % Nz;
         long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
+        // bounce addressing: verbatim from the fused kernel LOAD
+        long long mx = (ix - cx[i] + Nx) % Nx;
+        long long my = (iy - cy[i] + Ny) % Ny;
+        long long mz = (iz - cz[i] + Nz) % Nz;
+        long long j_ip = mx * (long long)Ny * Nz + my * (long long)Nz + mz;
+        bool nb_dn = node_type[j_i]  == 1;
+        bool nb_up = node_type[j_ip] == 1;
         if (is_odd) {
-            fhn[i]   = f[i     * N + idx];
-            fhn[i+1] = f[(i+1) * N + j_i];
+            fhn[i]   = nb_up ? f[(i+1) * N + idx] : f[i     * N + idx];
+            fhn[i+1] = nb_dn ? f[i     * N + j_i] : f[(i+1) * N + j_i];
         } else {
-            fhn[i]   = f[(i+1) * N + idx];
-            fhn[i+1] = f[i     * N + j_i];
+            fhn[i]   = nb_up ? f[i     * N + idx] : f[(i+1) * N + idx];
+            fhn[i+1] = nb_dn ? f[(i+1) * N + j_i] : f[i     * N + j_i];
         }
     }
 
@@ -1005,9 +1072,9 @@ class EsotericMacroKernelD3Q27:
         self._block_size = block_size
         self._kernel = None
 
-    def launch(self, f: 'npt.NDArray', rho_out: 'npt.NDArray',
-               u_out: 'npt.NDArray', Nx: int, Ny: int, Nz: int,
-               t_step: int) -> None:
+    def launch(self, f: 'npt.NDArray', node_type: 'npt.NDArray',
+               rho_out: 'npt.NDArray', u_out: 'npt.NDArray',
+               Nx: int, Ny: int, Nz: int, t_step: int) -> None:
         import cupy as cp
         if self._kernel is None:
             self._kernel = cp.RawKernel(
@@ -1016,6 +1083,6 @@ class EsotericMacroKernelD3Q27:
         N = Nx * Ny * Nz
         grid = (N + self._block_size - 1) // self._block_size
         self._kernel((grid,), (self._block_size,),
-                     (f, rho_out, u_out,
+                     (f, node_type, rho_out, u_out,
                       cp.int32(Nx), cp.int32(Ny), cp.int32(Nz),
                       cp.int32(t_step)))
