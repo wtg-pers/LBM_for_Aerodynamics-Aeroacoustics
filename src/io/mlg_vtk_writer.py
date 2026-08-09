@@ -187,11 +187,17 @@ class MLGVTKWriter:
             if rho is None or u is None:
                 continue
 
-            # Extract solid mask from obstacle BC (if present)
-            solid_mask = None
-            if (level_sim.obstacle_bc is not None
-                    and hasattr(level_sim.obstacle_bc, 'solid_mask')):
-                solid_mask = level_sim.obstacle_bc.solid_mask
+            # Extract solid mask. Single-GPU passes a Simulation and it hangs
+            # off the obstacle BC; the MPI path passes a gathered view that
+            # carries `.solid_mask` directly (mpi_output._LevelView). Reading
+            # only the first shape silently dropped the array from every MPI
+            # VTK, which is what makes the body render as fluid — solid cells
+            # hold bounce DEPOSITS, so their macroscopic u is large garbage
+            # and there is nothing left to blank it with.
+            solid_mask = getattr(level_sim, 'solid_mask', None)
+            if solid_mask is None:
+                _ob = getattr(level_sim, 'obstacle_bc', None)
+                solid_mask = getattr(_ob, 'solid_mask', None)
 
             # SGS eddy viscosity (allocated only when SGS enabled).
             extras = {}
