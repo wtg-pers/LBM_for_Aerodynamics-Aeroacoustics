@@ -247,10 +247,11 @@ class ActuatorLineModel:
         self.coeff_mode = coeff_mode    # 'wind_turbine' | 'rotorcraft' | 'auto'
         self.xp = xp if xp is not None else np   # array backend
 
-        # Pre-allocate body force array (on GPU if xp is cupy)
-        Nx, Ny, Nz = domain_shape
-        self._F_grid = self.xp.zeros((3, Nx, Ny, Nz), dtype=self.xp.float64)
-        # [lattice force / lu³]
+        # Body force array — allocated on FIRST STEP, not here. See
+        # _ensure_force_grid: under MPI this buffer is rebound to a rank-local
+        # slab before any step runs, so allocating the full domain here was
+        # pure waste.
+        self._F_grid = None            # (3, Nx, Ny, Nz) [lattice force / lu³]
 
         # Diagnostics storage (updated each step)
         self._last_bem_result: Optional[BEMResult] = None
@@ -416,6 +417,27 @@ class ActuatorLineModel:
     # -----------------------------------------------------------------
     # §2.1 Main Time Step
     # -----------------------------------------------------------------
+
+    def _ensure_force_grid(self) -> None:
+        """Allocate the (3, Nx, Ny, Nz) float64 force grid on FIRST USE.
+
+        Deferred out of __init__ deliberately. The distributed runner rebinds
+        every model's grid to a rank-local slab before any step runs, so a
+        full-domain buffer allocated at construction is discarded moments
+        later — 8 rotors on octo8's 35.5 M-cell fine level cost 6.8 GB of
+        f64 that nothing ever read, which is what pushed the replicated build
+        past a 24 GB card (measured: OOM at 24.88 GB of 25.77 GB).
+
+        Unobservable: the array is fully overwritten by the reset at the top
+        of the spreading step, and no reader exists between construction and
+        that point. Single-GPU peak also drops slightly, since the buffer is
+        now taken after the initializer's transients are released rather than
+        alongside them.
+        """
+        if self._F_grid is None:
+            Nx, Ny, Nz = self.domain_shape
+            self._F_grid = self.xp.zeros((3, Nx, Ny, Nz),
+                                         dtype=self.xp.float64)
 
     def step(
         self,
@@ -603,6 +625,7 @@ class ActuatorLineModel:
 
         # --- Step 9: Gaussian spreading ---
         # GPU path: F_grid allocated and filled on GPU, no CPU transfer
+        self._ensure_force_grid()
         self._F_grid[:] = 0.0  # Reset (works for both numpy and cupy)
         if external_F is not None:
             self._F_grid[:] = external_F  # Start from external force
@@ -2088,10 +2111,9 @@ class MultiRotorManager:
         self.models: List['ActuatorLineModel'] = []
         self.names: List[str] = []
 
-        # Pre-allocate accumulated body force array (on GPU if xp is cupy)
-        Nx, Ny, Nz = domain_shape
-        self._F_total = self.xp.zeros((3, Nx, Ny, Nz), dtype=self.xp.float64)
-        # [lattice force / lu³]
+        # Accumulator — allocated on FIRST STEP, same reason as the models'
+        # _F_grid (see ActuatorLineModel._ensure_force_grid).
+        self._F_total = None           # (3, Nx, Ny, Nz) [lattice force / lu³]
 
     # -----------------------------------------------------------------
     # Construction
@@ -2160,7 +2182,11 @@ class MultiRotorManager:
                      shape (3, Nx, Ny, Nz)  [lattice force / lu³]
                      Same backend as self.xp (GPU if cupy).
         """
-        # Reset accumulator
+        # Reset accumulator (allocated on first use — see _ensure_force_grid)
+        if self._F_total is None:
+            Nx, Ny, Nz = self.domain_shape
+            self._F_total = self.xp.zeros((3, Nx, Ny, Nz),
+                                          dtype=self.xp.float64)
         self._F_total[:] = 0.0
 
         if external_F is not None:
@@ -2510,9 +2536,11 @@ class MultiRotorView(MultiRotorManager):
     What still has to be presented as one thing is the OUTPUT: one performance
     CSV, one marker VTP, one rotor count. That is all this does.
 
-    It deliberately does not allocate `_F_total` and never steps: a view that
-    could be stepped would invite exactly the bug this whole effort is about
-    (force deposited somewhere the fluid never reads).
+    It never steps, and step() raises rather than returning something: a view
+    that could be stepped would invite exactly the bug this whole effort is
+    about (force deposited somewhere the fluid never reads). That override is
+    the guard — `_F_total` being None no longer distinguishes it, since the
+    real manager allocates its accumulator lazily too.
     """
 
     def __init__(self, xp=None) -> None:

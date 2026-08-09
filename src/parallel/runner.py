@@ -207,16 +207,23 @@ class DistributedMLGRunner:
             # Bind EVERY rotor, not just the first: MultiRotorManager.step
             # superposes each model's OWN _F_grid, so every model needs its
             # own rank-local buffer, offset and sampler.
+            #
+            # Setting domain_shape and leaving the buffers None is the whole
+            # binding: both are allocated lazily on the first step, and by
+            # then they read the rank-local shape set here. Allocating them
+            # eagerly (here or in the model's __init__) put a full-domain f64
+            # grid per rotor on the card during the build — 6.8 GB for
+            # octo8's 8 rotors, discarded immediately.
             for m in (getattr(al, "models", None) or [al]):
                 m._global_domain_shape = shapes[uid]
                 m.domain_shape = loc
-                m._F_grid = cp.zeros((3,) + loc, cp.float64)
+                m._F_grid = None
                 m._grid_offset = off
                 m._velocity_sampler = make_distributed_sampler(
                     red, rank, p, cp)
-            if getattr(al, "_F_total", None) is not None:
+            if hasattr(al, "models"):        # manager: rank-local accumulator
                 al.domain_shape = loc
-                al._F_total = cp.zeros((3,) + loc, cp.float64)
+                al._F_total = None
             self.alm[uid] = al
             cp.get_default_memory_pool().free_all_blocks()
         # RANK-INVARIANT, deliberately: taken from the replicated tree, not
