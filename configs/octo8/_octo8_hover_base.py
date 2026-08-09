@@ -112,6 +112,30 @@ def grid_map(d_lu: int = D_LU, side_clearance_lb: float = None):
          int(round(200 * d_lu / 40.0))]                 # z: legacy height
     return dx, mm2lu, o, tuple(n)
 
+def grid_map_centered(d_lu: int, half_xy_mm: float):
+    """(dx_m, mm2lu, O_LU, (Nx,Ny,Nz)) for a domain CENTRED on the vehicle.
+
+    half_xy_mm: half-extent in x and y measured from the vehicle centre (the
+    STL bbox centre; y=0 by symmetry). This is the sizing knob when the
+    far-field requirement is stated as "N metres around the aircraft" rather
+    than as a clearance from its surface — e.g. an outwash study whose
+    influence radius was measured in another solver.
+
+    z is NOT centred and is not part of this knob, for the same reason as in
+    grid_map: zmin IS the ground (IGE hover, height = HOVER_H_MM) and zmax is
+    the inflow. z keeps the legacy height scaled to `d_lu`.
+    """
+    dx = D_PHYS / d_lu
+    mm2lu = 0.001 / dx
+    n_xy = int(np.ceil(2.0 * half_xy_mm * mm2lu))
+    n_xy = int(np.ceil(n_xy / 2) * 2) + 2          # even, and >= the request
+    nz = int(round(200 * d_lu / 40.0))
+    o = np.array([(n_xy - 1) * 0.5 - _BBOX_CTR_MM[0] * mm2lu,
+                  (n_xy - 1) * 0.5 - _BBOX_CTR_MM[1] * mm2lu,
+                  -GROUND_CAD_MM * mm2lu - 0.5])
+    return dx, mm2lu, o, (n_xy, n_xy, nz)
+
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 # repaired(0808): 원본 assembly_full.stl은 비수밀(나사 32개 역와인딩 + 로드
@@ -152,7 +176,8 @@ _LAYOUT = [
 # S3. CONFIG BUILDER
 # =============================================================================
 def build_config(rpm=5000.0, n_rev=40, n_radial=32,
-                 vtk_deg=30.0, vtk_fields_last_rev=5, wall_bc="ibb"):
+                 vtk_deg=30.0, vtk_fields_last_rev=5, wall_bc="ibb",
+                 d_lu=None, half_xy_mm=None):
     """Octo-8 hover config.
 
     rpm                : 공칭 회전수(부호 없는 크기; 방향은 _LAYOUT이 결정)
@@ -161,10 +186,30 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                          필요 → n≥10; 32면 δr=0.625Δx (테이퍼·전이 해상 여유)
     vtk_deg            : VTK 출력 각도 간격 (30° → 105 steps)
     vtk_fields_last_rev: full-field VTK는 마지막 N바퀴만 (마커는 전 구간)
+    d_lu               : L0 로터 직경 해상도 [cells]. None = 모듈 기본(40).
+                         MLG를 쓸 때 L0 는 원방 담당이므로 40 보다 낮게 잡는다.
+    half_xy_mm         : 기체 중심 기준 x,y 반폭 [mm]. 주면 도메인이 그 값으로
+                         재계산된다(grid_map_centered). None 이면 legacy 도메인.
+
+    d_lu=None, half_xy_mm=None 이면 모듈 상수를 그대로 써서 기존 config 들이
+    비트 단위로 움직이지 않는다.
     """
+    if d_lu is None:
+        d_lu = D_LU
+    if half_xy_mm is not None:
+        dx_m, mm2lu, o_lu, (nx, ny, nz) = grid_map_centered(d_lu, half_xy_mm)
+    elif d_lu != D_LU:
+        dx_m, mm2lu, o_lu, (nx, ny, nz) = grid_map(d_lu)
+    else:                                    # legacy — 모듈 상수 그대로
+        dx_m, mm2lu, o_lu = DX_PHYS, MM2LU, O_LU
+        nx, ny, nz = NX, NY, NZ
+
+    def _to_lu(p_mm):
+        return (o_lu + np.asarray(p_mm, dtype=np.float64) * mm2lu).tolist()
+
     U_MAX_LU  = 0.1
-    R_LU      = 0.5 * D_LU
-    STEPS_REV = int(round(2.0 * np.pi * R_LU / U_MAX_LU))          # 1257
+    R_LU      = 0.5 * d_lu
+    STEPS_REV = int(round(2.0 * np.pi * R_LU / U_MAX_LU))          # 1257 @D/40
     MAX_STEPS = n_rev * STEPS_REV
     VTK_EVERY = int(round(STEPS_REV * vtk_deg / 360.0))            # 105
     FIELDS_START = MAX_STEPS - int(round(vtk_fields_last_rev * STEPS_REV))
@@ -180,7 +225,7 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                   "lattice_model": "D3Q27", "collision_model": "cumulant"}
     physics = {"rho": RHO_PHYS, "U_inf": 0.0, "nu": NU_PHYS,
                "L_char": D_PHYS, "flow_direction": [0.0, 0.0, -1.0]}
-    grid = {"Nx": NX, "Ny": NY, "Nz": NZ, "resolution": D_LU}
+    grid = {"Nx": nx, "Ny": ny, "Nz": nz, "resolution": d_lu}
     numerics = {"acoustic_scaling": False, "u_max": U_MAX_LU,
                 "c_s_phys": C_S_PHYS, "collision": "cumulant"}
 
@@ -203,8 +248,8 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
         "stl": {
             "enabled": True,
             "file": STL_PATH,
-            "scale_to_lu": MM2LU,
-            "center_lu": tuple(float(c) for c in STL_CENTER_LU),
+            "scale_to_lu": mm2lu,
+            "center_lu": tuple(float(c) for c in _to_lu(_BBOX_CTR_MM)),
             "rotation_deg": (0.0, 0.0, 0.0),
             "wall_bc": wall_bc,
         },
@@ -229,7 +274,7 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                 "radius": R_PHYS,
                 "omega": sign * omega_mag,
                 "n_blades": N_BLADES,
-                "hub_center": _cad_mm_to_lu([x_mm, y_mm, ROTOR_Z_MM]),  # L0 LU
+                "hub_center": _to_lu([x_mm, y_mm, ROTOR_Z_MM]),  # L0 LU
                 "rotation_axis": [0, 0, -1],
                 "thrust_direction": [0, 0, 1],
                 # 블레이드 통과 위상 스태거(동기화된 8기 blade-passage 아티팩트
@@ -263,7 +308,7 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
             "checkpoint_interval": 5 * STEPS_REV,
             "conservation_interval": STEPS_REV}
 
-    folder = "result_octo8_hover_%04drpm_D%d_%s" % (round(abs(rpm)), D_LU, wall_bc)
+    folder = "result_octo8_hover_%04drpm_D%d_%s" % (round(abs(rpm)), d_lu, wall_bc)
     output = {"output_dir": "./%s/vtk" % folder,
               "checkpoint_dir": "./%s/checkpoints" % folder,
               "csv_dir": "./%s/csv" % folder, "clear_previous": True,
