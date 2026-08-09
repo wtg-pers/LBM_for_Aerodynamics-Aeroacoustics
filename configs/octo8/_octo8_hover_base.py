@@ -72,6 +72,46 @@ NX, NY, NZ = 324, 496, 200
 _O_Z = -GROUND_CAD_MM * MM2LU - 0.5             # 71.898 - 0.5 = 71.398
 O_LU = np.array([266.0, 248.0, _O_Z])           # CAD 원점(노즈)의 LU 좌표
 
+
+def grid_map(d_lu: int = D_LU, side_clearance_lb: float = None):
+    """(dx_m, mm2lu, O_LU, (Nx, Ny, Nz)) for a base resolution of D/`d_lu`.
+
+    d_lu=40 with side_clearance_lb=None reproduces the module constants above
+    EXACTLY — the legacy domain, kept so the validated uniform/mlg2 configs do
+    not move.
+
+    side_clearance_lb: lateral (x, y) clearance from the body surface to the
+    domain boundary, in units of L_body (the vehicle's own largest bbox span).
+    geometry_manager warns below 0.5; the legacy domain sits at 0.18 (x) and
+    0.24 (y), so the wall jet leaving the ground reaches the sponge while still
+    developing — an outwash study cannot be read at face value there.
+
+    z is NEVER expanded and is not part of this knob:
+      * zmin IS the ground (IGE hover). Its "clearance" is the hover height —
+        a physical quantity, not a far-field margin. The axis-2 warning is a
+        FALSE POSITIVE for this case and stays no matter how big the box gets.
+      * zmax is the inflow, 2.1 D above the body, which the wake never reaches.
+    """
+    dx = D_PHYS / d_lu
+    mm2lu = 0.001 / dx
+    o_z = -GROUND_CAD_MM * mm2lu - 0.5
+    if side_clearance_lb is None:                       # legacy domain
+        s = d_lu / 40.0
+        return dx, mm2lu, np.array([266.0 * s, 248.0 * s, o_z]), \
+            (int(round(324 * s)), int(round(496 * s)), int(round(200 * s)))
+    span = (_BBOX_MAX_MM - _BBOX_MIN_MM) * mm2lu        # body bbox, this level
+    lb = float(span.max())                              # L_body (y span)
+    pad = side_clearance_lb * lb
+    o = np.array([pad - _BBOX_MIN_MM[0] * mm2lu,
+                  pad - _BBOX_MIN_MM[1] * mm2lu,
+                  o_z])
+    # even extents: MLG halves boxes level by level, and an odd outer extent
+    # buys nothing
+    n = [int(np.ceil((span[0] + 2 * pad) / 2) * 2),
+         int(np.ceil((span[1] + 2 * pad) / 2) * 2),
+         int(round(200 * d_lu / 40.0))]                 # z: legacy height
+    return dx, mm2lu, o, tuple(n)
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 # repaired(0808): 원본 assembly_full.stl은 비수밀(나사 32개 역와인딩 + 로드
