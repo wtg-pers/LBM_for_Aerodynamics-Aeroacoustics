@@ -29,6 +29,22 @@ def extract_level(lev) -> dict:
     LocalLevel wrap-slices its slab out of these views; the caller then
     releases the source arrays (see DistributedMLGRunner) so the transient
     peak stays at (t=0 build state + one slab) and shrinks level by level.
+
+    `f0` is the ONE exception to "views only": physical_f materialises a
+    standard-ordered copy of the WHOLE level, even though this rank only ever
+    uses its own slab of it. The esoteric original is dead once that copy
+    exists, so it is released HERE rather than by the caller after LocalLevel
+    is built — that keeps the NEXT level's peak from carrying this one's f.
+
+    ★ This does NOT remove the full-copy peak itself, which is the standing
+    limit on replicated-build size: at octo8 v1 the largest level is
+    39,635,241 cells = 4.28 GB per copy, and the gather OOM'd a 24 GB card
+    with 21.2 GB already allocated (2026-08-10 cluster run). The real fix is
+    to gather only this rank's slab region (esoteric_gather_std_region with
+    the wrapped own-range) instead of the whole level, which would cut the
+    transient by n_ranks; it needs LocalLevel's chunk loop to take a slab
+    rather than a full field, so it is a separate change. Until then a build
+    that does not fit uses --dist-init (no restart, no conservation).
     """
     shape = lev.domain_shape
     feq27 = None
@@ -42,6 +58,16 @@ def extract_level(lev) -> dict:
         # same per-cell math as the full elementwise init -> bit-equal
         feq27 = lev.collision.compute_equilibrium(rho_t, u_t)
     _oh = getattr(lev, '_eso_omega_high', 1.0 / lev.tau)
+
+    f0 = lev.physical_f                     # standard phys, t=0 (full copy)
+    if f0 is not None:
+        try:
+            lev.f = None                    # esoteric original is dead now
+        except AttributeError:
+            pass                            # read-only property: caller frees
+        else:
+            cp.get_default_memory_pool().free_all_blocks()
+
     return dict(
         shape=shape,
         omega=1.0 / lev.tau,
@@ -51,7 +77,7 @@ def extract_level(lev) -> dict:
         lam=getattr(lev, '_eso_lambda', 0.0),
         bgk=(type(lev.collision).__name__ == 'BGKCollision'),
         sgs=dict(lev._sgs_cfg),
-        f0=lev.physical_f,                             # standard phys, t=0
+        f0=f0,                                         # standard phys, t=0
         feq27=feq27,                                   # dist-init constant
         node_type=lev._eso_node_type.reshape(shape),
         # Wall-aware coupling skip (mlg.wall_coupling.mode='exclude'), or
