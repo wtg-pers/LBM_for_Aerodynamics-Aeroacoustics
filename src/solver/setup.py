@@ -745,31 +745,70 @@ class SimulationSetup:
         Body surface closer than 0.5*L_body to the fine_region edge
         couples the interface into the boundary layer (non-physical Cd
         shift) -> warning. STL track S0 carryover.
+
+        Under mlg.wall_coupling.mode='exclude' the wall neighbourhood is
+        skipped by the coupling instead (src/grid/wall_coupling.py), so
+        the intersection is reported with its per-face cost rather than
+        rejected — see that module for what the exclusion does and does
+        NOT cover.
         """
         import numpy as _np
         from src.grid.overlap_manager import body_coupling_band_report
+        from src.grid.wall_coupling import report_band_exclusion
 
         solid_np = fine_mask.get() if hasattr(fine_mask, 'get') else fine_mask
-        report = body_coupling_band_report(
-            _np.asarray(solid_np, dtype=bool), region,
-        )
+        solid_np = _np.asarray(solid_np, dtype=bool)
+        report = body_coupling_band_report(solid_np, region)
+        policy = self._wall_coupling
         if report['violations']:
             faces = ', '.join(
                 f"{face} ({n} solid cells)"
                 for face, n in report['violations']
             )
-            raise ValueError(
-                f"Level {k}: obstacle intersects the C2F/F2C coupling band "
-                f"on face(s): {faces}. Coupling interpolation would read/"
-                f"write through the body. Enlarge mlg.levels[{k}].region so "
-                f"the fine region encloses the body with >= 0.5*L_body "
-                f"padding (MLG region padding rule)."
-            )
+            if not policy.relaxes_guard:
+                raise ValueError(
+                    f"Level {k}: obstacle intersects the C2F/F2C coupling "
+                    f"band on face(s): {faces}. Coupling interpolation would "
+                    f"read/write through the body. Enlarge "
+                    f"mlg.levels[{k}].region so the fine region encloses the "
+                    f"body with >= 0.5*L_body padding (MLG region padding "
+                    f"rule), or set mlg.wall_coupling.mode='exclude' to skip "
+                    f"the wall neighbourhood instead (experimental)."
+                )
+            how = ("wall neighbourhood skipped" if policy.excludes_wall
+                   else "coupling UNCHANGED (control leg)")
+            print(f"    [wall_coupling] Level {k}: body intersects the C2F "
+                  f"band on {faces} — accepted, {how}")
+            for face, n_band, n_ex in report_band_exclusion(
+                    solid_np, region,
+                    policy.wall_margin if policy.excludes_wall else 0):
+                frac = 100.0 * n_ex / n_band
+                flag = "  <-- face is mostly excluded" if frac > 50.0 else ""
+                print(f"      band {face:7s}: {n_ex:,}/{n_band:,} cells "
+                      f"excluded ({frac:.1f}%){flag}")
         for face, dist, need in report['padding_warnings']:
             print(f"    [warn] Level {k}: body surface only {dist} fine "
                   f"cells from fine_region edge '{face}' "
                   f"(< 0.5*L_body = {need:.1f}) — interface couples into "
                   f"the boundary layer, Cd may shift non-physically")
+
+    def _attach_coupling_skip(self, sim, solid_mask, level: int,
+                              label: str = "") -> None:
+        """Give `sim` the flags its coupling scatters skip.
+
+        Strict policy (default) attaches None, so `coupling_skip_nt` falls
+        back to the level's esoteric node type and the run is bit-identical
+        to before wall-aware coupling existed.
+        """
+        from src.grid.wall_coupling import attach_coupling_skip
+
+        n = attach_coupling_skip(sim, solid_mask, self._wall_coupling)
+        if n:
+            tag = f"L{level}" + (f" '{label}'" if label else "")
+            n_solid = int(solid_mask.sum())
+            print(f"    [wall_coupling] {tag}: {n:,} cells excluded from "
+                  f"coupling ({n_solid:,} solid + "
+                  f"{n - n_solid:,} wall-adjacent fluid)")
 
     def _build_obstacle_wall_bc(
         self,
@@ -1446,8 +1485,13 @@ class SimulationSetup:
 
         Dispatches to 2D variant when lattice.dim == 2.
         """
+        from src.grid.wall_coupling import parse_wall_coupling
+
         self._mlg_config = self.config.get('mlg', {})
         self._mlg_enabled: bool = self._mlg_config.get('enabled', False)
+        # Parsed before the early returns so every path (disabled, 2D, 3D)
+        # has the attribute the band guard reads.
+        self._wall_coupling = parse_wall_coupling(self._mlg_config)
 
         if not self._mlg_enabled:
             self._mlg_vtk_writer = None
@@ -1469,6 +1513,10 @@ class SimulationSetup:
         print(f"  Overlap width: {overlap_width} coarse cells")
         print(f"  Interpolation: {interp_name}")
         print(f"  Filter level: {filter_level}")
+        if self._wall_coupling.relaxes_guard:
+            from src.grid.wall_coupling import check_margin_vs_band
+            check_margin_vs_band(self._wall_coupling, overlap_width)
+            print(f"  Wall coupling: {self._wall_coupling.describe()}")
 
         # ── Level scaler ─────────────────────────────────────────
         self._mlg_scaler = LevelScaler(
@@ -1760,6 +1808,7 @@ class SimulationSetup:
             sgs_cfg=self._sgs_cfg,
         )
         simulations.append(sim_0)
+        self._attach_coupling_skip(sim_0, self._mask, level=0)
 
         # ── Fine levels ──────────────────────────────────────────
         _blk_alms = []
@@ -1796,6 +1845,7 @@ class SimulationSetup:
             # This means the obstacle has 2^k times more grid points
             # on level k (e.g., D=20 at L0 → D=40 at L1).
             fine_obstacle_bc = None
+            fine_mask_k = None       # this level's solid mask, or None
             internal_geom = self.config.get('internal_geometry', {})
             if internal_geom:
                 fine_origin = _blk.origin
@@ -1825,6 +1875,7 @@ class SimulationSetup:
                     )
                     n_solid = int(xp.sum(fine_mask))
                     if fine_geom_info['type'] != 'none' and n_solid > 0:
+                        fine_mask_k = fine_mask
                         self._check_body_vs_coupling_band(k, region, fine_mask)
                         # Honor wall_bc (hwbb / ibb / surfel) on this MLG fine
                         # level too — NOT hardcoded HWBB. Without this, the BC
@@ -1872,6 +1923,8 @@ class SimulationSetup:
             )
             simulations.append(sim_k)
             _blk.sim = sim_k
+            self._attach_coupling_skip(sim_k, fine_mask_k, level=k,
+                                       label=_blk.name)
 
             # ── Coupling engine for pair (k-1, k) ────────────────
             coupling_k = GridCoupling(

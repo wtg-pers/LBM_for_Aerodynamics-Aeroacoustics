@@ -273,8 +273,8 @@ class DistributedMLGRunner:
             else:
                 self.lv.append(None)
             for a in ("f", "f_post", "f_prev", "rho", "u",
-                      "_eso_node_type", "_eso_bc_rho", "_eso_bc_ux",
-                      "_eso_bc_uy", "_eso_bc_uz"):
+                      "_eso_node_type", "_coupling_skip_nt", "_eso_bc_rho",
+                      "_eso_bc_ux", "_eso_bc_uy", "_eso_bc_uz"):
                 if hasattr(lev, a):
                     try:
                         setattr(lev, a, None)
@@ -496,7 +496,7 @@ class DistributedMLGRunner:
                                   is_half_step=is_half,
                                   f_prev_sub_loc=(self._fprev[uid] if is_half
                                                   else None),
-                                  nt_f=self.lv[uid].nt)
+                                  nt_f=self.lv[uid].nt_c2f)
                 self._toc("coupling", t0)
                 self._touch(uid)      # c2f wrote our strips
             for g in b.children:
@@ -507,7 +507,7 @@ class DistributedMLGRunner:
             t0 = self._tic()
             self.rlc[uid].f2c(self.lv[uid].mem, self.lv[puid].mem,
                               self.lv[uid].t, self.lv[puid].t,
-                              nt_c=self.lv[puid].nt)
+                              nt_c=self.lv[puid].nt_f2c)
             self._toc("coupling", t0)
         if p_mine:
             self._touch(puid)         # f2c wrote the coarse excised rows

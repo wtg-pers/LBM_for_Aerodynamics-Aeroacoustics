@@ -25,6 +25,11 @@ Variants, chosen so each new capability gets a test the moment it lands:
     mlg="nested"  one L1 PER ROTOR, each holding its own L2 (several blocks at
                   BOTH levels — the topology where a fine block's parent is
                   itself one of several)
+    mlg="cut"     like "single" but the L1 floor is RAISED into the sphere, so
+                  the body straddles the refinement interface — the octo8
+                  airframe situation at rig scale. Rejected outright unless
+                  mlg.wall_coupling.mode='exclude'; judged against "single",
+                  which is the same case with the body fully enclosed.
 
 The two rotors spin opposite ways on purpose: their torques cancel, so the
 sphere sees no net swirl and any asymmetry in the answer is a bug, not physics.
@@ -61,9 +66,17 @@ L2_BOXES = [{"name": "rotorA", "x_min": 30, "x_max": 50,
              "y_min": 48, "y_max": 68, "z_min": 44, "z_max": 60}]
 
 
+# "cut": the L1 floor sits at z=22, inside the sphere (which spans z 21..35).
+# The C2F band (fine_domain..fine_region = z 20..22 coarse) then contains
+# solid cells on the z_low face — the configuration _check_body_vs_coupling_band
+# rejects, and the one wall-aware coupling exists to make runnable.
+L1_BOX_CUT = dict(L1_BOX, z_min=22)
+
+
 def build(mlg: str = "off", wall_bc: str = "hwbb", n_rev: float = 0.5,
-          sphere: bool = True):
-    """mlg ∈ {"off", "single", "blocks"}."""
+          sphere: bool = True, wall_coupling: dict | None = None,
+          forces: bool = False):
+    """mlg ∈ {"off", "single", "blocks", "nested", "cut"}."""
     u_max = 0.1
     steps_rev = int(round(2 * np.pi * (D_LU / 2) / u_max))     # 503
 
@@ -85,6 +98,9 @@ def build(mlg: str = "off", wall_bc: str = "hwbb", n_rev: float = 0.5,
 
     if mlg == "single":
         levels = [{}, {"regions": [dict(L1_BOX, name="rig")]}]
+        num_levels = 2
+    elif mlg == "cut":
+        levels = [{}, {"regions": [dict(L1_BOX_CUT, name="rig")]}]
         num_levels = 2
     elif mlg == "nested":
         # L1 split per rotor, each with its own L2 child. fine_domain_coarse
@@ -135,14 +151,15 @@ def build(mlg: str = "off", wall_bc: str = "hwbb", n_rev: float = 0.5,
         "boundaries": boundaries,
         "internal_geometry": geom,
         "mlg": ({"enabled": True, "num_levels": num_levels, "overlap_width": 2,
-                 "interpolation": "cubic", "filter_level": 1, "levels": levels}
+                 "interpolation": "cubic", "filter_level": 1, "levels": levels,
+                 **({"wall_coupling": wall_coupling} if wall_coupling else {})}
                 if num_levels > 1 else {"enabled": False}),
         "sgs": {"enabled": False, "model": "off"},
         "airfoil_polar": {"method": "flat_plate", "Re_target": 1e5},
         "actuator_line": al,
         "conservation": {"enabled": True, "verbose": 0, "log_to_csv": True},
         "convergence": {"enabled": False},
-        "force_calculation": {"enabled": False},
+        "force_calculation": {"enabled": bool(forces)},
         "output": {"output_dir": f"./result_{tag}/vtk",
                    "checkpoint_dir": f"./result_{tag}/checkpoints",
                    "csv_dir": f"./result_{tag}/csv", "clear_previous": True,

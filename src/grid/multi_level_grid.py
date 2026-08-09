@@ -327,19 +327,26 @@ class MultiLevelGrid:
                 f_c, None, is_half_step=is_half_step, f_coarse_prev=f_prev,
                 f_coarse_is_sub=c_is_sub, f_coarse_prev_is_sub=True,
                 strips_out=strips)
+            from src.grid.wall_coupling import coupling_skip_nt
+            skip_f = coupling_skip_nt(sim_fine, 'c2f')
             for sp_sl, vals in strips:
                 # skip_solid_nt: coupling writes carry FOREIGN values — at
                 # solid cells they would land on live bounce-deposit slots
-                # (patch 12 root cause; f1d proof).
+                # (patch 12 root cause; f1d proof). Under
+                # mlg.wall_coupling.mode='exclude' the same argument also
+                # carries the wall-adjacent fluid layer, whose populations
+                # belong to the wall BC (src/grid/wall_coupling.py).
                 esoteric_scatter_std_region(
                     sim_fine.xp, sim_fine.f, vals,
                     sim_fine._esoteric_step, sp_sl,
-                    skip_solid_nt=sim_fine._eso_node_type)
+                    skip_solid_nt=skip_f)
         else:
+            from src.grid.wall_coupling import wall_skip_nt
             coupling.coarse_to_fine(
                 f_c, sim_fine.f, is_half_step=is_half_step,
                 f_coarse_prev=f_prev,
-                f_coarse_is_sub=c_is_sub, f_coarse_prev_is_sub=True)
+                f_coarse_is_sub=c_is_sub, f_coarse_prev_is_sub=True,
+                skip_nt=wall_skip_nt(sim_fine, 'c2f'))
 
     def _coupling_f2c(self, coupling, sim_fine, sim_coarse) -> None:
         """F2C with per-level esoteric scoping (see class comment)."""
@@ -363,10 +370,11 @@ class MultiLevelGrid:
             # levels; without the skip, the restriction's solid-cell values
             # overwrite the fluid neighbours' live deposits and the coarse
             # wall bounces garbage every cycle (patch 12 root cause).
+            from src.grid.wall_coupling import coupling_skip_nt
             esoteric_scatter_std_region(
                 sim_coarse.xp, sim_coarse.f, block,
                 sim_coarse._esoteric_step, coupling.excised_spatial_slices,
-                skip_solid_nt=sim_coarse._eso_node_type)
+                skip_solid_nt=coupling_skip_nt(sim_coarse, 'f2c'))
         elif getattr(sim_coarse, '_use_surfel', False):
             # Surfel coarse level: the std restriction has no solid skip
             # and writes THROUGH the body. Fine dead cells hold rho = 0,
@@ -391,8 +399,10 @@ class MultiLevelGrid:
                       where=~xp.isnan(block))
             sim_coarse.obstacle_bc.zero_dead(sim_coarse.f)
         else:
+            from src.grid.wall_coupling import wall_skip_nt
             coupling.fine_to_coarse(
-                f_f, sim_coarse.f, f_fine_is_at_coarse=f_is_at)
+                f_f, sim_coarse.f, f_fine_is_at_coarse=f_is_at,
+                skip_nt=wall_skip_nt(sim_coarse, 'f2c'))
 
     def _advance_eager(self) -> None:
         """Eager (non-graph) coarse timestep: the nested-stepping recursion."""

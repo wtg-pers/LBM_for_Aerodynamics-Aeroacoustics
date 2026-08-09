@@ -280,6 +280,7 @@ class GridCoupling:
         f_coarse_is_sub: bool = False,
         f_coarse_prev_is_sub: bool = False,
         strips_out: Optional[list] = None,
+        skip_nt: Optional['npt.NDArray'] = None,
     ) -> None:
         """Inject coarse data into the fine grid boundary strip.
 
@@ -299,6 +300,10 @@ class GridCoupling:
                 instead of being written into f_fine — avoids any
                 full-fine-field temporary. Uses the boundary-only
                 upsample (bit-identical on the strips).
+            skip_nt: fine-level coupling skip flags, raveled int8, 1 =
+                do not write (src/grid/wall_coupling.py). The esoteric
+                path masks inside its scatter instead and passes None
+                here; this is the standard-layout equivalent.
         """
         xp = self._xp
 
@@ -342,12 +347,31 @@ class GridCoupling:
             for c_sl, w_sl, r_sl in self._bnd_face_specs:
                 slab = self._upsample_block(coarse_nodes[c_sl])
                 strips_out.append((w_sl[1:], slab[r_sl]))
-        elif _C2F_BOUNDARY_ONLY:
-            self._upsample_boundary_into(coarse_nodes, f_fine)
+            return
+        keep = self._keep_mask(skip_nt, f_fine.shape[1:])
+        if _C2F_BOUNDARY_ONLY:
+            self._upsample_boundary_into(coarse_nodes, f_fine, keep)
         else:
             f_fine_full = self._upsample_block(coarse_nodes)
             for (sx, sy, sz) in self._fine_bnd_slices.values():
-                f_fine[:, sx, sy, sz] = f_fine_full[:, sx, sy, sz]
+                self._write(f_fine, (sx, sy, sz),
+                            f_fine_full[:, sx, sy, sz], keep)
+
+    # ── write masking (standard layout; esoteric masks in its scatter) ──
+
+    def _keep_mask(self, skip_nt, shape):
+        """Bool 'may be written' field from raveled int8 skip flags."""
+        if skip_nt is None:
+            return None
+        return skip_nt.reshape(shape) != 1
+
+    def _write(self, dst, spatial, values, keep) -> None:
+        """dst[:, *spatial] = values, honouring the keep mask if present."""
+        sl = (slice(None),) + tuple(spatial)
+        if keep is None:
+            dst[sl] = values
+            return
+        self._xp.copyto(dst[sl], values, where=keep[tuple(spatial)])
 
     # =================================================================
     # Public: Fine → Coarse
@@ -360,6 +384,7 @@ class GridCoupling:
         *,
         f_fine_is_at_coarse: bool = False,
         return_excised: bool = False,
+        skip_nt: Optional['npt.NDArray'] = None,
     ) -> Optional['npt.NDArray']:
         """Overwrite EXCISED coarse nodes with fine-grid data.
 
@@ -382,6 +407,9 @@ class GridCoupling:
                 May be None when return_excised is True.
             return_excised: return the excised block (Q, *excised_shape)
                 instead of writing it (caller scatters it; Phase e2).
+            skip_nt: coarse-level coupling skip flags, raveled int8, 1 =
+                do not write (src/grid/wall_coupling.py). Ignored when
+                return_excised — that caller masks in its own scatter.
         """
         R = self._region.REFINE_RATIO
 
@@ -405,8 +433,9 @@ class GridCoupling:
         # Overlap strip keeps native coarse values → smooth interface
         if return_excised:
             return f_reconstructed[self._excised_local_slices]
-        f_coarse[self._excised_coarse_slices] = \
-            f_reconstructed[self._excised_local_slices]
+        self._write(f_coarse, self._excised_coarse_slices[1:],
+                    f_reconstructed[self._excised_local_slices],
+                    self._keep_mask(skip_nt, f_coarse.shape[1:]))
         return None
 
     # =================================================================
@@ -572,6 +601,7 @@ extern "C" __global__ void feq_fneq(
 
     def _upsample_boundary_into(
         self, coarse_nodes: 'npt.NDArray', f_fine: 'npt.NDArray',
+        keep=None,
     ) -> None:
         """Boundary-only C→F (Phase 1a Stage A): upsample one thin coarse slab
         per fine face and write the 6 boundary strips of `f_fine` in place.
@@ -586,7 +616,7 @@ extern "C" __global__ void feq_fneq(
         """
         for c_sl, w_sl, r_sl in self._bnd_face_specs:
             slab = self._upsample_block(coarse_nodes[c_sl])
-            f_fine[w_sl] = slab[r_sl]
+            self._write(f_fine, w_sl[1:], slab[r_sl], keep)
 
     # =================================================================
     # Private: F→C Low-pass Filter

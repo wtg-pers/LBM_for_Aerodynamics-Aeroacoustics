@@ -54,6 +54,13 @@ def extract_level(lev) -> dict:
         f0=lev.physical_f,                             # standard phys, t=0
         feq27=feq27,                                   # dist-init constant
         node_type=lev._eso_node_type.reshape(shape),
+        # Wall-aware coupling skip (mlg.wall_coupling.mode='exclude'), or
+        # None under the strict default. Computed on the FULL solid mask at
+        # setup and sliced here exactly like node_type, so the flags are a
+        # global geometric property — identical for any rank count.
+        coupling_skip=(None if getattr(lev, '_coupling_skip_nt', None) is None
+                       else lev._coupling_skip_nt.reshape(shape)),
+        coupling_skip_dirs=tuple(getattr(lev, '_coupling_skip_dirs', ())),
         bc_rho=lev._eso_bc_rho.reshape(shape),
         bc_ux=lev._eso_bc_ux.reshape(shape),
         bc_uy=lev._eso_bc_uy.reshape(shape),
@@ -140,6 +147,15 @@ class LocalLevel:
         self.w345 = ld.get("omega_345", (self.oh, self.oh, self.oh))
         self.lam = ld.get("lam", 0.0)
         self.nt = wrap_slice(ld["node_type"], part).ravel().copy()
+        # Flags the COUPLING scatters skip, per direction. Each defaults to
+        # self.nt — the patch-12 solid-only skip — so a strict build, and
+        # any direction the policy does not cover, is unchanged.
+        _cs = ld.get("coupling_skip")
+        _dirs = ld.get("coupling_skip_dirs") or ()
+        _wall = (None if _cs is None
+                 else wrap_slice(_cs, part).ravel().copy())
+        self.nt_c2f = _wall if (_wall is not None and "c2f" in _dirs) else self.nt
+        self.nt_f2c = _wall if (_wall is not None and "f2c" in _dirs) else self.nt
         if t0 == 0:
             # fresh IC only: seed the implicit-HWBB bounce slots on the slab
             # (restart t0>0 scatters the checkpointed deposits bit-exactly —
