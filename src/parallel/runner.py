@@ -265,7 +265,7 @@ class DistributedMLGRunner:
                 str((getattr(lev, "_sgs_cfg", None) or {}).get("model", "off"))
                 == "dyn_smag")
             if self.owns[uid]:
-                ld = extract_level(lev)
+                ld = extract_level(lev, self.parts[uid])
                 self.lv.append(LocalLevel(
                     ld, self.parts[uid],
                     t0=self.completed_step * (2 ** b.level)))

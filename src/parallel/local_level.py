@@ -21,7 +21,7 @@ from src.kernels.esoteric_d3q27 import (
 from src.kernels.dyn_smag_d3q27 import DynSmagKernelD3Q27
 
 
-def extract_level(lev) -> dict:
+def extract_level(lev, part=None) -> dict:
     """Reference (NOT copy) everything the driver needs from a built level.
 
     Views only — at D40 the per-level f copy alone is up to 2.9GB and stacked
@@ -30,21 +30,20 @@ def extract_level(lev) -> dict:
     releases the source arrays (see DistributedMLGRunner) so the transient
     peak stays at (t=0 build state + one slab) and shrinks level by level.
 
-    `f0` is the ONE exception to "views only": physical_f materialises a
-    standard-ordered copy of the WHOLE level, even though this rank only ever
-    uses its own slab of it. The esoteric original is dead once that copy
-    exists, so it is released HERE rather than by the caller after LocalLevel
-    is built — that keeps the NEXT level's peak from carrying this one's f.
+    `f0` is the ONE exception to "views only" — it is a standard-ordered
+    copy. Given `part` it is SLAB-scoped (slab_std_f): only this rank's
+    own+ghost rows are materialised, which is all it ever uses. The whole-
+    level form is kept for a caller with no partition.
 
-    ★ This does NOT remove the full-copy peak itself, which is the standing
-    limit on replicated-build size: at octo8 v1 the largest level is
-    39,635,241 cells = 4.28 GB per copy, and the gather OOM'd a 24 GB card
-    with 21.2 GB already allocated (2026-08-10 cluster run). The real fix is
-    to gather only this rank's slab region (esoteric_gather_std_region with
-    the wrapped own-range) instead of the whole level, which would cut the
-    transient by n_ranks; it needs LocalLevel's chunk loop to take a slab
-    rather than a full field, so it is a separate change. Until then a build
-    that does not fit uses --dist-init (no restart, no conservation).
+    The esoteric original is dead once that copy exists, so it is released
+    HERE rather than by the caller after LocalLevel is built — that keeps the
+    next level's peak from carrying this one's f.
+
+    Why it matters: the full copy used to be the standing limit on
+    replicated-build size. At octo8 v1 the largest level is 39,635,241 cells
+    = 4.28 GB per copy, and gathering it OOM'd a 24 GB card that already held
+    21.2 GB (2026-08-10 cluster run). Slab-scoped, that transient is ~1/n_ranks
+    of it.
     """
     shape = lev.domain_shape
     feq27 = None
@@ -59,7 +58,17 @@ def extract_level(lev) -> dict:
         feq27 = lev.collision.compute_equilibrium(rho_t, u_t)
     _oh = getattr(lev, '_eso_omega_high', 1.0 / lev.tau)
 
-    f0 = lev.physical_f                     # standard phys, t=0 (full copy)
+    # Slab-scoped when the caller knows this rank's partition (the whole
+    # point — see slab_std_f); full-level copy otherwise, which is the old
+    # behaviour and what a 1-rank/no-partition caller still gets.
+    f0_is_slab = False
+    if lev.f is None:
+        f0 = None
+    elif part is not None:
+        f0 = slab_std_f(lev, part)
+        f0_is_slab = True
+    else:
+        f0 = lev.physical_f
     if f0 is not None:
         try:
             lev.f = None                    # esoteric original is dead now
@@ -78,6 +87,7 @@ def extract_level(lev) -> dict:
         bgk=(type(lev.collision).__name__ == 'BGKCollision'),
         sgs=dict(lev._sgs_cfg),
         f0=f0,                                         # standard phys, t=0
+        f0_is_slab=f0_is_slab,                         # local coords already
         feq27=feq27,                                   # dist-init constant
         node_type=lev._eso_node_type.reshape(shape),
         # Wall-aware coupling skip (mlg.wall_coupling.mode='exclude'), or
@@ -92,6 +102,47 @@ def extract_level(lev) -> dict:
         bc_uy=lev._eso_bc_uy.reshape(shape),
         bc_uz=lev._eso_bc_uz.reshape(shape),
     )
+
+
+def slab_std_f(lev, part):
+    """Standard-ordered f on THIS RANK's slab only — (27, *local_shape).
+
+    `physical_f` materialises the WHOLE level even though a rank only ever
+    uses its own slab of it. At octo8 v1 that is 4.28 GB for L2 alone, and it
+    OOM'd a 24 GB card during runner construction with 21.2 GB already held
+    (2026-08-10). This gathers 1/n_ranks of it (plus ghosts) instead.
+
+    Wrapping is preserved exactly as wrap_slice does it: the local range
+    [own_start - ghost, + local_shape) is taken modulo the global extent, so
+    a rank at either end reads across the seam. That range is covered in at
+    most two CONTIGUOUS pieces, both of which stay on the region kernel's
+    fast path (it rejects out-of-bounds slices and would otherwise fall back
+    to the python index path).
+    """
+    from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
+
+    xp = lev.xp
+    ax = part.axis
+    n_glob = int(lev.domain_shape[ax])
+    n_loc = int(part.local_shape[ax])
+    lo = part.own_start - part.ghost
+    out, pos = None, 0
+    while pos < n_loc:
+        start = (lo + pos) % n_glob
+        cnt = min(n_loc - pos, n_glob - start)
+        reg = [slice(None)] * 3
+        reg[ax] = slice(start, start + cnt)
+        piece = esoteric_gather_std_region(
+            xp, lev.f, lev._esoteric_step, tuple(reg))
+        if out is None:
+            out = xp.empty((piece.shape[0],) + tuple(part.local_shape),
+                           dtype=piece.dtype)
+        dst = [slice(None)] * 4
+        dst[1 + ax] = slice(pos, pos + cnt)
+        out[tuple(dst)] = piece
+        del piece
+        pos += cnt
+    return out
 
 
 def wrap_slice(arr, part, spatial_offset: int = 0):
@@ -139,15 +190,17 @@ class LocalLevel:
         cshape = list(self.dims)
         cshape[cax] = ch
         cbuf = cp.empty((27,) + tuple(cshape), cp.float32)
+        slab_src = bool(ld.get("f0_is_slab"))
         wrap_idx = None
-        if ld["f0"] is not None:
+        if ld["f0"] is None:                  # dist-init: uniform IC, no field
+            cp.copyto(cbuf, cp.asarray(ld["feq27"],
+                                       dtype=cp.float32).reshape(27, 1, 1, 1))
+        elif not slab_src:                    # full field: wrap on the axis
             lo = part.own_start - part.ghost
             wrap_idx = cp.asarray(
                 (np.arange(lo, lo + part.local_shape[part.axis])
                  % ld["f0"].shape[1 + part.axis]))
-        else:
-            cp.copyto(cbuf, cp.asarray(ld["feq27"],
-                                       dtype=cp.float32).reshape(27, 1, 1, 1))
+        # slab_src: already wrapped into local coords by slab_std_f
         for c0 in range(0, self.dims[cax], ch):
             n_c = min(ch, self.dims[cax] - c0)
             sl = slice(c0, c0 + n_c)
@@ -161,8 +214,12 @@ class LocalLevel:
                 # applies to the source directly; wrap only on the axis
                 src = [slice(None)] * 4
                 src[1 + cax] = sl
-                cp.take(ld["f0"][tuple(src)], wrap_idx,
-                        axis=1 + part.axis, out=view)
+                if slab_src:
+                    # already wrapped into local coords by slab_std_f
+                    cp.copyto(view, ld["f0"][tuple(src)])
+                else:
+                    cp.take(ld["f0"][tuple(src)], wrap_idx,
+                            axis=1 + part.axis, out=view)
             vals = view if view.flags.c_contiguous \
                 else cp.ascontiguousarray(view)
             esoteric_scatter_std_region(cp, self.mem, vals, t0, tuple(reg))
@@ -191,7 +248,8 @@ class LocalLevel:
             # its first advance), so only owned-region correctness matters.
             from src.kernels.esoteric_d3q27 import eso_seed_solid_bounce_ic
             if ld["f0"] is not None:
-                get_dir = lambda q: wrap_slice(ld["f0"][q], part)
+                get_dir = ((lambda q: ld["f0"][q]) if slab_src
+                           else (lambda q: wrap_slice(ld["f0"][q], part)))
             else:
                 get_dir = lambda q: float(ld["feq27"][q].ravel()[0])
             eso_seed_solid_bounce_ic(
