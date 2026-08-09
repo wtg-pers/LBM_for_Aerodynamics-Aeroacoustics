@@ -84,8 +84,15 @@ class SolverInitializer:
         if os.environ.get("LBM_DIST_INIT", "0") == "1":
             pass                        # no full fields exist (MPI runner)
         elif self._setup.conservation_mgr and self._setup.conservation_mgr.enabled:
-            f_for_monitor = sim.f
-            rho_init, _ = self._setup.macro.compute(f_for_monitor)
+            # compute_density, NOT compute: the momentum half of compute() was
+            # discarded here, and it is the expensive half. tensordot(c, f)
+            # promotes f to c's float64, so the throwaway momentum cost an
+            # astype of the WHOLE distribution — 6.94 GB at octo8's L0
+            # (27 x 32.14M x 8 B), plus the momentum and velocity arrays, all
+            # for a value the next line drops. It was the second wall the
+            # octo8 MPI build hit. Bit-identical: compute() derives rho with
+            # the same xp.sum(f, axis=0).
+            rho_init = self._setup.macro.compute_density(sim.f)
             self._setup.conservation_mgr.initialize(rho_init, step=start_step)
 
         # ── Step 4b: Open CSV files (with start_step for restart) ─
