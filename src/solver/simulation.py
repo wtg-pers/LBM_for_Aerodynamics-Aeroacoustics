@@ -597,8 +597,7 @@ class Simulation:
         from src.kernels.esoteric_d3q27 import (
             EsotericBGKKernelD3Q27,
             EsotericMacroKernelD3Q27,
-            convert_f_std_to_esoteric,
-            init_f_esoteric,
+            esoteric_scatter_std,
             eso_seed_solid_bounce_ic,
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE,
             _STD_TO_ESO,
@@ -613,8 +612,11 @@ class Simulation:
                 "use precision: float32 or disable LBM_ESOTERIC")
 
         if not self._esoteric_f_already_set:
-            f_eso = convert_f_std_to_esoteric(xp, f)
-            self.f = init_f_esoteric(xp, f_eso, t_start=0)
+            # Fused conversion: see esoteric_scatter_std. The two-call form
+            # (convert -> init) held the caller's f, the reordered copy AND
+            # the result simultaneously — three full-size arrays of the level
+            # being built, 11.5 GB on octo8's 35.5 M-cell L1.
+            self.f = esoteric_scatter_std(xp, f, 0)
         else:
             self.f = f
         self._f_post = None  # single-buffer in-place

@@ -600,9 +600,38 @@ def esoteric_gather_std(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
 
 
 def esoteric_scatter_std(xp, f_std: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
-    """Physical f in STANDARD ordering -> Esoteric memory layout."""
-    return init_f_esoteric(
-        xp, convert_f_std_to_esoteric(xp, f_std), t_start=t_step)
+    """Physical f in STANDARD ordering -> Esoteric memory layout.
+
+    FUSED: the esoteric-ordered intermediate is never materialized. The naive
+    composition `init_f_esoteric(convert_f_std_to_esoteric(f))` holds THREE
+    full-size arrays at once — the caller's f_std, the reordered copy, and the
+    result — which is 11.5 GB for a 35.5 M-cell level and is what put the
+    octo8 build over a 24 GB card (OOM while allocating the third).
+
+    Fusing is exact, not an approximation: every output slot is a copy of
+    exactly ONE input direction, either local or rolled, so composing the
+    direction permutation into the slot assignment changes which array is
+    read, never what is computed. Peak drops to (input + output + one
+    direction-sized roll temporary = 1/27 of a field).
+    """
+    even = (t_step % 2 == 0)
+    ndim = f_std.ndim - 1                 # spatial dims (3 for a D3Q27 field)
+    ax = tuple(range(ndim))
+    out = xp.empty_like(f_std)
+    out[0] = f_std[_STD_TO_ESO[0]]        # rest-direction: no pair, no roll
+    for p in range(13):
+        i = 2 * p + 1
+        ci = (int(CX_ESO[i]), int(CY_ESO[i]), int(CZ_ESO[i]))[:ndim]
+        a = _STD_TO_ESO[i]                # std source for esoteric dir i
+        b = _STD_TO_ESO[i + 1]            # std source for esoteric dir i+1
+        rolled = xp.roll(f_std[b], shift=ci, axis=ax)
+        if even:
+            out[i + 1] = f_std[a]
+            out[i] = rolled
+        else:
+            out[i] = f_std[a]
+            out[i + 1] = rolled
+    return out
 
 
 # ============================================================
