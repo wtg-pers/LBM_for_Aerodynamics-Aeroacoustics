@@ -42,9 +42,12 @@ L0 위에 **로터마다 하나씩 L1 블록 8개**를 놓아, 리그(`configs/t
 어느 face 도 고갈되지 않는다(= coarse 유입이 충분히 남는다). 즉 **형상 문제가
 아니라 커플링 처방 문제였고, 처방이 생기니 배치가 성립한다.**
 
-단 이것이 결과의 정당성을 보장하지는 않는다. 리그 판정
-(patch_notes/wall_coupling/01)에서 이 처방은 오차를 4.63% -> 2.73% 로 줄였을
-뿐 없애지 못했고, 잔차는 **읽기 쪽**(C2F 가 몸체를 관통해 보간)으로 남아 있다.
+단 이것이 결과의 정당성을 보장하지 않는다. 리그 판정
+(patch_notes/wall_coupling/01)에서 C2F 벽 제외는 **벽 BC 에 따라 부호가 뒤집힌다**
+(hwbb +1.90 / ibb −2.89). 이 케이스는 ibb 라 제외를 켜지 않는다(아래 주석).
+어느 쪽이든 잔차 ~5% 는 남고 원인은 **읽기 쪽**(C2F 가 몸체를 관통해 보간)이다 —
+Daeian 2025(CPC 313:109637)의 ghost-node 가 그 정공법이고 미구현이다.
+
 octo8 은 리그보다 절개가 심하다(8.3% vs 0.9%). 본 런 전에 차량 전체 L1
 (`octo8_hover_5000rpm_mlg2.py`) 과 대조하는 것이 순서다.
 
@@ -119,9 +122,15 @@ config["mlg"] = {
     "interpolation": "cubic", "filter_level": 1,
     "levels": [{}, {"regions": _regions}],
     # 이 배치를 성립시키는 유일한 요소. 빼면 위 ValueError 로 되돌아간다.
-    # wall_margin 은 overlap_width 미만이어야 한다(밴드 4셀; 2 면 절반이
-    # 날아가 해가 파괴됨 — patch_notes/wall_coupling/01 §3).
-    "wall_coupling": {"mode": "exclude", "wall_margin": 1, "apply_to": "c2f"},
+    #
+    # ★ 'exclude' 가 아니라 'allow' 인 이유: 이 케이스는 wall_bc="ibb" 다.
+    # 리그 실측(patch_notes/wall_coupling/01 §3)에서 C2F 벽 제외의 이득은
+    # 벽 BC 에 따라 부호가 뒤집힌다 — hwbb 는 +1.90 이득, ibb 는 −2.89 손해.
+    # IBB 는 매 substep deposit-rewrite 가 C2F 가 쓴 값을 이미 교정하므로,
+    # 제외는 교정 이득 없이 유입 고갈만 남긴다.
+    #   -> 'exclude' 로 바꿔 보려면 wall_margin < overlap_width 를 지킬 것
+    #      (밴드 4셀; margin 2 면 절반이 날아가 해가 파괴됨).
+    "wall_coupling": {"mode": "allow"},
 }
 
 # 프리뷰: step 0 부터 full-field VTK, 체크포인트 없음

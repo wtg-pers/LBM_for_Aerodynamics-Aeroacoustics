@@ -61,9 +61,25 @@ fine level changes two things at once: the coupling now runs at a wall,
 AND the cut-off part loses resolution. Comparing 'exclude' against a body
 fully enclosed by the fine level cannot separate them. 'allow' holds the
 geometry fixed and varies only the coupling, so ('allow' - 'exclude') is
-what the wall exclusion actually buys. It is a measurement leg, not a
-production setting — its whole point is to run the coupling through a
-wall on purpose.
+what the wall exclusion actually buys.
+
+★ And that quantity CHANGES SIGN WITH THE WALL BC (rig, 4 rev, body
+force vs each leg's own enclosed-body reference):
+
+    wall_bc    allow     exclude    exclusion buys
+    hwbb      -4.63%     -2.73%        +1.90  (helps)
+    ibb       -5.54%     -8.43%        -2.89  (hurts)
+
+Mechanism: IBB runs a deposit-rewrite pass after every fused launch, so
+it already corrects whatever C2F wrote at a wall-adjacent cell. Excluding
+those cells then buys no correction and costs the outer inflow — pure
+starvation. HWBB has no such after-pass, so blocking the overwrite is a
+net gain there.
+
+So 'exclude' is NOT a general improvement, and 'allow' is not merely a
+control: on an IBB case it is the better of the two. Pick by measurement
+against an enclosed-body reference, per case. Both sit ~5% off that
+reference here, because neither addresses the READ side.
 
 What this does NOT do (read the caveat before trusting a result)
 ----------------------------------------------------------------
@@ -130,8 +146,7 @@ class WallCouplingPolicy:
         if self.mode == "strict":
             return "strict (body may not touch the C2F band)"
         if self.mode == "allow":
-            return ("allow (band intersection accepted, coupling UNCHANGED "
-                    "— control leg only, not a production setting)")
+            return ("allow (band intersection accepted, coupling UNCHANGED)")
         return (f"exclude on {self.apply_to.upper()} (skip solid + "
                 f"{self.wall_margin} fluid layer"
                 f"{'s' if self.wall_margin != 1 else ''} at the wall)")

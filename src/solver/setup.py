@@ -776,7 +776,7 @@ class SimulationSetup:
                     f"the wall neighbourhood instead (experimental)."
                 )
             how = ("wall neighbourhood skipped" if policy.excludes_wall
-                   else "coupling UNCHANGED (control leg)")
+                   else "coupling UNCHANGED")
             print(f"    [wall_coupling] Level {k}: body intersects the C2F "
                   f"band on {faces} — accepted, {how}")
             for face, n_band, n_ex in report_band_exclusion(
