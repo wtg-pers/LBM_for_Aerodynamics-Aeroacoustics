@@ -226,6 +226,24 @@ def _run(args, MPI):
     # per-BLOCK shapes, level-major (index == block uid)
     block_shapes = [tuple(b.sim.domain_shape) for b in mlg.iter_blocks()]
 
+    # Cadences: CLI wins, else the CONFIG's time.* — same source the
+    # single-GPU path uses. Without this fallback an MPI run that does not
+    # pass --vtk-every gets _vtk_every = 0, and MPIOutputManager._vtk_due
+    # is `bool(self._vtk_every) and ...` — so VTK and marker VTP are
+    # silently never written, no error, only empty levelN directories
+    # (octo8 v1 smoke, 2026-08-10). Checkpointing had the same hole, which
+    # is worse: a long run would finish with nothing to restart from.
+    _t = (setup.config or {}).get('time', {})
+    if args.vtk_every is None:
+        vtk_every = int(_t.get('output_interval', 0) or 0)
+    if args.ckpt_every is None:
+        ckpt_every = int(_t.get('checkpoint_interval', 0) or 0)
+    if args.log_every is None and _t.get('logging_interval'):
+        log_every = max(1, int(_t['logging_interval']))
+    if rank == 0:
+        print(f"[mpi] cadence: vtk={vtk_every} ckpt={ckpt_every} "
+              f"log={log_every} (CLI overrides config time.*)", flush=True)
+
     output = setup.build_output_manager(
         manager_cls=MPIOutputManager,
         comm=comm, rank=rank, nr=nr, mpi_mod=MPI,
