@@ -58,10 +58,27 @@ _BBOX_CTR_MM = 0.5 * (_BBOX_MIN_MM + _BBOX_MAX_MM)   # (-1090.395, 0, 186.478)
 
 ROTOR_Z_MM = 133.711                            # 로터 디스크 평면 (CAD z)
 
-# 호버링 높이(0808 사용자 확정): 지면 → **로터면** 955.5mm = 2.09D (IGE).
-#   → 지면 z_cad = -821.789mm. 기어 최하단(-132.044)은 지면 위 689.7mm.
+# 호버링 높이: 지면 → **로터면** [mm]. 실험 조건이므로 rpm 과 같은 급의
+# 노브다 — 모듈 상수는 기본값이고, build_config/grid_map* 의 hover_h_mm 로
+# 케이스별로 준다(v3 = 450mm).
+#   0808 사용자 확정 기본값 955.5mm = 2.09D (IGE)
+#     → 지면 z_cad = -821.789mm. 기어 최하단(-132.044)은 지면 위 689.7mm.
 HOVER_H_MM    = 955.5
 GROUND_CAD_MM = ROTOR_Z_MM - HOVER_H_MM          # -821.789
+
+
+def ground_cad_mm(hover_h_mm=None):
+    """지면의 CAD z [mm]. hover_h_mm=None 이면 모듈 기본값."""
+    h = HOVER_H_MM if hover_h_mm is None else float(hover_h_mm)
+    if h <= 0.0:
+        raise ValueError(f"hover_h_mm must be > 0, got {h}")
+    g = ROTOR_Z_MM - h
+    # 기체가 지면을 뚫으면 마스크가 지면 아래로 내려가 hwbb 벽과 겹친다.
+    if _BBOX_MIN_MM[2] <= g:
+        raise ValueError(
+            f"hover_h_mm={h}: 지면 z_cad={g:.3f}mm 이 기체 최하단 "
+            f"{_BBOX_MIN_MM[2]:.3f}mm 위에 있다 — 기체가 지면에 박힌다")
+    return g
 
 # 도메인 (lu): CAD 하드웨어 x[-186.0,-4.8], y[±167.2] lu 기준
 #   x: 후방(테일측 -x) 2D, 전방(노즈 너머 +x) ~1.5D
@@ -73,7 +90,8 @@ _O_Z = -GROUND_CAD_MM * MM2LU - 0.5             # 71.898 - 0.5 = 71.398
 O_LU = np.array([266.0, 248.0, _O_Z])           # CAD 원점(노즈)의 LU 좌표
 
 
-def grid_map(d_lu: int = D_LU, side_clearance_lb: float = None):
+def grid_map(d_lu: int = D_LU, side_clearance_lb: float = None,
+             hover_h_mm: float = None):
     """(dx_m, mm2lu, O_LU, (Nx, Ny, Nz)) for a base resolution of D/`d_lu`.
 
     d_lu=40 with side_clearance_lb=None reproduces the module constants above
@@ -94,7 +112,7 @@ def grid_map(d_lu: int = D_LU, side_clearance_lb: float = None):
     """
     dx = D_PHYS / d_lu
     mm2lu = 0.001 / dx
-    o_z = -GROUND_CAD_MM * mm2lu - 0.5
+    o_z = -ground_cad_mm(hover_h_mm) * mm2lu - 0.5
     if side_clearance_lb is None:                       # legacy domain
         s = d_lu / 40.0
         return dx, mm2lu, np.array([266.0 * s, 248.0 * s, o_z]), \
@@ -112,7 +130,7 @@ def grid_map(d_lu: int = D_LU, side_clearance_lb: float = None):
          int(round(200 * d_lu / 40.0))]                 # z: legacy height
     return dx, mm2lu, o, tuple(n)
 
-def grid_map_centered(d_lu: int, half_xy_mm: float):
+def grid_map_centered(d_lu: int, half_xy_mm: float, hover_h_mm: float = None):
     """(dx_m, mm2lu, O_LU, (Nx,Ny,Nz)) for a domain CENTRED on the vehicle.
 
     half_xy_mm: half-extent in x and y measured from the vehicle centre (the
@@ -132,7 +150,7 @@ def grid_map_centered(d_lu: int, half_xy_mm: float):
     nz = int(round(200 * d_lu / 40.0))
     o = np.array([(n_xy - 1) * 0.5 - _BBOX_CTR_MM[0] * mm2lu,
                   (n_xy - 1) * 0.5 - _BBOX_CTR_MM[1] * mm2lu,
-                  -GROUND_CAD_MM * mm2lu - 0.5])
+                  -ground_cad_mm(hover_h_mm) * mm2lu - 0.5])
     return dx, mm2lu, o, (n_xy, n_xy, nz)
 
 
@@ -177,7 +195,8 @@ _LAYOUT = [
 # =============================================================================
 def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                  vtk_deg=30.0, vtk_fields_last_rev=5, wall_bc="ibb",
-                 d_lu=None, half_xy_mm=None, side_bc="sponge", theta0=None):
+                 d_lu=None, half_xy_mm=None, side_bc="sponge", theta0=None,
+                 hover_h_mm=None):
     """Octo-8 hover config.
 
     rpm                : 공칭 회전수(부호 없는 크기; 방향은 _LAYOUT이 결정)
@@ -209,12 +228,17 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
     if d_lu is None:
         d_lu = D_LU
     if half_xy_mm is not None:
-        dx_m, mm2lu, o_lu, (nx, ny, nz) = grid_map_centered(d_lu, half_xy_mm)
+        dx_m, mm2lu, o_lu, (nx, ny, nz) = grid_map_centered(
+            d_lu, half_xy_mm, hover_h_mm)
     elif d_lu != D_LU:
-        dx_m, mm2lu, o_lu, (nx, ny, nz) = grid_map(d_lu)
+        dx_m, mm2lu, o_lu, (nx, ny, nz) = grid_map(d_lu,
+                                                   hover_h_mm=hover_h_mm)
     else:                                    # legacy — 모듈 상수 그대로
         dx_m, mm2lu, o_lu = DX_PHYS, MM2LU, O_LU
         nx, ny, nz = NX, NY, NZ
+        if hover_h_mm is not None:           # 지면만 옮긴 legacy 도메인
+            o_lu = np.array([O_LU[0], O_LU[1],
+                             -ground_cad_mm(hover_h_mm) * MM2LU - 0.5])
 
     def _to_lu(p_mm):
         return (o_lu + np.asarray(p_mm, dtype=np.float64) * mm2lu).tolist()
@@ -351,6 +375,147 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
             "convergence": {"enabled": False},
             "force_calculation": {"enabled": False},
             "output": output, "time": time}
+
+
+# =============================================================================
+# S4. 4-LEVEL MLG (far field / ground outwash / airframe / per-rotor blocks)
+# =============================================================================
+# 로터 블록 비율: 단일프롭 검증(apc18x8e EXTENTS[-1])이 쓴 값 그대로.
+_ROTOR_LAT_D = 0.6875      # 디스크 중심 기준 좌우 반폭 [D]
+_ROTOR_UP_D  = 0.125       # 디스크 위 [D]
+_ROTOR_DN_D  = 0.25        # 디스크 아래 [D] (ALM Gaussian 지지)
+
+
+def build_mlg_4level(config, d_lu0, half_xy_mm, l1_half_mm,
+                     hover_h_mm=None, overlap_width=2, pad2=2.0,
+                     l1_zmin=2.0, wall_coupling_mode="allow",
+                     interpolation="cubic", filter_level=1):
+    """v2/v3 가 공유하는 4레벨 구성. `config["mlg"]` 를 채우고 정보를 돌려준다.
+
+        L0 D/d_lu0     far field          (도메인 전체)
+        L1 D/2x        ground outwash     (+-l1_half_mm, 바닥은 지면)
+        L2 D/4x        airframe           (기체 bbox + 전 로터 블록 + 밴드)
+        L3 D/8x        로터 8기, 블록 하나씩
+
+    ★ l1_zmin 은 0 이 아니라 overlap_width 다. 도메인 바닥에 붙인 fine region
+    은 flush 라서 C2F 밴드가 폭 0 으로 붕괴하고(설계된 상태), fine 레벨은
+    boundaries_config={} 라 자기 벽도 없다. 그러면 L1 바닥은 coarse 유입도
+    벽도 없이 남는다. 바닥 두 L0 셀을 밴드로 내주면 L1 은 지면 노드까지 fine
+    셀을 갖되 그 밴드를 L0(지면 hwbb 를 가진)에서 받는다.
+
+    반환: dict(dx, mm2lu, origin, shape, l1, l2, rotor_boxes, n_cells, ...)
+    """
+    dx, mm2lu, o, n = grid_map_centered(d_lu0, half_xy_mm, hover_h_mm)
+
+    def _lu(p_mm):
+        return o + np.asarray(p_mm, dtype=np.float64) * mm2lu
+
+    b_lo, b_hi = _lu(_BBOX_MIN_MM), _lu(_BBOX_MAX_MM)      # airframe bbox
+    ctr = _lu([_BBOX_CTR_MM[0], 0.0, 0.0])
+
+    lat = _ROTOR_LAT_D * d_lu0
+    up, dn = _ROTOR_UP_D * d_lu0, _ROTOR_DN_D * d_lu0
+    rz = float(_lu([0.0, 0.0, ROTOR_Z_MM])[2])
+    rotor_boxes = []
+    for name, x_mm, y_mm, _hand in _LAYOUT:
+        h = _lu([x_mm, y_mm, ROTOR_Z_MM])
+        rotor_boxes.append({
+            "name": name,
+            "x_min": float(h[0] - lat), "x_max": float(h[0] + lat),
+            "y_min": float(h[1] - lat), "y_max": float(h[1] + lat),
+            "z_min": float(rz - dn),    "z_max": float(rz + up),
+        })
+
+    # L2: 기체 AND 전 로터 블록 + L3 밴드(2 부모셀 = 0.5 L0 lu) + pad2
+    r_lo = np.min([[b["x_min"], b["y_min"], b["z_min"]] for b in rotor_boxes], 0)
+    r_hi = np.max([[b["x_max"], b["y_max"], b["z_max"]] for b in rotor_boxes], 0)
+    l2_lo = np.floor(np.minimum(b_lo, r_lo) - pad2)
+    l2_hi = np.ceil(np.maximum(b_hi, r_hi) + pad2)
+
+    # L1: 기체 중심 기준 +-l1_half_mm, 바닥은 지면 위 l1_zmin
+    half1 = l1_half_mm * mm2lu
+    l1_lo = np.array([np.floor(ctr[0] - half1), np.floor(ctr[1] - half1),
+                      float(l1_zmin)])
+    l1_hi = np.array([np.ceil(ctr[0] + half1), np.ceil(ctr[1] + half1),
+                      float(np.ceil(l2_hi[2] + 5.0))])
+
+    ow = int(overlap_width)
+    if not ((l1_lo <= l2_lo - ow).all() and (l1_hi >= l2_hi + ow).all()):
+        raise ValueError(
+            f"L1 {l1_lo}..{l1_hi} 이 L2 {l2_lo}..{l2_hi} + 밴드({ow})를 담지 "
+            f"못한다 — l1_half_mm 을 키우거나 hover 높이를 확인할 것")
+    if not (l1_lo[0] >= ow and l1_hi[0] <= n[0] - 1 - ow):
+        raise ValueError(
+            "L1 이 도메인 면에 닿는다 — fine 레벨은 도메인 BC 가 없다")
+    if l1_lo[2] < ow:
+        raise ValueError(
+            f"l1_zmin={l1_zmin} < overlap_width={ow}: 바닥 밴드가 안 잡힌다")
+
+    def _box(name, lo, hi):
+        return {"name": name,
+                "x_min": float(lo[0]), "x_max": float(hi[0]),
+                "y_min": float(lo[1]), "y_max": float(hi[1]),
+                "z_min": float(lo[2]), "z_max": float(hi[2])}
+
+    config["mlg"] = {
+        "enabled": True, "num_levels": 4, "overlap_width": ow,
+        "interpolation": interpolation, "filter_level": filter_level,
+        "levels": [
+            {},                                              # L0 far field
+            {"regions": [_box("outwash", l1_lo, l1_hi)]},     # L1 ground
+            {"regions": [_box("airframe", l2_lo, l2_hi)]},    # L2 airframe
+            {"regions": rotor_boxes},                         # L3 rotors x8
+        ],
+        "wall_coupling": {"mode": wall_coupling_mode},
+    }
+
+    def _fine_n(lo, hi, k):
+        """밴드 포함 fine 노드 수 (region*2^k + 4*ow + 1)."""
+        return [int(round((hi[i] - lo[i]) * 2 ** k)) + 4 * ow + 1
+                for i in range(3)]
+
+    n3 = _fine_n([rotor_boxes[0]["x_min"], rotor_boxes[0]["y_min"],
+                  rotor_boxes[0]["z_min"]],
+                 [rotor_boxes[0]["x_max"], rotor_boxes[0]["y_max"],
+                  rotor_boxes[0]["z_max"]], 3)
+    shapes = {"L0": tuple(int(v) for v in n),
+              "L1": _fine_n(l1_lo, l1_hi, 1),
+              "L2": _fine_n(l2_lo, l2_hi, 2),
+              "L3": n3}
+    cells = {k: float(np.prod(v)) for k, v in shapes.items()}
+    cells["L3"] *= len(rotor_boxes)
+    updates = (cells["L0"] + cells["L1"] * 2 + cells["L2"] * 4
+               + cells["L3"] * 8)
+    return {"dx": dx, "mm2lu": mm2lu, "origin": o, "shape": tuple(n),
+            "l1": (l1_lo, l1_hi), "l2": (l2_lo, l2_hi),
+            "rotor_boxes": rotor_boxes, "shapes": shapes, "cells": cells,
+            "total_cells": sum(cells.values()), "updates": updates,
+            "ground_cad_mm": ground_cad_mm(hover_h_mm),
+            "hover_h_mm": HOVER_H_MM if hover_h_mm is None else hover_h_mm}
+
+
+def mlg_report(cfg, info, d_lu0, l1_half_mm, n_rev, tag=""):
+    """build_mlg_4level 결과를 사람이 읽는 표로. config 의 __main__ 용."""
+    dxmm = info["dx"] * 1000.0
+    print(f"  [{tag}] hover {info['hover_h_mm']:.1f} mm = "
+          f"{info['hover_h_mm'] / (D_PHYS * 1000):.2f} D  "
+          f"(지면 z_cad {info['ground_cad_mm']:.1f} mm)")
+    rpm = abs(cfg["actuator_line"]["rotors"][0]["rotor"]["rpm"])
+    print(f"        rpm {rpm:.0f} | {n_rev} rev = "
+          f"{cfg['time']['max_steps']:,} steps")
+    for k, lbl in (("L0", "far-field"), ("L1", "outwash"),
+                   ("L2", "airframe"), ("L3", "rotors x8")):
+        s = info["shapes"][k]
+        lev = int(k[1])
+        print(f"  {k}  D/{d_lu0 * 2 ** lev:<4d} dx={dxmm / 2 ** lev:6.3f} mm  "
+              f"{s[0]}x{s[1]}x{s[2]} = {info['cells'][k] / 1e6:7.2f} M   {lbl}")
+    print(f"  ---- {info['total_cells'] / 1e6:.2f} M cells | "
+          f"{info['updates'] / 1e6:.1f} M upd/coarse step")
+    dom = (info["shape"][0] - 1) / info["mm2lu"]
+    print(f"  far-field {dom / 1000:.2f} m | L1 ground radius "
+          f"{l1_half_mm / 1000:.2f} m")
+    print(f"  running mem @4 ranks ~ "
+          f"{info['total_cells'] * 130 / 4 / 1e9:.1f} GB/rank")
 
 
 if __name__ == "__main__":
