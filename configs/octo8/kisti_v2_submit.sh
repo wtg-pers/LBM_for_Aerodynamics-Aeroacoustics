@@ -7,8 +7,11 @@
 # --restart-latest 로 이어 받는다. 체크포인트는 5 rev(3,140 step)마다 떨어진다.
 #
 #   cd "$(pwd -P)"                                 # ★ 물리 경로에서 제출할 것
-#   sbatch --export=ALL,BASH_ENV= configs/octo8/kisti_v2_submit.sh
-#                                                    # 최초 제출 (이후 자동)
+#   sbatch --export=ALL,BASH_ENV= -p amd_a100nv_8 -t 48:00:00 \
+#          --comment=inhouse configs/octo8/kisti_v2_submit.sh
+#
+#   최초 제출만 -p/-t/--comment 를 CLI 로 준다(#SBATCH 는 변수 확장이 안 되고,
+#   ①을 단일 소스로 두기 위해서다). 이후 자동 재제출은 ①의 값을 그대로 쓴다.
 #
 # ★ --export=ALL,BASH_ENV= 는 장식이 아니다. KISTI 로그인 환경은 BASH_ENV 를
 #   설정해 두었고 그 파일이 quota 배너를 찍은 뒤 exit 한다. 비대화형 bash 는
@@ -36,7 +39,12 @@
 PARTITION="amd_a100nv_8"
 WALLTIME="48:00:00"     # sinfo 기준 상한. 초과분은 자동 재제출로 이어받는다
 ACCOUNT=""              # sacctmgr 상 Def Acct 가 자동 적용되면 빈 값으로 둔다
-COMMENT=""              # KISTI 가 응용분야 코드를 요구하면 채운다
+# ★ KISTI 는 --comment 로 응용분야를 요구한다(없으면 제출 자체가 거부됨).
+#   목록: tensorflow caffe pytorch sklearn python jupyter ipy vasp charmm
+#         gromacs gaussian lammps openfoam namd wrf qe inhouse siesta r
+#         relion amber matlab vscode etc
+#   자체 개발 솔버이므로 inhouse (파이썬으로 돌지만 분류 축은 응용 종류다).
+COMMENT="inhouse"
 CUDA_MODULE="cuda/12.9.1"            # cupy-cuda12x 대응
 # python 모듈: KISTI 는 3.12.4 가 deprecated 라 **로드해도 3.14.2 로
 # 리다이렉트**된다. venv 는 setup_env.sh 가 고른 인터프리터로 이미 만들어져
