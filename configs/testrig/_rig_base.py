@@ -34,6 +34,12 @@ Variants, chosen so each new capability gets a test the moment it lands:
 The two rotors spin opposite ways on purpose: their torques cancel, so the
 sphere sees no net swirl and any asymmetry in the answer is a bug, not physics.
 """
+# PEP 604 (`dict | None`) in the signatures below is evaluated at def time on
+# Python 3.9 and raises TypeError there. The cluster runs 3.9 while dev boxes
+# run 3.10+, so without this the whole rig imports fine locally and every
+# cluster leg dies identically at import (ow4 sweep, 2026-08-10).
+from __future__ import annotations
+
 import numpy as np
 
 # ── rotor (a small 2-bladed prop; flat-plate polar keeps the rig fast) ──
