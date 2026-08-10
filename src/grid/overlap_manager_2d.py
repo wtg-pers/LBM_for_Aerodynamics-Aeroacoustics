@@ -338,6 +338,20 @@ class OverlapManager2D:
         self._regions.append(region)
         return region
 
+    def regions_at(self, level_coarse: int) -> List[OverlapRegion2D]:
+        """Every region whose coarse side is `level_coarse` — 3D-API twin.
+
+        2D is chain-only (`add_level_pair` derives the level from the region
+        count), so this returns at most one. The method exists because
+        callers that must cope with several blocks per level in 3D — the
+        summary printer among them — then need only ONE code path. Without
+        it `setup._print_summary` raised AttributeError on every 2D MLG run
+        from the multi-block change (92055e4) onward; nothing caught it
+        because no gate ran a 2D MLG config through main.py.
+        """
+        return ([self._regions[level_coarse]]
+                if 0 <= level_coarse < len(self._regions) else [])
+
     def get_region(self, level_coarse: int) -> OverlapRegion2D:
         if not 0 <= level_coarse < len(self._regions):
             raise IndexError(

@@ -125,9 +125,13 @@ def build_chain(levels: Sequence[object],
         origin = prev.origin
         if region is not None:
             fdc = region.fine_domain_coarse
+            # IndexBox2D has no z_start — a 2D chain keeps the parent's z
+            # (always 0.0). The origin tuple stays 3-long either way because
+            # every consumer (VTK writer, summary) indexes it positionally.
+            z0 = prev.origin[2] + getattr(fdc, 'z_start', 0.0) * prev.spacing
             origin = (prev.origin[0] + fdc.x_start * prev.spacing,
                       prev.origin[1] + fdc.y_start * prev.spacing,
-                      prev.origin[2] + fdc.z_start * prev.spacing)
+                      z0)
         blk = GridBlock(level=k, index=0, uid=k, name=f"L{k}",
                         shape=tuple(levels[k].domain_shape),
                         origin=origin, spacing=0.5 ** k,
