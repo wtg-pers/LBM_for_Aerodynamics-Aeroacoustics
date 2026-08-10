@@ -24,7 +24,7 @@ MPI_ONLY_DESTS: Dict[str, Tuple[str, Any]] = {
     'csv': ('--csv', None),
     'log_every': ('--log-every', None),
     'vtk_every': ('--vtk-every', None),
-    'vtk_fields_last': ('--vtk-fields-last', 0),
+    'vtk_fields_last': ('--vtk-fields-last', None),
     'ckpt_every': ('--ckpt-every', None),
     'dist_init': ('--dist-init', False),
     'verify': ('--verify', False),
@@ -222,8 +222,14 @@ Examples:
         help='[MPI] coarse steps between assembled VTK writes (0=off)'
     )
     mpi_group.add_argument(
-        '--vtk-fields-last', type=int, default=0, metavar='N',
-        help='[MPI] write level-field VTK only for the last N vtk events'
+        # default None, like its three siblings above: the driver's
+        # "CLI wins, else config" fallback tests `is None`, so a default of
+        # 0 made that fallback DEAD — output.vtk.fields_start_step stayed
+        # ignored under MPI even after the fix that added it (5330da3).
+        # 0 keeps meaning "no suppression"; None means "not given".
+        '--vtk-fields-last', type=int, default=None, metavar='N',
+        help='[MPI] write level-field VTK only for the last N vtk events '
+             '(unset: from output.vtk.fields_start_step; 0: all)'
     )
     mpi_group.add_argument(
         '--ckpt-every', type=int, default=None, metavar='N',

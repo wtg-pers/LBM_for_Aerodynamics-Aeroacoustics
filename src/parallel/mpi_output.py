@@ -301,6 +301,46 @@ class MPIOutputManager(OutputManager):
     def _vtk_due(self, step) -> bool:
         return bool(self._vtk_every) and step % self._vtk_every == 0
 
+    def _mask_solid(self, uid, rho, u):
+        """Single-GPU solid-node convention on a gathered block (rank 0).
+
+        The slab rho/u buffers are never written at SOLID nodes (module
+        docstring), so what the gather assembles there is meaningless —
+        measured rho = 0 and |u| = sqrt(3) against a physical u_max ~ 5e-2,
+        i.e. 35x the real range. Every auto-scaled colour bar in ParaView
+        then reads the body instead of the flow, which is exactly the
+        symptom `solid_mask` was added for (3b3f080): the mask lets you
+        threshold the values away, it does not stop them landing in the
+        file. The single-GPU path shows the seeded rest state there, so
+        write that.
+
+        Applied in ONE place because the L0 gather is done from three call
+        sites (VTK views, checkpoint payload, finalize) and each drifting
+        on its own is how this class of defect is born.
+        """
+        if self._solid_masks is None or uid >= len(self._solid_masks):
+            return
+        sm = self._solid_masks[uid]
+        if sm is None:
+            return
+        s = np.asarray(sm, dtype=bool)
+        if s.shape != rho.shape:
+            return
+        rho[s] = 1.0
+        u[:, s] = 0.0
+
+    def _gather_l0_macros(self):
+        """COLLECTIVE L0 rho/u gather -> (rho, u) on rank 0, (None, None) off."""
+        comm, rank, nr, r = self._comm, self._rank, self._nr, self._runner
+        rho0 = _gather_block(comm, rank, nr, r.parts[0],
+                             r.lv[0].rho[None], TAG_MACRO, 1)
+        u0 = _gather_block(comm, rank, nr, r.parts[0], r.lv[0].u,
+                           TAG_MACRO + 2, 3)
+        if rank != 0:
+            return None, None
+        self._mask_solid(0, rho0[0], u0)
+        return rho0[0], u0
+
     def _gather_views(self):
         """COLLECTIVE per-BLOCK rho/u/nut gathers -> rank0 _MLGView.
 
@@ -328,6 +368,7 @@ class MPIOutputManager(OutputManager):
                 sm = (self._solid_masks[uid]
                       if (self._solid_masks is not None
                           and uid < len(self._solid_masks)) else None)
+                self._mask_solid(uid, rho[0], u)
                 views.append(_BlockView(b.level, b.index, uid, _LevelView(
                     rho[0], u, nu_t=(None if nut is None else nut[0]),
                     solid_mask=sm)))
@@ -378,10 +419,9 @@ class MPIOutputManager(OutputManager):
                 cp.get_default_memory_pool().free_all_blocks()
             except Exception:
                 pass
-        rho0 = _gather_block(comm, rank, nr, r.parts[0],
-                             r.lv[0].rho[None], TAG_MACRO, 1)
-        u0 = _gather_block(comm, rank, nr, r.parts[0], r.lv[0].u,
-                           TAG_MACRO + 2, 3)
+        # Restore reads f only, so checkpoint rho/u are informational — but
+        # "informational" is not a licence to differ from the single path.
+        rho_c, u_c = self._gather_l0_macros()
         if rank != 0:
             return None
         extra = None
@@ -393,16 +433,20 @@ class MPIOutputManager(OutputManager):
             per = {}
             for b in r.blocks:
                 per[b.level] = per.get(b.level, 0) + 1
-            if len(r.blocks) > r.NL:
-                extra["num_blocks"] = len(r.blocks)
-                extra["block_levels"] = [b.level for b in r.blocks]
+            # Unconditional, matching OutputManager._build_checkpoint_extra:
+            # it writes these whenever the grid exposes blocks, so gating
+            # them on `> NL` made a one-block-per-level chain produce a
+            # DIFFERENT key set under MPI than on one GPU. Nothing reads
+            # them today, which is precisely why the drift went unnoticed.
+            extra["num_blocks"] = len(r.blocks)
+            extra["block_levels"] = [b.level for b in r.blocks]
             for uid, b in enumerate(r.blocks):
                 if b.level == 0:
                     continue
                 sfx = "" if per[b.level] <= 1 else f"_b{b.index}"
                 extra[f"f_level_{b.level}{sfx}"] = f_blocks[uid]
         return {'f': f_blocks[0], 'extra': extra,
-                'rho': rho0[0], 'u': u0}
+                'rho': rho_c, 'u': u_c}
 
     def _save_checkpoint(self, step, sim) -> None:
         if not self._ckpt_due(step):
@@ -497,14 +541,7 @@ class MPIOutputManager(OutputManager):
             pass
 
     def _final_fields(self, sim):
-        comm, rank, nr, r = self._comm, self._rank, self._nr, self._runner
-        rho0 = _gather_block(comm, rank, nr, r.parts[0],
-                             r.lv[0].rho[None], TAG_MACRO, 1)
-        u0 = _gather_block(comm, rank, nr, r.parts[0], r.lv[0].u,
-                           TAG_MACRO + 2, 3)
-        if rank != 0:
-            return None, None
-        return rho0[0], u0
+        return self._gather_l0_macros()
 
     def _field_nan_flag(self, rho_final) -> bool:
         rho, _u, fluid = self._l0_owned()
