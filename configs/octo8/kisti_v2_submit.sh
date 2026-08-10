@@ -6,7 +6,14 @@
 # 이 스크립트는 상한에 걸리기 전에 **자기 자신을 다시 제출**하고, 다음 잡은
 # --restart-latest 로 이어 받는다. 체크포인트는 5 rev(3,140 step)마다 떨어진다.
 #
-#   sbatch configs/octo8/kisti_v2_submit.sh          # 최초 제출 (이후 자동)
+#   sbatch --export=ALL,BASH_ENV= configs/octo8/kisti_v2_submit.sh
+#                                                    # 최초 제출 (이후 자동)
+#
+# ★ --export=ALL,BASH_ENV= 는 장식이 아니다. KISTI 로그인 환경은 BASH_ENV 를
+#   설정해 두었고 그 파일이 quota 배너를 찍은 뒤 exit 한다. 비대화형 bash 는
+#   BASH_ENV 를 **첫 줄보다 먼저** source 하므로, 그대로 두면 이 잡 스크립트는
+#   한 줄도 실행되지 않고 .out 에 배너만 남긴 채 조용히 성공(exit 0)한다.
+#   증상 확인: `bash -c 'echo HELLO'` 가 HELLO 를 안 찍으면 걸린 것.
 #   scancel <jobid>                                  # 연쇄 중단
 #   touch STOP_OCTO8_V2                              # 다음 턴에 우아하게 종료
 #
@@ -60,6 +67,8 @@ DIST_INIT="--dist-init"
 # (partition/time/account/comment 는 아래 자동 재제출에서 CLI 로 넘긴다 —
 #  #SBATCH 는 변수 확장이 안 되므로 ①을 단일 소스로 유지하려면 이 방법뿐이다)
 
+# 이 줄이 .out 에 없으면 BASH_ENV 에 걸려 스크립트가 시작조차 못 한 것이다
+echo "[submit] script start  BASH_ENV=[${BASH_ENV:-}]  $(date)"
 set -u
 cd "$REPO_DIR"
 CFG="configs/octo8/octo8_v2_hover.py"
@@ -145,7 +154,8 @@ if [[ "$FLAG" == "1" ]]; then
     echo "[submit] 100 rev 완료 — 연쇄 종료"; exit 0
 fi
 
-SUB=(sbatch -p "$PARTITION" -t "$WALLTIME")
+# ★ BASH_ENV= 를 반드시 물려준다 — 안 그러면 다음 잡이 조용히 아무것도 안 한다
+SUB=(sbatch --export=ALL,BASH_ENV= -p "$PARTITION" -t "$WALLTIME")
 [[ -n "$ACCOUNT" ]] && SUB+=(-A "$ACCOUNT")
 [[ -n "$COMMENT" ]] && SUB+=(--comment "$COMMENT")
 echo "[submit] 이어서 재제출: ${SUB[*]} $0"
