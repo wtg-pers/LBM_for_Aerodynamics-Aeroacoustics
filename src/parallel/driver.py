@@ -211,9 +211,11 @@ def _run(args, MPI):
         # rank-0-only by silencing the others at the source (stderr kept
         # for tracebacks)
         sys.stdout = open(os.devnull, "w")
-    if args.dist_init and (args.restart or args.restart_latest):
-        raise ValueError("--dist-init + restart: restore path loads full "
-                         "fields (use replicated build for restarts for now)")
+    # --dist-init + restart is supported since the restore path became
+    # slab-scoped: initializer._restart_mlg hands the checkpoint's HOST array
+    # to the level and extract_level wrap-slices this rank's part out of it,
+    # so the device never holds more than a slab. Before that the restore
+    # uploaded the whole field to every rank and the two were exclusive.
     mlg, setup, start_step, end_step = _build(
         args, dev, with_writers=(rank == 0),
         io_role=('writer' if rank == 0 else 'silent'))

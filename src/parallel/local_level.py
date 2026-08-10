@@ -46,8 +46,11 @@ def extract_level(lev, part=None) -> dict:
     of it.
     """
     shape = lev.domain_shape
+    # dist-init RESTART: the checkpoint's full field sits on the HOST; take
+    # this rank's wrapped slab off it and never upload the rest.
+    restart_host = getattr(lev, '_dist_restart_f', None)
     feq27 = None
-    if lev.f is None:                                  # dist-init: uniform IC
+    if lev.f is None and restart_host is None:         # dist-init: uniform IC
         rho0, u0 = lev._dist_init_ic
         xp0 = lev.xp
         rho_t = xp0.full((1, 1, 1), rho0, dtype=xp0.float32)
@@ -62,7 +65,11 @@ def extract_level(lev, part=None) -> dict:
     # point — see slab_std_f); full-level copy otherwise, which is the old
     # behaviour and what a 1-rank/no-partition caller still gets.
     f0_is_slab = False
-    if lev.f is None:
+    if restart_host is not None and part is not None:
+        f0 = wrap_slice(restart_host, part, 1)   # host -> device, slab only
+        f0_is_slab = True
+        lev._dist_restart_f = None               # release the host reference
+    elif lev.f is None:
         f0 = None
     elif part is not None:
         f0 = slab_std_f(lev, part)

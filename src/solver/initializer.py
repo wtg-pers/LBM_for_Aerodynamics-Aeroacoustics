@@ -415,6 +415,22 @@ class SolverInitializer:
         """
         setup = self._setup
         xp = self.xp
+        # LBM_DIST_INIT: the MPI runner keeps only its slab, so the restored
+        # field must NOT be uploaded whole to every rank's device — that
+        # upload is the only reason --dist-init and restart used to be
+        # mutually exclusive. Hand the HOST array to the level instead and
+        # let extract_level wrap-slice this rank's part out of it (host RAM
+        # holds the full field; the device never sees more than a slab).
+        dist = os.environ.get("LBM_DIST_INIT", "0") == "1"
+
+        def _restore(level_sim, arr_host, tag):
+            if dist:
+                level_sim.init_esoteric_metadata_host()
+                level_sim._dist_restart_f = arr_host
+            else:
+                level_sim.set_distribution(xp.asarray(arr_host))
+            print(f"  {tag}: restored from checkpoint"
+                  + (" (slab-scoped)" if dist else ""))
 
         if setup.checkpoint_mgr is None:
             raise RuntimeError("Cannot restart: checkpoints are disabled")
@@ -437,10 +453,9 @@ class SolverInitializer:
               f"current levels: {mlg.num_levels}")
 
         # ── Restore Level 0 ──────────────────────────────────────
-        f0 = xp.asarray(state['f'])
-        mlg.get_level(0).set_distribution(f0)
-        mlg.get_level(0).step_count = start_step
-        print(f"  Level 0: restored from checkpoint")
+        _l0 = mlg.get_level(0)
+        _restore(_l0, state['f'], "Level 0")
+        _l0.step_count = start_step
 
         # ── Restore fine levels ──────────────────────────────────
         _blks = list(mlg.iter_blocks()) if hasattr(mlg, 'iter_blocks') else None
@@ -458,9 +473,17 @@ class SolverInitializer:
 
         for k, level_sim, key in _targets:
             if key in state:
-                f_k = xp.asarray(state[key])
-                level_sim.set_distribution(f_k)
-                print(f"  Level {k}: restored from checkpoint")
+                _restore(level_sim, state[key], f"Level {k}")
+            elif dist:
+                # Not in checkpoint → uniform IC, same as a fresh dist-init
+                print(f"  Level {k}: not in checkpoint, init equilibrium "
+                      f"(slab-scoped)")
+                level_sim.init_esoteric_metadata_host()
+                _fv = setup._physics_config.get('initial_flow_velocity',
+                                                [0.0, 0.0, 0.0])
+                level_sim._dist_init_ic = (
+                    1.0, list(_fv) if isinstance(_fv, (list, tuple))
+                    else [float(_fv), 0.0, 0.0])
             else:
                 # Not in checkpoint → initialize from equilibrium
                 print(f"  Level {k}: not in checkpoint, init equilibrium")
