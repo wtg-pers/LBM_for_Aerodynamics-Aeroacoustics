@@ -30,10 +30,16 @@ WALLTIME="48:00:00"     # sinfo 기준 상한. 초과분은 자동 재제출로 
 ACCOUNT=""              # sacctmgr 상 Def Acct 가 자동 적용되면 빈 값으로 둔다
 COMMENT=""              # KISTI 가 응용분야 코드를 요구하면 채운다
 CUDA_MODULE="cuda/12.9.1"            # cupy-cuda12x 대응
-PY_MODULE="python/3.12.4"            # ★ 기본값 3.14.2 를 쓰면 안 된다 — 너무
-                                     #   최신이라 cupy/aerosandbox 휠이 없다
+# python 모듈: KISTI 는 3.12.4 가 deprecated 라 **로드해도 3.14.2 로
+# 리다이렉트**된다. venv 는 setup_env.sh 가 고른 인터프리터로 이미 만들어져
+# 있으므로 여기서는 굳이 python 모듈을 로드하지 않는다(venv 가 이긴다).
+PY_MODULE=""
+GCC_MODULE="gcc/15.2.0"              # ★ cudampi 가 컴파일러를 먼저 요구한다
 MPI_MODULE="cudampi/openmpi-4.1.8"   # ★ cudampi/* 여야 --cuda-aware 1 이 산다
-VENV="$HOME/01_python_project/venv_lbm/bin/activate"   # setup_env.sh 가 만든 것
+# venv 경로는 리포 위치에서 유도한다 — 사용자가 폴더명을 바꿔도 따라간다
+# (setup_env.sh 는 자기 옆에 venv_lbm 을 만든다 = 리포의 부모)
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+VENV="$(dirname "$REPO_DIR")/venv_lbm/bin/activate"
 NGPU=8
 
 # 복제 빌드는 랭크당 ~42 GB. A100 80GB 면 들어가므로 DIST_INIT="" 로 두면
@@ -55,6 +61,7 @@ DIST_INIT="--dist-init"
 #  #SBATCH 는 변수 확장이 안 되므로 ①을 단일 소스로 유지하려면 이 방법뿐이다)
 
 set -u
+cd "$REPO_DIR"
 CFG="configs/octo8/octo8_v2_hover.py"
 STOPFILE="STOP_OCTO8_V2"
 
@@ -73,6 +80,9 @@ mkdir -p logs
 #  환경
 # ─────────────────────────────────────────────────────────────
 module purge
+# ★ 순서 중요: cudampi 는 컴파일러가 먼저 로드돼 있어야 한다
+#   ("COMPILER env vars were not properly defined")
+[[ -n "$GCC_MODULE"  ]] && module load "$GCC_MODULE"
 [[ -n "$PY_MODULE"   ]] && module load "$PY_MODULE"
 [[ -n "$CUDA_MODULE" ]] && module load "$CUDA_MODULE"
 module load "$MPI_MODULE"
