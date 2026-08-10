@@ -177,7 +177,7 @@ _LAYOUT = [
 # =============================================================================
 def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                  vtk_deg=30.0, vtk_fields_last_rev=5, wall_bc="ibb",
-                 d_lu=None, half_xy_mm=None):
+                 d_lu=None, half_xy_mm=None, side_bc="sponge"):
     """Octo-8 hover config.
 
     rpm                : 공칭 회전수(부호 없는 크기; 방향은 _LAYOUT이 결정)
@@ -190,6 +190,11 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                          MLG를 쓸 때 L0 는 원방 담당이므로 40 보다 낮게 잡는다.
     half_xy_mm         : 기체 중심 기준 x,y 반폭 [mm]. 주면 도메인이 그 값으로
                          재계산된다(grid_map_centered). None 이면 legacy 도메인.
+    side_bc            : 측면 4면(+-x, +-y) BC. "sponge"(기본) | "neumann".
+                         아웃워시 도달거리가 목적이면 neumann — sponge 는 흡수층
+                         20셀 안에서 벽 제트를 **강제 감쇠**시켜 재려는 양을
+                         훼손한다. 대가는 무반사성 상실이므로, 음향이 목적이 되면
+                         다시 sponge(또는 무반사 BC)로 돌아와야 한다.
 
     d_lu=None, half_xy_mm=None 이면 모듈 상수를 그대로 써서 기존 config 들이
     비트 단위로 움직이지 않는다.
@@ -235,11 +240,19 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
         return {"location": loc, "method": "sponge",
                 "velocity": [0.0, 0.0, 0.0], "density": 1.0,
                 "thickness": 20, "strength": 0.1}
+
+    def _side(loc):
+        if side_bc == "neumann":            # zero-gradient: f[bdy] = f[int]
+            return {"location": loc, "method": "neumann"}
+        if side_bc != "sponge":
+            raise ValueError(f"side_bc must be 'sponge' or 'neumann', "
+                             f"got {side_bc!r}")
+        return _sponge(loc)
     boundaries = {
-        "xmin": _sponge("xmin"),
-        "xmax": _sponge("xmax"),
-        "ymin": _sponge("ymin"),
-        "ymax": _sponge("ymax"),
+        "xmin": _side("xmin"),
+        "xmax": _side("xmax"),
+        "ymin": _side("ymin"),
+        "ymax": _side("ymax"),
         "zmin": {"location": "zmin", "method": "hwbb"},
         "zmax": {"location": "zmax", "method": "eq", "velocity": [0.0, 0.0, 0.0]},
     }
