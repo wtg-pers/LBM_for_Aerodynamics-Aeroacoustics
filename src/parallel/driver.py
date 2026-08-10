@@ -242,15 +242,25 @@ def _run(args, MPI):
         ckpt_every = int(_t.get('checkpoint_interval', 0) or 0)
     if args.log_every is None and _t.get('logging_interval'):
         log_every = max(1, int(_t['logging_interval']))
+    # full-field 억제: 단일 GPU 는 output.vtk.fields_start_step(스텝 단위),
+    # MPI 는 vtk_fields_last(출력 개수 단위)로 서로 다른 값을 본다. CLI 를
+    # 안 주면 config 를 개수로 환산해 같은 뜻이 되게 한다 — 안 그러면 100 rev
+    # 를 30° 간격 full-field 로 쏟아내 1,207 x ~5.3 GB = 6.4 PB 가 된다.
+    vtk_fields_last = args.vtk_fields_last
+    if vtk_fields_last is None and vtk_every > 0:
+        _fs = int(((setup.config or {}).get('output', {}) or {})
+                  .get('vtk', {}).get('fields_start_step', 0) or 0)
+        if _fs > 0:
+            vtk_fields_last = max(1, (end_step - _fs) // vtk_every)
     if rank == 0:
         print(f"[mpi] cadence: vtk={vtk_every} ckpt={ckpt_every} "
-              f"log={log_every} (CLI overrides config time.*)", flush=True)
-
+              f"log={log_every} fields_last={vtk_fields_last or 'all'}",
+              flush=True)
     output = setup.build_output_manager(
         manager_cls=MPIOutputManager,
         comm=comm, rank=rank, nr=nr, mpi_mod=MPI,
         log_every=log_every, vtk_every=vtk_every, ckpt_every=ckpt_every,
-        vtk_fields_last=args.vtk_fields_last,
+        vtk_fields_last=vtk_fields_last,
         dense_csv_path=args.csv)
 
     axis = None if args.axis == "auto" else "xyz".index(args.axis)

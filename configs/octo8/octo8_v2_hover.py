@@ -93,8 +93,13 @@ L1_HALF_MM = 5000.0               # ground-resolved outwash radius
 N_RADIAL = 48                     # delta_r 3.7 mm <= eps floor 5.71 mm @D/160
 N_REV = 100
 
+# ★ full-field VTK 는 마지막 VTK_FIELDS_REV 바퀴만. 30° 간격 전 구간이면
+# 1,207 스냅샷 x ~5.3 GB = ~6.4 PB 로 어떤 파일시스템도 감당 못 한다.
+# 마커 VTP·CSV 는 계속 30° 로 떨어진다(작다).
+VTK_FIELDS_REV = 5           # 5 x 628 / 52 = 60 스냅샷 ~ 320 GB
 config = build_config(rpm=5000.0, n_rev=N_REV, n_radial=N_RADIAL,
-                      vtk_deg=30.0, vtk_fields_last_rev=N_REV, wall_bc="ibb",
+                      vtk_deg=30.0, vtk_fields_last_rev=VTK_FIELDS_REV,
+                      wall_bc="ibb",
                       d_lu=D_LU_0, half_xy_mm=HALF_XY_MM, side_bc="neumann")
 
 _dx, _mm2lu, _O, _N = grid_map_centered(D_LU_0, HALF_XY_MM)
@@ -221,3 +226,7 @@ if __name__ == "__main__":
           f"VTK every {config['time']['output_interval']} | "
           f"ckpt every {config['time']['checkpoint_interval']:,}")
     print(f"  running mem @4 ranks ~ {tot*130/4/1e9:.1f} GB/rank")
+    n_out = config['time']['max_steps'] // config['time']['output_interval']
+    n_fld = int(VTK_FIELDS_REV * 628 / config['time']['output_interval'])
+    print(f"  VTK: {n_out} 출력 중 full-field {n_fld}개 "
+          f"(~{n_fld*tot*25/1e9:.0f} GB) | 나머지는 마커 VTP 만")
