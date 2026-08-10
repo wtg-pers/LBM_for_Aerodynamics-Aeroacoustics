@@ -19,24 +19,36 @@
 # ─────────────────────────────────────────────────────────────
 #  ① 여기만 채우면 된다 (클러스터 고유값)
 # ─────────────────────────────────────────────────────────────
-PARTITION=""            # squeue/sinfo 로 확인. 예: cas_v100_2, gpu
-WALLTIME="48:00:00"     # 큐 상한. sinfo -o "%P %l" 로 확인
-ACCOUNT=""              # 필요 없으면 빈 값. sacctmgr show user $USER
-COMMENT=""              # KISTI 는 --comment 로 응용분야 코드를 요구할 수 있다
-CUDA_MODULE=""          # module avail cuda 로 확인
-PY_MODULE=""            # 시스템 python 이 3.9+ 면 빈 값
+# 파티션 (전부 wall-clock 48h). v2 = 212.7 M 셀 / 100 rev = 4.02e13 업데이트,
+# LBM 은 대역폭 지배라 총 대역폭으로 환산한 추정:
+#     cas_v100_2     V100 x2   1.8 TB/s   13.8 GB/rank   1.6~5.2 일  (재제출 필수)
+#     cas_v100nv_8   V100 x8   7.2 TB/s    3.5 GB/rank   10~31 h
+#   ★ amd_a100nv_8   A100 x8  ~16 TB/s    3.5 GB/rank   4~14 h   <- 한 잡에 끝남
+#     amd_h200nv_8   H200 x8  ~38 TB/s    3.5 GB/rank   1.8~5.9 h
+PARTITION="amd_a100nv_8"
+WALLTIME="48:00:00"     # sinfo 기준 상한. 초과분은 자동 재제출로 이어받는다
+ACCOUNT=""              # sacctmgr 상 Def Acct 가 자동 적용되면 빈 값으로 둔다
+COMMENT=""              # KISTI 가 응용분야 코드를 요구하면 채운다
+CUDA_MODULE="cuda/12.9.1"            # cupy-cuda12x 대응
+PY_MODULE="python/3.12.4"            # ★ 기본값 3.14.2 를 쓰면 안 된다 — 너무
+                                     #   최신이라 cupy/aerosandbox 휠이 없다
 MPI_MODULE="cudampi/openmpi-4.1.8"   # ★ cudampi/* 여야 --cuda-aware 1 이 산다
 VENV="$HOME/01_python_project/venv_lbm/bin/activate"   # setup_env.sh 가 만든 것
-NGPU=2
+NGPU=8
+
+# 복제 빌드는 랭크당 ~42 GB. A100 80GB 면 들어가므로 DIST_INIT="" 로 두면
+# conservation 진단이 살아난다. 40GB 판이면 --dist-init 이 필수.
+# 대화형 잡에서 nvidia-smi 로 확인 후 결정할 것.
+DIST_INIT="--dist-init"
 
 # ─────────────────────────────────────────────────────────────
 #  ② SLURM 지시자 — ①의 값이 여기 반영되도록 재제출 시 --export 로 넘긴다
 # ─────────────────────────────────────────────────────────────
 #SBATCH --job-name=octo8_v2
 #SBATCH --nodes=1
-#SBATCH --ntasks=2
+#SBATCH --ntasks=8
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:8
 #SBATCH --output=logs/octo8_v2_%j.out
 #SBATCH --error=logs/octo8_v2_%j.out
 # (partition/time/account/comment 는 아래 자동 재제출에서 CLI 로 넘긴다 —
@@ -89,7 +101,7 @@ fi
 
 GPULIST=$(seq -s, 0 $((NGPU-1)))
 mpirun -n "$NGPU" python main.py \
-    --config "$CFG" --gpu "$GPULIST" --cuda-aware 1 --dist-init $RESTART
+    --config "$CFG" --gpu "$GPULIST" --cuda-aware 1 $DIST_INIT $RESTART
 RC=$?
 echo "=== $(date) | solver exit $RC ==="
 
