@@ -177,7 +177,7 @@ _LAYOUT = [
 # =============================================================================
 def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                  vtk_deg=30.0, vtk_fields_last_rev=5, wall_bc="ibb",
-                 d_lu=None, half_xy_mm=None, side_bc="sponge"):
+                 d_lu=None, half_xy_mm=None, side_bc="sponge", theta0=None):
     """Octo-8 hover config.
 
     rpm                : 공칭 회전수(부호 없는 크기; 방향은 _LAYOUT이 결정)
@@ -190,6 +190,13 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                          MLG를 쓸 때 L0 는 원방 담당이므로 40 보다 낮게 잡는다.
     half_xy_mm         : 기체 중심 기준 x,y 반폭 [mm]. 주면 도메인이 그 값으로
                          재계산된다(grid_map_centered). None 이면 legacy 도메인.
+    theta0             : 전 로터 공통 초기 방위각 [rad]. None(기본)이면 로터마다
+                         i*pi/8 스태거(아래 참조). 값을 주면 8기 모두 그 값.
+                         rotation_axis=[0,0,-1] 이라 e_ref=x_hat, e_perp=-y_hat 이므로
+                         블레이드 방향 = (cos t, -sin t, 0):
+                           t=0    -> +x (노즈)      t=pi/2 -> -y (날개 평행)
+                         2엽이라 t0 와 t0+pi 에 놓인다 -> theta0=pi/2 면 두 블레이드가
+                         -y/+y 를 향해 **y축에 평행**하게 정렬된다.
     side_bc            : 측면 4면(+-x, +-y) BC. "sponge"(기본) | "neumann".
                          아웃워시 도달거리가 목적이면 neumann — sponge 는 흡수층
                          20셀 안에서 벽 제트를 **강제 감쇠**시켜 재려는 양을
@@ -290,9 +297,12 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                 "hub_center": _to_lu([x_mm, y_mm, ROTOR_Z_MM]),  # L0 LU
                 "rotation_axis": [0, 0, -1],
                 "thrust_direction": [0, 0, 1],
-                # 블레이드 통과 위상 스태거(동기화된 8기 blade-passage 아티팩트
-                # 방지; 실기체도 위상 무작위)
-                "theta_0": float(i * np.pi / 8.0),
+                # 기본은 블레이드 통과 위상 스태거(동기화된 8기 blade-passage
+                # 아티팩트 방지; 실기체도 위상 무작위). theta0 를 주면 8기를
+                # 그 값으로 정렬한다 — 초기 위상을 통제하고 싶을 때. 다만 8기가
+                # 동기화되면 blade-passage 성분이 인위적으로 결맞을 수 있다.
+                "theta_0": (float(i * np.pi / 8.0) if theta0 is None
+                            else float(theta0)),
                 "blade": {"sections": secs},
                 "grid": {"n_radial": int(n_radial),
                          "marker_distribution": "uniform",

@@ -104,7 +104,11 @@ VTK_FIELDS_REV = N_REV       # 전 구간
 config = build_config(rpm=5000.0, n_rev=N_REV, n_radial=N_RADIAL,
                       vtk_deg=30.0, vtk_fields_last_rev=VTK_FIELDS_REV,
                       wall_bc="ibb",
-                      d_lu=D_LU_0, half_xy_mm=HALF_XY_MM, side_bc="neumann")
+                      d_lu=D_LU_0, half_xy_mm=HALF_XY_MM, side_bc="neumann",
+                      # 8기 전부 y축(날개 방향)에 평행하게 정렬해 시작.
+                      # e_perp=-y_hat 이라 theta=pi/2 가 -y, +pi 더한 2번째
+                      # 블레이드가 +y. 스태거를 포기하는 대신 초기 위상이 통제된다.
+                      theta0=np.pi / 2)
 
 _dx, _mm2lu, _O, _N = grid_map_centered(D_LU_0, HALF_XY_MM)
 
