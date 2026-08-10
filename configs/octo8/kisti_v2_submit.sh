@@ -6,6 +6,7 @@
 # 이 스크립트는 상한에 걸리기 전에 **자기 자신을 다시 제출**하고, 다음 잡은
 # --restart-latest 로 이어 받는다. 체크포인트는 5 rev(3,140 step)마다 떨어진다.
 #
+#   cd "$(pwd -P)"                                 # ★ 물리 경로에서 제출할 것
 #   sbatch --export=ALL,BASH_ENV= configs/octo8/kisti_v2_submit.sh
 #                                                    # 최초 제출 (이후 자동)
 #
@@ -45,7 +46,10 @@ GCC_MODULE="gcc/15.2.0"              # ★ cudampi 가 컴파일러를 먼저 �
 MPI_MODULE="cudampi/openmpi-4.1.8"   # ★ cudampi/* 여야 --cuda-aware 1 이 산다
 # venv 경로는 리포 위치에서 유도한다 — 사용자가 폴더명을 바꿔도 따라간다
 # (setup_env.sh 는 자기 옆에 venv_lbm 을 만든다 = 리포의 부모)
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# ★ pwd -P (물리 경로). KISTI 는 ~/scratch 가 /scratch 로의 심볼릭 링크이고,
+#   bash 의 pwd 는 링크를 남긴 논리 경로를 돌려준다. 그 경로로 제출하면
+#   SLURM 이 "/home01 디렉토리에서는 제출 불가"로 거부한다(2026-08-10 실측).
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 VENV="$(dirname "$REPO_DIR")/venv_lbm/bin/activate"
 NGPU=8
 
