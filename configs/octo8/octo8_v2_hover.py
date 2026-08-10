@@ -93,10 +93,14 @@ L1_HALF_MM = 5000.0               # ground-resolved outwash radius
 N_RADIAL = 48                     # delta_r 3.7 mm <= eps floor 5.71 mm @D/160
 N_REV = 100
 
-# ★ full-field VTK 는 마지막 VTK_FIELDS_REV 바퀴만. 30° 간격 전 구간이면
-# 1,207 스냅샷 x ~5.3 GB = ~6.4 PB 로 어떤 파일시스템도 감당 못 한다.
-# 마커 VTP·CSV 는 계속 30° 로 떨어진다(작다).
-VTK_FIELDS_REV = 5           # 5 x 628 / 52 = 60 스냅샷 ~ 320 GB
+# full-field VTK 를 전 구간 30° 로 뽑는다(사용자 확정). 용량:
+#   1,207 스냅샷 x 212.7 M 셀 x ~32 B/셀 = **약 7~8 TB**
+# (32 B/셀 = density+pressure+velocity(3)+velocity_magnitude 4B 씩 + nu_t
+#  + solid_mask; farfield40 실측 1.7 GB / 52.3 M 셀 = 32.5 B/셀 과 일치)
+# KISTI /scratch 100 TB 에 들어간다. **/home01 은 64 GB 라 절대 불가** —
+# 리포와 출력을 /scratch 에 두어야 한다.
+# 줄이려면 vtk_deg 를 키우거나 아래를 마지막 N 바퀴로 낮춘다.
+VTK_FIELDS_REV = N_REV       # 전 구간
 config = build_config(rpm=5000.0, n_rev=N_REV, n_radial=N_RADIAL,
                       vtk_deg=30.0, vtk_fields_last_rev=VTK_FIELDS_REV,
                       wall_bc="ibb",
@@ -228,5 +232,5 @@ if __name__ == "__main__":
     print(f"  running mem @4 ranks ~ {tot*130/4/1e9:.1f} GB/rank")
     n_out = config['time']['max_steps'] // config['time']['output_interval']
     n_fld = int(VTK_FIELDS_REV * 628 / config['time']['output_interval'])
-    print(f"  VTK: {n_out} 출력 중 full-field {n_fld}개 "
-          f"(~{n_fld*tot*25/1e9:.0f} GB) | 나머지는 마커 VTP 만")
+    print(f"  VTK: {n_out} 출력 중 full-field {min(n_fld,n_out)}개 "
+          f"~ {min(n_fld,n_out)*tot*32/1e12:.1f} TB  (/scratch 100 TB 내)")
