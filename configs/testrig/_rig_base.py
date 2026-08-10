@@ -75,7 +75,7 @@ L1_BOX_CUT = dict(L1_BOX, z_min=22)
 
 def build(mlg: str = "off", wall_bc: str = "hwbb", n_rev: float = 0.5,
           sphere: bool = True, wall_coupling: dict | None = None,
-          forces: bool = False):
+          forces: bool = False, overlap_width: int = 2):
     """mlg ∈ {"off", "single", "blocks", "nested", "cut"}."""
     u_max = 0.1
     steps_rev = int(round(2 * np.pi * (D_LU / 2) / u_max))     # 503
@@ -150,7 +150,8 @@ def build(mlg: str = "off", wall_bc: str = "hwbb", n_rev: float = 0.5,
                      "c_s_phys": 340.3, "collision": "cumulant"},
         "boundaries": boundaries,
         "internal_geometry": geom,
-        "mlg": ({"enabled": True, "num_levels": num_levels, "overlap_width": 2,
+        "mlg": ({"enabled": True, "num_levels": num_levels,
+                 "overlap_width": int(overlap_width),
                  "interpolation": "cubic", "filter_level": 1, "levels": levels,
                  **({"wall_coupling": wall_coupling} if wall_coupling else {})}
                 if num_levels > 1 else {"enabled": False}),
