@@ -113,9 +113,15 @@ class MomentumExchangeForce:
             # needs_bounce allocation (~27 B/cell at the force level).
             self.needs_bounce = None
             self.n_boundary_links = 0
-        elif wall_bc is not None and hasattr(wall_bc, 'needs_bounce'):
+        elif getattr(wall_bc, 'needs_bounce', None) is not None:
             self.needs_bounce = wall_bc.needs_bounce
             self.n_boundary_links = int(xp.sum(self.needs_bounce))
+        elif getattr(wall_bc, 'n_links', None) is not None:
+            # Link-mode IBB (3D production): the wall BC never built the
+            # (Q,)+shape mask. compute() reaches only _compute_ibb_sparse,
+            # which uses the link triple — so do NOT materialize it here.
+            self.needs_bounce = None
+            self.n_boundary_links = int(wall_bc.n_links)
         else:
             self._precompute_boundary_links()
             self.n_boundary_links = int(xp.sum(self.needs_bounce))
@@ -318,15 +324,19 @@ class MomentumExchangeForce:
         # Sparse path (used by 3D after _build_sparse_links releases q_fraction;
         # also works for any wall_bc that exposes link_cell/link_dir/link_q).
         wb = self._wall_bc_ref
-        sparse_ok = (
+        has_links = (
             wb is not None
-            and getattr(wb, 'n_links', 0) > 0
             and getattr(wb, 'link_cell', None) is not None
             and getattr(wb, 'link_dir', None) is not None
             and getattr(wb, 'link_q', None) is not None
         )
-        if sparse_ok:
+        if has_links and getattr(wb, 'n_links', 0) > 0:
             return self._compute_ibb_sparse(f_post)
+        if has_links and self._q_fraction is None:
+            # Link mode with an empty link list (this level's mask has no
+            # fluid-solid interface): zero wall force, and there is no dense
+            # array to fall through to.
+            return tuple(0.0 for _ in range(self.dim))
 
         # Dense Python fallback (q_fraction array required).
         xp = self.xp

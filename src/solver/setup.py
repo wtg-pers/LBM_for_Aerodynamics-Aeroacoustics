@@ -51,14 +51,12 @@ from src.boundary.domain_bc_manager import DomainBCManager
 from src.boundary.bc_config import BCType
 from src.boundary.wall import HalfwayBounceBack
 from src.boundary.interpolated_wall import InterpolatedBounceBack
-from src.boundary.stl_geometry import compute_q_fraction_triangles
 from src.boundary.q_fraction import (
-    compute_q_fraction_sphere,
     compute_needs_bounce,
     compute_q_fraction_circle,
-    compute_q_fraction_cylinder_axis,
     compute_q_fraction_polyline,
 )
+# 3D q sources are imported inside _setup_ibb_links (link cores).
 from src.boundary.geometry_manager import (
     create_geometry_mask, validate_geometry_config,
     create_fine_level_geometry_config,
@@ -951,14 +949,18 @@ class SimulationSetup:
                 f"Expected 'hwbb', 'ibb' or 'surfel'."
             )
 
-        # Compute q-fraction from geometry info (2D and 3D paths)
+        gtype = geom_info.get('type')
+        dim = self.lattice.dim
+
+        if dim == 3:
+            return self._setup_ibb_links(mask, geom_info, gtype)
+
+        # ── 2D: dense q_fraction (the D2Q9 IBB kernel indexes it directly) ──
         needs_bounce = compute_needs_bounce(
             self.xp, self.lattice, mask,
         )
 
         q_fraction = None
-        gtype = geom_info.get('type')
-        dim = self.lattice.dim
 
         if dim == 2 and gtype == 'circle':
             q_fraction = compute_q_fraction_circle(
@@ -975,43 +977,6 @@ class SimulationSetup:
             )
             print(f"  Wall BC: Bouzidi IBB (q from airfoil polyline, "
                   f"{len(x_poly)} vertices)")
-        elif dim == 3 and gtype == 'cylinder':
-            axis = geom_info.get('axis', 'z')
-            q_fraction = compute_q_fraction_cylinder_axis(
-                self.xp, self.lattice, mask, needs_bounce,
-                center=geom_info['center'],
-                radius=geom_info['radius'],
-                axis=axis,
-            )
-            print(f"  Wall BC: Bouzidi IBB (analytic q from cylinder "
-                  f"axis='{axis}', 3D)")
-        elif dim == 3 and gtype == 'sphere':
-            q_fraction = compute_q_fraction_sphere(
-                self.xp, self.lattice, mask, needs_bounce,
-                center=geom_info['center'],
-                radius=geom_info['radius'],
-            )
-            print(f"  Wall BC: Bouzidi IBB (analytic q from sphere, 3D)")
-        elif dim == 3 and gtype == 'stl' and 'triangles_lu' in geom_info:
-            q_fraction = compute_q_fraction_triangles(
-                self.xp, self.lattice, mask, needs_bounce,
-                triangles_lu=geom_info['triangles_lu'],
-            )
-            print(f"  Wall BC: Bouzidi IBB (ray-triangle q from STL, "
-                  f"{geom_info.get('n_faces', '?')} faces)")
-            if geom_info.get('span_through_axis'):
-                # z-invariant prism contract: the mask is symmetrized to
-                # the mid-slice section, and q must match — per-link q
-                # from an unstructured side tessellation wobbles by the
-                # chordal sagitta along z, which breaks quasi-2D slice
-                # invariance at the wall (observed ~3e-3 after 24 steps).
-                # Broadcasting the mid-slice q IS the ideal prism's q.
-                nz_q = int(q_fraction.shape[-1])
-                q_fraction = self.xp.broadcast_to(
-                    q_fraction[..., nz_q // 2:nz_q // 2 + 1],
-                    q_fraction.shape).copy()
-                print("  span-through prism: q broadcast from mid slice "
-                      "(z-invariant wall)")
         else:
             print(f"  [warn] wall_bc='ibb' with dim={dim} geom type='{gtype}' "
                   f"has no q-source; using q=0.5 sentinel (≡ HWBB).")
@@ -1023,6 +988,104 @@ class SimulationSetup:
 
         bc = InterpolatedBounceBack(
             self.xp, self.lattice, mask, q_fraction=q_fraction,
+        )
+        print(f"  {bc.get_info()}")
+        return bc
+
+    def _setup_ibb_links(self, mask, geom_info, gtype):
+        """3D wall_bc='ibb' — built entirely in the sparse link representation.
+
+        The dense twin above allocates (Q,)+shape twice (needs_bounce 27 B/cell
+        + q_fraction 108 B/cell, plus a host copy of each) to carry ~10 links
+        per 1000 cells. Measured build peak was 248 B/cell, which puts v2's L1
+        (108.6 M cells) at ~27 GB — past a 24 GB card before a single field is
+        allocated. Nothing here is ever of size (Q,)+shape.
+        """
+        from src.boundary.q_fraction import (
+            broadcast_links_mid_slice,
+            compute_boundary_links,
+            compute_q_fraction_cylinder_axis_links,
+            compute_q_fraction_sphere_links,
+            count_seam_links,
+        )
+        from src.boundary.stl_geometry import (
+            compute_q_fraction_triangles_links)
+
+        shape = tuple(int(s) for s in mask.shape)
+        link_cell, link_dir = compute_boundary_links(
+            self.xp, self.lattice, mask,
+        )
+        link_q = None
+        _span = geom_info.get('span_through_axis')
+        _per = ()
+        if _span:
+            _per = (({'x': 0, 'y': 1, 'z': 2}[str(_span).lower()]
+                     if isinstance(_span, str) else int(_span)),)
+        n_seam = count_seam_links(self.xp, self.lattice, shape,
+                                  link_cell, link_dir, periodic_axes=_per)
+
+        if gtype == 'cylinder':
+            axis = geom_info.get('axis', 'z')
+            link_q = compute_q_fraction_cylinder_axis_links(
+                self.xp, self.lattice, shape, link_cell, link_dir,
+                center=geom_info['center'],
+                radius=geom_info['radius'],
+                axis=axis,
+            )
+            print(f"  Wall BC: Bouzidi IBB (analytic q from cylinder "
+                  f"axis='{axis}', 3D)")
+        elif gtype == 'sphere':
+            link_q = compute_q_fraction_sphere_links(
+                self.xp, self.lattice, shape, link_cell, link_dir,
+                center=geom_info['center'],
+                radius=geom_info['radius'],
+            )
+            print(f"  Wall BC: Bouzidi IBB (analytic q from sphere, 3D)")
+        elif gtype == 'stl' and 'triangles_lu' in geom_info:
+            q_stats = {}
+            link_q = compute_q_fraction_triangles_links(
+                self.xp, self.lattice, shape, link_cell, link_dir,
+                triangles_lu=geom_info['triangles_lu'], stats=q_stats,
+            )
+            print(f"  Wall BC: Bouzidi IBB (ray-triangle q from STL, "
+                  f"{geom_info.get('n_faces', '?')} faces)")
+            # A ray miss on a watertight mesh is normally a real defect. On a
+            # fine block whose face CUTS the body it is not: the roll-based
+            # enumeration wraps, so the opposite face's outer cell layer gets
+            # links to cells a box away, and those rays cross nothing. Name
+            # which one this is instead of leaving the mesh accused.
+            n_miss = int(q_stats.get('n_miss', 0))
+            if n_seam:
+                print(f"  [note] {n_seam:,} of {int(link_cell.size):,} links "
+                      f"cross the box seam (roll wrap) — the body is cut by a "
+                      f"face; {min(n_seam, n_miss):,} of the {n_miss:,} ray "
+                      f"misses are these, not mesh defects")
+            span_axis = geom_info.get('span_through_axis')
+            if span_axis:
+                # z-invariant prism contract: the mask is symmetrized to
+                # the mid-slice section, and q must match — per-link q
+                # from an unstructured side tessellation wobbles by the
+                # chordal sagitta along z, which breaks quasi-2D slice
+                # invariance at the wall (observed ~3e-3 after 24 steps).
+                # Broadcasting the mid-slice q IS the ideal prism's q.
+                ax = ({'x': 0, 'y': 1, 'z': 2}[span_axis.lower()]
+                      if isinstance(span_axis, str) else int(span_axis))
+                link_q = broadcast_links_mid_slice(
+                    self.xp, shape, link_cell, link_dir, link_q, ax,
+                )
+                print("  span-through prism: q broadcast from mid slice "
+                      "(z-invariant wall)")
+        else:
+            print(f"  [warn] wall_bc='ibb' with dim=3 geom type='{gtype}' "
+                  f"has no q-source; using q=0.5 sentinel (≡ HWBB).")
+
+        if os.environ.get('LBM_FORCE_Q_HALF', '0') == '1' and link_q is not None:
+            link_q = self.xp.full_like(link_q, 0.5)
+            print(f"  [SANITY] LBM_FORCE_Q_HALF=1 → q_fraction overridden to 0.5 "
+                  f"(IBB linear formula degenerates to HWBB)")
+
+        bc = InterpolatedBounceBack.from_links(
+            self.xp, self.lattice, mask, link_cell, link_dir, link_q,
         )
         print(f"  {bc.get_info()}")
         return bc
@@ -2474,11 +2537,17 @@ class SimulationSetup:
         ) or "unknown"
 
         if isinstance(self.obstacle_bc, InterpolatedBounceBack):
-            q = self.obstacle_bc.q_fraction
-            nb = self.obstacle_bc.needs_bounce
             xp = self.xp
-            n_links = int(xp.sum(nb))
-            n_sentinel = int(xp.sum(nb & (q == 0.5))) if n_links else 0
+            q = self.obstacle_bc.q_fraction
+            if q is None:                        # link mode (3D production)
+                n_links = int(self.obstacle_bc.n_links)
+                n_sentinel = int(xp.sum(
+                    self.obstacle_bc.link_q == xp.float32(0.5))) \
+                    if n_links else 0
+            else:
+                nb = self.obstacle_bc.needs_bounce
+                n_links = int(xp.sum(nb))
+                n_sentinel = int(xp.sum(nb & (q == 0.5))) if n_links else 0
             mode = "Bouzidi IBB"
             extra = (f" [{n_sentinel}/{n_links} q=0.5 sentinel]"
                      if n_links else "")

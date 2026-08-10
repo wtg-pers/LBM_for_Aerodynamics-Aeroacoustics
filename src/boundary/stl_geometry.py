@@ -299,20 +299,69 @@ def compute_q_fraction_triangles(
     Returns:
         (Q, Nx, Ny, Nz) float32, 0.5 default, q at boundary links.
     """
+    from src.boundary.q_fraction import (
+        links_from_needs_bounce, _scatter_dense)
+    shape = tuple(int(s) for s in solid_mask.shape)
+    link_cell, link_dir = links_from_needs_bounce(xp, needs_bounce)
+    link_q = compute_q_fraction_triangles_links(
+        xp, lattice, shape, link_cell, link_dir, triangles_lu,
+        slack=slack, stats=stats, verbose=verbose,
+    )
+    return _scatter_dense(xp, lattice, shape, link_cell, link_dir, link_q)
+
+
+def compute_q_fraction_triangles_links(
+    xp: 'ModuleType',
+    lattice,
+    shape: Tuple[int, int, int],
+    link_cell: 'npt.NDArray',
+    link_dir: 'npt.NDArray',
+    triangles_lu: Tuple['npt.NDArray', 'npt.NDArray'],
+    slack: float = 1e-12,
+    stats: Optional[Dict] = None,
+    verbose: bool = True,
+) -> 'npt.NDArray':
+    """Per-link Moller-Trumbore q against the level-local triangle mesh.
+
+    Sparse core of `compute_q_fraction_triangles` (see it for the geometry,
+    the acceleration structure and the numerical policy). Consumes the link
+    triple instead of the (Q,)+shape mask and returns per-link q, so nothing
+    of size (Q,)+shape is ever allocated — this is the path production 3D
+    builds take.
+
+    Args:
+        shape: (Nx, Ny, Nz) of the level this link list indexes.
+        link_cell: (n_links,) flat C-order fluid-node index.
+        link_dir:  (n_links,) direction i, direction-major sorted.
+
+    Returns:
+        (n_links,) float32, 0.5 sentinel where no crossing was found.
+    """
     if lattice.dim != 3:
         raise ValueError("compute_q_fraction_triangles is 3D-only.")
+
+    from src.boundary.q_fraction import (
+        _dir_ranges, _link_coords, _to_numpy, _to_xp)
 
     vertices_lu, faces = triangles_lu
     v = np.asarray(vertices_lu, dtype=np.float64)
     f = np.asarray(faces, dtype=np.int64)
-    shape = tuple(int(s) for s in solid_mask.shape)
+    shape = tuple(int(s) for s in shape)
     nx, ny, nz = shape
     Q = lattice.Q
     c_all = lattice.c
     c_np = (c_all.get() if hasattr(c_all, 'get')
             else np.asarray(c_all)).astype(np.float64)
-    nb = needs_bounce.get() if hasattr(needs_bounce, 'get') else needs_bounce
-    nb = np.asarray(nb, dtype=bool)
+    lc = _to_numpy(link_cell)
+    ld = _to_numpy(link_dir)
+
+    q_link = np.full(int(lc.size), 0.5, dtype=np.float32)
+    if lc.size == 0:
+        if stats is not None:
+            stats.update({'n_links': 0, 'n_miss': 0, 'n_on_surface': 0})
+        return _to_xp(xp, q_link)
+    coords = _link_coords(lc, shape)
+    rng = _dir_ranges(ld, Q)
 
     tri = v[f]
     v0 = tri[:, 0, :]
@@ -348,16 +397,16 @@ def compute_q_fraction_triangles(
     keys_sorted = keys[order]
     tris_sorted = tri_ids[rep_tri[order]]
 
-    q_out = np.full((Q,) + shape, 0.5, dtype=np.float32)
     n_links_total = 0
     n_miss_total = 0
     n_on_surface_total = 0
 
     for i in range(1, Q):
-        idx = np.argwhere(nb[i])  # (n, 3) fluid nodes
-        n = idx.shape[0]
+        lo, hi = int(rng[i, 0]), int(rng[i, 1])
+        n = hi - lo
         if n == 0:
             continue
+        idx = coords[lo:hi]        # (n, 3) fluid nodes
         n_links_total += n
         d = c_np[:, i]
         p0 = idx.astype(np.float64)
@@ -413,8 +462,7 @@ def compute_q_fraction_triangles(
         n_on_surface_total += int((miss & t_zero).sum())
         n_miss_total += int((miss & ~t_zero).sum())
         if np.any(got):
-            q_out[i, idx[got, 0], idx[got, 1], idx[got, 2]] = \
-                t_min[got].astype(np.float32)
+            q_link[lo:hi][got] = t_min[got].astype(np.float32)
 
     if stats is not None:
         stats['n_links'] = n_links_total
@@ -430,7 +478,7 @@ def compute_q_fraction_triangles(
                  if n_on_surface_total else "")
         print(f"  q from STL mesh: {n_links_total:,} links, "
               f"{f.shape[0]} triangles, n_miss=0{extra}")
-    return xp.asarray(q_out)
+    return _to_xp(xp, q_link)
 
 
 # =============================================================================

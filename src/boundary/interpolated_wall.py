@@ -38,12 +38,29 @@ class InterpolatedBounceBack:
     (MomentumExchangeForce, simulation loop) does not need changes:
 
         solid_mask         : (shape,) bool
-        needs_bounce       : (Q, shape) bool — link mask
+        needs_bounce       : (Q, shape) bool — link mask, or None (see below)
         n_boundary_links   : int
         c, opp, Q, dim     : lattice views
 
     Extra:
-        q_fraction         : (Q, shape) float32 — q per link, 0.5 default
+        q_fraction         : (Q, shape) float32 — q per link, 0.5 default,
+                             or None in link mode
+        link_cell/link_dir/link_q/n_links : the sparse boundary-link triple
+
+    Two construction modes
+    ----------------------
+    `__init__` (dense) takes the (Q,)+shape `q_fraction` array; used by 2D,
+    whose CUDA kernels index it directly, and by gates.
+
+    `from_links` (sparse) takes the link triple straight from
+    `compute_boundary_links` + a `*_links` q core and NEVER allocates
+    anything of size (Q,)+shape — neither `needs_bounce` nor `q_fraction`.
+    Both are then None, and `n_boundary_links == n_links`. This is what 3D
+    production builds use: the dense pair costs 135 B/cell to carry ~10
+    links per 1000 cells, and at v2's L1 (108.6 M cells) that alone exceeds
+    a 24 GB card. Consumers that genuinely need the dense mask (2D kernels,
+    the WFB link-geometry sibling) call `materialize_needs_bounce()`
+    explicitly, so the cost is never paid by accident.
     """
 
     def __init__(
@@ -82,6 +99,7 @@ class InterpolatedBounceBack:
             )
 
         self._use_sparse = (self.dim == 3) if use_sparse is None else bool(use_sparse)
+        self._link_mode = False
 
         self._precompute_boundary_links()
 
@@ -110,6 +128,123 @@ class InterpolatedBounceBack:
             # Release dense q_fraction (Q * prod(shape) * 4 bytes). For 3D
             # Re=3900 v2 (51M cells) this frees ~5.5 GB.
             self.q_fraction = None
+
+    # ──────────────────────────────────────────────────────────────
+    # Sparse (link) construction
+    # ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_links(
+        cls,
+        xp: "ModuleType",
+        lattice,
+        solid_mask: "npt.NDArray",
+        link_cell: "npt.NDArray",
+        link_dir: "npt.NDArray",
+        link_q: Optional["npt.NDArray"] = None,
+    ) -> "InterpolatedBounceBack":
+        """Build from the sparse link triple — no (Q,)+shape allocation.
+
+        `link_cell`/`link_dir` must come from `compute_boundary_links` (or an
+        equivalent enumeration in the same direction-major, ascending-flat-
+        cell order); `link_q` is the matching per-link q from one of the
+        `compute_q_fraction_*_links` cores, or None for q = 0.5 everywhere
+        (≡ HWBB).
+
+        Produces exactly the same `link_cell`/`link_dir`/`link_q` a dense
+        `__init__` with the equivalent q_fraction would — the same
+        non-physical-q clamp and the same solid-upstream sanitisation are
+        applied, per link (gate: ibb_sparse identity).
+        """
+        self = cls.__new__(cls)
+        self.xp = xp
+        self.lattice = lattice
+        self.solid_mask = xp.asarray(solid_mask, dtype=bool)
+        self.c = xp.asarray(lattice.c)
+        self.opp = xp.asarray(lattice.opp)
+        self.Q = lattice.Q
+        self.dim = lattice.dim
+        if self.dim != 3:
+            raise NotImplementedError(
+                "InterpolatedBounceBack.from_links is 3D-only "
+                f"(dim={self.dim}); 2D uses the dense q_fraction kernels."
+            )
+        self._use_sparse = True
+        self._link_mode = True
+        # Dense forms deliberately absent — see the class docstring.
+        self.needs_bounce = None
+        self.q_fraction = None
+
+        self.link_cell = xp.asarray(link_cell).astype(xp.int32)
+        self.link_dir = xp.asarray(link_dir).astype(xp.int8)
+        self.n_links = int(self.link_cell.size)
+        self.n_boundary_links = self.n_links
+
+        if link_q is None:
+            q = xp.full(self.n_links, xp.float32(0.5), dtype=xp.float32)
+        else:
+            q = xp.asarray(link_q).astype(xp.float32)
+            if int(q.size) != self.n_links:
+                raise ValueError(
+                    f"link_q size {int(q.size)} != n_links {self.n_links}"
+                )
+            # Any non-physical q -> sentinel 0.5 (HWBB fallback).
+            bad = (q <= 0.0) | (q > 1.0)
+            if bool(xp.any(bad)):
+                q = xp.where(bad, xp.float32(0.5), q)
+        self.link_q = q
+
+        self._sanitize_links_for_solid_upstream()
+        return self
+
+    def _sanitize_links_for_solid_upstream(self) -> None:
+        """Per-link twin of `_sanitize_q_for_solid_upstream` (see it).
+
+        The upstream node x_f - c_i is taken with per-axis wrap, matching the
+        `xp.roll` the dense sanitiser uses.
+        """
+        xp = self.xp
+        if self.n_links == 0:
+            self._n_links_fixed = 0
+            return
+        nx, ny, nz = (int(s) for s in self.solid_mask.shape)
+        cell = self.link_cell.astype(xp.int64)
+        gx = cell // (ny * nz)
+        gy = (cell // nz) % ny
+        gz = cell % nz
+        d = self.link_dir.astype(xp.int64)
+        c = self.c.astype(xp.int64)
+        ux = (gx - c[0][d]) % nx
+        uy = (gy - c[1][d]) % ny
+        uz = (gz - c[2][d]) % nz
+        upstream_is_solid = self.solid_mask.reshape(-1)[
+            (ux * ny + uy) * nz + uz]
+        bad = (self.link_q < 0.5) & upstream_is_solid
+        n_fixed = int(xp.sum(bad))
+        if n_fixed:
+            self.link_q = xp.where(bad, xp.float32(0.5), self.link_q)
+        self._n_links_fixed = n_fixed
+
+    def materialize_needs_bounce(self) -> "npt.NDArray":
+        """Build (and cache) the dense (Q,)+shape link mask from the links.
+
+        Explicit because it costs Q bytes per cell (27 B/cell in 3D). Only
+        the dense consumers — 2D CUDA kernels, `compute_link_wall_geometry`
+        (WFB) — should ask for it.
+        """
+        if self.needs_bounce is not None:
+            return self.needs_bounce
+        xp = self.xp
+        shape = tuple(int(s) for s in self.solid_mask.shape)
+        N = 1
+        for s in shape:
+            N *= s
+        nb = xp.zeros((self.Q, N), dtype=bool)
+        if self.n_links:
+            nb[self.link_dir.astype(xp.int64),
+               self.link_cell.astype(xp.int64)] = True
+        self.needs_bounce = nb.reshape((self.Q,) + shape)
+        return self.needs_bounce
 
     # ──────────────────────────────────────────────────────────────
     # Setup helpers
@@ -236,9 +371,10 @@ class InterpolatedBounceBack:
         if self.q_fraction is None:
             raise RuntimeError(
                 "InterpolatedBounceBack.apply() Python path requires the "
-                "dense q_fraction array, but the instance was built with "
-                "use_sparse=True. Use the GPU kernel via Simulation, or "
-                "construct with use_sparse=False to keep the dense array."
+                "dense q_fraction array, but this instance has none — it was "
+                "built either with use_sparse=True or via from_links(). Use "
+                "the GPU kernel via Simulation (it consumes the link triple), "
+                "or construct densely with use_sparse=False."
             )
 
         xp = self.xp
