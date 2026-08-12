@@ -105,30 +105,26 @@ class FaceLocation(Enum):
         """Parse location from string, supporting legacy names.
         
         Supported inputs:
-            'xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'  (canonical)
-            'west', 'east', 'south', 'north', 'bottom', 'top'  (legacy)
-        
+            'xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'
+
         Args:
             name: Location string (case-insensitive)
-            
+
         Returns:
             FaceLocation enum value
-            
+
         Raises:
-            ValueError: If name is not recognized
+            ValueError: If name is not recognized (the legacy compass
+            aliases west/east/south/north/bottom/top were removed — no
+            active config used them)
         """
-        _LEGACY_MAP = {
-            'west': 'xmin', 'east': 'xmax',
-            'south': 'ymin', 'north': 'ymax',
-            'bottom': 'zmin', 'top': 'zmax',
-        }
-        key = _LEGACY_MAP.get(name.lower().strip(), name.lower().strip())
-        
+        key = name.lower().strip()
+
         for member in cls:
             if member.value == key:
                 return member
-        
-        valid = [m.value for m in cls] + list(_LEGACY_MAP.keys())
+
+        valid = [m.value for m in cls]
         raise ValueError(f"Unknown face location: '{name}'. Valid: {valid}")
 
     @property
@@ -207,18 +203,10 @@ class FaceConfig:
 #
 _METHOD_MAP: Dict[str, Tuple[BCType, bool]] = {
     # ── Velocity inlets ──
-    'regularized_inlet':    (BCType.VELOCITY, True),    # f = f_eq + f^(1)
-    'reg_inlet':            (BCType.VELOCITY, True),
     'equilibrium':          (BCType.VELOCITY, False),   # f = f_eq only
     'eq':                   (BCType.VELOCITY, False),
-    
-    # ── Pressure outlets (regularized) ──
-    'regularized_outlet':   (BCType.PRESSURE, True),    # ρ relaxation + f^(1)
-    'reg_outlet':           (BCType.PRESSURE, True),
-    
+
     # ── Domain walls ──
-    'regularized_wall':     (BCType.WALL, True),        # f = f_eq(ρ_ext, 0) + f^(1)
-    'reg_wall':             (BCType.WALL, True),
     'bounce_back':          (BCType.WALL, False),       # f_i = f_ī (half-way BB)
     'hwbb':                 (BCType.WALL, False),
 
@@ -240,13 +228,17 @@ _METHOD_MAP: Dict[str, Tuple[BCType, bool]] = {
     'none':                 (BCType.PERIODIC, False),
 }
 
-# Legacy 'type' field → default method mapping
-_LEGACY_TYPE_MAP: Dict[str, str] = {
-    'inlet':    'regularized_inlet',
-    'outlet':   'regularized_outlet',
-    'wall':     'regularized_wall',
-    'open':     'regularized_outlet',
-    'periodic': 'periodic',
+# Domain-BC policy (feedback_domain_bc_policy): eq + neumann (+ sponge)
+# only. The regularized family was accepted here for years while its
+# reconstruction was never properly finished — rejected with guidance
+# until a real implementation lands as its own track.
+_REMOVED_METHODS: Dict[str, str] = {
+    k: ("regularized BCs are not implemented properly and were removed "
+        "from the accepted set (policy: eq + neumann + sponge). A proper "
+        "regularized implementation is planned as a separate track — "
+        "until then use 'eq' (+ 'sponge') or 'neumann'.")
+    for k in ('regularized_inlet', 'reg_inlet', 'regularized_outlet',
+              'reg_outlet', 'regularized_wall', 'reg_wall')
 }
 
 
@@ -265,6 +257,8 @@ def classify_method(method: str) -> Tuple[BCType, bool]:
     key = method.lower().strip()
     if key in _METHOD_MAP:
         return _METHOD_MAP[key]
+    if key in _REMOVED_METHODS:
+        raise ValueError(f"BC method '{method}': {_REMOVED_METHODS[key]}")
     raise ValueError(
         f"Unknown BC method: '{method}'. "
         f"Available: {sorted(set(k for k in _METHOD_MAP.keys()))}"
@@ -291,9 +285,23 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> FaceConfig:
         FaceConfig — always valid
 
     Raises:
-        ValueError: If location or method is missing or unrecognized
-                    (fail-fast: no silent drops).
+        ValueError: If location or method is missing or unrecognized, or
+                    any key is unknown (fail-fast: no silent drops).
     """
+    # =====================================================================
+    # Step 0: Key whitelist. A mistyped or removed-alias key ('u_inf',
+    # 'rho_inf', 'pressure', 'type') used to be silently ignored with the
+    # parameter's default applied in its place — e.g. 'u_inf' bypassed the
+    # m/s → LU conversion entirely.
+    # =====================================================================
+    _KNOWN_KEYS = {'location', 'method', 'velocity', 'density', 'rho',
+                   'k', 'relax_coeff', 'thickness', 'strength', 'sigma_max'}
+    _unknown = set(bc_dict) - _KNOWN_KEYS
+    if _unknown:
+        raise ValueError(
+            f"Boundary '{bc_name}': unknown key(s) {sorted(_unknown)}. "
+            f"Known keys: {sorted(_KNOWN_KEYS)}")
+
     # =====================================================================
     # Step 1: Determine location
     # =====================================================================
@@ -318,15 +326,6 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> FaceConfig:
     # Step 2: Determine method
     # =====================================================================
     method = bc_dict.get('method', '').lower().strip()
-    bc_type_str = bc_dict.get('type', '').lower().strip()
-
-    if not method:
-        method = _LEGACY_TYPE_MAP.get(bc_type_str, '')
-    elif method not in _METHOD_MAP:
-        fallback = _LEGACY_TYPE_MAP.get(bc_type_str, '')
-        if fallback:
-            method = fallback
-
     if not method:
         raise ValueError(
             f"Boundary '{bc_name}': no 'method' specified. "
@@ -353,15 +352,14 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> FaceConfig:
     # Step 4: Extract physical parameters
     # =====================================================================
     # Velocity  [Δx/Δt]
-    velocity_raw = bc_dict.get('velocity', bc_dict.get('u_inf', 0.0))
+    velocity_raw = bc_dict.get('velocity', 0.0)
     if isinstance(velocity_raw, (list, tuple)):
         velocity: Union[float, List[float]] = [float(v) for v in velocity_raw]
     else:
         velocity = float(velocity_raw)
-    
+
     # Density  [dimensionless]
-    density = float(bc_dict.get('rho', bc_dict.get('density',
-                    bc_dict.get('rho_inf', bc_dict.get('pressure', 1.0)))))
+    density = float(bc_dict.get('rho', bc_dict.get('density', 1.0)))
     
     # Relaxation coefficient  [dimensionless]
     relax_coeff = float(bc_dict.get('k', bc_dict.get('relax_coeff', 0.1)))

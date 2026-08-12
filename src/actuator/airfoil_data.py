@@ -1304,16 +1304,18 @@ class MultiAirfoilPolarManager:
                 cache[airfoil_name] = self._queries[key]
                 return self._queries[key]
 
-        # Fallback to default
-        if self._default_airfoil is not None:
-            warnings.warn(
-                f"Unknown airfoil '{airfoil_name}', using default "
-                f"'{self._default_airfoil}'"
-            )
+        # 'default' is the explicit sentinel blade.py injects for sections
+        # without an 'airfoil' key — it resolves to the declared default.
+        # Any OTHER unknown name is an error: the old behavior substituted
+        # the default airfoil with a once-per-location warning, so a typo
+        # flew a different airfoil for the whole run.
+        if name_lower == 'default' and self._default_airfoil is not None:
             cache[airfoil_name] = self._queries[self._default_airfoil]
             return self._queries[self._default_airfoil]
 
-        raise KeyError(f"Airfoil '{airfoil_name}' not found and no default set")
+        raise KeyError(
+            f"Airfoil '{airfoil_name}' is not registered "
+            f"(registered: {sorted(self._queries)})")
 
     def query(
         self,
@@ -1449,6 +1451,18 @@ def create_polar_from_config(
 
         if not airfoils_cfg:
             raise ValueError("'airfoils' dict required for method='multi'")
+        if default_name is None and len(airfoils_cfg) > 1:
+            # Without this, every airfoil registered as default and the
+            # LAST one in dict order silently won.
+            raise ValueError(
+                "airfoil_polar method='multi' with several airfoils needs "
+                f"an explicit \"default\" key (one of "
+                f"{sorted(airfoils_cfg)}) — sections without an 'airfoil' "
+                "entry resolve to it")
+        if default_name is not None and default_name not in airfoils_cfg:
+            raise ValueError(
+                f"airfoil_polar \"default\"={default_name!r} is not one of "
+                f"the declared airfoils {sorted(airfoils_cfg)}")
 
         for name, af_cfg in airfoils_cfg.items():
             af_method = af_cfg.get("method", "neuralfoil")

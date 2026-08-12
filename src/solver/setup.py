@@ -518,6 +518,20 @@ class SimulationSetup:
                 "See docs/CONFIG_GUIDE.md."
             )
 
+        # Deprecated physics keys (nu-only policy): these were parsed once,
+        # then ignored for years — a user hand-editing "Re" saw no effect.
+        _dead_phys = ('Re', 'tau', 'omega', 'nu_lu', 'u_ref_lu', 'L_ref_lu',
+                      'Re_U_ref', 'Re_L_ref')
+        _phys = self.config.get('physics', {})
+        _found = [k for k in _dead_phys if k in _phys]
+        if _found:
+            raise ValueError(
+                f"physics block contains removed key(s) {_found}: the "
+                "solver takes physics.nu only (Re-targeting: keep L_char "
+                "fixed and derive NU = U*L/RE in the config script). "
+                "Delete the key(s) — they have been ignored since the "
+                "nu-only migration.")
+
         # Legacy detection: separate top-level `interval` block.
         # Migrated → all cadences live inside `time`.
         if 'interval' in self.config:
@@ -1560,10 +1574,20 @@ class SimulationSetup:
         )
 
         # ── u_inf_lu ──
+        # 'U_inf' PRESENT (even 0.0 — hover is a value, not "unspecified")
+        # → pass through; ABSENT → None, and downstream may estimate. The
+        # old `> 0` test turned an explicit hover 0.0 into "unspecified",
+        # so the CSV u_inf_used silently became a BEM induced-velocity
+        # estimate instead of the configured freestream.
         pc = self._physics_config
-        U_inf_phys = pc.get('U_inf', 0.0)                     # [m/s]
-        u_inf_lu = U_inf_phys * self.dt_phys / self.dx_phys    # [Δx/Δt]
-        u_inf_lu_arg = u_inf_lu if u_inf_lu > 0 else None
+        if 'U_inf' in pc:
+            U_inf_phys = float(pc['U_inf'])                    # [m/s]
+            u_inf_lu = U_inf_phys * self.dt_phys / self.dx_phys  # [Δx/Δt]
+            u_inf_lu_arg = u_inf_lu
+        else:
+            U_inf_phys = 0.0
+            u_inf_lu = 0.0
+            u_inf_lu_arg = None
 
         # hub_center is given in L0 lattice units; rotor speed is given
         # as rpm. Convert to [m] / [rad/s] for downstream ALM code.

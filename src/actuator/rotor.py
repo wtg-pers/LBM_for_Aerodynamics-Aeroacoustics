@@ -1155,10 +1155,20 @@ class Rotor:
             inflow_direction=inflow_direction,
         )
 
-        # thrust_axis: direction for F_n projection (default: rotation_axis)
-        if thrust_direction is not None:
-            td = np.array(thrust_direction, dtype=np.float64)
-            rotor.thrust_axis = td / np.linalg.norm(td)
+        # thrust_axis: disk normal for F_n projection AND the single source
+        # of n_a = -thrust_axis (axial_inflow_dir). Absent, the property
+        # falls back to +rotation_axis — OPPOSITE-SIGNED semantics whose
+        # ambiguity was the documented source of "sometimes-flipped"
+        # corrections, and the setup-side shaft||disk-normal invariant
+        # check silently skipped. Explicit or nothing.
+        if thrust_direction is None:
+            raise ValueError(
+                "actuator_line.rotor: 'thrust_direction' is required (unit "
+                "vector of the thrust/disk normal; axial inflow = its "
+                "negative). Without it the axial direction silently fell "
+                "back to the sign-arbitrary rotation_axis.")
+        td = np.array(thrust_direction, dtype=np.float64)
+        rotor.thrust_axis = td / np.linalg.norm(td)
 
         return rotor
 

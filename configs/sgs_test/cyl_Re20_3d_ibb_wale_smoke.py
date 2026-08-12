@@ -31,8 +31,7 @@ print(f"  [smoke 3D IBB+WALE Re={RE}, D={D_LU}] Nx={Nx} Ny={Ny} Nz={Nz}, tau={TA
 simulation = {"device_mode": "gpu", "precision": "float32", "dimension": 3,
               "lattice_model": "D3Q27", "collision_model": "cumulant",
               "omega_3": 0.6, "omega_4": 1.4}
-physics = {"rho": 1.0, "U_inf": 1.0, "Re": RE,
- "nu": ((1.0) * (1.0) / (RE)),  # [m^2/s] auto-migrated (nu-only policy; Re key now ignored)
+physics = {"rho": 1.0, "U_inf": 1.0, "nu": ((1.0) * (1.0) / (RE)),  # [m^2/s] auto-migrated (nu-only policy; Re key now ignored)
            "L_char": 1.0, "flow_direction": [1.0, 0.0, 0.0]}
 grid = {"Nx": Nx, "Ny": Ny, "Nz": Nz, "resolution": CPC_L0}
 numerics = {"u_max": U_MAX_LU, "collision": "cumulant"}
