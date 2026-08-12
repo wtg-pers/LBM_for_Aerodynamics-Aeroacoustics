@@ -129,8 +129,18 @@ def create_geometry_mask(
                 selected_config = geom_config
                 break
     
-    # No geometry enabled → return empty mask
+    # No geometry enabled → return empty mask. But an ENABLED entry whose
+    # type is not in this dimension's list (typo, or e.g. 'sphere' in 2D)
+    # must not fall through here — that ran an obstacle-free flow while the
+    # user believed a body was present.
     if selected_type is None:
+        _enabled_unknown = [
+            k for k, v in geometry_config.items()
+            if isinstance(v, dict) and v.get('enabled', False)]
+        if _enabled_unknown:
+            raise ValueError(
+                f"internal_geometry: enabled type(s) {_enabled_unknown} are "
+                f"not supported in {dim}D (supported: {geometry_types})")
         if verbose:
             print("  Internal Obstacle: (none)")
         empty_mask = xp.zeros(domain_shape, dtype=bool)
@@ -575,6 +585,15 @@ def validate_geometry_config(
     
     geom_type = enabled_geoms[0]
     config = geometry_config[geom_type]
+
+    # Whitelist first: the type-specific branches below silently pass any
+    # name they do not recognize (the code used to admit unknown types
+    # unchecked and create_geometry_mask then dropped the obstacle).
+    _known = (('airfoil', 'circle', 'cylinder', 'box') if lattice_dim == 2
+              else ('stl', 'cylinder', 'sphere', 'box', 'airfoil'))
+    if geom_type not in _known:
+        return False, (f"Unknown geometry type '{geom_type}' for "
+                       f"{lattice_dim}D (supported: {', '.join(_known)})")
 
     # Type-specific validation
     if geom_type == 'stl':

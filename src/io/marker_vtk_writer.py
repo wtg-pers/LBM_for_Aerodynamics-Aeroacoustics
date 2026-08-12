@@ -393,10 +393,15 @@ class MarkerVTPWriter:
 
             # A rotor that lives on its own refinement block carries its own
             # frame; fall back to the caller's when it does not.
+            _fo = getattr(model, 'frame_origin', None)
+            _fs = getattr(model, 'frame_spacing', None)
+            # `is None`, not truthiness: _apply_frame's contract is
+            # origin-None = identity, and an ndarray origin would make
+            # `or` raise on ambiguous truth value.
             all_positions.append(_apply_frame(
                 model._last_positions,
-                getattr(model, 'frame_origin', None) or origin,
-                getattr(model, 'frame_spacing', None) or spacing))
+                origin if _fo is None else _fo,
+                spacing if _fs is None else _fs))
 
             # ── rotor_id: 이 로터의 모든 마커에 동일한 ri ──
             all_scalars['rotor_id'].append(

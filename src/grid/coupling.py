@@ -89,11 +89,10 @@ class GridCoupling:
         # ── CUDA interpolation kernel (if available) ─────────────
         self._cuda_interp = None
         if xp.__name__ == 'cupy':
-            try:
-                from src.kernels.interpolation_d3q27 import CubicInterpolationKernel3D
-                self._cuda_interp = CubicInterpolationKernel3D()
-            except Exception:
-                pass
+            # No silent fallback: a broken kernel import used to degrade to
+            # the triple-nested Python interpolate_1d with no trace.
+            from src.kernels.interpolation_d3q27 import CubicInterpolationKernel3D
+            self._cuda_interp = CubicInterpolationKernel3D()
 
         # ── Lattice constants on device ──────────────────────────
         self._dtype = lattice.dtype
@@ -124,13 +123,13 @@ class GridCoupling:
                 and os.environ.get("COUPLING_FUSED_RESCALE", "1") == "1"
                 and self._Q == 27 and self._dim == 3
                 and self._c.dtype == xp.float32):
-            try:
-                from src.kernels.coupling_rescale_d3q27 import (
-                    CouplingRescaleKernelD3Q27)
-                self._fused_rescale = CouplingRescaleKernelD3Q27(
-                    self._c, self._w, self._cs2)
-            except Exception:
-                self._fused_rescale = None
+            # No silent fallback: the unfused chain is only fp32-last-bit
+            # equivalent (NOT bit-identical), so a quiet degrade changes
+            # results. Opt out explicitly via COUPLING_FUSED_RESCALE=0.
+            from src.kernels.coupling_rescale_d3q27 import (
+                CouplingRescaleKernelD3Q27)
+            self._fused_rescale = CouplingRescaleKernelD3Q27(
+                self._c, self._w, self._cs2)
 
         # ── Fine domain slices on coarse grid ────────────────────
         # Solver array: f.shape = (Q, Nx, Ny, Nz)

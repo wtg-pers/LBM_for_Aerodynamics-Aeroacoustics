@@ -905,13 +905,19 @@ class SimulationSetup:
                   f"force")
 
         # Find which internal_geometry sub-dict is enabled
+        _enabled = [(_k, _v) for _k, _v in internal_geom.items()
+                    if isinstance(_v, dict) and _v.get('enabled', False)]
+        if len(_enabled) > 1:
+            # Silently taking the first (dict order!) let the wall_bc come
+            # from one geometry while the mask came from another.
+            raise ValueError(
+                "internal_geometry: more than one geometry enabled "
+                f"({', '.join(k for k, _ in _enabled)}) — enable exactly one")
         wall_bc_type = 'hwbb'
         enabled_cfg = {}
-        for _k, _v in internal_geom.items():
-            if isinstance(_v, dict) and _v.get('enabled', False):
-                enabled_cfg = _v
-                wall_bc_type = _v.get('wall_bc', 'hwbb').lower()
-                break
+        if _enabled:
+            enabled_cfg = _enabled[0][1]
+            wall_bc_type = enabled_cfg.get('wall_bc', 'hwbb').lower()
 
         if wall_bc_type == 'hwbb':
             if cut_faces and os.environ.get('LBM_ESOTERIC', '0') == '1':
@@ -1062,8 +1068,11 @@ class SimulationSetup:
             print(f"  Wall BC: Bouzidi IBB (q from airfoil polyline, "
                   f"{len(x_poly)} vertices)")
         else:
-            print(f"  [warn] wall_bc='ibb' with dim={dim} geom type='{gtype}' "
-                  f"has no q-source; using q=0.5 sentinel (≡ HWBB).")
+            raise ValueError(
+                f"wall_bc='ibb' with dim={dim} geom type='{gtype}' has no "
+                "q-source — the run would silently degrade to HWBB "
+                "(q=0.5 everywhere). Use wall_bc='hwbb' explicitly, or add "
+                "a q-source for this geometry type.")
 
         if os.environ.get('LBM_FORCE_Q_HALF', '0') == '1' and q_fraction is not None:
             q_fraction = self.xp.full_like(q_fraction, 0.5)
@@ -1176,8 +1185,11 @@ class SimulationSetup:
                 print("  span-through prism: q broadcast from mid slice "
                       "(z-invariant wall)")
         else:
-            print(f"  [warn] wall_bc='ibb' with dim=3 geom type='{gtype}' "
-                  f"has no q-source; using q=0.5 sentinel (≡ HWBB).")
+            raise ValueError(
+                f"wall_bc='ibb' with dim=3 geom type='{gtype}' has no "
+                "q-source — the run would silently degrade to HWBB "
+                "(q=0.5 everywhere). Use wall_bc='hwbb' explicitly, or add "
+                "a q-source for this geometry type.")
 
         if os.environ.get('LBM_FORCE_Q_HALF', '0') == '1' and link_q is not None:
             link_q = self.xp.full_like(link_q, 0.5)
@@ -1764,6 +1776,18 @@ class SimulationSetup:
                 local_y_max = round((y_max_phys - po[1]) / pd[1])
                 local_z_min = round((z_min_phys - po[2]) / pd[2])
                 local_z_max = round((z_max_phys - po[2]) / pd[2])
+                # Announce the snap: the octo8 rotor boxes were silently
+                # moved by this round() and nobody could see it in the log.
+                _snap = max(
+                    abs(local_x_min * pd[0] + po[0] - x_min_phys),
+                    abs(local_x_max * pd[0] + po[0] - x_max_phys),
+                    abs(local_y_min * pd[1] + po[1] - y_min_phys),
+                    abs(local_y_max * pd[1] + po[1] - y_max_phys),
+                    abs(local_z_min * pd[2] + po[2] - z_min_phys),
+                    abs(local_z_max * pd[2] + po[2] - z_max_phys))
+                if _snap > 1e-9:
+                    print(f"  [note] fine region snapped to the parent grid "
+                          f"(max shift {_snap:.4g} L0 cells)")
 
                 fine_region = IndexBox(
                     x_start=local_x_min, x_end=local_x_max,
@@ -1804,7 +1828,11 @@ class SimulationSetup:
                       f"origin = ({new_origin[0]:.1f}, {new_origin[1]:.1f}, "
                       f"{new_origin[2]:.1f})")
 
-        for _w in validate_block_tree(root, overlap_width):
+        # nesting="error": Rule A violations (child band invading the
+        # parent's own region → cells overwritten twice per coarse step)
+        # were a print on this manual-placement path but a hard error on
+        # the box_packing path — same defect, same verdict now.
+        for _w in validate_block_tree(root, overlap_width, nesting="error"):
             print(f"  [warn] MLG blocks: {_w}")
 
         self._mlg_is_multiblock = any(
@@ -1875,6 +1903,11 @@ class SimulationSetup:
         models = getattr(self.al_model, 'models', None) or [self.al_model]
         names = getattr(self.al_model, 'names', None) or ['rotor']
         policy = str(self._mlg_config.get('alm_band_policy', 'warn')).lower()
+        if policy not in ('warn', 'error'):
+            # Any unknown string used to fall through to 'warn' — a user
+            # who wrote 'strict'/'raise' believed the hard gate was armed.
+            raise ValueError(
+                f"mlg.alm_band_policy={policy!r}: expected 'warn' or 'error'")
 
         reports, exts = [], []
         for i, m in enumerate(models):
@@ -2402,6 +2435,14 @@ class SimulationSetup:
             local_x_max = round((x_max_phys - po[0]) / pd[0])
             local_y_min = round((y_min_phys - po[1]) / pd[1])
             local_y_max = round((y_max_phys - po[1]) / pd[1])
+            _snap = max(
+                abs(local_x_min * pd[0] + po[0] - x_min_phys),
+                abs(local_x_max * pd[0] + po[0] - x_max_phys),
+                abs(local_y_min * pd[1] + po[1] - y_min_phys),
+                abs(local_y_max * pd[1] + po[1] - y_max_phys))
+            if _snap > 1e-9:
+                print(f"  [note] fine region snapped to the parent grid "
+                      f"(max shift {_snap:.4g} L0 cells)")
 
             fine_region = IndexBox2D(
                 x_start=local_x_min, x_end=local_x_max,

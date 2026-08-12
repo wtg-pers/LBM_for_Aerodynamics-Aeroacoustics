@@ -142,7 +142,10 @@ class SolverInitializer:
             elif hasattr(al, 'models'):
                 n_markers = al.models[0].rotor.markers_per_blade
             else:
-                n_markers = 0
+                # n_markers = 0 here used to silently skip every blade CSV.
+                raise TypeError(
+                    f"ALM model {type(al).__name__} exposes neither .rotor "
+                    "nor .models — cannot size the blade CSV files")
 
             for j in range(n_markers):
                 path = os.path.join(blade_dir, f'{j}.csv')

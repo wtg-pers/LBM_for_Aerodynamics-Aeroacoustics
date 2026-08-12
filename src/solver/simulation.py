@@ -220,15 +220,12 @@ class Simulation:
             if isinstance(self.collision, (BGKCollision, CumulantCollision)):
                 # IBB is supported on the single-GPU esoteric path since S5
                 # (two-phase deposit-rewrite pass built in _init_esoteric).
-                # A failure inside falls back to the standard path, which
-                # still honors IBB — no silent wall-BC downgrade either way.
-                try:
-                    self._init_esoteric(f)
-                except Exception as e:
-                    import warnings
-                    warnings.warn(
-                        f"[esoteric] init failed, using standard path: {e}")
-                    self._use_esoteric = False
+                # Init failure used to warn and continue on the standard
+                # path — on MLG that could leave a MIXED per-level state
+                # (some levels esoteric, some standard; the L3 OOM case in
+                # driver._fail_fast_config history). Esoteric was requested
+                # explicitly (env/config), so failure is fatal.
+                self._init_esoteric(f)
         if self._use_esoteric:
             return  # single-buffer: skip _f_post / SGS / fused setup below
 
@@ -1059,12 +1056,27 @@ class Simulation:
         if self._surfel_ck_ok is None:
             from src.collision.cumulant import CumulantCollision
             sb = self.obstacle_bc
-            self._surfel_ck_ok = bool(
-                getattr(sb, 'collide_path', 'host') == 'kernel'
-                and self.xp.__name__ == 'cupy'
-                and isinstance(self.collision, CumulantCollision)
-                and self.f is not None
-                and self.f.dtype == self.xp.float32)
+            if getattr(sb, 'collide_path', 'host') != 'kernel':
+                self._surfel_ck_ok = False
+            else:
+                # collide='kernel' is an explicit request: unmet
+                # prerequisites used to route to the host chain silently.
+                problems = []
+                if self.xp.__name__ != 'cupy':
+                    problems.append("device is not cupy")
+                if not isinstance(self.collision, CumulantCollision):
+                    problems.append(
+                        f"collision {type(self.collision).__name__} "
+                        "is not Cumulant")
+                if self.f is None or self.f.dtype != self.xp.float32:
+                    problems.append("f is not float32")
+                if problems:
+                    raise ValueError(
+                        "surfel collide='kernel' requested but unavailable: "
+                        + "; ".join(problems)
+                        + " — pass collide='host' explicitly for the "
+                        "reference chain")
+                self._surfel_ck_ok = True
         return self._surfel_ck_ok
 
     def _advance_surfel_kernel(self) -> None:

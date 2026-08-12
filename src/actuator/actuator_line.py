@@ -890,6 +890,13 @@ class ActuatorLineModel:
             pass
         elif self._multi_airfoil:
             mgr = getattr(self.polar_query, 'manager', None)
+            if mgr is None and not getattr(self, '_warned_no_mgr', False):
+                # groups stays None → per-marker legacy loop (~40x slower),
+                # which used to happen with no trace at all.
+                self._warned_no_mgr = True
+                print("  [warn] ALM: multi-airfoil blade but polar_query has "
+                      "no manager handle — falling back to the per-marker "
+                      "dispatch loop")
             if mgr is not None:
                 key = id(blade)
                 cached = self._polar_groups.get(key)

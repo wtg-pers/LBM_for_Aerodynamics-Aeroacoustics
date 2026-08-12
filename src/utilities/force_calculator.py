@@ -154,22 +154,18 @@ class MomentumExchangeForce:
         self._cuda_kernel = None
         self._cuda_kernel_ibb = None
         if xp.__name__ == 'cupy':
+            # No silent fallback: a failed kernel import used to drop to the
+            # array path with zero trace (message-free `except: pass`).
             if self.dim == 3:
-                try:
-                    from src.kernels.mem_force_d3q27 import MEMForceKernelD3Q27
-                    self._cuda_kernel = MEMForceKernelD3Q27()
-                except Exception:
-                    pass
+                from src.kernels.mem_force_d3q27 import MEMForceKernelD3Q27
+                self._cuda_kernel = MEMForceKernelD3Q27()
             elif self.dim == 2 and self.Q == 9:
-                try:
-                    from src.kernels.mem_force_d2q9 import (
-                        MEMForceKernelD2Q9, MEMForceIBBKernelD2Q9,
-                    )
-                    self._cuda_kernel = MEMForceKernelD2Q9()
-                    if self._ibb_aware:
-                        self._cuda_kernel_ibb = MEMForceIBBKernelD2Q9()
-                except Exception:
-                    pass
+                from src.kernels.mem_force_d2q9 import (
+                    MEMForceKernelD2Q9, MEMForceIBBKernelD2Q9,
+                )
+                self._cuda_kernel = MEMForceKernelD2Q9()
+                if self._ibb_aware:
+                    self._cuda_kernel_ibb = MEMForceIBBKernelD2Q9()
 
         # Storage for time history
         self.force_history: List[Dict[str, Any]] = []

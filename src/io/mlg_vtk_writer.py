@@ -182,6 +182,12 @@ class MLGVTKWriter:
             rho = level_sim.rho
             u = level_sim.u
             if rho is None or u is None:
+                # A hole in the assembly: the .vti and the .vth index both
+                # come out well-formed with this block simply absent, so
+                # say so loudly instead of hiding it.
+                print(f"  [warn] MLG VTK: block "
+                      f"{info.get('name', f'L{k}')} has no rho/u this "
+                      f"step — omitted from the output")
                 continue
 
             # Extract solid mask. Single-GPU passes a Simulation and it hangs

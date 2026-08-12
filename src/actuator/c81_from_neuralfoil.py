@@ -75,8 +75,13 @@ def generate(airfoil_name, out_path, Re=2.0e6,
         CD[:, j] = pol.get_CD(aoa_grid)
         try:
             CM[:, j] = pol.get_CM(aoa_grid)
-        except Exception:
-            CM[:, j] = 0.0
+        except Exception as e:
+            # Writing CM=0 produced a perfectly well-formed deck that the
+            # loader could not distinguish from a real one downstream.
+            raise RuntimeError(
+                f"C81 deck: get_CM failed at Mach column {j}: {e}. A "
+                "zero-moment deck must be an explicit choice, not a "
+                "swallowed exception.") from e
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     _write_c81(out_path, airfoil_name.upper(), mach_grid, aoa_grid, CL, CD, CM)
     return out_path

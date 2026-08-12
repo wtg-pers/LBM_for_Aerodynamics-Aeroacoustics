@@ -74,11 +74,9 @@ class GridCoupling2D:
         # ── CUDA interpolation kernel (if available) ─────────────
         self._cuda_interp = None
         if xp.__name__ == 'cupy':
-            try:
-                from src.kernels.interpolation_d2q9 import CubicInterpolationKernel2D
-                self._cuda_interp = CubicInterpolationKernel2D()
-            except Exception:
-                pass
+            # No silent fallback (see coupling.py — same contract).
+            from src.kernels.interpolation_d2q9 import CubicInterpolationKernel2D
+            self._cuda_interp = CubicInterpolationKernel2D()
 
         # ── Lattice constants on device ──────────────────────────
         self._dtype = lattice.dtype

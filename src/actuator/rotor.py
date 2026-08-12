@@ -722,6 +722,12 @@ class Rotor:
 
         # --- Mode selection ---
         omega_R = np.abs(self.omega) * self.radius          # [m/s or lu/lt] tip speed
+        if mode not in ('auto', 'wind_turbine', 'rotorcraft'):
+            # A typo used to fall through to the wind-turbine branch and
+            # rescale C_T/C_P silently.
+            raise ValueError(
+                f"coeff_mode={mode!r}: expected 'auto', 'wind_turbine' "
+                "or 'rotorcraft'")
         if mode == 'auto':
             actual_mode = 'rotorcraft' if u_inf < 0.01 * omega_R else 'wind_turbine'
         else:
@@ -1117,8 +1123,14 @@ class Rotor:
         )
         blade.set_lattice_spacing(dx=dx)
 
-        # Hub center
-        hub_center = tuple(config.get('hub_center', (0.0, 0.0, 0.0)))
+        # Hub center — required, like grid.dx / grid.n_radial above. The
+        # old (0,0,0) default silently parked a mistyped rotor at the
+        # domain origin.
+        if 'hub_center' not in config:
+            raise ValueError(
+                "actuator_line.rotor: 'hub_center' is required "
+                "(L0 lattice-unit coordinates)")
+        hub_center = tuple(config['hub_center'])
 
         # Angular velocity
         omega = config.get('omega', None)

@@ -306,14 +306,13 @@ def parse_face_config(bc_name: str, bc_dict: Dict[str, Any]) -> FaceConfig:
     
     try:
         location = FaceLocation.from_string(str(location_str))
-    except ValueError:
-        try:
-            location = FaceLocation.from_string(bc_name)
-        except ValueError as e:
-            raise ValueError(
-                f"Boundary '{bc_name}': cannot determine location "
-                f"from 'location'={location_str!r} or bc_name. {e}"
-            ) from None
+    except ValueError as e:
+        # No bc_name retry: an explicit-but-mistyped 'location' used to be
+        # silently overridden by the dict key.
+        raise ValueError(
+            f"Boundary '{bc_name}': cannot determine location "
+            f"from 'location'={location_str!r}. {e}"
+        ) from None
     
     # =====================================================================
     # Step 2: Determine method

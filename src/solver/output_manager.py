@@ -141,11 +141,8 @@ class OutputManager:
         self._alm_marker_spacing = alm_marker_spacing  # dx_fine in L0 lu
         self._is_multi_rotor: bool = False
         if al_model is not None:
-            try:
-                from src.actuator.actuator_line import MultiRotorManager
-                self._is_multi_rotor = isinstance(al_model, MultiRotorManager)
-            except ImportError:
-                pass
+            from src.actuator.actuator_line import MultiRotorManager
+            self._is_multi_rotor = isinstance(al_model, MultiRotorManager)
 
         # File-IO ownership. True on the single-GPU path; the MPI subclass
         # sets it False on rank != 0 (those ranks still join every collective
@@ -668,19 +665,17 @@ class OutputManager:
         )
 
         # Correction wake filaments (Kleine free / Dağ prescribed helix) → ParaView.
-        # No-op for the straight kernel (no stored wake). Uses the same fine→global
-        # transform as the markers so the wake overlays the flow field.
-        try:
-            from src.io.wake_vtk_writer import write_wake_vtp
-            wdir = os.path.join(
-                getattr(self.marker_vtk_writer, 'output_dir', '.'), 'wake')
-            write_wake_vtp(
-                self.al_model, step, wdir,
-                origin=self._alm_marker_origin,
-                spacing=(self._alm_marker_spacing
-                         if self._alm_marker_origin is not None else 1.0))
-        except Exception:
-            pass
+        # write_wake_vtp itself returns None when there is no stored wake
+        # (straight kernel, <2 rings), so a real failure here must raise —
+        # the old blanket except silently dropped every wake file.
+        from src.io.wake_vtk_writer import write_wake_vtp
+        wdir = os.path.join(
+            getattr(self.marker_vtk_writer, 'output_dir', '.'), 'wake')
+        write_wake_vtp(
+            self.al_model, step, wdir,
+            origin=self._alm_marker_origin,
+            spacing=(self._alm_marker_spacing
+                     if self._alm_marker_origin is not None else 1.0))
 
     def _check_conservation(self, step: int, sim: 'Simulation') -> None:
         """Run mass conservation check."""
@@ -947,20 +942,18 @@ class OutputManager:
             for attr in ('_u_buf', '_rho_buf', '_nu_t_in'):
                 if hasattr(s, attr):
                     setattr(s, attr, None)
-        try:
-            from src.grid.multi_level_grid import MultiLevelGrid
-            if isinstance(sim, MultiLevelGrid):
-                for _level in sim._levels:
-                    _free_wale_buffers(_level)
-            else:
-                _free_wale_buffers(sim)
-        except Exception:
-            pass
+        from src.grid.multi_level_grid import MultiLevelGrid
+        if isinstance(sim, MultiLevelGrid):
+            for _level in sim._levels:
+                _free_wale_buffers(_level)
+        else:
+            _free_wale_buffers(sim)
         try:
             import cupy as _cp
-            _cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
+        except ImportError:      # CPU run — nothing to free
             pass
+        else:
+            _cp.get_default_memory_pool().free_all_blocks()
 
     def _final_fields(self, sim):
         """Data seam: (rho_final, u_final) for the finalize channels.

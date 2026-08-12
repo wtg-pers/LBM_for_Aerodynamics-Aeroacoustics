@@ -445,14 +445,17 @@ class SurfelKernelD3Q27:
         self.tau_out = cp.zeros(self.n_f, dtype=cp.float64)
         self.fb_out = cp.zeros(self.n_f, dtype=cp.uint8)
         self._per = tuple(int(p) for p in facets.periodic)
+        # Physics scalars are REQUIRED facet attributes (surfel_boundary
+        # always sets them): a getattr default here (nu=1/6 ~ tau=1!) would
+        # silently poison the wall model if the adapter drifted.
         law = getattr(facets, 'law', None)
         self.law_id = -1 if law is None else int(law.kernel_id)
         self.law_iters = int(getattr(law, 'kernel_iters', 0) or 0)
-        self.h_law = float(getattr(facets, 'h_law', 3.0))
-        self.nu = float(getattr(facets, 'nu', 1.0 / 6.0))
-        self.y_plus_min = float(getattr(facets, 'y_plus_min', 30.0))
-        self.fric_dir = self._FRIC[getattr(facets, 'friction_dir', 'state')]
-        self.fb_mode = self._FB[getattr(facets, 'fallback', 'noslip')]
+        self.h_law = float(facets.h_law)
+        self.nu = float(facets.nu)
+        self.y_plus_min = float(facets.y_plus_min)
+        self.fric_dir = self._FRIC[facets.friction_dir]
+        self.fb_mode = self._FB[facets.fallback]
         # Yang Eq. (2) wall-model input filter (patch_notes/surfel/13).
         # wm_mode 0 = off (default) -> the kernel skips the block entirely,
         # so an unfiltered run stays bit-identical to before the knob.

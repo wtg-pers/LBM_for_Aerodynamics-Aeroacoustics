@@ -69,20 +69,17 @@ class StreamingPull:
         # Skip precomputing index arrays if CUDA streaming kernel is available
         # (saves 4 × Q × N × 4B of GPU memory)
         self._use_cuda = False
-        if xp.__name__ == 'cupy' and self.dim == 3:
-            try:
-                from src.kernels.streaming_d3q27 import StreamingKernelD3Q27
-                self._cuda_kernel = StreamingKernelD3Q27()
-                self._use_cuda = True
-            except Exception:
-                self._precompute_indices()
+        if xp.__name__ == 'cupy' and self.dim == 3 and self.Q == 27:
+            # Q check matters: a D3Q19 lattice must NOT pick the D3Q27
+            # kernel. Kernel construction defers compilation, so the old
+            # try/except here never caught a real nvrtc failure anyway.
+            from src.kernels.streaming_d3q27 import StreamingKernelD3Q27
+            self._cuda_kernel = StreamingKernelD3Q27()
+            self._use_cuda = True
         elif xp.__name__ == 'cupy' and self.dim == 2 and self.Q == 9:
-            try:
-                from src.kernels.streaming_d2q9 import StreamingKernelD2Q9
-                self._cuda_kernel = StreamingKernelD2Q9()
-                self._use_cuda = True
-            except Exception:
-                self._precompute_indices()
+            from src.kernels.streaming_d2q9 import StreamingKernelD2Q9
+            self._cuda_kernel = StreamingKernelD2Q9()
+            self._use_cuda = True
         else:
             self._precompute_indices()
 

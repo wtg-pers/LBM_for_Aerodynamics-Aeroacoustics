@@ -253,11 +253,14 @@ class SurfelBoundary:
         cxyz, jn, eta, fs = cxyz[keep], jn[keep], eta[keep], fs[keep]
         M = int(cxyz.shape[0])
         if M == 0:
-            # a level whose body region holds no full band cell (deeply
-            # under-resolved) — nothing to inject; report, do not crash
-            self.tau_model_on = False
-            self._taum_summary = "tau-model requested but band is EMPTY"
-            return
+            # A level whose body region holds no full band cell (deeply
+            # under-resolved). tau_model=True was an explicit request —
+            # switching it off silently made the user interpret results
+            # as tau-modelled when nothing was injected.
+            raise ValueError(
+                "surfel tau_model=True but the injection band holds zero "
+                "full cells on this level (deeply under-resolved) — drop "
+                "tau_model on this config or refine the level")
 
         # tau_w gather: facets near each cell's wall foot point,
         # area-weighted (curved analog of the channel column average).
