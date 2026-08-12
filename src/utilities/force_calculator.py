@@ -105,6 +105,9 @@ class MomentumExchangeForce:
         self.opp = xp.asarray(lattice.opp)
         self.solid_mask = xp.asarray(solid_mask, dtype=bool)
         self.shape = solid_mask.shape
+        # Set before the enumeration below — _precompute_boundary_links
+        # inherits the wall BC's seam (periodic_axes) policy from it.
+        self._wall_bc_ref = wall_bc
 
         # Reuse boundary link info from wall BC if provided
         if getattr(wall_bc, 'kind', None) == 'surfel':
@@ -134,7 +137,6 @@ class MomentumExchangeForce:
         # sparse triple (link_cell, link_dir, link_q) instead.
         self._q_fraction = None
         self._ibb_aware = False
-        self._wall_bc_ref = wall_bc
         if wall_bc is not None and hasattr(wall_bc, 'q_fraction'):
             sparse_ok = all(
                 hasattr(wall_bc, n) for n in
@@ -179,63 +181,21 @@ class MomentumExchangeForce:
     
     def _precompute_boundary_links(self) -> None:
         """Precompute fluid-solid boundary links
-        
+
         For each direction i, identify fluid nodes whose neighbor
         in direction i is solid. These are the boundary links.
-        
-        needs_bounce[i, x, y(, z)] = True means:
-            - (x, y(, z)) is a fluid node
-            - neighbor in direction i is a solid node
-            - Distribution f_i at this node bounces back
+
+        Only reached when no wall BC was supplied (the production paths
+        reuse the BC's enumeration). Delegates to
+        q_fraction.compute_needs_bounce — the single link enumeration —
+        inheriting the wall BC's seam policy when one is present.
         """
-        xp = self.xp
-        c = self.c.astype(xp.int32)
-        solid = self.solid_mask
-        
-        if self.dim == 2:
-            self._precompute_boundary_links_2d(c, solid)
-        else:
-            self._precompute_boundary_links_3d(c, solid)
-    
-    def _precompute_boundary_links_2d(self, c: 'npt.NDArray', solid: 'npt.NDArray') -> None:
-        """Precompute boundary links for 2D domain"""
-        xp = self.xp
-        Nx, Ny = self.shape
-        self.needs_bounce = xp.zeros((self.Q,) + self.shape, dtype=bool)
-        
-        for i in range(self.Q):
-            if i == 0:  # Rest direction
-                continue
-            
-            cx, cy = int(c[0, i]), int(c[1, i])
-            
-            # Shift solid mask by -c_i
-            shifted_solid = xp.roll(
-                xp.roll(solid, -cx, axis=0),
-                -cy, axis=1)
-            
-            # Boundary link: fluid node where neighbor is solid
-            self.needs_bounce[i] = (~solid) & shifted_solid
-    
-    def _precompute_boundary_links_3d(self, c: 'npt.NDArray', solid: 'npt.NDArray') -> None:
-        """Precompute boundary links for 3D domain"""
-        xp = self.xp
-        Nx, Ny, Nz = self.shape
-        self.needs_bounce = xp.zeros((self.Q,) + self.shape, dtype=bool)
-        
-        for i in range(self.Q):
-            if i == 0:
-                continue
-            
-            cx, cy, cz = int(c[0, i]), int(c[1, i]), int(c[2, i])
-            
-            shifted_solid = xp.roll(
-                xp.roll(
-                    xp.roll(solid, -cx, axis=0),
-                    -cy, axis=1),
-                -cz, axis=2)
-            
-            self.needs_bounce[i] = (~solid) & shifted_solid
+        from src.boundary.q_fraction import compute_needs_bounce
+
+        self.needs_bounce = compute_needs_bounce(
+            self.xp, self.lattice, self.solid_mask,
+            periodic_axes=getattr(self._wall_bc_ref, '_periodic_axes', None),
+        )
     
     def compute(self, f_post: 'npt.NDArray') -> Tuple:
         """Compute total force on solid using momentum exchange.

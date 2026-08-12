@@ -24,7 +24,7 @@ Author: LBM Development Team
 Date: 2026-04
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -70,6 +70,7 @@ class InterpolatedBounceBack:
         solid_mask: "npt.NDArray",
         q_fraction: Optional["npt.NDArray"] = None,
         use_sparse: Optional[bool] = None,
+        periodic_axes: Optional[Tuple[int, ...]] = None,
     ) -> None:
         """
         Args:
@@ -84,6 +85,12 @@ class InterpolatedBounceBack:
                         is materialised and the dense (Q, *shape) array is
                         released. Default: True for 3D (memory critical),
                         False for 2D (existing dense kernel path is fine).
+            periodic_axes: axes whose wrap is a contract — see
+                q_fraction.compute_needs_bounce. None = legacy torus.
+                Also governs the solid-upstream sanitiser: an upstream
+                node that would leave the box on a non-periodic axis is
+                treated like a solid upstream (q<1/2 demoted to 0.5)
+                instead of being read through the wrap.
         """
         self.xp = xp
         self.lattice = lattice
@@ -92,6 +99,7 @@ class InterpolatedBounceBack:
         self.opp = xp.asarray(lattice.opp)
         self.Q = lattice.Q
         self.dim = lattice.dim
+        self._periodic_axes = periodic_axes
 
         if self.dim not in (2, 3):
             raise NotImplementedError(
@@ -142,6 +150,7 @@ class InterpolatedBounceBack:
         link_cell: "npt.NDArray",
         link_dir: "npt.NDArray",
         link_q: Optional["npt.NDArray"] = None,
+        periodic_axes: Optional[Tuple[int, ...]] = None,
     ) -> "InterpolatedBounceBack":
         """Build from the sparse link triple — no (Q,)+shape allocation.
 
@@ -164,6 +173,7 @@ class InterpolatedBounceBack:
         self.opp = xp.asarray(lattice.opp)
         self.Q = lattice.Q
         self.dim = lattice.dim
+        self._periodic_axes = periodic_axes
         if self.dim != 3:
             raise NotImplementedError(
                 "InterpolatedBounceBack.from_links is 3D-only "
@@ -201,7 +211,10 @@ class InterpolatedBounceBack:
         """Per-link twin of `_sanitize_q_for_solid_upstream` (see it).
 
         The upstream node x_f - c_i is taken with per-axis wrap, matching the
-        `xp.roll` the dense sanitiser uses.
+        `xp.roll` the dense sanitiser uses. With explicit `periodic_axes`, an
+        upstream that would leave the box on a non-periodic axis is demoted
+        exactly like a solid upstream — the wrapped cell is a stranger, not
+        one step further into the fluid.
         """
         xp = self.xp
         if self.n_links == 0:
@@ -214,12 +227,21 @@ class InterpolatedBounceBack:
         gz = cell % nz
         d = self.link_dir.astype(xp.int64)
         c = self.c.astype(xp.int64)
-        ux = (gx - c[0][d]) % nx
-        uy = (gy - c[1][d]) % ny
-        uz = (gz - c[2][d]) % nz
-        upstream_is_solid = self.solid_mask.reshape(-1)[
+        ux_raw = gx - c[0][d]
+        uy_raw = gy - c[1][d]
+        uz_raw = gz - c[2][d]
+        ux = ux_raw % nx
+        uy = uy_raw % ny
+        uz = uz_raw % nz
+        upstream_bad = self.solid_mask.reshape(-1)[
             (ux * ny + uy) * nz + uz]
-        bad = (self.link_q < 0.5) & upstream_is_solid
+        if self._periodic_axes is not None:
+            for ax, (u_raw, n_ax) in enumerate(
+                    ((ux_raw, nx), (uy_raw, ny), (uz_raw, nz))):
+                if ax in self._periodic_axes:
+                    continue
+                upstream_bad = upstream_bad | (u_raw < 0) | (u_raw >= n_ax)
+        bad = (self.link_q < 0.5) & upstream_bad
         n_fixed = int(xp.sum(bad))
         if n_fixed:
             self.link_q = xp.where(bad, xp.float32(0.5), self.link_q)
@@ -251,29 +273,19 @@ class InterpolatedBounceBack:
     # ──────────────────────────────────────────────────────────────
 
     def _precompute_boundary_links(self) -> None:
-        """Fill needs_bounce[i, ...] (fluid node, direction into solid)."""
-        xp = self.xp
-        c = self.c
-        solid = self.solid_mask
-        shape = solid.shape
-        dim = self.dim
+        """Fill needs_bounce[i, ...] (fluid node, direction into solid).
 
-        self.needs_bounce = xp.zeros((self.Q,) + shape, dtype=bool)
-        for i in range(self.Q):
-            if i == 0:
-                continue
-            if dim == 2:
-                cx, cy = int(c[0, i]), int(c[1, i])
-                shifted = xp.roll(xp.roll(solid, -cx, axis=0), -cy, axis=1)
-            else:  # 3D
-                cx, cy, cz = int(c[0, i]), int(c[1, i]), int(c[2, i])
-                shifted = xp.roll(
-                    xp.roll(xp.roll(solid, -cx, axis=0), -cy, axis=1),
-                    -cz, axis=2,
-                )
-            self.needs_bounce[i] = (~solid) & shifted
+        Delegates to q_fraction.compute_needs_bounce — the single link
+        enumeration — so the seam (periodic_axes) policy cannot drift
+        between the dense and sparse construction paths.
+        """
+        from src.boundary.q_fraction import compute_needs_bounce
 
-        self.n_boundary_links = int(xp.sum(self.needs_bounce))
+        self.needs_bounce = compute_needs_bounce(
+            self.xp, self.lattice, self.solid_mask,
+            periodic_axes=self._periodic_axes,
+        )
+        self.n_boundary_links = int(self.xp.sum(self.needs_bounce))
 
     def _sanitize_q_for_solid_upstream(self) -> None:
         """Force q = 0.5 on links whose q<1/2 branch would read a solid node.
@@ -281,29 +293,47 @@ class InterpolatedBounceBack:
         The Bouzidi q<1/2 term needs the post-collision distribution at
         x_f − c_i (one step further into the fluid). In thin regions
         (airfoil TE, narrow gaps) that node may itself be solid. For those
-        links we fall back to q = 0.5 → HWBB.
+        links we fall back to q = 0.5 → HWBB. With explicit periodic_axes,
+        an upstream that would leave the box on a non-periodic axis is
+        demoted the same way (the roll would read the opposite face).
         """
         xp = self.xp
         solid = self.solid_mask
+        dim = self.dim
         n_fixed = 0
 
         for i in range(1, self.Q):
-            if self.dim == 2:
+            if dim == 2:
                 cx, cy = int(self.c[0, i]), int(self.c[1, i])
-                upstream_is_solid = xp.roll(
+                upstream_bad = xp.roll(
                     xp.roll(solid, +cx, axis=0), +cy, axis=1
                 )
+                c_i = (cx, cy)
             else:  # 3D
                 cx, cy, cz = (int(self.c[0, i]), int(self.c[1, i]),
                                int(self.c[2, i]))
-                upstream_is_solid = xp.roll(
+                upstream_bad = xp.roll(
                     xp.roll(xp.roll(solid, +cx, axis=0), +cy, axis=1),
                     +cz, axis=2,
                 )
+                c_i = (cx, cy, cz)
+            if self._periodic_axes is not None:
+                # upstream x - c_i leaves the box at x[ax] = 0 (c > 0)
+                # or x[ax] = N-1 (c < 0); |c| <= 1 for D2Q9/D3Q27.
+                # roll always copies, so writing here is safe.
+                for ax in range(dim):
+                    if ax in self._periodic_axes:
+                        continue
+                    comp = int(c_i[ax])
+                    if comp == 0:
+                        continue
+                    sl = [slice(None)] * dim
+                    sl[ax] = 0 if comp > 0 else -1
+                    upstream_bad[tuple(sl)] = True
             bad = (
                 self.needs_bounce[i]
                 & (self.q_fraction[i] < 0.5)
-                & upstream_is_solid
+                & upstream_bad
             )
             if bool(xp.any(bad)):
                 n_fixed += int(xp.sum(bad))

@@ -707,6 +707,15 @@ class SimulationSetup:
             verbose=True,
         )
 
+        # Which axes are genuinely periodic on L0 — the seam contract the
+        # obstacle link enumeration is built against (q_fraction docstring;
+        # patch_notes/ibb_sparse/02 sec. 7 (b)). Derived once here, single
+        # source: an axis wraps iff neither face carries a non-periodic BC.
+        from src.boundary.bc_config import derive_periodic_axes
+        self._periodic_axes = derive_periodic_axes(
+            self.config.get('boundaries', {}), self.lattice.dim,
+        )
+
         # Internal obstacle
         internal_geom = self.config.get('internal_geometry', {})
         is_valid, msg = validate_geometry_config(
@@ -835,11 +844,47 @@ class SimulationSetup:
                 correct grid resolution.
             level_ctx: MLG fine-level context (surfel path, S8a-2) —
                 {'level': k, 'nu_lu': lu.nu, 'region': OverlapRegion}.
-                None on L0 / single grid. HWBB/IBB ignore it (their
-                inputs are the mask and geom_info alone).
+                None on L0 / single grid. Also selects the seam policy
+                for the link enumeration (see below).
         """
+        from src.boundary.q_fraction import detect_cut_faces
+
         if mask is None:
             mask = self._mask
+
+        # ── Seam policy (periodic_axes) for the link enumeration ─────
+        # L0: derived from the domain BCs (an axis wraps iff neither face
+        #     carries a non-periodic BC).
+        # MLG fine block: every face is a coupling boundary — nothing
+        #     wraps by right.
+        # Either way the span_through axis is added back: the z-invariant
+        # prism's wrap is its correctness contract (geometry_manager),
+        # and with a z-invariant mask it changes no link anyway.
+        if level_ctx is not None:
+            per_axes: Tuple[int, ...] = ()
+        else:
+            per_axes = getattr(self, '_periodic_axes', None)
+        _span = geom_info.get('span_through_axis')
+        if _span is not None:
+            _span_ax = ({'x': 0, 'y': 1, 'z': 2}[str(_span).lower()]
+                        if isinstance(_span, str) else int(_span))
+            if per_axes is not None and _span_ax not in per_axes:
+                per_axes = tuple(per_axes) + (_span_ax,)
+
+        # Body cut by a non-periodic box face = open body. The links that
+        # used to wrap there are suppressed by the enumeration below, so
+        # the fact must be carried on the BC: momentum-exchange force on
+        # an open body is not the body force (the torus closure used to
+        # hide a |F|=869 imbalance — patch_notes/ibb_sparse/02 sec. 3).
+        cut_faces = (detect_cut_faces(self.xp, mask, per_axes)
+                     if per_axes is not None else ())
+        if cut_faces:
+            where = ("the coupling faces of this fine block"
+                     if level_ctx is not None else "the domain boundary")
+            print(f"  [note] body is cut by box face(s) "
+                  f"{', '.join(cut_faces)} ({where}) — seam links "
+                  f"suppressed, MEM force on this block is not a body "
+                  f"force")
 
         # Find which internal_geometry sub-dict is enabled
         wall_bc_type = 'hwbb'
@@ -851,8 +896,27 @@ class SimulationSetup:
                 break
 
         if wall_bc_type == 'hwbb':
+            if cut_faces and os.environ.get('LBM_ESOTERIC', '0') == '1':
+                # The esoteric fused kernel bounces via node_type with
+                # UNCONDITIONAL periodic address arithmetic (% N) — the
+                # link filter above cannot reach it, so ghost bounces
+                # across the seam remain. They only ever write the
+                # outermost cell layer, which lies inside the C2F/F2C
+                # band by construction (overlap_width >= 1 is enforced),
+                # so the coupling overwrite contains them — but the seam
+                # is NOT honest the way the ibb link path now is. The
+                # force guard elsewhere is what keeps this safe to run
+                # (rig_cut / wall_coupling exclude track relies on it).
+                print(f"  [warn] wall_bc='hwbb' + esoteric with body cut "
+                      f"by {', '.join(cut_faces)}: kernel-level periodic "
+                      f"addressing keeps ghost bounces on the seam "
+                      f"(contained in the coupling band). wall_bc='ibb' "
+                      f"is the seam-honest choice for cut bodies.")
             print(f"  Wall BC: half-way bounce-back (HWBB)")
-            return HalfwayBounceBack(self.xp, self.lattice, mask)
+            bc = HalfwayBounceBack(self.xp, self.lattice, mask,
+                                   periodic_axes=per_axes)
+            bc.cut_faces = cut_faces
+            return bc
 
         if wall_bc_type == 'surfel':
             # Scope guards (patch_notes/surfel/46 sec. 1): STL, standard
@@ -953,11 +1017,13 @@ class SimulationSetup:
         dim = self.lattice.dim
 
         if dim == 3:
-            return self._setup_ibb_links(mask, geom_info, gtype)
+            return self._setup_ibb_links(mask, geom_info, gtype,
+                                         periodic_axes=per_axes,
+                                         cut_faces=cut_faces)
 
         # ── 2D: dense q_fraction (the D2Q9 IBB kernel indexes it directly) ──
         needs_bounce = compute_needs_bounce(
-            self.xp, self.lattice, mask,
+            self.xp, self.lattice, mask, periodic_axes=per_axes,
         )
 
         q_fraction = None
@@ -988,11 +1054,14 @@ class SimulationSetup:
 
         bc = InterpolatedBounceBack(
             self.xp, self.lattice, mask, q_fraction=q_fraction,
+            periodic_axes=per_axes,
         )
+        bc.cut_faces = cut_faces
         print(f"  {bc.get_info()}")
         return bc
 
-    def _setup_ibb_links(self, mask, geom_info, gtype):
+    def _setup_ibb_links(self, mask, geom_info, gtype,
+                         periodic_axes=None, cut_faces=()):
         """3D wall_bc='ibb' — built entirely in the sparse link representation.
 
         The dense twin above allocates (Q,)+shape twice (needs_bounce 27 B/cell
@@ -1013,16 +1082,29 @@ class SimulationSetup:
 
         shape = tuple(int(s) for s in mask.shape)
         link_cell, link_dir = compute_boundary_links(
-            self.xp, self.lattice, mask,
+            self.xp, self.lattice, mask, periodic_axes=periodic_axes,
         )
         link_q = None
         _span = geom_info.get('span_through_axis')
-        _per = ()
-        if _span:
-            _per = (({'x': 0, 'y': 1, 'z': 2}[str(_span).lower()]
-                     if isinstance(_span, str) else int(_span)),)
+        _per_seam = periodic_axes
+        if _per_seam is None:
+            # Legacy torus enumeration: the seam count is diagnostic only,
+            # and span-axis wraps are contractual, not seam crossings.
+            _per_seam = ()
+            if _span:
+                _per_seam = (({'x': 0, 'y': 1, 'z': 2}[str(_span).lower()]
+                              if isinstance(_span, str) else int(_span)),)
         n_seam = count_seam_links(self.xp, self.lattice, shape,
-                                  link_cell, link_dir, periodic_axes=_per)
+                                  link_cell, link_dir,
+                                  periodic_axes=_per_seam)
+        if periodic_axes is not None and n_seam:
+            # By construction the enumeration and the counter share the
+            # same wrap predicate — a nonzero count means they drifted.
+            raise AssertionError(
+                f"seam filter left {n_seam} wrapped links "
+                f"(periodic_axes={periodic_axes}) — "
+                f"compute_boundary_links/_suppress_wrapped_links and "
+                f"count_seam_links disagree")
 
         if gtype == 'cylinder':
             axis = geom_info.get('axis', 'z')
@@ -1086,7 +1168,9 @@ class SimulationSetup:
 
         bc = InterpolatedBounceBack.from_links(
             self.xp, self.lattice, mask, link_cell, link_dir, link_q,
+            periodic_axes=periodic_axes,
         )
+        bc.cut_faces = tuple(cut_faces)
         print(f"  {bc.get_info()}")
         return bc
 
@@ -1329,6 +1413,18 @@ class SimulationSetup:
         )
 
         if force_enabled and not self._args.no_force:
+            _cut = getattr(self.obstacle_bc, 'cut_faces', ())
+            if _cut:
+                # L0 warning, not an error: a body touching a WALL face
+                # (ground-mounted) is closed by that wall physically —
+                # the wetted-surface MEM force is still meaningful, minus
+                # the un-wetted contact patch's baseline-pressure term.
+                # On MLG fine blocks (body cut by COUPLING faces) the same
+                # condition is a hard error — see the MLG force selection.
+                print(f"  [warn] body touches domain face(s) "
+                      f"{', '.join(_cut)} — MEM force misses the contact "
+                      f"patch (baseline-pressure term); interpret offsets "
+                      f"accordingly")
             ref_config = fc.get('reference', {})
 
             if self.lattice.dim == 2:
@@ -2058,6 +2154,16 @@ class SimulationSetup:
                         % (_top, len(_same), ", ".join(b.name for b in _same)))
             for _fb in _cands[:1]:
                 k = _fb.level
+                _cut = getattr(_fb.sim.obstacle_bc, 'cut_faces', ())
+                if _cut:
+                    raise ValueError(
+                        f"force_calculation: block '{_fb.name}' (L{k})'s "
+                        f"body is cut by box face(s) {', '.join(_cut)} — "
+                        f"MEM force on an open body is not the body force "
+                        f"(the seam links that used to close the torus are "
+                        f"suppressed; patch_notes/ibb_sparse/02 sec. 3). "
+                        f"Disable force_calculation or enclose the body in "
+                        f"one block.")
                 if True:
                     lu_k = self._mlg_scaler.get_level_units(k)
                     scale = 1.0 / lu_k.dx   # = 2^k
@@ -2302,6 +2408,9 @@ class SimulationSetup:
                             internal_geom=internal_geom,
                             geom_info=fine_geom_info,
                             mask=fine_mask,
+                            # fine block: every face is a coupling boundary,
+                            # nothing wraps (seam policy — see the method).
+                            level_ctx={'level': k},
                         )
 
             sim_k = Simulation(
@@ -2338,6 +2447,16 @@ class SimulationSetup:
         if self.force_mgr is not None:
             for k in range(num_levels - 1, -1, -1):
                 if simulations[k].obstacle_bc is not None and k > 0:
+                    _cut = getattr(simulations[k].obstacle_bc,
+                                   'cut_faces', ())
+                    if _cut:
+                        raise ValueError(
+                            f"force_calculation: level {k}'s body is cut "
+                            f"by box face(s) {', '.join(_cut)} — MEM force "
+                            f"on an open body is not the body force "
+                            f"(patch_notes/ibb_sparse/02 sec. 3). Disable "
+                            f"force_calculation or enlarge the region to "
+                            f"enclose the body.")
                     lu_k = self._mlg_scaler.get_level_units(k)
                     scale = 1.0 / lu_k.dx   # = 2^k
 

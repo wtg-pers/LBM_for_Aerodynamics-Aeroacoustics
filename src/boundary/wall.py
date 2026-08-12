@@ -55,14 +55,18 @@ class HalfwayBounceBack:
     """
     
     def __init__(self, xp: 'ModuleType', lattice: 'Lattice',
-                 solid_mask: 'npt.NDArray') -> None:
+                 solid_mask: 'npt.NDArray',
+                 periodic_axes: Optional[Tuple[int, ...]] = None) -> None:
         """Initialize half-way bounce-back
-        
+
         Args:
             xp: Array module (numpy or cupy)
             lattice: Lattice model (D2Q9, D3Q19, D3Q27)
             solid_mask: Boolean array of shape (Nx, Ny, Nz) or (Nx, Ny)
                        True = solid (wall), False = fluid
+            periodic_axes: axes whose wrap is a contract — see
+                q_fraction.compute_needs_bounce. None = legacy torus
+                (every axis wraps); production callers pass it explicitly.
         """
         self.xp = xp
         self.lattice = lattice
@@ -71,83 +75,29 @@ class HalfwayBounceBack:
         self.opp = xp.asarray(lattice.opp)
         self.Q = lattice.Q
         self.dim = lattice.dim
-        
+        self._periodic_axes = periodic_axes
+
         # Precompute boundary information for efficiency
         self._precompute_boundary_links()
-    
+
     def _precompute_boundary_links(self) -> None:
         """Precompute fluid-solid boundary links
-        
+
         For each fluid node adjacent to a solid, identify which directions
         point into solid nodes. These are the directions that need bounce-back.
-        
-        This precomputation allows vectorized application of bounce-back.
+
+        Delegates to q_fraction.compute_needs_bounce — the single link
+        enumeration (its dense form). Keeping a private roll loop here is
+        how the seam (torus wrap) policy drifts between HWBB, IBB and the
+        force calculator.
         """
-        xp = self.xp
-        c = self.c
-        solid = self.solid_mask
-        
-        shape = solid.shape
-        
-        if self.dim == 3:
-            Nx, Ny, Nz = shape
-            
-            # For each direction i, find fluid nodes whose neighbor in direction i is solid
-            # These are the "boundary links" that need bounce-back
-            
-            # Store as list of (direction, fluid_indices) pairs
-            # Or more efficiently: store masks for each direction
-            
-            self.bounce_mask = []  # List of (Q,) masks for each spatial point
-            
-            # Create shifted solid masks for each direction
-            # If solid_mask shifted by -c_i has True at x, then x+c_i is solid
-            # So fluid node x streaming in direction i hits a wall
-            
-            self.needs_bounce = xp.zeros((self.Q,) + shape, dtype=bool)
-            
-            for i in range(self.Q):
-                if i == 0:  # Rest direction, no streaming
-                    continue
-                    
-                cx, cy, cz = int(c[0, i]), int(c[1, i]), int(c[2, i])
-                
-                # Shift solid mask by -c_i (opposite direction)
-                # This tells us: for each point x, is x + c_i solid?
-                shifted_solid = xp.roll(
-                    xp.roll(
-                        xp.roll(solid, -cx, axis=0),
-                        -cy, axis=1),
-                    -cz, axis=2)
-                
-                # Boundary link: fluid node where neighbor in direction i is solid
-                # needs_bounce[i, x, y, z] = True means:
-                #   - (x, y, z) is fluid
-                #   - (x + cx, y + cy, z + cz) is solid
-                #   - So f_i at (x,y,z) should bounce back to f_opp[i]
-                self.needs_bounce[i] = (~solid) & shifted_solid
-            
-            # Count boundary links for info
-            self.n_boundary_links = int(xp.sum(self.needs_bounce))
-            
-        elif self.dim == 2:
-            Nx, Ny = shape
-            
-            self.needs_bounce = xp.zeros((self.Q,) + shape, dtype=bool)
-            
-            for i in range(self.Q):
-                if i == 0:
-                    continue
-                    
-                cx, cy = int(c[0, i]), int(c[1, i])
-                
-                shifted_solid = xp.roll(
-                    xp.roll(solid, -cx, axis=0),
-                    -cy, axis=1)
-                
-                self.needs_bounce[i] = (~solid) & shifted_solid
-            
-            self.n_boundary_links = int(xp.sum(self.needs_bounce))
+        from src.boundary.q_fraction import compute_needs_bounce
+
+        self.needs_bounce = compute_needs_bounce(
+            self.xp, self.lattice, self.solid_mask,
+            periodic_axes=self._periodic_axes,
+        )
+        self.n_boundary_links = int(self.xp.sum(self.needs_bounce))
     
     def apply(self, f: 'npt.NDArray', f_post: Optional['npt.NDArray'] = None) -> None:
         """Apply half-way bounce-back boundary condition.

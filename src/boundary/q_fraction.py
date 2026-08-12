@@ -43,7 +43,7 @@ Author: LBM Development Team
 Date: 2026-04
 """
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
@@ -52,15 +52,47 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
 
+def _suppress_wrapped_links(shifted, c_i, periodic_axes) -> None:
+    """Zero the outermost layer of `shifted` wherever the roll wrapped.
+
+    `xp.roll(solid, -c)` treats the box as a torus: on the face a direction
+    exits, the "neighbour" it reports is the opposite face's cell. For every
+    axis NOT in `periodic_axes` that wrap is a lie, and the lied-to entries
+    live exactly in the one outermost layer the roll pulled across the seam
+    (|c| <= 1 for D2Q9/D3Q27). In-place, order-preserving.
+    """
+    dim = len(c_i)
+    for ax in range(dim):
+        if ax in periodic_axes:
+            continue
+        comp = int(c_i[ax])
+        if comp == 0:
+            continue
+        sl = [slice(None)] * dim
+        sl[ax] = -1 if comp > 0 else 0
+        shifted[tuple(sl)] = False
+
+
 def compute_needs_bounce(
     xp: "ModuleType",
     lattice,
     solid_mask: "npt.NDArray",
+    periodic_axes: Optional[Tuple[int, ...]] = None,
 ) -> "npt.NDArray":
     """Boundary-link mask needs_bounce[i, x, y(, z)].
 
     True iff the node is fluid AND its direction-i neighbor is solid.
     Matches HalfwayBounceBack / MomentumExchangeForce convention.
+
+    periodic_axes declares which axes genuinely wrap (the seam contract):
+        None      — legacy: every axis wraps (the box is a torus). Kept for
+                    reference wrappers and recorded-baseline gates only.
+        tuple     — only the listed axes wrap; on all others, links that
+                    would cross the box seam are NOT enumerated.
+    Production callers pass it explicitly: on L0 it is derived from the
+    domain BCs (plus the span_through axis), on an MLG fine block every
+    face is a coupling boundary so only the span_through axis may wrap
+    (patch_notes/ibb_sparse/02 sec. 7 option (b)).
     """
     Q = lattice.Q
     dim = lattice.dim
@@ -75,12 +107,16 @@ def compute_needs_bounce(
         if dim == 2:
             cx, cy = int(c[0, i]), int(c[1, i])
             shifted = xp.roll(xp.roll(solid, -cx, axis=0), -cy, axis=1)
+            c_i = (cx, cy)
         else:
             cx, cy, cz = int(c[0, i]), int(c[1, i]), int(c[2, i])
             shifted = xp.roll(
                 xp.roll(xp.roll(solid, -cx, axis=0), -cy, axis=1),
                 -cz, axis=2,
             )
+            c_i = (cx, cy, cz)
+        if periodic_axes is not None:
+            _suppress_wrapped_links(shifted, c_i, periodic_axes)
         nb[i] = (~solid) & shifted
     return nb
 
@@ -89,6 +125,7 @@ def compute_boundary_links(
     xp: "ModuleType",
     lattice,
     solid_mask: "npt.NDArray",
+    periodic_axes: Optional[Tuple[int, ...]] = None,
 ) -> Tuple["npt.NDArray", "npt.NDArray"]:
     """Sparse boundary-link enumeration — needs_bounce without the (Q,)+shape.
 
@@ -106,6 +143,9 @@ def compute_boundary_links(
         xp:         Array module (numpy or cupy).
         lattice:    Lattice (2D or 3D).
         solid_mask: Boolean mask, True = solid.
+        periodic_axes: which axes genuinely wrap — same contract as
+            compute_needs_bounce (None = legacy torus; the two functions
+            MUST be given the same value or dense/sparse identity breaks).
 
     Returns:
         link_cell (n_links,) int32 — flat index into solid_mask.ravel()
@@ -123,15 +163,19 @@ def compute_boundary_links(
         if dim == 2:
             cx, cy = int(c[0, i]), int(c[1, i])
             shifted = xp.roll(xp.roll(solid, -cx, axis=0), -cy, axis=1)
+            c_i = (cx, cy)
         else:
             cx, cy, cz = int(c[0, i]), int(c[1, i]), int(c[2, i])
             shifted = xp.roll(
                 xp.roll(xp.roll(solid, -cx, axis=0), -cy, axis=1),
                 -cz, axis=2,
             )
+            c_i = (cx, cy, cz)
         # in-place: no third full-size array. roll always copies (checked on
         # both numpy and cupy, incl. shift=0), so this never touches `solid`.
         shifted &= fluid
+        if periodic_axes is not None:
+            _suppress_wrapped_links(shifted, c_i, periodic_axes)
         idx = xp.where(shifted.reshape(N))[0]
         del shifted
         if idx.size == 0:
@@ -143,6 +187,41 @@ def compute_boundary_links(
     if not cells:
         return (xp.zeros(0, dtype=xp.int32), xp.zeros(0, dtype=xp.int8))
     return xp.concatenate(cells), xp.concatenate(dirs)
+
+
+def detect_cut_faces(
+    xp: "ModuleType",
+    solid_mask: "npt.NDArray",
+    periodic_axes: Tuple[int, ...] = (),
+) -> Tuple[str, ...]:
+    """Faces whose outermost cell layer contains solid — the body is cut.
+
+    A body cut by a non-periodic box face is an OPEN body: with the seam
+    links suppressed (periodic_axes explicit), momentum-exchange force on
+    it is missing the cut cross-section's pressure integral and must not
+    be reported as the body force (measured: the torus closure was hiding
+    a |F| = 869 imbalance on a resting fluid — patch_notes/ibb_sparse/02
+    sec. 3). Faces on `periodic_axes` are skipped: there the wrap is the
+    physics (span_through prism) and the accounting closes.
+
+    Returns face names in ('x_lo', 'x_hi', 'y_lo', ...) order.
+    """
+    solid = xp.asarray(solid_mask, dtype=bool)
+    dim = solid.ndim
+    names = ('x', 'y', 'z')
+    faces = []
+    for ax in range(dim):
+        if ax in periodic_axes:
+            continue
+        sl_lo = [slice(None)] * dim
+        sl_hi = [slice(None)] * dim
+        sl_lo[ax] = 0
+        sl_hi[ax] = -1
+        if bool(solid[tuple(sl_lo)].any()):
+            faces.append(f"{names[ax]}_lo")
+        if bool(solid[tuple(sl_hi)].any()):
+            faces.append(f"{names[ax]}_hi")
+    return tuple(faces)
 
 
 def links_from_needs_bounce(

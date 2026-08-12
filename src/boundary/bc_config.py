@@ -419,5 +419,41 @@ def parse_all_boundaries(boundaries_config: Dict[str, Dict[str, Any]]) -> List[F
         if fc.location in seen:
             raise ValueError(f"Duplicate boundary location: {fc.location.value}")
         seen.add(fc.location)
-    
+
     return face_configs
+
+
+def derive_periodic_axes(
+    boundaries_config: Dict[str, Dict[str, Any]],
+    dim: int,
+) -> Tuple[int, ...]:
+    """Axes on which the domain is genuinely a torus.
+
+    An axis is periodic iff NEITHER of its faces carries a non-periodic BC:
+    a face absent from the config has no FaceConfig at all, so the pull
+    streaming's wrap is what acts there (that IS the periodic BC in this
+    code base), and a face given method='periodic'/'none' says so
+    explicitly. Any other method (wall, velocity, pressure, neumann,
+    sponge) claims the face, and the wrap underneath it is an
+    implementation detail the BC overwrites — not a seam contract.
+
+    This is the single source for the `periodic_axes` the boundary-link
+    enumeration (q_fraction.compute_boundary_links / compute_needs_bounce)
+    must be given on L0: real periodic boxes keep their wrap links (the
+    momentum accounting closes through the seam), everything else stops
+    inventing neighbours across it.
+    """
+    axis_faces = {
+        0: (FaceLocation.XMIN, FaceLocation.XMAX),
+        1: (FaceLocation.YMIN, FaceLocation.YMAX),
+        2: (FaceLocation.ZMIN, FaceLocation.ZMAX),
+    }
+    claimed = {
+        fc.location
+        for fc in parse_all_boundaries(boundaries_config or {})
+        if fc.bc_type != BCType.PERIODIC
+    }
+    return tuple(
+        ax for ax in range(dim)
+        if not (axis_faces[ax][0] in claimed or axis_faces[ax][1] in claimed)
+    )
