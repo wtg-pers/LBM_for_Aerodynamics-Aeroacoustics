@@ -472,38 +472,21 @@ class SolverInitializer:
                         for k in range(1, mlg.num_levels)]
 
         for k, level_sim, key in _targets:
-            if key in state:
-                _restore(level_sim, state[key], f"Level {k}")
-            elif dist:
-                # Not in checkpoint → uniform IC, same as a fresh dist-init
-                print(f"  Level {k}: not in checkpoint, init equilibrium "
-                      f"(slab-scoped)")
-                level_sim.init_esoteric_metadata_host()
-                _fv = setup._physics_config.get('initial_flow_velocity',
-                                                [0.0, 0.0, 0.0])
-                level_sim._dist_init_ic = (
-                    1.0, list(_fv) if isinstance(_fv, (list, tuple))
-                    else [float(_fv), 0.0, 0.0])
-            else:
-                # Not in checkpoint → initialize from equilibrium
-                print(f"  Level {k}: not in checkpoint, init equilibrium")
-                shape = level_sim.domain_shape
-                dim = setup.lattice.dim
-                dtype = setup.compute_dtype
-                rho_0 = xp.ones(shape, dtype=dtype)
-                u_0 = xp.zeros((dim,) + shape, dtype=dtype)
-
-                physics_config = setup._physics_config
-                flow_vel = physics_config.get('initial_flow_velocity',
-                                              [0.0, 0.0, 0.0])
-                if isinstance(flow_vel, (list, tuple)):
-                    for d in range(min(len(flow_vel), dim)):
-                        u_0[d] = flow_vel[d]
-                else:
-                    u_0[0] = flow_vel
-
-                f_k = level_sim.collision.compute_equilibrium(rho_0, u_0)
-                level_sim.set_distribution(f_k)
+            if key not in state:
+                # A missing level key means the checkpoint's block layout
+                # differs from this config's (the '_b<index>' suffix only
+                # appears when a level has MULTIPLE blocks), or the level
+                # count changed. Continuing used to reset the level to
+                # uniform equilibrium and keep running — a silently wrong
+                # flow field. Refuse instead.
+                _avail = sorted(str(_k) for _k in state.keys()
+                                if str(_k).startswith('f_level_'))
+                raise ValueError(
+                    f"Restart: checkpoint has no key '{key}' for level {k} "
+                    f"(fine-level keys present: {_avail or 'none'}). "
+                    "Restart with the same block layout / level count the "
+                    "checkpoint was written with.")
+            _restore(level_sim, state[key], f"Level {k}")
 
         # ── ALM: fast-forward rotor kinematics (restart bug fix) ──
         # theta/time/_step_count previously reset to 0 on restart, which

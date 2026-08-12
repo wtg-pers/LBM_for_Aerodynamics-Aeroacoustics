@@ -34,53 +34,52 @@ def setup_library(MODE: str, device_id: Optional[int] = None) -> 'ModuleType':
         import numpy as xp
         print(f"MODE: CPU")
         return xp
-    
-    else:  # GPU mode
-        try:
-            import cupy as xp
-            
-            # Set GPU device
-            if device_id is not None:
-                xp.cuda.Device(device_id).use()
-                actual_device = device_id
-            else:
-                # Default to GPU 0
-                xp.cuda.Device(0).use()
-                actual_device = 0
-            
-            # Verify GPU is accessible
-            xp.cuda.Device(actual_device).compute_capability
-            
-            # Get GPU name for informative output (version-safe method)
-            device_props = xp.cuda.runtime.getDeviceProperties(actual_device)
-            device_name_raw = device_props['name']
-            
-            # Handle both bytes (old CuPy) and str (new CuPy)
-            if isinstance(device_name_raw, bytes):
-                device_name = device_name_raw.decode('utf-8')
-            else:
-                device_name = device_name_raw
-            
-            device = xp.cuda.Device(actual_device)
-            total_memory = device.mem_info[1] / 1e9  # Total memory in GB
-            
-            print(f"MODE: GPU")
-            print(f"  Device ID: {actual_device}")
-            print(f"  Device Name: {device_name}")
-            print(f"  Total Memory: {total_memory:.2f} GB")
-            
-            return xp
-            
-        except ImportError:
-            print(f"Warning: CuPy not installed. Falling back to NumPy (CPU mode).")
-            import numpy as xp
-            return xp
-            
-        except Exception as e:
-            print(f"Warning: Cannot use GPU {device_id if device_id is not None else 0}: {e}")
-            print("Falling back to NumPy (CPU mode).")
-            import numpy as xp
-            return xp
+
+    if MODE != 'gpu':
+        raise ValueError(
+            f"device_mode must be 'cpu' or 'gpu', got {MODE!r}")
+
+    # GPU mode. A GPU request must never silently degrade to NumPy: the
+    # run would drop the fused kernels, esoteric path and SGS in one go
+    # and complete with a one-line note buried in the setup log.
+    try:
+        import cupy as xp
+    except ImportError as e:
+        raise RuntimeError(
+            "device_mode='gpu' but CuPy is not importable. Install CuPy "
+            "or set simulation device_mode: 'cpu' explicitly.") from e
+
+    actual_device = device_id if device_id is not None else 0
+    try:
+        xp.cuda.Device(actual_device).use()
+
+        # Verify GPU is accessible
+        xp.cuda.Device(actual_device).compute_capability
+
+        # Get GPU name for informative output (version-safe method)
+        device_props = xp.cuda.runtime.getDeviceProperties(actual_device)
+        device_name_raw = device_props['name']
+
+        # Handle both bytes (old CuPy) and str (new CuPy)
+        if isinstance(device_name_raw, bytes):
+            device_name = device_name_raw.decode('utf-8')
+        else:
+            device_name = device_name_raw
+
+        device = xp.cuda.Device(actual_device)
+        total_memory = device.mem_info[1] / 1e9  # Total memory in GB
+    except Exception as e:
+        raise RuntimeError(
+            f"device_mode='gpu' but GPU {actual_device} is unusable: {e}. "
+            "Fix the device/driver (or CUDA_VISIBLE_DEVICES) or set "
+            "device_mode: 'cpu' explicitly.") from e
+
+    print(f"MODE: GPU")
+    print(f"  Device ID: {actual_device}")
+    print(f"  Device Name: {device_name}")
+    print(f"  Total Memory: {total_memory:.2f} GB")
+
+    return xp
 
 
 def get_available_gpus() -> Tuple[int, list]:

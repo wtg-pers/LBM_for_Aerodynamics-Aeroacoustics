@@ -274,6 +274,16 @@ class Simulation:
         self._fused_is_d2q9 = False
 
         if self.xp.__name__ == 'cupy' and len(self.domain_shape) == 3:
+            # Every kernel below takes const float*; RawKernel passes the
+            # array pointer without checking dtype, so a float64 field is
+            # read as garbage rather than raising. Same contract as the
+            # esoteric guard in _init_esoteric.
+            import numpy as _np
+            if self.f.dtype != _np.float32:
+                raise ValueError(
+                    f"GPU D3Q27 kernels are float32-only (got "
+                    f"{self.f.dtype}); set simulation precision: 'float32', "
+                    "or device_mode: 'cpu' for a float64 reference run")
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
 
@@ -290,22 +300,39 @@ class Simulation:
                         "SGS turbulence models are wired to the cumulant "
                         "collision only; BGK + SGS is not supported."
                     )
-                try:
-                    from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
-                    self._fused_kernel = BGKCollideKernelD3Q27()
-                    self._use_fused = True
-                except Exception:
-                    pass
+                from src.kernels.bgk_d3q27 import BGKCollideKernelD3Q27
+                self._fused_kernel = BGKCollideKernelD3Q27()
+                self._use_fused = True
             elif isinstance(self.collision, CumulantCollision):
-                try:
-                    from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
-                    self._fused_kernel = CumulantCollideKernelD3Q27(sgs_model=sgs_model_kernel)
-                    self._use_fused = True
-                    self._fused_is_cumulant = True
-                    if sgs_model != "off":
-                        print(f"  [fused kernel] D3Q27 cumulant + SGS={sgs_model}")
-                except Exception:
-                    pass
+                # The std fused kernel relaxes ALL higher cumulants at the
+                # single rate it receives as omega_high (launch feeds
+                # omega_3) and implements no limiter. A config asking for
+                # distinct omega_4/omega_5/limiter must not run with those
+                # knobs dropped — the esoteric kernel supports them.
+                _c = self.collision
+                _dropped = []
+                if _c.omega_4 != _c.omega_3:
+                    _dropped.append(f"omega_4={_c.omega_4}")
+                if _c.omega_5 != _c.omega_3:
+                    _dropped.append(f"omega_5={_c.omega_5}")
+                if _c.omega_high != _c.omega_3:
+                    _dropped.append(f"omega_6..10(=omega_high={_c.omega_high})")
+                if float(getattr(_c, 'cumulant_limiter', 0.0)) != 0.0:
+                    _dropped.append(f"cumulant_limiter={_c.cumulant_limiter}")
+                if _dropped:
+                    raise ValueError(
+                        "std fused D3Q27 cumulant kernel relaxes all higher "
+                        f"cumulants at omega_3={_c.omega_3} and has no "
+                        "limiter; it cannot honor: " + ", ".join(_dropped)
+                        + ". Use the esoteric path (omega_3/omega_4/limiter "
+                        "supported), align the values with omega_3, or "
+                        "implement per-order rates in the std kernel first.")
+                from src.kernels.cumulant_d3q27 import CumulantCollideKernelD3Q27
+                self._fused_kernel = CumulantCollideKernelD3Q27(sgs_model=sgs_model_kernel)
+                self._use_fused = True
+                self._fused_is_cumulant = True
+                if sgs_model != "off":
+                    print(f"  [fused kernel] D3Q27 cumulant + SGS={sgs_model}")
 
                 # WALE / dyn_smag pre-pass kernels (3D)
                 # Both feed nu_t to the cumulant collide WALE branch.
@@ -324,74 +351,80 @@ class Simulation:
             if self.obstacle_bc is not None:
                 from src.boundary.wall import HalfwayBounceBack
                 if type(self.obstacle_bc) is HalfwayBounceBack:
-                    try:
-                        from src.kernels.bounce_back_d3q27 import HWBBKernelD3Q27
-                        self._hwbb_kernel = HWBBKernelD3Q27()
-                    except Exception:
-                        pass
+                    from src.kernels.bounce_back_d3q27 import HWBBKernelD3Q27
+                    self._hwbb_kernel = HWBBKernelD3Q27()
                 else:
-                    try:
-                        from src.boundary.interpolated_wall import InterpolatedBounceBack
-                        if isinstance(self.obstacle_bc, InterpolatedBounceBack):
-                            from src.kernels.interpolated_wall_d3q27 import IBBKernelD3Q27
-                            self._ibb_kernel = IBBKernelD3Q27()
-                    except Exception:
-                        pass
+                    from src.boundary.interpolated_wall import InterpolatedBounceBack
+                    if isinstance(self.obstacle_bc, InterpolatedBounceBack):
+                        from src.kernels.interpolated_wall_d3q27 import IBBKernelD3Q27
+                        self._ibb_kernel = IBBKernelD3Q27()
 
         elif self.xp.__name__ == 'cupy' and len(self.domain_shape) == 2:
-            # D2Q9 fused path (currently only Cumulant). Kernel is float32-only.
+            # D2Q9 fused path (currently only Cumulant).
             import numpy as _np
-            is_f32 = (self.f.dtype == _np.float32)
 
-            if is_f32:
-                from src.collision.cumulant_d2q9 import CumulantCollisionD2Q9
+            # The D2Q9 kernel set indexes f as q*N+idx in int32 (the D3Q27
+            # set was ported to 64-bit, this one was not): past
+            # N = 2^31/9 the flat index overflows and the kernels corrupt
+            # memory instead of raising.
+            _N_cells = 1
+            for _s in self.domain_shape:
+                _N_cells *= int(_s)
+            if 9 * _N_cells > 2 ** 31:
+                raise NotImplementedError(
+                    f"D2Q9 CUDA kernels are int32-indexed and this grid "
+                    f"(N={_N_cells:,}) exceeds the 2^31/9 ceiling (~238M "
+                    "cells per level). 64-bit indexing for the D2Q9 kernel "
+                    "set must be implemented before running grids this "
+                    "large (follow the D3Q27 64-bit port).")
 
-                if isinstance(self.collision, CumulantCollisionD2Q9):
-                    sgs_model = self._sgs_cfg["model"]
-                    sgs_model_kernel = "wale" if sgs_model == "dyn_smag" else sgs_model
-                    try:
-                        from src.kernels.cumulant_d2q9 import CumulantCollideKernelD2Q9
-                        self._fused_kernel = CumulantCollideKernelD2Q9(
-                            sgs_model=sgs_model_kernel,
-                        )
-                        self._use_fused = True
-                        self._fused_is_cumulant = True
-                        self._fused_is_d2q9 = True
-                    except Exception:
-                        pass
+            # Kernels are float32-only (const float*; RawKernel does not
+            # check array dtype — float64 would read as garbage).
+            if self.f.dtype != _np.float32:
+                raise ValueError(
+                    f"GPU D2Q9 kernels are float32-only (got "
+                    f"{self.f.dtype}); set simulation precision: 'float32', "
+                    "or device_mode: 'cpu' for a float64 reference run")
 
-                # WALE / dyn_smag pre-pass kernels (2D)
-                if self._sgs_cfg["model"] == "wale":
-                    from src.kernels.macro_d2q9 import MacroKernelD2Q9
-                    from src.kernels.wale_d2q9 import WALEKernelD2Q9
-                    self._macro_kernel = MacroKernelD2Q9()
-                    self._wale_kernel  = WALEKernelD2Q9()
-                elif self._sgs_cfg["model"] == "dyn_smag":
-                    from src.kernels.macro_d2q9 import MacroKernelD2Q9
-                    from src.kernels.dyn_smag_d2q9 import DynSmagKernelD2Q9
-                    self._macro_kernel = MacroKernelD2Q9()
-                    self._wale_kernel  = DynSmagKernelD2Q9()
+            from src.collision.cumulant_d2q9 import CumulantCollisionD2Q9
 
-                # Obstacle BC kernel: dispatch on exact type.
-                # Plain HalfwayBounceBack → HWBBKernelD2Q9
-                # InterpolatedBounceBack  → IBBKernelD2Q9
-                # MovingWallBounceBack / others → Python path.
-                if self.obstacle_bc is not None:
-                    from src.boundary.wall import HalfwayBounceBack
-                    if type(self.obstacle_bc) is HalfwayBounceBack:
-                        try:
-                            from src.kernels.bounce_back_d2q9 import HWBBKernelD2Q9
-                            self._hwbb_kernel = HWBBKernelD2Q9()
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            from src.boundary.interpolated_wall import InterpolatedBounceBack
-                            if isinstance(self.obstacle_bc, InterpolatedBounceBack):
-                                from src.kernels.interpolated_wall_d2q9 import IBBKernelD2Q9
-                                self._ibb_kernel = IBBKernelD2Q9()
-                        except Exception:
-                            pass
+            if isinstance(self.collision, CumulantCollisionD2Q9):
+                sgs_model = self._sgs_cfg["model"]
+                sgs_model_kernel = "wale" if sgs_model == "dyn_smag" else sgs_model
+                from src.kernels.cumulant_d2q9 import CumulantCollideKernelD2Q9
+                self._fused_kernel = CumulantCollideKernelD2Q9(
+                    sgs_model=sgs_model_kernel,
+                )
+                self._use_fused = True
+                self._fused_is_cumulant = True
+                self._fused_is_d2q9 = True
+
+            # WALE / dyn_smag pre-pass kernels (2D)
+            if self._sgs_cfg["model"] == "wale":
+                from src.kernels.macro_d2q9 import MacroKernelD2Q9
+                from src.kernels.wale_d2q9 import WALEKernelD2Q9
+                self._macro_kernel = MacroKernelD2Q9()
+                self._wale_kernel  = WALEKernelD2Q9()
+            elif self._sgs_cfg["model"] == "dyn_smag":
+                from src.kernels.macro_d2q9 import MacroKernelD2Q9
+                from src.kernels.dyn_smag_d2q9 import DynSmagKernelD2Q9
+                self._macro_kernel = MacroKernelD2Q9()
+                self._wale_kernel  = DynSmagKernelD2Q9()
+
+            # Obstacle BC kernel: dispatch on exact type.
+            # Plain HalfwayBounceBack → HWBBKernelD2Q9
+            # InterpolatedBounceBack  → IBBKernelD2Q9
+            # MovingWallBounceBack / others → Python path.
+            if self.obstacle_bc is not None:
+                from src.boundary.wall import HalfwayBounceBack
+                if type(self.obstacle_bc) is HalfwayBounceBack:
+                    from src.kernels.bounce_back_d2q9 import HWBBKernelD2Q9
+                    self._hwbb_kernel = HWBBKernelD2Q9()
+                else:
+                    from src.boundary.interpolated_wall import InterpolatedBounceBack
+                    if isinstance(self.obstacle_bc, InterpolatedBounceBack):
+                        from src.kernels.interpolated_wall_d2q9 import IBBKernelD2Q9
+                        self._ibb_kernel = IBBKernelD2Q9()
 
     @property
     def is_ready(self) -> bool:

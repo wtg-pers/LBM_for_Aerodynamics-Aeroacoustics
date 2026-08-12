@@ -452,8 +452,22 @@ class SimulationSetup:
                     raise ValueError(
                         "numerics.esoteric=true cannot be satisfied: "
                         + "; ".join(problems))
-            if "LBM_ESOTERIC" not in os.environ:
-                os.environ["LBM_ESOTERIC"] = "1" if eso_cfg else "0"
+            _env = os.environ.get("LBM_ESOTERIC")
+            _want = "1" if eso_cfg else "0"
+            if _env is None:
+                os.environ["LBM_ESOTERIC"] = _want
+            elif _env != _want:
+                # Explicit config vs explicit env used to resolve silently
+                # (env won), flipping the streaming layout — and with it
+                # memory footprint and the domain-wall BC semantics —
+                # behind the user's back. Under MPI the driver setdefaults
+                # LBM_ESOTERIC=1, so numerics.esoteric=false + mpirun also
+                # lands here (the distributed runner is esoteric-only).
+                raise ValueError(
+                    f"numerics.esoteric={bool(eso_cfg)} conflicts with "
+                    f"LBM_ESOTERIC={_env} in the environment. Unset the "
+                    "env var (the config seeds it), or drop the config "
+                    "key (env-driven A/B twins run configs without it).")
 
         self._output_config = self.config.get('output', {})
         self._vtk_config = self._output_config.get('vtk', {})
@@ -549,7 +563,11 @@ class SimulationSetup:
         """Device selection + lattice creation + validation."""
         import numpy as np
 
-        device_mode = self.sim_params.get('device_mode')
+        # Missing device_mode has always meant "try GPU" (None fell through
+        # to the GPU branch); make that default explicit — setup_library
+        # rejects anything other than 'cpu'/'gpu' and no longer falls back
+        # to NumPy on GPU failure.
+        device_mode = self.sim_params.get('device_mode', 'gpu')
         device_id = (self._args.gpu
                      if self._args.gpu is not None
                      else self.sim_params.get('device_id', 0))

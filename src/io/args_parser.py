@@ -30,6 +30,7 @@ MPI_ONLY_DESTS: Dict[str, Tuple[str, Any]] = {
     'verify': ('--verify', False),
     'strict_bit': ('--strict-bit', False),
     'profile': ('--profile', False),
+    'cut_policy': ('--cut-policy', 'balanced'),
 }
 
 
