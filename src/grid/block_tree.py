@@ -96,6 +96,36 @@ class GridBlock:
                 lo[1], lo[1] + self.shape[1] - 1,
                 lo[2], lo[2] + self.shape[2] - 1)
 
+    @property
+    def domain_faces(self) -> Tuple[str, ...]:
+        """Array faces that lie ON the global domain boundary.
+
+        A fine block's face is normally a coupling boundary; when it
+        coincides with the DOMAIN face there is no coarse fluid beyond it
+        to couple against (the C2F band collapses to width 0 there by
+        design) — that face is a physical boundary and must be treated as
+        one. This is the single-source test for it: pure integer
+        arithmetic against the root extent via `global_box`, valid at any
+        depth (a face interior to the parent can never satisfy it, since
+        nesting keeps every ancestor extent inside the root's).
+
+        Names follow OverlapRegion.flush_faces: 'x_min', 'x_max', ...
+        The root reports all six (its faces ARE the domain faces).
+        """
+        root = self
+        while root.parent is not None:
+            root = root.parent
+        ratio = int(round(root.spacing / self.spacing))
+        box = self.global_box
+        faces = []
+        for d, ax in enumerate("xyz"):
+            hi_dom = (root.shape[d] - 1) * ratio
+            if box[2 * d] == 0:
+                faces.append(f"{ax}_min")
+            if box[2 * d + 1] == hi_dom:
+                faces.append(f"{ax}_max")
+        return tuple(faces)
+
     def __repr__(self) -> str:
         return (f"GridBlock({self.label}, shape={self.shape}, "
                 f"origin={tuple(round(o, 3) for o in self.origin)}, "

@@ -1944,6 +1944,107 @@ class SimulationSetup:
         """
         if self.lattice.dim == 2:
             return self._build_mlg_simulation_2d()
+        return self._build_mlg_simulation_3d()
+
+    def _fine_level_boundaries(self, blk) -> dict:
+        """Domain BCs for an MLG fine block — only on its DOMAIN-flush faces.
+
+        A fine block face is a coupling boundary EXCEPT where it coincides
+        with the global domain face: there the C2F band collapses to width
+        0 by design, and with boundaries_config={} the pull streaming's
+        periodic wrap acted as the "BC" — the face pulled populations from
+        the OPPOSITE face of the block. For a ground plane that is plainly
+        wrong; it is why fine regions were forbidden from touching the
+        domain (docs/manual/05 §5.7-5) and why v3 leaves 0..46 mm above
+        ground at L0 (patch_notes/mlg_blocks/02 axis (1)).
+
+        Returns the subset of self.config['boundaries'] whose faces this
+        block is flush against, velocities converted to lattice units the
+        same way _setup_boundaries does. u_lu is level-invariant here
+        (acoustic scaling: dt and dx halve together), and density is
+        dimensionless, so entries copy verbatim.
+
+        Wall-plane caveat (documented, stage-2 candidate): hwbb places the
+        wall 0.5*dx_k below node 0, so a fine wall sits 0.5*(1 - 2^-k) L0
+        lu HIGHER than the same wall on L0 (L1: +0.25). The build prints
+        the offset; making the planes coincide exactly (q-fraction face
+        BC) is a separate, registered step.
+        """
+        import copy as _copy
+        from src.boundary.bc_config import parse_face_config
+
+        dom_faces = blk.domain_faces
+        if not dom_faces:
+            return {}
+
+        _SUPPORTED = {'hwbb', 'bounce_back', 'slip', 'symmetry', 'free_slip',
+                      'neumann', 'zero_gradient', 'eq', 'equilibrium'}
+        _WALLS = {'hwbb', 'bounce_back'}
+        _OPPOSITE = {'x_min': 'x_max', 'x_max': 'x_min',
+                     'y_min': 'y_max', 'y_max': 'y_min',
+                     'z_min': 'z_max', 'z_max': 'z_min'}
+
+        by_loc = {}
+        for name, bc in (self.config.get('boundaries', {}) or {}).items():
+            fc = parse_face_config(name, bc)
+            by_loc[fc.location.value] = (name, bc, fc)
+
+        uc = self._unit_converter
+        out = {}
+        for face in dom_faces:
+            loc = face.replace('_', '')            # 'z_min' -> 'zmin'
+            if loc not in by_loc:
+                # Domain face without a BC = periodic axis. Flush on BOTH
+                # ends is the span_through contract (the wrap IS the
+                # physics — no face BC wanted); flush on one end only
+                # would wrap this block into itself.
+                if _OPPOSITE[face] in dom_faces:
+                    continue
+                raise ValueError(
+                    f"MLG block '{blk.name}' (L{blk.level}) is flush with "
+                    f"domain face {loc}, which has no BC (periodic axis) — "
+                    f"the block would stream-wrap into itself there. Either "
+                    f"span the whole axis (both faces flush) or pull the "
+                    f"region off that face.")
+            name, bc, fc = by_loc[loc]
+            if fc.method not in _SUPPORTED:
+                raise NotImplementedError(
+                    f"MLG block '{blk.name}' (L{blk.level}) is flush with "
+                    f"domain face {loc} (method='{fc.method}') — fine-level "
+                    f"domain BC supports {sorted(_SUPPORTED)} for now. "
+                    f"sponge needs thickness x2^k and per-dt strength "
+                    f"rescaling plus a band-overlap decision; keep the "
+                    f"region off this face until that lands.")
+            # The C2F/F2C machinery must agree this face has no band —
+            # otherwise the coupling would overwrite the BC every substep.
+            if blk.region is not None \
+                    and not blk.region.flush_faces.get(face, False):
+                raise AssertionError(
+                    f"MLG block '{blk.name}': face {face} is domain-flush "
+                    f"by global_box but NOT flush in the parent frame — "
+                    f"nesting broke (this should be impossible; the "
+                    f"ancestor chain must reach the domain face for the "
+                    f"block to).")
+            entry = _copy.deepcopy(bc)
+            entry['location'] = loc
+            if 'velocity' in entry:
+                v = entry['velocity']
+                if isinstance(v, (list, tuple)):
+                    entry['velocity'] = [uc.phys_to_lu_velocity(vi)
+                                         for vi in v]
+                else:
+                    entry['velocity'] = uc.phys_to_lu_velocity(float(v))
+            out[name] = entry
+            if fc.method in _WALLS:
+                shift = 0.5 * (1.0 - blk.spacing)
+                print(f"    Level {blk.level} '{blk.name}': {loc} wall "
+                      f"(hwbb) — wall plane at -{0.5 * blk.spacing:g} L0 lu"
+                      f", {shift:g} L0 lu above the L0 wall plane "
+                      f"(half-cell convention; exact-plane face BC is the "
+                      f"registered follow-up)")
+        return out
+
+    def _build_mlg_simulation_3d(self) -> "MultiLevelGrid":
 
         xp = self.xp
         num_levels = self._mlg_config['num_levels']
@@ -1982,14 +2083,23 @@ class SimulationSetup:
                 xp, self.lattice, fine_shape,
             )
 
-            # Fine level BC: empty (coupling handles boundaries)
+            # Fine level BC: coupling handles every face EXCEPT the ones
+            # flush with the global domain — those get the domain's own
+            # BCs (fine-level domain BC; patch_notes/mlg_blocks/03).
+            fine_bounds = self._fine_level_boundaries(_blk)
             fine_bc_mgr = DomainBCManager(
                 xp=xp,
                 lattice=self.lattice,
-                boundaries_config={},
+                boundaries_config=fine_bounds,
                 domain_shape=fine_shape,
                 verbose=False,
             )
+            if fine_bounds:
+                print(f"    Level {k} '{_blk.name}': domain BC on flush "
+                      f"face(s) "
+                      + ", ".join(f"{e['location']}="
+                                  f"{e.get('method', e.get('type', '?'))}"
+                                  for e in fine_bounds.values()))
 
             # ── Fine-level obstacle ──────────────────────────────
             # Physical process: same obstacle geometry, higher resolution.
@@ -2361,6 +2471,12 @@ class SimulationSetup:
                 xp, self.lattice, fine_shape,
             )
 
+            # Fine level BC: empty — 2D is OUTSIDE the fine-level domain
+            # BC feature (3D: _fine_level_boundaries). GridCoupling2D
+            # writes all 4 faces unconditionally (no flush_faces concept
+            # in OverlapManager2D), so a face BC here would be overwritten
+            # every substep. Introduce flush faces to the 2D coupling
+            # first if this is ever needed.
             fine_bc_mgr = DomainBCManager(
                 xp=xp,
                 lattice=self.lattice,
