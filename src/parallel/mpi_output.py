@@ -426,10 +426,7 @@ class MPIOutputManager(OutputManager):
             return None
         extra = None
         if include_extra:
-            # step_convention marker: 'index' = 0-based last-processed
-            # label (C8 unified). Pre-unification main_mpi checkpoints
-            # (step = advance count) lack it — restore prints a note.
-            extra = {"num_levels": r.NL, "step_convention": "index"}
+            extra = {"num_levels": r.NL}
             per = {}
             for b in r.blocks:
                 per[b.level] = per.get(b.level, 0) + 1

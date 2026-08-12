@@ -22,66 +22,6 @@ if TYPE_CHECKING:
 
 
 _CUBIC_INTERP_3D_KERNEL = r'''
-extern "C" __global__
-void cubic_interp_3d(
-    float* __restrict__ f,     // (Q, Nx, Ny, Nz) -- modified in-place
-    const int Q,
-    const int Nx, const int Ny, const int Nz
-) {
-    // Each thread handles one (q, ix, iy, iz)
-    int total = Q * Nx * Ny * Nz;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
-
-    int NyNz = Ny * Nz;
-    long long NxNyNz = (long long)Nx * NyNz;   // 64-bit: q*NxNyNz overflows int32 at N>~79.5M
-
-    int q  = tid / NxNyNz;
-    int rem = tid - q * NxNyNz;
-    int ix = rem / NyNz;
-    rem = rem - ix * NyNz;
-    int iy = rem / Nz;
-    int iz = rem - iy * Nz;
-
-    // Only process odd indices (at least one of ix, iy, iz is odd)
-    int ox = ix & 1, oy = iy & 1, oz = iz & 1;
-    if (ox == 0 && oy == 0 && oz == 0) return;  // even node, skip
-
-    // Helper: read f[q, x, y, z] with bounds check
-    #define F(x, y, z) f[q * NxNyNz + (x) * NyNz + (y) * Nz + (z)]
-
-    // 1D cubic interpolation weight function
-    // For odd index i along axis with even neighbors:
-    //   Interior (i-3>=0 && i+3<n): 9/16*(g[i-1]+g[i+1]) - 1/16*(g[i-3]+g[i+3])
-    //   Left boundary (i=1, n>=5):  3/8*g[0] + 3/4*g[2] - 1/8*g[4]
-    //   Right boundary (i=n-2):     3/8*g[n-1] + 3/4*g[n-3] - 1/8*g[n-5]
-    //   Fallback (n<5):             0.5*(g[i-1]+g[i+1])
-
-    // Strategy: interpolate sequentially x -> y -> z
-    // But we need intermediate values at partially-interpolated nodes.
-    // Instead, use the factored approach:
-    //   For a node (ox, oy, oz):
-    //     (1,0,0): interp x only, using even y,z neighbors
-    //     (0,1,0): interp y only
-    //     (0,0,1): interp z only
-    //     (1,1,0): interp x first (using even-y values), then interp y...
-    //              but we don't have intermediate values in a single pass.
-
-    // For a single-kernel approach, we need the SEQUENTIAL interpolation
-    // to work. This requires 3 passes (like the original), not 1 pass.
-    // A single kernel can't do sequential axis interpolation because
-    // odd-x values depend on even-x values, and odd-xy values depend
-    // on odd-x values.
-
-    // CONCLUSION: 3D interpolation is inherently sequential (axis by axis).
-    // A single kernel can handle ONE axis at a time.
-    // We provide a 1D kernel that's called 3 times.
-    // This is still faster than CuPy because: 1 kernel launch per axis
-    // instead of multiple CuPy operations per axis.
-
-    // This kernel is NOT used -- see cubic_interp_1d below.
-    return;
-}
 
 // --- 1D cubic interpolation kernel -------------------------
 // Fills all odd indices along one axis in a single kernel launch.

@@ -184,15 +184,6 @@ class Simulation:
         # on isinstance(obstacle_bc, ...). Both None → Python path.
         self._ibb_kernel = None
 
-        # ── Wall-Function Bounce (WFB, opt-in via attach_wfb) ──
-        # Sparse post-pass right after the obstacle bounce; None (default)
-        # leaves every existing path bit-identical. Std path only in W2;
-        # the esoteric deposit-rewrite integration is W5.
-        self._wfb = None
-        # Near-wall SGS reconstruction (CAMWA Eq.39, W3c) — rescales the
-        # SGS nu_t band before collision. None (default) = no-op.
-        self._nw_sgs = None
-
     # =====================================================================
     # Public Interface
     # =====================================================================
@@ -430,33 +421,6 @@ class Simulation:
     def is_ready(self) -> bool:
         """Whether set_distribution() has been called."""
         return self._is_ready
-
-    def attach_wfb(self, wfb) -> None:
-        """Attach a WallFunctionBounce pass (wall-model track W2, opt-in).
-
-        Runs right after the obstacle bounce each step; requires the
-        standard path (the esoteric deposit-rewrite integration is W5).
-        """
-        if self._use_esoteric:
-            raise RuntimeError(
-                "WFB on the esoteric path is not integrated yet (W5); "
-                "run the standard path (LBM_ESOTERIC=0).")
-        self._wfb = wfb
-
-    def attach_near_wall_sgs(self, nw_sgs) -> None:
-        """Attach a NearWallEddyViscosity reconstruction (W3c, opt-in).
-
-        Runs in the SGS pre-pass, after the plain SGS field is built and
-        REPLACING the blanket sgs.wall_damp_cells zeroing inside its
-        band (the two are alternative treatments of the same wall-layer
-        nu_t pathology; the reconstruction is the wall-model-consistent
-        one). Requires an SGS model that fills nu_t_in.
-        """
-        if self._sgs_cfg["model"] not in ("wale", "dyn_smag", "smagorinsky"):
-            raise RuntimeError(
-                "near-wall SGS reconstruction needs an SGS model "
-                f"(got model={self._sgs_cfg['model']!r})")
-        self._nw_sgs = nw_sgs
 
     @property
     def f_post(self) -> Optional['npt.NDArray']:
@@ -1038,9 +1002,6 @@ class Simulation:
         self.bc_manager.apply_all(self.f, self._f_post)
         if self.obstacle_bc is not None:
             self.obstacle_bc.apply_with_reset(self.f, self._f_post)
-            if self._wfb is not None:
-                self._wfb.apply(self.f, self._f_post, self.u, self.rho,
-                                nu_t=self.nu_t)
 
         self.step_count += 1
 
@@ -1223,7 +1184,7 @@ class Simulation:
                     Cs=self._sgs_cfg["Cs"],
                     nu_t_out=self.nu_t,
                     nu_t_in=self._nu_t_in,
-                    nut_scale=self._nut_scale_arg(),
+                    nut_scale=None,
                 )
         else:
             self._fused_kernel.launch(
@@ -1296,13 +1257,7 @@ class Simulation:
                     Cs_max=float(self._sgs_cfg["Cs_max"]),
                     alpha_sq=float(self._sgs_cfg["alpha_sq"]),
                 )
-        if self._nw_sgs is not None and self._wfb is not None:
-            # Wall-model-consistent reconstruction REPLACES the blanket
-            # wall_damp zeroing inside its band (W3c).
-            self._nw_sgs.apply(self._nu_t_in, self._wfb.mean_utau(),
-                               self._wfb.nu)
-        else:
-            self._sgs_wall_damp()
+        self._sgs_wall_damp()
 
     def _sgs_mask_solid_u(self) -> None:
         """No-slip the SGS input velocity at SOLID cells (patch 12, F1e).
@@ -1325,21 +1280,6 @@ class Simulation:
             self._sgs_solid_idx = idx
         if idx.size:
             self._u_buf[:, idx] = 0.0
-
-    def _nut_scale_arg(self) -> Optional['npt.NDArray']:
-        """Per-cell nu_t multiplier for the in-kernel smagorinsky branch.
-
-        None whenever the near-wall reconstruction is not attached or the
-        wall model has not yet produced a u_tau — then the kernel runs
-        bit-unchanged. u_tau is the previous step's mean (the one-step
-        lag is intentional; see NearWallEddyViscosity.apply)."""
-        if self._nw_sgs is None or self._wfb is None:
-            return None
-        N = 1
-        for d in self.domain_shape:
-            N *= int(d)
-        return self._nw_sgs.scale_field(
-            N, self._wfb.mean_utau(), self._wfb.nu)
 
     def _sgs_wall_damp(self) -> None:
         """Zero nu_t_in within sgs.wall_damp_cells of a SOLID body.
@@ -1403,11 +1343,6 @@ class Simulation:
         else:
             self.obstacle_bc.apply_with_reset(self.f, self._f_post)
 
-        # WFB (W2): correct the just-bounced slots from the wall model.
-        if self._wfb is not None:
-            self._wfb.apply(self.f, self._f_post, self.u, self.rho,
-                            nu_t=self.nu_t)
-
     def _advance_fused_with_alm(self) -> None:
         """Fused path with ALM: macro → ALM → fused collision."""
         xp = self.xp
@@ -1468,7 +1403,7 @@ class Simulation:
                     N=N,
                     Cs=self._sgs_cfg["Cs"],
                     nu_t_out=self.nu_t,
-                    nut_scale=self._nut_scale_arg(),
+                    nut_scale=None,
                 )
         else:
             self._fused_kernel.launch(

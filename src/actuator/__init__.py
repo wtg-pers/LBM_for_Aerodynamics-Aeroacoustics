@@ -47,8 +47,8 @@ from .coordinates import (
 # =============================================================================
 from .airfoil_data import (
     AirfoilPolarData, AirfoilDatabase,
-    make_polar_query, gen_airfoil_polar,
-    load_airfoil_from_csv, load_airfoil_sections_from_csv,
+    make_polar_query,
+    load_airfoil_from_csv,
     create_flat_plate_polar, create_naca0012_polar,
     create_nrel_s826_database,
     # NEW: Config-based polar factory
@@ -110,8 +110,8 @@ __all__ = [
     'create_coordinate_system',
     # Airfoil data
     'AirfoilPolarData', 'AirfoilDatabase',
-    'make_polar_query', 'gen_airfoil_polar',
-    'load_airfoil_from_csv', 'load_airfoil_sections_from_csv',
+    'make_polar_query',
+    'load_airfoil_from_csv',
     'create_flat_plate_polar', 'create_naca0012_polar',
     'create_nrel_s826_database',
     # NEW: Config-based polar factory

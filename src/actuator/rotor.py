@@ -1078,18 +1078,6 @@ class Rotor:
         Returns:
             Rotor instance
         """
-        # Check for NTNU BT1 preset (shortcut)
-        if config.get('preset') in ('ntnu_bt1', 'NTNU_BT1'):
-            return cls.from_ntnu_bt1(
-                tsr=config.get('tsr', 6.0),
-                u_inf=config.get('u_inf', 10.0),
-                hub_center=tuple(config.get('hub_center', (3.66, 1.341, 0.817))),
-                resolution=config.get('grid', {}).get('resolution', 160),
-                dx=config.get('grid', {}).get('dx', None),
-                theta_0=config.get('theta_0', 0.0),
-                rotation_axis=config.get('rotation_axis', [1, 0, 0]),
-            )
-
         # --- General construction ---
         # Blade
         blade_cfg = config.get('blade', {})

@@ -516,22 +516,6 @@ def convert_f_std_to_esoteric(xp, f_std: 'npt.NDArray') -> 'npt.NDArray':
     return f_eso
 
 
-def convert_f_esoteric_to_std(xp, f_eso: 'npt.NDArray') -> 'npt.NDArray':
-    """Convert f from Esoteric ordering back to standard D3Q27 ordering.
-
-    Args:
-        xp: Array module
-        f_eso: Distribution in Esoteric ordering (27, Nx, Ny, Nz)
-
-    Returns:
-        f_std: Distribution in standard ordering (27, Nx, Ny, Nz)
-    """
-    f_std = xp.empty_like(f_eso)
-    for eso_q in range(27):
-        std_q = _STD_TO_ESO[eso_q]
-        f_std[std_q] = f_eso[eso_q]
-    return f_std
-
 
 # ============================================================
 # Gather / Scatter: Esoteric memory <-> physical distribution

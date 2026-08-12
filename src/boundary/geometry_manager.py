@@ -916,8 +916,6 @@ def create_fine_level_geometry_config(
                 'faces': mesh.faces,
             }
         }
-        if 'wall_bc' in active_config:
-            new_config['stl']['wall_bc'] = active_config['wall_bc']
         if 'span_through_axis' in active_config:
             # fine levels re-check the z-invariant prism contract on their
             # own localized mask (fine z-extent == full domain z)
@@ -1149,8 +1147,6 @@ def create_fine_level_geometry_config_2d(
         }
         # Carry the wall-BC selector so each MLG fine level honors HWBB / IBB
         # the user requested at L0.
-        if 'wall_bc' in active_config:
-            new_config[active_type]['wall_bc'] = active_config['wall_bc']
         if verbose:
             print(f"    Fine obstacle ({active_type}): "
                   f"center=({cx_local:.1f}, {cy_local:.1f}), "
@@ -1209,12 +1205,12 @@ def create_fine_level_geometry_config_2d(
                 'angle_of_attack': aoa,
             }
         }
-        # Preserve geometry-source keys (selig_file / naca / inline coords)
-        # plus the wall-BC selector so each MLG tier picks up HWBB / IBB
-        # the user requested at L0.
+        # Preserve geometry-source keys (selig_file / naca / inline coords).
+        # wall_bc is deliberately NOT copied: fine-level obstacle BCs read it
+        # from the L0 internal_geometry (single source, setup.py
+        # _build_obstacle_wall_bc(internal_geom=...)).
         for key in (
             'selig_file', 'naca', 'x_coords', 'y_coords', 'num_points',
-            'wall_bc',
         ):
             if key in active_config:
                 new_config['airfoil'][key] = active_config[key]

@@ -58,9 +58,8 @@ class InterpolatedBounceBack:
     Both are then None, and `n_boundary_links == n_links`. This is what 3D
     production builds use: the dense pair costs 135 B/cell to carry ~10
     links per 1000 cells, and at v2's L1 (108.6 M cells) that alone exceeds
-    a 24 GB card. Consumers that genuinely need the dense mask (2D kernels,
-    the WFB link-geometry sibling) call `materialize_needs_bounce()`
-    explicitly, so the cost is never paid by accident.
+    a 24 GB card. The 2D dense constructor path builds its own mask, so
+    the cost is never paid by accident on 3D builds.
     """
 
     def __init__(
@@ -246,27 +245,6 @@ class InterpolatedBounceBack:
         if n_fixed:
             self.link_q = xp.where(bad, xp.float32(0.5), self.link_q)
         self._n_links_fixed = n_fixed
-
-    def materialize_needs_bounce(self) -> "npt.NDArray":
-        """Build (and cache) the dense (Q,)+shape link mask from the links.
-
-        Explicit because it costs Q bytes per cell (27 B/cell in 3D). Only
-        the dense consumers — 2D CUDA kernels, `compute_link_wall_geometry`
-        (WFB) — should ask for it.
-        """
-        if self.needs_bounce is not None:
-            return self.needs_bounce
-        xp = self.xp
-        shape = tuple(int(s) for s in self.solid_mask.shape)
-        N = 1
-        for s in shape:
-            N *= s
-        nb = xp.zeros((self.Q, N), dtype=bool)
-        if self.n_links:
-            nb[self.link_dir.astype(xp.int64),
-               self.link_cell.astype(xp.int64)] = True
-        self.needs_bounce = nb.reshape((self.Q,) + shape)
-        return self.needs_bounce
 
     # ──────────────────────────────────────────────────────────────
     # Setup helpers

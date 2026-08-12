@@ -132,9 +132,6 @@ class MLGVTKWriter:
         for info in self._block_info:
             self._per_level[info['level']] += 1
 
-        # Back-compat alias (read-only users indexed this by level)
-        self._level_info = self._block_info
-
         # ── Time-series tracking ─────────────────────────────────
         self.time_steps: List[Tuple[float, str]] = []
         self._scan_existing_files()
@@ -452,7 +449,7 @@ class MLGVTKWriter:
         """Estimate total output file size per timestep."""
         bytes_per_float = 4 if self._precision == 'float32' else 8
         total = 0
-        for info in self._level_info:
+        for info in self._block_info:
             Nx, Ny, Nz = info['shape']
             n = Nx * Ny * Nz
             total += n * bytes_per_float * 5
@@ -461,6 +458,6 @@ class MLGVTKWriter:
             'per_level_MB': [
                 info['shape'][0] * info['shape'][1] * info['shape'][2]
                 * bytes_per_float * 5 / 1e6
-                for info in self._level_info
+                for info in self._block_info
             ],
         }

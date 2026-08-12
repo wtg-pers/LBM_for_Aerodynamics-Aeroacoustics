@@ -2292,50 +2292,49 @@ class SimulationSetup:
                         f"suppressed; patch_notes/ibb_sparse/02 sec. 3). "
                         f"Disable force_calculation or enclose the body in "
                         f"one block.")
-                if True:
-                    lu_k = self._mlg_scaler.get_level_units(k)
-                    scale = 1.0 / lu_k.dx   # = 2^k
+                lu_k = self._mlg_scaler.get_level_units(k)
+                scale = 1.0 / lu_k.dx   # = 2^k
 
-                    fc = self._force_config
-                    ref_config = fc.get('reference', {})
-                    fine_force_config = {
-                        'enabled': True,
-                        'interval': self._force_interval,
-                        'start_step': fc.get('start_step', 0),
-                        'reference': {
-                            'rho': self.force_mgr.rho_ref,
-                            'velocity': self.force_mgr.u_ref,
-                            'char_length': self.force_mgr.char_length * scale,
-                            'span_length': self.force_mgr.span_length * scale,
-                        },
-                        'log': {'enabled': True, 'filename': 'force_history'},
-                        # Preserve the surface-distribution flag from the original
-                        # ForceManager. Without this the MLG-replacement ForceManager
-                        # (constructed below without `internal_geometry`) defaults to
-                        # False and the per-link NPZ is never written.
-                        'save_link_forces': self.force_mgr.save_link_forces,
-                    }
+                fc = self._force_config
+                ref_config = fc.get('reference', {})
+                fine_force_config = {
+                    'enabled': True,
+                    'interval': self._force_interval,
+                    'start_step': fc.get('start_step', 0),
+                    'reference': {
+                        'rho': self.force_mgr.rho_ref,
+                        'velocity': self.force_mgr.u_ref,
+                        'char_length': self.force_mgr.char_length * scale,
+                        'span_length': self.force_mgr.span_length * scale,
+                    },
+                    'log': {'enabled': True, 'filename': 'force_history'},
+                    # Preserve the surface-distribution flag from the original
+                    # ForceManager. Without this the MLG-replacement ForceManager
+                    # (constructed below without `internal_geometry`) defaults to
+                    # False and the per-link NPZ is never written.
+                    'save_link_forces': self.force_mgr.save_link_forces,
+                }
 
-                    self.force_mgr.close()
-                    fine_geom_for_force = getattr(
-                        self, '_mlg_fine_geom_configs', {}
-                    ).get(_fb.uid, self.config.get('internal_geometry', {}))
-                    self.force_mgr = ForceManager(
-                        xp=xp,
-                        lattice=self.lattice,
-                        solid_mask=_fb.sim.obstacle_bc.solid_mask,
-                        config=fine_force_config,
-                        wall_bc=_fb.sim.obstacle_bc,
-                        csv_dir=self._csv_dir,
-                        internal_geometry=fine_geom_for_force,
-                    )
-                    self.force_mgr.initialize()
-                    self._mlg_force_level = k
-                    self._mlg_force_block = _fb.uid
-                    print(f"\n  Force measurement: {_fb.label} "
-                          f"(D_fine={self.force_mgr.char_length:.0f} "
-                          f"[fine lu])")
-                    break
+                self.force_mgr.close()
+                fine_geom_for_force = getattr(
+                    self, '_mlg_fine_geom_configs', {}
+                ).get(_fb.uid, self.config.get('internal_geometry', {}))
+                self.force_mgr = ForceManager(
+                    xp=xp,
+                    lattice=self.lattice,
+                    solid_mask=_fb.sim.obstacle_bc.solid_mask,
+                    config=fine_force_config,
+                    wall_bc=_fb.sim.obstacle_bc,
+                    csv_dir=self._csv_dir,
+                    internal_geometry=fine_geom_for_force,
+                )
+                self.force_mgr.initialize()
+                self._mlg_force_level = k
+                self._mlg_force_block = _fb.uid
+                print(f"\n  Force measurement: {_fb.label} "
+                      f"(D_fine={self.force_mgr.char_length:.0f} "
+                      f"[fine lu])")
+                break
 
         return mlg
 

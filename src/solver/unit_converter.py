@@ -94,7 +94,7 @@ class UnitConverter:
         self.omega_phys: float = 0.0
         self.R_phys: float = 0.0
         self.tip_speed: float = 0.0
-        self.chord_phys: float = 0.0       # mean chord (kept for back-compat)
+        self.chord_phys: float = 0.0       # mean chord (diagnostic)
         self.chord_ref:  float = 0.0       # chord at r/R = 0.75
         self._has_alm = False
 
@@ -199,8 +199,8 @@ class UnitConverter:
             _Re_U_ref_def = self.U_inf if self.U_inf > 0 else self.U_max_phys
             _Re_L_ref_def = self.L_char
 
-        Re_U_ref = physics.get('Re_U_ref', _Re_U_ref_def)
-        Re_L_ref = physics.get('Re_L_ref', _Re_L_ref_def)
+        Re_U_ref = _Re_U_ref_def
+        Re_L_ref = _Re_L_ref_def
         self.Re: float = (Re_U_ref * Re_L_ref / self.nu_phys
                           if self.nu_phys > 0 else 0.0)
         self._Re_U_ref = Re_U_ref

@@ -1,11 +1,9 @@
-"""Wall-function closures for under-resolved boundary layers (WFB track).
+"""Wall-function closures for under-resolved boundary layers.
 
-PLACEMENT (user decision 2026-08-01, reverting the W1 interim move to
-src/turbulence/wall_model.py): the wall model is a BOUNDARY-CONDITION
-concept — its physics closure lives here in src/boundary/, next to the
-pieces that consume it: wall_link_geometry.py (W0 per-link frames),
-wfb.py (W2 bounce-application driver) and src/kernels/wfb_d3q27.py
-(fused pass, mirrors these expressions 1:1).
+Originally built for the WFB track (W0-W3d, closed and deleted 2026-08-13
+— see patch_notes/wall_model/). The closures survived the track: the
+surfel boundary is the live consumer (surfel_boundary.py WALL_LAWS,
+src/kernels/surfel_d3q27.py mirrors the Musker expressions in-kernel).
 
 Implemented closure: equilibrium wall function on the Musker (1979)
 composite profile
@@ -206,7 +204,8 @@ class MuskerLaw:
 
 WallLaw = Union[ViscousLaw, MuskerLaw]
 
-#: Config-name registry (internal_geometry.<type>.wall_law, wired in W4).
+#: Config-name registry (internal_geometry.<type>.surfel.law — consumed by
+#: surfel_boundary.py).
 WALL_LAWS: Dict[str, Type] = {
     "musker": MuskerLaw,
     "laminar": ViscousLaw,

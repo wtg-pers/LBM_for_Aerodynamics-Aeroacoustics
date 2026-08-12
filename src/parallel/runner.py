@@ -136,7 +136,7 @@ class DistributedMLGRunner:
         self.nb = len(src)
         NL = mlg.num_levels
         self.NL = NL
-        self.multiblock = bool(getattr(mlg, "is_multiblock", False))
+        self.multiblock = bool(mlg.is_multiblock)
         shapes = [tuple(b.sim.domain_shape) for b in src]
 
         self.axis, self.bounds = self._decompose(src, shapes, axis,
@@ -234,9 +234,6 @@ class DistributedMLGRunner:
         # others sat in the ALM bcast (4 ranks, 2 rotor blocks, one sole
         # owner each).
         self.has_alm = bool(self._alm_all)
-        # Back-compat handle: the single model of a single-ALM-block run.
-        self.model = next(iter(self._alm_all.values())) \
-            if len(self._alm_all) == 1 else None
 
         # restart: continue esoteric parity + step numbering from the
         # restored state. The initializer sets L0 step_count = start_step
@@ -584,12 +581,6 @@ class DistributedMLGRunner:
                     setattr(m.rotor, a, v)
 
     # ── diagnostics / assembly seams ─────────────────────────────────
-    @property
-    def body_level(self) -> Optional[int]:
-        """Level of the body block (kept for the level-shaped consumers)."""
-        return None if self.body_block is None \
-            else self.blocks[self.body_block].level
-
     def blocks_at(self, level: int) -> List[int]:
         """uids of the blocks on `level`, config order."""
         return [b.uid for b in self.blocks if b.level == level]

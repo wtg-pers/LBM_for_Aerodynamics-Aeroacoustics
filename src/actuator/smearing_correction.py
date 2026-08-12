@@ -300,24 +300,6 @@ def freewake_influence(control_pos, rings, eps, axial_dir, tail_len=1.0e6,
     return Vz @ S                                              # (nc, ne)
 
 
-def _gradient_matrix(r: np.ndarray) -> np.ndarray:
-    """G such that (G @ Γ) == np.gradient(Γ, r), for non-uniform r.
-
-    DEPRECATED trailed-vorticity operator (marker dΓ/dr). Kept only for
-    reference/back-compat — it DROPS the tip & root trailed vortices (Σ γ ≠ 0),
-    which made the correction ~10-30× too weak; use `edge_operator` instead.
-    See patch_notes/alm_dag_edge_fix/.
-    """
-    n = len(r)
-    G = np.zeros((n, n), dtype=np.float64)
-    e = np.zeros(n)
-    for k in range(n):
-        e[:] = 0.0
-        e[k] = 1.0
-        G[:, k] = np.gradient(e, r)
-    return G
-
-
 def edge_operator(r: np.ndarray, eps: np.ndarray, dr):
     """Panel-edge trailed-vortex system (Dağ & Sørensen 2020 Eq. 17-18).
 
@@ -454,26 +436,3 @@ def correct_noniterative(
     _, _, alpha_c = _triangle(u_n_c, u_tan, twist_deg)
     return u_n_c, alpha_c, Gamma_new, w_corr
 
-
-def correct_iterative_reference(
-    r, chord, dr, eps, u_n, u_tan, twist_deg, cl_eval, Gamma_prev,
-    A: np.ndarray = None, max_iter: int = 200, tol: float = 1e-12,
-):
-    """Fixed-point reference (for validating the non-iterative solve).
-
-    Iterates  Γ ← ½ c u_rel(Γ) C_l(α(Γ))  to convergence (no relaxation needed
-    for these synthetic linear-C_l tests). Returns Gamma_converged.
-    """
-    if A is None:
-        A = influence_matrix(r, eps, dr)
-    Gamma = Gamma_prev.copy()
-    for _ in range(max_iter):
-        w = A @ Gamma
-        u_rel, _, alpha = _triangle(u_n + w, u_tan, twist_deg)
-        CL = np.asarray(cl_eval(alpha), dtype=np.float64)
-        Gamma_new = 0.5 * chord * u_rel * CL
-        if np.max(np.abs(Gamma_new - Gamma)) < tol:
-            Gamma = Gamma_new
-            break
-        Gamma = Gamma_new
-    return Gamma
