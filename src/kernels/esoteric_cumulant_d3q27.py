@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 from src.kernels.esoteric_d3q27 import (
     CX_ESO, CY_ESO, CZ_ESO, W_ESO, _fmt_array,
     NODE_FLUID, NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE,
+    _ESO_WALL_DECL, _ESO_WALL_PAIR_TESTS,
 )
 # SGS branch templates: SINGLE SOURCE shared with the standard fused cumulant
 # kernel (identical blocks -> identical SGS physics in both layouts).
@@ -57,7 +58,9 @@ void esoteric_cumulant_d3q27(
     const float omega_5,                   // C111 rate
     const float lambda_lim,                // Geier limiter threshold (<=0 off)
     const int Nx, const int Ny, const int Nz,
-    const int t_step{{SGS_PARAM}}
+    const int t_step,
+    const int wall_mask,                   // 6-bit domain wall faces (0 = none)
+    float*        __restrict__ wall_mail{{SGS_PARAM}}   // face mailbox, or NULL
 ) {
     long long N = (long long)Nx * (long long)Ny * (long long)Nz;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -78,7 +81,7 @@ void esoteric_cumulant_d3q27(
     const float w[27] = {''' + _fmt_array(W_ESO) + r'''};
 
     int is_odd = t_step & 1;
-
+''' + _ESO_WALL_DECL + r'''
     // ========================================================
     // LOAD (Esoteric Pull streaming part 2/2)
     // ========================================================
@@ -101,16 +104,19 @@ void esoteric_cumulant_d3q27(
         long long j_ip = mx * (long long)Ny * Nz + my * (long long)Nz + mz;
         bool nb_dn = node_type[j_i]  == 1;
         bool nb_up = node_type[j_ip] == 1;
+''' + _ESO_WALL_PAIR_TESTS + r'''
         if (is_odd) {
-            fhn[i]   = nb_up ? f[(long long)(i+1) * N + idx]
-                             : f[(long long)i     * N + idx];
-            fhn[i+1] = nb_dn ? f[(long long)i     * N + j_i]
-                             : f[(long long)(i+1) * N + j_i];
+            fhn[i]   = (nb_up || wup) ? f[(long long)(i+1) * N + idx]
+                                      : f[(long long)i     * N + idx];
+            fhn[i+1] = (mi >= 0) ? wall_mail[mi]
+                     : (nb_dn ? f[(long long)i     * N + j_i]
+                              : f[(long long)(i+1) * N + j_i]);
         } else {
-            fhn[i]   = nb_up ? f[(long long)i     * N + idx]
-                             : f[(long long)(i+1) * N + idx];
-            fhn[i+1] = nb_dn ? f[(long long)(i+1) * N + j_i]
-                             : f[(long long)i     * N + j_i];
+            fhn[i]   = (nb_up || wup) ? f[(long long)i     * N + idx]
+                                      : f[(long long)(i+1) * N + idx];
+            fhn[i+1] = (mi >= 0) ? wall_mail[mi]
+                     : (nb_dn ? f[(long long)(i+1) * N + j_i]
+                              : f[(long long)i     * N + j_i]);
         }
     }
 
@@ -391,11 +397,15 @@ void esoteric_cumulant_d3q27(
         long long ny = (iy + cy[i] + Ny) % Ny;
         long long nz = (iz + cz[i] + Nz) % Nz;
         long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
+''' + _ESO_WALL_PAIR_TESTS + r'''
+        if (mi >= 0) wall_mail[mi] = fhn[i];  // wall hit: reflect at self
         if (is_odd) {
-            f[(long long)(i+1) * N + j_i] = fhn[i];
+            if (mi < 0 && fdn == 0)
+                f[(long long)(i+1) * N + j_i] = fhn[i];
             f[(long long)i     * N + idx] = fhn[i+1];
         } else {
-            f[(long long)i     * N + j_i] = fhn[i];
+            if (mi < 0 && fdn == 0)
+                f[(long long)i     * N + j_i] = fhn[i];
             f[(long long)(i+1) * N + idx] = fhn[i+1];
         }
     }
@@ -470,6 +480,8 @@ class EsotericCumulantKernelD3Q27:
         omega_4: Optional[float] = None,
         omega_5: Optional[float] = None,
         lambda_lim: float = 0.0,
+        wall_mask: int = 0,
+        wall_mail: Optional['npt.NDArray'] = None,
     ) -> None:
         if self._kernel is None:
             self._compile()
@@ -477,6 +489,7 @@ class EsotericCumulantKernelD3Q27:
         N = Nx * Ny * Nz
         grid = (N + self._block_size - 1) // self._block_size
         force_arg = force if force is not None else cp.int32(0)
+        wm_arg = wall_mail if wall_mail is not None else cp.int32(0)
         o3 = omega_high if omega_3 is None else omega_3
         o4 = omega_high if omega_4 is None else omega_4
         o5 = omega_high if omega_5 is None else omega_5
@@ -487,6 +500,7 @@ class EsotericCumulantKernelD3Q27:
             cp.float32(o3), cp.float32(o4), cp.float32(o5),
             cp.float32(lambda_lim),
             cp.int32(Nx), cp.int32(Ny), cp.int32(Nz), cp.int32(t_step),
+            cp.int32(wall_mask), wm_arg,
         )
         if self._sgs_model == "smagorinsky":
             nu_t_arg = nu_t_out if nu_t_out is not None else cp.int32(0)

@@ -79,6 +79,7 @@ class Simulation:
         obstacle_bc: Optional['HalfwayBounceBack'] = None,
         al_model: Optional[object] = None,
         sgs_cfg: Optional[dict] = None,
+        eso_wall_implicit_ok: bool = False,
     ) -> None:
         """Initialize Simulation with all physical operators.
 
@@ -98,6 +99,12 @@ class Simulation:
             sgs_cfg: Validated SGS config dict with keys
                      {enabled, model, Cs, Cw}, or None for SGS-disabled.
                      Produced by src.turbulence.sgs.parse_sgs_config.
+            eso_wall_implicit_ok: opt-in for the esoteric implicit
+                     domain-wall faces (face mailbox, eso_wall track).
+                     ONLY the single-grid setup path passes True; MLG
+                     member sims and every MPI path keep the legacy
+                     degradation (loud) until PLAN sec 4 steps 5-6 wire
+                     the coupling/runner surfaces.
         """
         # ── Array module ──
         self.xp = xp
@@ -167,6 +174,12 @@ class Simulation:
         self._esoteric_step: int = 0
         self._esoteric_f_already_set: bool = False
         self._eso_ibb = None   # EsotericIBBD3Q27 (deposit-rewrite IBB, S5)
+        # ── eso domain wall (eso_wall track, patch_notes/eso_wall) ──
+        # _eso_wall_mask: 6-bit wall faces (0=xmin..5=zmax), set by
+        # _build_esoteric_domain_bc iff eso_wall_implicit_ok.
+        self._eso_wall_implicit_ok: bool = eso_wall_implicit_ok
+        self._eso_wall_mask: int = 0
+        self._eso_wall_mail: Optional['npt.NDArray'] = None
 
         # ── WALE pre-pass kernels (lazy init for sgs_model="wale") ──
         # The WALE eddy-viscosity needs u globally before collision so the
@@ -465,6 +478,17 @@ class Simulation:
         path in set_distribution). Otherwise returns f itself.
         """
         if self._use_esoteric and self.f is not None:
+            if self._eso_wall_mask:
+                # The std gather has no slots for the wall mailbox and
+                # would emit stale wrap values at every wall row — a
+                # checkpoint written from it restarts silently wrong.
+                # npz extra key lands with PLAN step 4-3
+                # (patch_notes/eso_wall).
+                raise RuntimeError(
+                    "physical_f with eso implicit domain walls: not "
+                    "representable until the mailbox checkpoint key "
+                    "(patch_notes/eso_wall/PLAN.md sec 4-3). Disable "
+                    "checkpoints for wall cases meanwhile.")
             from src.kernels.esoteric_d3q27 import esoteric_gather_std
             return esoteric_gather_std(self.xp, self.f, self._esoteric_step)
         return self.f
@@ -628,6 +652,32 @@ class Simulation:
         self._build_esoteric_domain_bc(
             node_type, bc_rho, bc_ux, bc_uy, bc_uz,
             NODE_SOLID, NODE_EQ_BC, NODE_NEUMANN, NODE_SPONGE)
+
+        if self._eso_wall_mask:
+            if self._esoteric_f_already_set:
+                raise RuntimeError(
+                    "eso domain wall + checkpoint restore: the wall "
+                    "mailbox is state OUTSIDE the 27N f slots, so a "
+                    "restored f alone cannot reproduce the wall bounce. "
+                    "Save/restore (npz extra key) lands with PLAN "
+                    "step 4-3 (patch_notes/eso_wall); until then a wall "
+                    "series cannot restart.")
+            # (9, face_area) f32 segment per wall face, fixed face order
+            # xmin..zmax — matches the in-kernel offset arithmetic.
+            # Zero mailbox = "no incoming from the wall at t0"; exact IC
+            # seeding (PLAN sec 2-3) lands with step 4-3 — until then a
+            # non-uniform IC carries a one-step near-wall transient.
+            seg = [9 * Ny * Nz, 9 * Ny * Nz, 9 * Nx * Nz,
+                   9 * Nx * Nz, 9 * Nx * Ny, 9 * Nx * Ny]
+            total = sum(seg[b] for b in range(6)
+                        if self._eso_wall_mask >> b & 1)
+            self._eso_wall_mail = xp.zeros(total, dtype=xp.float32)
+            faces = '+'.join(
+                n for b, n in enumerate(
+                    ('xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax'))
+                if self._eso_wall_mask >> b & 1)
+            print(f"  [esoteric] implicit domain wall {faces}: "
+                  f"face mailbox {total * 4 / 1e6:.1f} MB")
 
         if not self._esoteric_f_already_set:
             # fresh IC only: seed the implicit-HWBB bounce slots. Restore
@@ -793,6 +843,11 @@ class Simulation:
         eso_sponge_twin_gate.py (manual 06 §6.9-①).
         """
         Nx, Ny, Nz = self.domain_shape
+        _FBIT = {'xmin': 0, 'west': 0, 'xmax': 1, 'east': 1,
+                 'ymin': 2, 'south': 2, 'ymax': 3, 'north': 3,
+                 'zmin': 4, 'bottom': 4, 'zmax': 5, 'top': 5}
+        wall_mask = 0
+        face_methods: dict = {}
         for face_bc in getattr(self.bc_manager, 'face_bcs', []):
             loc = getattr(getattr(face_bc, 'location', None), 'value', None)
             cfg = getattr(face_bc, 'config', None)
@@ -807,12 +862,27 @@ class Simulation:
             else:
                 continue
             method = str(getattr(cfg, 'method', '') or '')
+            face_methods[_FBIT[loc]] = method
             # NEVER overwrite NODE_SOLID: a span-through body has solid
             # cells ON the face planes; flipping them to a face-BC type
             # would open the wall there (leak). bc_rho/u writes below stay
             # unconditional — solid cells never read them.
             face = node_type[sl]
             nonsolid = face != NODE_SOLID
+            is_wall_method = (method == 'hwbb' or 'wall' in method
+                              or 'bounce' in method)
+            if is_wall_method and self._eso_wall_implicit_ok:
+                # eso_wall track proper fix: the row stays FLUID and the
+                # kernels reflect every wall-crossing link at the halfway
+                # plane node0 −0.5 (parity-swap / face mailbox) — std-
+                # identical wall position (Couette gate G2). The whole
+                # axis is de-periodized; the opposite face is guarded
+                # below.
+                wall_mask |= 1 << _FBIT[loc]
+                print(f"  * eso domain wall '{loc}' ({method}): implicit "
+                      "halfway wall at node0 -0.5 (face mailbox, "
+                      "patch_notes/eso_wall)")
+                continue
             if 'wall' in method or 'bounce' in method:
                 face[nonsolid] = NODE_SOLID
                 print(f"  * eso domain wall '{loc}' ({method}): SOLID row "
@@ -824,13 +894,13 @@ class Simulation:
             else:
                 face[nonsolid] = NODE_EQ_BC
                 if method == 'hwbb':
-                    # NOT a wall on this path: 'hwbb' matches neither
-                    # substring above, so it lands here as EQ(u=0) at
-                    # node0. Measured (eso_wall_couette_gate, tau 0.8):
-                    # effective wall z0 = +0.20 vs std halfway -0.50 —
-                    # a tau-DEPENDENT slip wall, not a clean half-cell.
-                    # Silent since the original port; loud until the
-                    # proper fix lands (patch_notes/eso_wall/PLAN.md).
+                    # NOT a wall on this path (MLG/MPI surfaces until
+                    # PLAN §4 steps 5-6): 'hwbb' lands here as EQ(u=0)
+                    # at node0. Measured (eso_wall_couette_gate,
+                    # tau 0.8): effective wall z0 = +0.20 vs std halfway
+                    # -0.50 — a tau-DEPENDENT slip wall, not a clean
+                    # half-cell. Loud until the wall wiring covers this
+                    # path too (patch_notes/eso_wall/PLAN.md).
                     print(f"  * WARNING: eso face '{loc}' method 'hwbb' "
                           "DEGRADES to EQ(u=0) at node0 — measured "
                           "effective wall z0=+0.20 (tau 0.8) vs std "
@@ -845,6 +915,46 @@ class Simulation:
                     if len(vel) > 0: bc_ux[sl] = float(vel[0])
                     if len(vel) > 1: bc_uy[sl] = float(vel[1])
                     if len(vel) > 2: bc_uz[sl] = float(vel[2])
+
+        # eso wall guard: an axis with a wall face is de-periodized as a
+        # WHOLE, so its opposite face must be a wall too or a covered BC
+        # row that discards its (now meaningless) cross-face load —
+        # eq/sponge overwrite after LOAD, so they qualify; neumann
+        # passes the loaded value through (stale wrap slot -> silent
+        # corruption) and an absent BC leaves a FLUID row consuming the
+        # same stale slots as real data. Both are hard errors
+        # (patch_notes/eso_wall/PLAN.md §2-2).
+        self._eso_wall_mask = wall_mask
+        if wall_mask:
+            sponge_bits = 0
+            for sb in getattr(self.bc_manager, 'sponge_layers', []):
+                b = _FBIT.get(
+                    getattr(getattr(sb, 'location', None), 'value', ''))
+                if b is not None:
+                    sponge_bits |= 1 << b
+            _FNAME = ['xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax']
+            for blo in (0, 2, 4):
+                pair = (blo, blo + 1)
+                if not any(wall_mask >> b & 1 for b in pair):
+                    continue
+                for b in pair:
+                    if wall_mask >> b & 1:
+                        continue
+                    meth = face_methods.get(b)
+                    if meth is not None and 'neumann' in meth:
+                        raise ValueError(
+                            f"eso domain wall: face '{_FNAME[b]}' is "
+                            f"neumann opposite a wall on the same axis "
+                            "— passthrough would consume stale "
+                            "de-periodized slots. Use eq or sponge "
+                            "there (patch_notes/eso_wall/PLAN.md)")
+                    if meth is None and not (sponge_bits >> b & 1):
+                        raise ValueError(
+                            f"eso domain wall: face '{_FNAME[b]}' has "
+                            "no BC opposite a wall on the same axis — "
+                            "the axis is de-periodized, so the face "
+                            "needs a wall, eq, or sponge BC "
+                            "(patch_notes/eso_wall/PLAN.md)")
 
         for sb in getattr(self.bc_manager, 'sponge_layers', []):
             loc = getattr(getattr(sb, 'location', None), 'value', '')
@@ -898,7 +1008,8 @@ class Simulation:
         Nx, Ny, Nz = self.domain_shape
         self._eso_macro_kernel.launch(
             self.f, self._eso_node_type, self._rho_buf, self._u_buf,
-            Nx, Ny, Nz, self._esoteric_step)
+            Nx, Ny, Nz, self._esoteric_step,
+            wall_mask=self._eso_wall_mask, wall_mail=self._eso_wall_mail)
         self._sgs_mask_solid_u()
         if self._sgs_cfg["model"] == "wale":
             self._wale_kernel.launch(
@@ -929,7 +1040,8 @@ class Simulation:
         # Pass 1: rho/u views share memory with the 3D-shaped arrays.
         self._eso_macro_kernel.launch(
             self.f, self._eso_node_type, self.rho.ravel(),
-            self.u.reshape(3, -1), Nx, Ny, Nz, self._esoteric_step)
+            self.u.reshape(3, -1), Nx, Ny, Nz, self._esoteric_step,
+            wall_mask=self._eso_wall_mask, wall_mail=self._eso_wall_mail)
         self._check_nan("esoteric+alm:post-macro")
         body_force = self._compute_body_force(self.u, self.rho)
         if body_force is not None and body_force.dtype != xp.float32:
@@ -963,6 +1075,8 @@ class Simulation:
                 omega_5=getattr(self, '_eso_omega_345',
                                 (self._eso_omega_high,) * 3)[2],
                 lambda_lim=getattr(self, '_eso_lambda', 0.0),
+                wall_mask=self._eso_wall_mask,
+                wall_mail=self._eso_wall_mail,
             )
         else:
             force_out = None
@@ -978,6 +1092,8 @@ class Simulation:
                 t_step=self._esoteric_step,
                 needs_bounce=self._eso_needs_bounce,
                 force_out=force_out,
+                wall_mask=self._eso_wall_mask,
+                wall_mail=self._eso_wall_mail,
             )
         # IBB (S5): overwrite toward-solid deposits of the step just run
         # with Bouzidi values (2-phase pass; parity = this step's index).

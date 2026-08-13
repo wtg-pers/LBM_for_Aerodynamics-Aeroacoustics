@@ -94,6 +94,122 @@ def _fmt_array(arr):
     """Format Python list as C array initializer."""
     return ', '.join(f'{v}f' if isinstance(v, float) else str(v) for v in arr)
 
+
+# ============================================================
+# Domain-wall de-periodization + face mailbox (eso_wall track)
+# Shared C snippets injected into BGK / cumulant / macro LOAD+STORE.
+# Design + race proof: patch_notes/eso_wall/PLAN.md sec 1-2.
+# ============================================================
+
+def _axis_pair_slots():
+    """Per-axis mailbox slot of each esoteric pair p (or -1).
+
+    For each axis exactly 9 of the 13 canonical directions have a
+    nonzero component; their order index is the pair's slot in that
+    axis's (9, face_area) mailbox segment. Both faces of an axis share
+    the slot table (they use different segments)."""
+    tabs = []
+    for comp in (CX_ESO, CY_ESO, CZ_ESO):
+        t, n = [], 0
+        for p in range(13):
+            if comp[2 * p + 1] != 0:
+                t.append(n)
+                n += 1
+            else:
+                t.append(-1)
+        assert n == 9
+        tabs.append(t)
+    return tabs
+
+
+def _wall_decl_src() -> str:
+    px, py, pz = _axis_pair_slots()
+    return r'''
+    // ---- eso domain wall: axis de-periodization + face mailbox ----
+    // patch_notes/eso_wall/PLAN.md sec 2. wall_mask face bits:
+    // 0=xmin 1=xmax 2=ymin 3=ymax 4=zmin 5=zmax. Any wall bit
+    // de-periodizes its WHOLE axis: cross-face STOREs are skipped
+    // (wall hits divert to the mailbox), cross-face LOADs become wall
+    // reflections (mailbox read, or the parity-swap read at self that
+    // implicit solid HWBB already uses) or dont-care stale reads on
+    // the opposite BC row (setup guards it to be eq/sponge). Every
+    // mailbox entry is read+written by ONE thread (LOAD at t+1 reads
+    // what the same thread's STORE at t wrote), and a skipped
+    // cross-STORE address is exactly the address only the skipping
+    // thread would have touched -- the esoteric one-thread-per-address
+    // invariant survives de-periodization. wall_mask == 0 keeps every
+    // new test false: bit-identical to the periodic kernel.
+    const int P9X[13] = {''' + _fmt_array(px) + r'''};
+    const int P9Y[13] = {''' + _fmt_array(py) + r'''};
+    const int P9Z[13] = {''' + _fmt_array(pz) + r'''};
+    const int dep_x = wall_mask & 3;
+    const int dep_y = wall_mask & 12;
+    const int dep_z = wall_mask & 48;
+    const long long area_yz = (long long)Ny * Nz;
+    const long long area_xz = (long long)Nx * Nz;
+    const long long area_xy = (long long)Nx * Ny;
+    long long moff[6];
+    {
+        long long o = 0;
+        const long long seg[6] = {9*area_yz, 9*area_yz, 9*area_xz,
+                                  9*area_xz, 9*area_xy, 9*area_xy};
+        for (int fc = 0; fc < 6; fc++) {
+            moff[fc] = o;
+            if (wall_mask & (1 << fc)) o += seg[fc];
+        }
+    }
+'''
+
+
+_ESO_WALL_DECL = _wall_decl_src()
+
+# Per-pair tests, inside the p-loop AFTER j_i/j_ip are computed. Yields:
+#   wdn/mi >= 0 : the +c_i target crosses a wall -> mailbox round trip
+#                 at own cell (STORE writes mi, next LOAD reads mi);
+#   wup != 0    : the -c_i source crosses a wall -> reflect via the
+#                 parity-swap read at self (same branch as solid HWBB);
+#   fdn != 0, wdn == 0 : crossed only the guarded opposite face of a
+#                 de-periodized axis (STORE dropped, LOAD dont-care).
+# STORE only consumes fdn/mi; LOAD only wup/mi (rest dead-coded).
+_ESO_WALL_PAIR_TESTS = r'''
+        int fdn = 0, fup = 0;
+        if (dep_x && cx[i] != 0) {
+            if (cx[i] > 0) { if (ix == Nx-1) fdn |= 2;
+                             if (ix == 0)    fup |= 1; }
+            else           { if (ix == 0)    fdn |= 1;
+                             if (ix == Nx-1) fup |= 2; }
+        }
+        if (dep_y && cy[i] != 0) {
+            if (cy[i] > 0) { if (iy == Ny-1) fdn |= 8;
+                             if (iy == 0)    fup |= 4; }
+            else           { if (iy == 0)    fdn |= 4;
+                             if (iy == Ny-1) fup |= 8; }
+        }
+        if (dep_z && cz[i] != 0) {
+            if (cz[i] > 0) { if (iz == Nz-1) fdn |= 32;
+                             if (iz == 0)    fup |= 16; }
+            else           { if (iz == 0)    fdn |= 16;
+                             if (iz == Nz-1) fup |= 32; }
+        }
+        const int wup = fup & wall_mask;
+        const int wdn = fdn & wall_mask;
+        long long mi = -1;
+        if (wdn) {
+            // multi-wall corner: ONE full reflection; the lowest face
+            // bit picks the segment (same pick at STORE and LOAD).
+            const int fc = (wdn & 1) ? 0 : (wdn & 2) ? 1 : (wdn & 4) ? 2
+                         : (wdn & 8) ? 3 : (wdn & 16) ? 4 : 5;
+            int p9; long long fa, c2;
+            if (fc < 2)      { p9 = P9X[p]; fa = area_yz;
+                               c2 = iy * (long long)Nz + iz; }
+            else if (fc < 4) { p9 = P9Y[p]; fa = area_xz;
+                               c2 = ix * (long long)Nz + iz; }
+            else             { p9 = P9Z[p]; fa = area_xy;
+                               c2 = ix * (long long)Ny + iy; }
+            mi = moff[fc] + (long long)p9 * fa + c2;
+        }
+'''
+
 _ESOTERIC_BGK_KERNEL = r'''
 extern "C" __global__
 void esoteric_bgk_d3q27(
@@ -112,7 +228,9 @@ void esoteric_bgk_d3q27(
     const int t_step,                      // time step (parity: t_step & 1)
     const float*  __restrict__ force,      // (3, N) body force (ALM), or NULL
     const float*  __restrict__ nu_t_in,    // (N,) SGS eddy viscosity, or NULL
-    float*        __restrict__ nu_t_out    // (N,) nu_t diagnostics, or NULL
+    float*        __restrict__ nu_t_out,   // (N,) nu_t diagnostics, or NULL
+    const int wall_mask,                   // 6-bit domain wall faces (0 = none)
+    float*        __restrict__ wall_mail   // face mailbox, or NULL
 ) {
     // 64-bit indexing: q*N+idx overflows int32 above ~79.5M nodes/level
     // (see project int32 kernel ceiling; cumulant esoteric already 64-bit).
@@ -136,7 +254,7 @@ void esoteric_bgk_d3q27(
     const float w[27] = {''' + _fmt_array(W_ESO) + r'''};
 
     int is_odd = t_step & 1;
-
+''' + _ESO_WALL_DECL + r'''
     // ========================================================
     // LOAD (Esoteric Pull streaming part 2/2)
     // ========================================================
@@ -167,17 +285,19 @@ void esoteric_bgk_d3q27(
         long long j_ip = mx * (long long)Ny * Nz + my * (long long)Nz + mz;
         bool nb_dn = node_type[j_i]  == 1;   // x + c_i solid: bounce dir i+1
         bool nb_up = node_type[j_ip] == 1;   // x - c_i solid: bounce dir i
-
+''' + _ESO_WALL_PAIR_TESTS + r'''
         if (is_odd) {
-            fhn[i]   = nb_up ? f[(i+1) * N + idx]
-                             : f[i     * N + idx];   // dir i from slot i at self
-            fhn[i+1] = nb_dn ? f[i     * N + j_i]
-                             : f[(i+1) * N + j_i];   // dir i+1 from slot i+1 at neighbor
+            fhn[i]   = (nb_up || wup) ? f[(i+1) * N + idx]
+                                      : f[i     * N + idx];
+            fhn[i+1] = (mi >= 0) ? wall_mail[mi]
+                     : (nb_dn ? f[i     * N + j_i]
+                              : f[(i+1) * N + j_i]);
         } else {
-            fhn[i]   = nb_up ? f[i     * N + idx]
-                             : f[(i+1) * N + idx];   // dir i from slot i+1 at self
-            fhn[i+1] = nb_dn ? f[(i+1) * N + j_i]
-                             : f[i     * N + j_i];   // dir i+1 from slot i at neighbor
+            fhn[i]   = (nb_up || wup) ? f[i     * N + idx]
+                                      : f[(i+1) * N + idx];
+            fhn[i+1] = (mi >= 0) ? wall_mail[mi]
+                     : (nb_dn ? f[(i+1) * N + j_i]
+                              : f[i     * N + j_i]);
         }
     }
 
@@ -309,12 +429,15 @@ void esoteric_bgk_d3q27(
         long long ny = (iy + cy[i] + Ny) % Ny;
         long long nz = (iz + cz[i] + Nz) % Nz;
         long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
-
+''' + _ESO_WALL_PAIR_TESTS + r'''
+        if (mi >= 0) wall_mail[mi] = fhn[i];  // wall hit: reflect at self
         if (is_odd) {
-            f[(i+1) * N + j_i] = fhn[i];     // dir i -> slot i+1 at neighbor
+            if (mi < 0 && fdn == 0)
+                f[(i+1) * N + j_i] = fhn[i]; // dir i -> slot i+1 at neighbor
             f[i     * N + idx] = fhn[i+1];   // dir i+1 -> slot i at self
         } else {
-            f[i     * N + j_i] = fhn[i];     // dir i -> slot i at neighbor
+            if (mi < 0 && fdn == 0)
+                f[i     * N + j_i] = fhn[i]; // dir i -> slot i at neighbor
             f[(i+1) * N + idx] = fhn[i+1];   // dir i+1 -> slot i+1 at self
         }
     }
@@ -367,6 +490,8 @@ class EsotericBGKKernelD3Q27:
         force: Optional['npt.NDArray'] = None,
         nu_t_in: Optional['npt.NDArray'] = None,
         nu_t_out: Optional['npt.NDArray'] = None,
+        wall_mask: int = 0,
+        wall_mail: Optional['npt.NDArray'] = None,
     ) -> None:
         if self._kernel is None:
             self._compile()
@@ -380,6 +505,7 @@ class EsotericBGKKernelD3Q27:
         f_arg = force if force is not None else cp.int32(0)
         nti_arg = nu_t_in if nu_t_in is not None else cp.int32(0)
         nto_arg = nu_t_out if nu_t_out is not None else cp.int32(0)
+        wm_arg = wall_mail if wall_mail is not None else cp.int32(0)
 
         self._kernel(
             (grid,), (self._block_size,),
@@ -389,7 +515,8 @@ class EsotericBGKKernelD3Q27:
              cp.float32(omega),
              cp.int32(Nx), cp.int32(Ny), cp.int32(Nz),
              cp.int32(t_step),
-             f_arg, nti_arg, nto_arg),
+             f_arg, nti_arg, nto_arg,
+             cp.int32(wall_mask), wm_arg),
         )
 
 
@@ -1023,7 +1150,9 @@ void esoteric_macro_d3q27(
     float*       __restrict__ rho_out,  // (N,)
     float*       __restrict__ u_out,    // (3, N)
     const int Nx, const int Ny, const int Nz,
-    const int t_step
+    const int t_step,
+    const int wall_mask,                // 6-bit domain wall faces (0 = none)
+    const float* __restrict__ wall_mail // face mailbox (read-only), or NULL
 ) {
     long long N = (long long)Nx * (long long)Ny * (long long)Nz;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1039,7 +1168,7 @@ void esoteric_macro_d3q27(
     const int cz[27] = {''' + _fmt_array(CZ_ESO) + r'''};
 
     int is_odd = t_step & 1;
-
+''' + _ESO_WALL_DECL + r'''
     float fhn[27];
     fhn[0] = f[0 * N + idx];
     for (int p = 0; p < 13; p++) {
@@ -1055,12 +1184,19 @@ void esoteric_macro_d3q27(
         long long j_ip = mx * (long long)Ny * Nz + my * (long long)Nz + mz;
         bool nb_dn = node_type[j_i]  == 1;
         bool nb_up = node_type[j_ip] == 1;
+''' + _ESO_WALL_PAIR_TESTS + r'''
         if (is_odd) {
-            fhn[i]   = nb_up ? f[(i+1) * N + idx] : f[i     * N + idx];
-            fhn[i+1] = nb_dn ? f[i     * N + j_i] : f[(i+1) * N + j_i];
+            fhn[i]   = (nb_up || wup) ? f[(i+1) * N + idx]
+                                      : f[i     * N + idx];
+            fhn[i+1] = (mi >= 0) ? wall_mail[mi]
+                     : (nb_dn ? f[i     * N + j_i]
+                              : f[(i+1) * N + j_i]);
         } else {
-            fhn[i]   = nb_up ? f[i     * N + idx] : f[(i+1) * N + idx];
-            fhn[i+1] = nb_dn ? f[(i+1) * N + j_i] : f[i     * N + j_i];
+            fhn[i]   = (nb_up || wup) ? f[i     * N + idx]
+                                      : f[(i+1) * N + idx];
+            fhn[i+1] = (mi >= 0) ? wall_mail[mi]
+                     : (nb_dn ? f[(i+1) * N + j_i]
+                              : f[i     * N + j_i]);
         }
     }
 
@@ -1087,7 +1223,9 @@ class EsotericMacroKernelD3Q27:
 
     def launch(self, f: 'npt.NDArray', node_type: 'npt.NDArray',
                rho_out: 'npt.NDArray', u_out: 'npt.NDArray',
-               Nx: int, Ny: int, Nz: int, t_step: int) -> None:
+               Nx: int, Ny: int, Nz: int, t_step: int,
+               wall_mask: int = 0,
+               wall_mail: Optional['npt.NDArray'] = None) -> None:
         import cupy as cp
         if self._kernel is None:
             self._kernel = cp.RawKernel(
@@ -1095,7 +1233,9 @@ class EsotericMacroKernelD3Q27:
                 options=('--use_fast_math',))
         N = Nx * Ny * Nz
         grid = (N + self._block_size - 1) // self._block_size
+        wm_arg = wall_mail if wall_mail is not None else cp.int32(0)
         self._kernel((grid,), (self._block_size,),
                      (f, node_type, rho_out, u_out,
                       cp.int32(Nx), cp.int32(Ny), cp.int32(Nz),
-                      cp.int32(t_step)))
+                      cp.int32(t_step),
+                      cp.int32(wall_mask), wm_arg))

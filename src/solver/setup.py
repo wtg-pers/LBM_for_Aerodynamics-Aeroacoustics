@@ -330,6 +330,11 @@ class SimulationSetup:
             obstacle_bc=self.obstacle_bc,
             al_model=self.al_model,
             sgs_cfg=self._sgs_cfg,
+            # eso implicit domain walls (eso_wall track): single-grid
+            # only. MLG member sims + every MPI path keep the loud EQ/
+            # SOLID degradation until PLAN sec 4 steps 5-6 wire the
+            # coupling region gather/scatter and the runner.
+            eso_wall_implicit_ok=True,
         )
 
     def build_output_manager(self, manager_cls=None,
