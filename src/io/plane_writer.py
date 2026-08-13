@@ -299,6 +299,51 @@ class _PlaneSeries:
             self._buf_u[cursor] = u[(slice(None),) + self._slicer]
         return True
 
+    # ── seam columns (MPI split strips, see _sync_seams) ─────────
+    def seam_pack(self, n: int, j: int) -> np.ndarray:
+        """First in-plane column along split dim j, rows :n (host,
+        packed p then u) — the strip's first OWNED column."""
+        parts = []
+        if self._buf_p is not None:
+            b = self._buf_p[:n, 0, :] if j == 0 else self._buf_p[:n, :, 0]
+            parts.append((b.get() if hasattr(b, 'get')
+                          else np.asarray(b)).ravel())
+        if self._buf_u is not None:
+            b = (self._buf_u[:n, :, 0, :] if j == 0
+                 else self._buf_u[:n, :, :, 0])
+            parts.append((b.get() if hasattr(b, 'get')
+                          else np.asarray(b)).ravel())
+        if not parts:
+            return np.empty(0, self.dtype)
+        return np.ascontiguousarray(np.concatenate(parts))
+
+    def seam_nbytes(self, n: int, j: int) -> int:
+        n2 = self.slice2[1 - j]
+        item = np.dtype(self.dtype).itemsize
+        vals = n * n2 * ((self._buf_p is not None)
+                         + 3 * (self._buf_u is not None))
+        return vals * item
+
+    def seam_apply(self, n: int, j: int, data: np.ndarray) -> None:
+        """Overwrite the LAST (ext) column along split dim j, rows :n
+        with the neighbour strip's packed first column."""
+        xp_dev = hasattr(self._buf_p if self._buf_p is not None
+                         else self._buf_u, 'get')
+        if xp_dev:
+            import cupy
+        off = 0
+        if self._buf_p is not None:
+            tgt = (self._buf_p[:n, -1, :] if j == 0
+                   else self._buf_p[:n, :, -1])
+            src = data[off:off + tgt.size].reshape(tgt.shape)
+            tgt[...] = cupy.asarray(src) if xp_dev else src
+            off += tgt.size
+        if self._buf_u is not None:
+            tgt = (self._buf_u[:n, :, -1, :] if j == 0
+                   else self._buf_u[:n, :, :, -1])
+            src = data[off:off + tgt.size].reshape(tgt.shape)
+            tgt[...] = cupy.asarray(src) if xp_dev else src
+
     # ── flush (one D2H + files) ──────────────────────────────────
     def flush(self, steps: List[int]) -> None:
         n = len(steps)
@@ -385,6 +430,100 @@ class _PlaneSeries:
             f.write('\n  </AppendedData>\n</VTKFile>\n'.encode('ascii'))
 
 
+
+_GDESC = {0: "YZ", 1: "XZ", 2: "XY"}       # plane normal axis -> 2D AMR
+
+
+def _write_vth_file(path: str, name: str, step: int, ax: int,
+                    entries: List[Dict[str, Any]]) -> None:
+    """Per-step vtkOverlappingAMR index (.vth) over the plane's pieces.
+
+    THE user-facing composed product: ParaView blanks coarse cells under
+    finer boxes automatically (the volume .vth experience), at native
+    fine resolution, with zero extra payload — the .vti pieces are the
+    same files the .vtm references. Flat (plane-normal) axis follows the
+    empirically validated 2D-AMR convention: grid_description in
+    {YZ, XZ, XY} and amr_box "0 -1" on the flat axis (vtk 9.3 reader
+    generates the blanking ghost array; verified: L1-footprint L0 cells
+    hidden). In-plane boxes are GLOBAL cell indices at each level —
+    node-aligned origins make them exact integers; split strips carry a
+    one-node overlap (ext) so the cell boxes tile without a seam gap.
+    """
+    by_level: Dict[int, List[Dict[str, Any]]] = {}
+    for e in entries:
+        by_level.setdefault(e['level'], []).append(e)
+    flat_coord = entries[0]['origin'][ax]
+    org = [0.0, 0.0, 0.0]
+    org[ax] = float(flat_coord)
+    lines = ['<?xml version="1.0"?>',
+             '<VTKFile type="vtkHierarchicalBoxDataSet" version="1.1" '
+             'byte_order="LittleEndian">',
+             f'  <vtkHierarchicalBoxDataSet '
+             f'origin="{org[0]:g} {org[1]:g} {org[2]:g}" '
+             f'grid_description="{_GDESC[ax]}">']
+    for k in sorted(by_level):
+        sp = by_level[k][0]['spacing']
+        lines.append(f'    <Block level="{k}" '
+                     f'spacing="{sp:g} {sp:g} {sp:g}">')
+        for j, e in enumerate(by_level[k]):
+            box = []
+            for d in range(3):
+                if d == ax:
+                    box += [0, -1]
+                    continue
+                i0 = int(round(e['origin'][d] / e['spacing']))
+                box += [i0, i0 + int(e['shape3'][d]) - 2]
+            fn = f"{name}_{e['tag']}_{step:08d}.vti"
+            lines.append(f'      <DataSet index="{j}" '
+                         f'amr_box="{box[0]} {box[1]} {box[2]} {box[3]} '
+                         f'{box[4]} {box[5]}" file="{fn}"/>')
+        lines.append('    </Block>')
+    lines += ['  </vtkHierarchicalBoxDataSet>', '</VTKFile>', '']
+    with open(path, 'w') as f:
+        f.write('\n'.join(lines))
+
+
+def _vti_nodes(path: str) -> Optional[Tuple[int, int, int]]:
+    """Node counts from a .vti header (first 2 KB), or None."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(2048).decode('ascii', 'replace')
+        m = re.search(r'WholeExtent="([^"]+)"', head)
+        if not m:
+            return None
+        we = [int(v) for v in m.group(1).split()]
+        return (we[1] - we[0] + 1, we[3] - we[2] + 1, we[5] - we[4] + 1)
+    except OSError:
+        return None
+
+
+def _index_hist_vth(p: Dict[str, Any], steps) -> None:
+    """Index historical steps as .vth too — only where the archive
+    matches the CURRENT piece geometry: every referenced .vti exists
+    and one representative header carries the current node counts
+    (split strips written before the +1-node ext would tile with a
+    seam AND disagree with the amr_box). Non-matching steps keep the
+    .vtm-only view — the .vtm rebuild tolerates layout changes, an
+    AMR index cannot."""
+    geo = p.get('vth_geo')
+    if not geo:
+        return
+    probe = next((e for e in geo if re.search(r's\d+$', e['tag'])),
+                 geo[0])
+    for step in sorted(steps):
+        paths = {e['tag']: os.path.join(
+            p['dir'], f"{p['name']}_{e['tag']}_{step:08d}.vti")
+            for e in geo}
+        if not all(os.path.isfile(v) for v in paths.values()):
+            continue
+        if _vti_nodes(paths[probe['tag']]) != tuple(probe['shape3']):
+            continue
+        _write_vth_file(
+            os.path.join(p['dir'], f"{p['name']}_{step:08d}.vth"),
+            p['name'], step, p['ax'], geo)
+        p.setdefault('written_vth', set()).add(step)
+
+
 class PlaneWriterManager:
     """Drives every configured plane: bind -> per-step record -> flush.
 
@@ -446,11 +585,21 @@ class PlaneWriterManager:
             s.flush(steps)
         for step in steps:
             self._write_vtm(p, step)
+            self._write_vth(p, step)
         p['written'].update(steps)
         p['cursor'] = 0
         p['steps'] = []
         if steps:
             self._write_pvd(p)
+
+    def _write_vth(self, p: Dict[str, Any], step: int) -> None:
+        geo = p.get('vth_geo')
+        if not geo:
+            return
+        _write_vth_file(
+            os.path.join(p['dir'], f"{p['name']}_{step:08d}.vth"),
+            p['name'], step, p['ax'], geo)
+        p.setdefault('written_vth', set()).add(step)
 
     def _write_vtm(self, p: Dict[str, Any], step: int) -> None:
         """Per-step multiblock collecting every block slice (fine drawn
@@ -478,6 +627,19 @@ class PlaneWriterManager:
         lines += ['  </Collection>', '</VTKFile>', '']
         with open(os.path.join(p['dir'], f"{p['name']}.pvd"), 'w') as f:
             f.write('\n'.join(lines))
+        vth_steps = sorted(p.get('written_vth', ()))
+        if vth_steps:
+            al = ['<?xml version="1.0"?>',
+                  '<VTKFile type="Collection" version="0.1" '
+                  'byte_order="LittleEndian">',
+                  '  <Collection>']
+            for st in vth_steps:
+                al.append(f'    <DataSet timestep="{float(st)}" group="" '
+                          f'part="0" file="{p["name"]}_{st:08d}.vth"/>')
+            al += ['  </Collection>', '</VTKFile>', '']
+            with open(os.path.join(p['dir'],
+                                   f"{p['name']}_amr.pvd"), 'w') as f:
+                f.write('\n'.join(al))
 
     def _bind(self, target: Any, append: bool) -> None:
         blocks = grid_block_views(target)
@@ -520,7 +682,11 @@ class PlaneWriterManager:
                          for s in series)
             p = {'name': pc['name'], 'dir': series[0].dir,
                  'series': series, 'interval': pc['interval'],
-                 'flush_every': eff_flush,
+                 'flush_every': eff_flush, 'ax': ax,
+                 'vth_geo': [
+                     {'level': s_.level, 'tag': s_.tag,
+                      'origin': s_.origin, 'spacing': s_.spacing,
+                      'shape3': s_.shape3} for s_ in series],
                  'cursor': 0, 'steps': [], 'written': set()}
             if append:
                 for s in series:
@@ -539,6 +705,7 @@ class PlaneWriterManager:
                     # change; rebuild from what is actually on disk now.
                     for step in sorted(p['written']):
                         self._write_vtm(p, step)
+                    _index_hist_vth(p, p['written'])
                     self._write_pvd(p)
             self._planes.append(p)
             lv_str = ('all' if pc['level'] == 'all' else f"L{pc['level']}")
@@ -695,16 +862,69 @@ class MPIPlaneWriterManager:
     # ── private ──────────────────────────────────────────────────
     def _flush_plane(self, p: Dict[str, Any]) -> None:
         steps = p['steps']
+        self._sync_seams(p, len(steps))
         for s in p['series']:
             s.flush(steps)
         if self._rank == 0:
             for step in steps:
                 self._write_vtm(p, step)
+                self._write_vth(p, step)
             p['written'].update(steps)
             if steps:
                 self._write_pvd(p)
         p['cursor'] = 0
         p['steps'] = []
+
+    def _write_vth(self, p: Dict[str, Any], step: int) -> None:
+        geo = p.get('vth_geo')
+        if not geo:
+            return
+        _write_vth_file(
+            os.path.join(p['dir'], f"{p['name']}_{step:08d}.vth"),
+            p['name'], step, p['ax'], geo)
+        p.setdefault('written_vth', set()).add(step)
+
+    def _sync_seams(self, p: Dict[str, Any], n: int) -> None:
+        """Make each ext column the NEXT strip's first OWNED column.
+
+        The ext (+1 node) column is recorded from this rank's ghost
+        mirror, which is bit-identical on plain bulk rows but goes
+        STALE on coupling-band rows (measured: L1 top C2F row -- the
+        owner's C2F scatter is not mirrored into neighbours' ghosts
+        before sampling). At flush the true column is sitting in the
+        next strip owner's ring buffer as its piece's first owned
+        column, so a single Sendrecv per seam per flush replaces the
+        ghost copy with the owner's -- bit-identical by construction,
+        the same flush-time-only communication contract as the probe
+        channel's rank-0 assembly. The schedule is computed on every
+        rank from the replicated piece table (rank-invariant)."""
+        if n == 0 or self._comm is None or p.get('seam_j', -1) < 0:
+            return
+        j = p['seam_j']
+        reqs, apply_q = [], []
+        for k, pe in enumerate(p['pieces']):
+            if not pe.get('ext'):
+                continue
+            nxt = next(q for q in p['pieces']
+                       if q['uid'] == pe['uid']
+                       and q['start'] == pe['start'] + pe['count'])
+            tag = 700 + k
+            if self._rank == pe['rank']:
+                sr = pe['_series']
+                buf = np.empty(sr.seam_nbytes(n, j) //
+                               np.dtype(sr.dtype).itemsize, sr.dtype)
+                reqs.append(self._comm.Irecv(buf, source=nxt['rank'],
+                                             tag=tag))
+                apply_q.append((sr, buf))
+            if self._rank == nxt['rank']:
+                col = nxt['_series'].seam_pack(n, j)
+                reqs.append(self._comm.Isend(col, dest=pe['rank'],
+                                             tag=tag))
+        if reqs:
+            from mpi4py import MPI as _MPI
+            _MPI.Request.Waitall(reqs)
+        for sr, buf in apply_q:
+            sr.seam_apply(n, j, buf)
 
     def _write_vtm(self, p: Dict[str, Any], step: int) -> None:
         """Per-step multiblock over ALL ranks' pieces (piece-table
@@ -752,6 +972,19 @@ class MPIPlaneWriterManager:
         lines += ['  </Collection>', '</VTKFile>', '']
         with open(os.path.join(p['dir'], f"{p['name']}.pvd"), 'w') as f:
             f.write('\n'.join(lines))
+        vth_steps = sorted(p.get('written_vth', ()))
+        if vth_steps:
+            al = ['<?xml version="1.0"?>',
+                  '<VTKFile type="Collection" version="0.1" '
+                  'byte_order="LittleEndian">',
+                  '  <Collection>']
+            for st in vth_steps:
+                al.append(f'    <DataSet timestep="{float(st)}" group="" '
+                          f'part="0" file="{p["name"]}_{st:08d}.vth"/>')
+            al += ['  </Collection>', '</VTKFile>', '']
+            with open(os.path.join(p['dir'],
+                                   f"{p['name']}_amr.pvd"), 'w') as f:
+                f.write('\n'.join(al))
 
     def _piece_table(self, pc: Dict[str, Any], ax: int, snapped: float,
                      runner: Any) -> List[Dict[str, Any]]:
@@ -776,16 +1009,25 @@ class MPIPlaneWriterManager:
             base = (f"L{m['level']}" if m['index'] == 0
                     else f"L{m['level']}b{m['index']}")
             split = len(owners) > 1
+            ext_n = m['shape'][axis]
             for r, s, c in owners:
+                # split strips: +1 node on the high side (except the
+                # block end) so adjacent pieces SHARE the boundary node
+                # -> AMR cell boxes tile with no seam gap. The extra
+                # node is the neighbour's first owned node, read from
+                # this rank's halo-synced ghost column (bit-identical
+                # mirror).
+                ext = 1 if (split and s + c < ext_n) else 0
                 pieces.append({'uid': m['uid'], 'meta': m, 'rank': r,
-                               'start': s, 'count': c, 'node': node,
+                               'start': s, 'count': c, 'ext': ext,
+                               'node': node,
                                'tag': base + (f"s{s}" if split else "")})
         return pieces
 
     def _piece_row_bytes(self, pe: Dict[str, Any], fields: List[str],
                          ax: int, axis: int) -> int:
         shape = list(pe['meta']['shape'])
-        shape[axis] = pe['count']
+        shape[axis] = pe['count'] + pe.get('ext', 0)
         n1, n2 = [n for d, n in enumerate(shape) if d != ax]
         item = np.dtype(self._dtype).itemsize
         return n1 * n2 * item * (('p' in fields) + 3 * ('u' in fields))
@@ -810,6 +1052,7 @@ class MPIPlaneWriterManager:
                 "MPIPlaneWriterManager.sample needs the distributed "
                 f"runner as target, got {type(runner).__name__}")
         axis = runner.axis
+        self._comm = getattr(runner, '_comm', None)
         xp = None
         for pc in self._cfg:
             ax = _AXES[pc['normal']]
@@ -840,14 +1083,18 @@ class MPIPlaneWriterManager:
                         "disagrees")
                 L = runner.lv[uid]
                 part = runner.parts[uid]
-                own = part.owned_local()
+                own = list(part.owned_local())
+                if pe.get('ext'):
+                    _a = own[axis]
+                    own[axis] = slice(_a.start, _a.stop + pe['ext'])
+                own = tuple(own)
                 view = _SlabView(L.rho[own], L.u[(slice(None),) + own])
                 if xp is None:
                     import cupy
                     xp = cupy.get_array_module(L.rho)
                 m = pe['meta']
                 shape = list(m['shape'])
-                shape[axis] = pe['count']
+                shape[axis] = pe['count'] + pe.get('ext', 0)
                 origin = [float(v) for v in m['origin']]
                 origin[axis] += pe['start'] * m['spacing']
                 node_local = (pe['node'] - pe['start'] if ax == axis
@@ -858,13 +1105,15 @@ class MPIPlaneWriterManager:
                        'tag': pe['tag']}
                 s = _PlaneSeries(pc['name'], blk, ax, node_local,
                                  out_dir, self._units, self._dtype)
+                pe['_series'] = s
                 mask2 = self._mask2.get((pc['name'], uid))
                 if mask2 is not None and ax != axis:
                     # cut this rank's strip out of the full-block slice
                     # (the strip splits the in-plane dim = decomp axis)
                     j = [d for d in range(3) if d != ax].index(axis)
                     sl = [slice(None), slice(None)]
-                    sl[j] = slice(pe['start'], pe['start'] + pe['count'])
+                    sl[j] = slice(pe['start'], pe['start'] + pe['count']
+                                  + pe.get('ext', 0))
                     mask2 = mask2[tuple(sl)]
                     mask2 = mask2 if mask2.any() else None
                 s.mask2 = mask2
@@ -882,10 +1131,25 @@ class MPIPlaneWriterManager:
             nbytes = sum(s.alloc(xp, eff_flush, pc['fields'])
                          for s in series) if series else 0
 
+            vgeo = []
+            for pe in pieces:
+                m = pe['meta']
+                sh = list(m['shape'])
+                sh[axis] = pe['count'] + pe.get('ext', 0)
+                sh[ax] = 1
+                og = [float(v) for v in m['origin']]
+                og[axis] += pe['start'] * m['spacing']
+                og[ax] = float(snapped)
+                vgeo.append({'level': m['level'], 'tag': pe['tag'],
+                             'origin': tuple(og),
+                             'spacing': float(m['spacing']),
+                             'shape3': tuple(int(v) for v in sh)})
             p = {'name': pc['name'], 'dir': out_dir, 'series': series,
                  'pieces': pieces, 'interval': pc['interval'],
-                 'flush_every': eff_flush, 'cursor': 0, 'steps': [],
-                 'written': set()}
+                 'flush_every': eff_flush, 'ax': ax, 'vth_geo': vgeo,
+                 'seam_j': ([d for d in range(3) if d != ax].index(axis)
+                            if ax != axis else -1),
+                 'cursor': 0, 'steps': [], 'written': set()}
             if append and self._rank == 0:
                 hist = self._existing_steps(pc['name'], out_dir)
                 if hist:
@@ -900,6 +1164,7 @@ class MPIPlaneWriterManager:
                     for step, files in sorted(hist.items()):
                         self._write_vtm_from_files(p, step, files)
                     p['written'].update(hist)
+                    _index_hist_vth(p, hist)
                     self._write_pvd(p)
             self._planes.append(p)
 

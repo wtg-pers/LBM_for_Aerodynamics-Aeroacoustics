@@ -6,6 +6,12 @@ blanking in a .vtm) and parallel planes appear split into s<start>
 strips. What a reader usually wants is the SAME view ParaView gives when
 slicing the volume .vth: one composed section.
 
+NOTE: the channel now ALSO writes a native per-step .vth AMR index
+(<plane>_<step>.vth + <plane>_amr.pvd) -- open that in ParaView for the
+composed finest-resolution view with automatic coarse-cell blanking.
+This tool remains for L0-lattice resampled single .vti products and for
+archives that predate the .vth output.
+
 This tool composes OFFLINE (zero runtime cost, works on finished or
 in-progress result trees): for every step it merges all pieces of a
 plane onto the plane's L0 node grid and, because the level hierarchy is
