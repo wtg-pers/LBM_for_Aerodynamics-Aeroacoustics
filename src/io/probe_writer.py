@@ -55,7 +55,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-__all__ = ["parse_probe_config", "PressureProbeManager"]
+__all__ = ["parse_probe_config", "PressureProbeManager", "grid_block_views"]
+
+
+def grid_block_views(target: Any) -> List[Dict[str, Any]]:
+    """Uniform (sim, origin, spacing, shape, level, name) views of a target.
+
+    MultiLevelGrid exposes the block tree; a plain Simulation becomes the
+    single L0 pseudo-block. origin/spacing are the same values the .vti
+    files declare, so sampling frames match ParaView exactly. Shared by
+    the probe and plane channels.
+    """
+    if hasattr(target, 'iter_blocks'):
+        return [{'sim': b.sim, 'origin': b.origin, 'spacing': b.spacing,
+                 'shape': b.shape, 'level': b.level, 'index': b.index,
+                 'name': b.label}
+                for b in target.iter_blocks()]
+    return [{'sim': target, 'origin': (0.0, 0.0, 0.0), 'spacing': 1.0,
+             'shape': target.domain_shape, 'level': 0, 'index': 0,
+             'name': 'L0'}]
 
 _ALLOWED_KEYS = {"enabled", "points", "units", "interval", "flush_every"}
 
@@ -231,7 +249,7 @@ class PressureProbeManager:
         else:
             points_lu = [p for p in self._points_in]
 
-        blocks = self._block_list(target)
+        blocks = grid_block_views(target)
         records = []
         for pid, p in enumerate(points_lu):
             rec = self._locate(pid, p, blocks)
@@ -270,20 +288,6 @@ class PressureProbeManager:
               f"{self.interval} step(s), fs = {self.fs_hz:.1f} Hz "
               f"-> {self.csv_path}")
         self._bound = True
-
-    def _block_list(self, target: Any) -> List[Dict[str, Any]]:
-        """Uniform (sim, origin, spacing, shape, level, name) views.
-
-        MultiLevelGrid exposes the block tree; a plain Simulation becomes
-        the single L0 pseudo-block. origin/spacing are the same values the
-        .vti files declare, so probe frames match ParaView exactly.
-        """
-        if hasattr(target, 'iter_blocks'):
-            return [{'sim': b.sim, 'origin': b.origin, 'spacing': b.spacing,
-                     'shape': b.shape, 'level': b.level, 'name': b.label}
-                    for b in target.iter_blocks()]
-        return [{'sim': target, 'origin': (0.0, 0.0, 0.0), 'spacing': 1.0,
-                 'shape': target.domain_shape, 'level': 0, 'name': 'L0'}]
 
     def _locate(self, pid: int, p_lu: Tuple[float, ...],
                 blocks: List[Dict[str, Any]]) -> Dict[str, Any]:

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from src.io.marker_vtk_writer import MarkerVTPWriter
     from src.io.checkpoint import CheckpointManager
     from src.io.probe_writer import PressureProbeManager
+    from src.io.plane_writer import PlaneWriterManager
     from src.utilities.flux_utils import ConservationManager
     from src.utilities.force_calculator import ForceManager
     from src.utilities.convergence import ConvergenceMonitor
@@ -70,6 +71,7 @@ class OutputManager:
         marker_vtk_writer: Optional['MarkerVTPWriter'] = None,
         checkpoint_mgr: Optional['CheckpointManager'] = None,
         probe_mgr: Optional['PressureProbeManager'] = None,
+        plane_mgr: Optional['PlaneWriterManager'] = None,
         # ── Monitors ──
         conservation_mgr: Optional['ConservationManager'] = None,
         force_mgr: Optional['ForceManager'] = None,
@@ -108,6 +110,7 @@ class OutputManager:
             marker_vtk_writer: Marker VTP writer for ALM (optional)
             checkpoint_mgr: Checkpoint save/load manager (optional)
             probe_mgr: Pressure probe channel (optional)
+            plane_mgr: Plane slice channel (optional)
             conservation_mgr: Mass conservation monitor (optional)
             force_mgr: MEM force calculator (optional)
             conv_monitor: Convergence/divergence monitor (optional)
@@ -133,6 +136,7 @@ class OutputManager:
         self.marker_vtk_writer = marker_vtk_writer
         self.checkpoint_mgr = checkpoint_mgr
         self.probe_mgr = probe_mgr
+        self.plane_mgr = plane_mgr
 
         # ── Monitors ──
         self.conservation_mgr = conservation_mgr
@@ -247,6 +251,12 @@ class OutputManager:
         if self.probe_mgr is not None:
             self.probe_mgr.sample(step, sim)
 
+        # ─── 0b. Plane slices (dense-in-time acoustic cuts) ──────
+        # Same ring-buffer pattern; the flush inside does real disk work
+        # at flush_every cadence, not per step.
+        if self.plane_mgr is not None:
+            self.plane_mgr.sample(step, sim)
+
         # ─── 1. Progress bar ──────────────────────────────────────
         self._update_progress(step, sim)
 
@@ -303,9 +313,11 @@ class OutputManager:
         if self._pbar is not None:
             self._pbar.close()
 
-        # Probe tail: flush buffered rows before any summary/return path.
+        # Probe/plane tails: flush buffered rows before any summary path.
         if self.probe_mgr is not None:
             self.probe_mgr.finalize()
+        if self.plane_mgr is not None:
+            self.plane_mgr.finalize()
 
         elapsed = time.perf_counter() - self._start_time
         total_steps = self._end_step - self._start_step

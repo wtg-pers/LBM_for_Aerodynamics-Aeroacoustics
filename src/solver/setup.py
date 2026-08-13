@@ -342,16 +342,19 @@ class SimulationSetup:
         Returns:
             OutputManager ready for start() → process() → finalize()
         """
-        # Probes are a single-process channel (step 1): under MPI the
-        # sampling target is each rank's LOCAL view, so the base-class
+        # Probes/planes are single-process channels (step 1): under MPI
+        # the sampling target is each rank's LOCAL view, so the base-class
         # gather would read the wrong (or missing) nodes. A requested
         # channel must never silently produce nothing — hard error, on
-        # every rank (the request flag is parsed rank-invariantly).
-        if manager_cls is not None and getattr(self, '_probe_cfg', None):
-            raise ValueError(
-                "output.probes is not supported under MPI yet: the probe "
-                "needs owner-rank sampling through the partition map. "
-                "Run single-process, or drop the probes block.")
+        # every rank (the request flags are parsed rank-invariantly).
+        for _ch, _flag in (('probes', getattr(self, '_probe_cfg', None)),
+                           ('planes', getattr(self, '_plane_cfg', None))):
+            if manager_cls is not None and _flag:
+                raise ValueError(
+                    f"output.{_ch} is not supported under MPI yet: the "
+                    "channel needs owner-rank sampling through the "
+                    "partition map. Run single-process, or drop the "
+                    f"{_ch} block.")
 
         cls = manager_cls or OutputManager
         mgr = cls(
@@ -364,6 +367,7 @@ class SimulationSetup:
             marker_vtk_writer=self.marker_vtk_writer,
             checkpoint_mgr=self.checkpoint_mgr,
             probe_mgr=getattr(self, 'probe_mgr', None),
+            plane_mgr=getattr(self, 'plane_mgr', None),
             conservation_mgr=self.conservation_mgr,
             force_mgr=self.force_mgr,
             conv_monitor=self.conv_monitor,
@@ -1256,6 +1260,20 @@ class SimulationSetup:
                                        'checkpoint_dir', './checkpoints')
         self._csv_dir = _resolve(args.csv_dir, 'csv', 'csv_dir', './results/csv')
 
+        # ── Output field units (output.units: 'lu' | 'phys') ──
+        # One FieldUnits instance is shared by every VTK-family writer
+        # (volume 2D/3D, MLG, planes) so the value/name mapping has a
+        # single source. Coordinates stay L0-lu in both modes.
+        from src.io.field_units import FieldUnits
+        _units_mode = oc.get('units', 'phys')
+        if _units_mode not in ('lu', 'phys'):
+            raise ValueError(
+                f"output.units={_units_mode!r}: use 'phys' (default — "
+                "p_prime_pa/velocity_ms) or 'lu' (lattice)")
+        self.field_units = FieldUnits(_units_mode, self._unit_converter)
+        for _ln in self.field_units.summary_lines():
+            print(_ln)  # captured -> setup_log.txt (summary repeats it)
+
         is_restart = args.restart_latest or args.restart is not None
         clear_previous = args.clear or oc.get('clear_previous', False)
 
@@ -1298,6 +1316,7 @@ class SimulationSetup:
                 domain_shape=self.domain_shape,
                 precision=vc.get('precision', 'float32'),
                 compression_level=vc.get('compression_level', 0),
+                units=self.field_units,
             )
             size_est = self.vtk_writer.get_file_size_estimate()
             print(f"  VTK: enabled ({size_est['estimated_MB']:.2f} MB/file)")
@@ -1355,6 +1374,22 @@ class SimulationSetup:
             print(f"  Probes: {n} point(s), every "
                   f"{self._probe_cfg['interval']} step(s) "
                   f"-> {self.probe_mgr.csv_path}")
+
+        # ── Plane slices (dense-in-time acoustic cuts) ──
+        # Same rank rules as the probes (parse everywhere, build on IO
+        # rank). Planes write under the VTK root even when the volume
+        # channel is disabled — a plane-only acoustic run is legitimate.
+        from src.io.plane_writer import parse_plane_config, PlaneWriterManager
+        self._plane_cfg = parse_plane_config(oc, self._dimension)
+        self.plane_mgr = None
+        if self._plane_cfg is not None and self.is_io_rank:
+            os.makedirs(output_dir, exist_ok=True)
+            self.plane_mgr = PlaneWriterManager(
+                self._plane_cfg, output_dir,
+                self._unit_converter, self.field_units,
+                precision=vc.get('precision', 'float32'))
+            print(f"  Planes: {len(self._plane_cfg)} plane(s) "
+                  f"-> {os.path.join(output_dir, 'planes')}/")
 
         # ── Rotor CSV ──
         # CSV is opened by SolverInitializer after start_step is known,
@@ -1925,6 +1960,7 @@ class SimulationSetup:
             num_levels=num_levels,
             precision=self._vtk_config.get('precision', 'float32'),
             blocks=self._mlg_blocks,
+            units=self.field_units,
         )
         print(f"  {self._mlg_vtk_writer.get_info()}")
 
@@ -2541,6 +2577,7 @@ class SimulationSetup:
             scaler=self._mlg_scaler,
             num_levels=num_levels,
             precision=self._vtk_config.get('precision', 'float32'),
+            units=self.field_units,
         )
         print(f"  {self._mlg_vtk_writer.get_info()}")
 
@@ -3172,6 +3209,12 @@ class SimulationSetup:
         print(f" Time   : {self.config_max_steps:,} steps{dt_str} | "
               f"VTK: {self.output_interval} | Log: {self.log_interval} | "
               f"{ckpt_str}")
+
+        # ── Output units (always shown: applied units, or the lattice->
+        #    physical recipe with this run's actual constants) ──────
+        if getattr(self, 'field_units', None) is not None:
+            for line in self.field_units.summary_lines():
+                print(line)
 
         # ── Log file ─────────────────────────────────────────────
         print(f" Log    : {self._log_path}")

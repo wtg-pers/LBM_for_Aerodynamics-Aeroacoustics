@@ -31,6 +31,7 @@ import numpy as np
 if TYPE_CHECKING:
     from types import ModuleType
     import numpy.typing as npt
+    from src.io.field_units import FieldUnits
 
 
 class VTKWriter:
@@ -52,15 +53,16 @@ class VTKWriter:
         >>> writer.write(step=1000, rho=rho, u=u, solid_mask=mask)
     """
     
-    def __init__(self, 
+    def __init__(self,
                  output_dir: str,
                  domain_shape: tuple,
                  precision: str = 'float32',
                  compression_level: int = 0,
                  origin: tuple = None,
-                 spacing: tuple = None) -> None:
+                 spacing: tuple = None,
+                 units: Optional['FieldUnits'] = None) -> None:
         """Initialize VTK writer
-        
+
         Args:
             output_dir: Output directory path
             domain_shape: (Nx, Ny) for 2D or (Nx, Ny, Nz) for 3D  [lattice units]
@@ -68,8 +70,10 @@ class VTKWriter:
             compression_level: Compression level (currently unused)
             origin: Grid origin  [physical or lattice units]
             spacing: Grid spacing  [physical or lattice units]
+            units: FieldUnits value converter (None = lattice passthrough)
         """
         self.output_dir = output_dir
+        self.units = units
         
         # Handle 2D vs 3D
         if len(domain_shape) == 2:
@@ -131,6 +135,12 @@ class VTKWriter:
             print(f"    Found {len(self.time_steps)} existing VTK files")
             print(f"    Step range: {int(self.time_steps[0][0])} -> {int(self.time_steps[-1][0])}")
     
+    def _units_convert(self, name: str, arr: np.ndarray):
+        """Apply the FieldUnits value/name mapping (identity when unset)."""
+        if self.units is None:
+            return name, arr
+        return self.units.convert(name, arr)
+
     def _to_numpy(self, arr: 'npt.NDArray') -> np.ndarray:
         """Convert CuPy array to NumPy if necessary"""
         if hasattr(arr, 'get'):
@@ -202,31 +212,33 @@ class VTKWriter:
         data_arrays = []
         
         if rho is not None:
-            rho_np = self._to_numpy(rho).astype(self.dtype)
-            
+            name, rho_np = self._units_convert('density', self._to_numpy(rho))
+            rho_np = rho_np.astype(self.dtype)
+
             # Expand 2D to 3D if needed
             if self.dim == 2:
                 rho_np = self._expand_2d_to_3d(rho_np, is_vector=False)
-            
+
             # VTK expects x to vary fastest
             # Transpose (Nx, Ny, Nz) -> (Nz, Ny, Nx) then flatten
             rho_vtk = np.ascontiguousarray(rho_np.transpose(2, 1, 0)).ravel()
-            data_arrays.append(('density', self.vtk_type, 1, rho_vtk.tobytes()))
+            data_arrays.append((name, self.vtk_type, 1, rho_vtk.tobytes()))
             # Pressure: p = ρ * c_s² = ρ / 3
-        
+
         if u is not None:
-            u_np = self._to_numpy(u).astype(self.dtype)
-            
+            name, u_np = self._units_convert('velocity', self._to_numpy(u))
+            u_np = u_np.astype(self.dtype)
+
             # Expand 2D to 3D if needed
             if self.dim == 2:
                 u_np = self._expand_2d_to_3d(u_np, is_vector=True)
-            
+
             # Transpose spatial dimensions: (3, Nx, Ny, Nz) -> (3, Nz, Ny, Nx)
             u_transposed = u_np.transpose(0, 3, 2, 1)
-            
+
             # Interleave components: (Nz, Ny, Nx, 3)
             u_interleaved = np.ascontiguousarray(u_transposed.transpose(1, 2, 3, 0))
-            data_arrays.append(('velocity', self.vtk_type, 3, u_interleaved.ravel().tobytes()))
+            data_arrays.append((name, self.vtk_type, 3, u_interleaved.ravel().tobytes()))
         
         if solid_mask is not None:
             mask_np = self._to_numpy(solid_mask).astype(np.int8)
@@ -241,7 +253,9 @@ class VTKWriter:
         # --- Extra scalar fields ---
         if extra_scalars is not None:
             for name, field in extra_scalars.items():
-                field_np = self._to_numpy(field).astype(self.dtype)
+                name, field_np = self._units_convert(
+                    name, self._to_numpy(field))
+                field_np = field_np.astype(self.dtype)
                 if self.dim == 2:
                     field_np = self._expand_2d_to_3d(field_np, is_vector=False)
                 field_vtk = np.ascontiguousarray(
@@ -254,7 +268,9 @@ class VTKWriter:
         # --- Extra vector fields ---
         if extra_vectors is not None:
             for name, field in extra_vectors.items():
-                field_np = self._to_numpy(field).astype(self.dtype)
+                name, field_np = self._units_convert(
+                    name, self._to_numpy(field))
+                field_np = field_np.astype(self.dtype)
                 if self.dim == 2:
                     field_np = self._expand_2d_to_3d(field_np, is_vector=True)
                 field_t = field_np.transpose(0, 3, 2, 1)  # (3,Nx,Ny,Nz) → (3,Nz,Ny,Nx)

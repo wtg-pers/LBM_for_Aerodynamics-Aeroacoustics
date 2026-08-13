@@ -53,8 +53,10 @@ class MLGVTKWriter:
         num_levels: int,
         precision: str = 'float32',
         blocks: Optional[List] = None,
+        units: Optional[object] = None,
     ) -> None:
         self.output_dir = output_dir
+        self.units = units  # FieldUnits (None = lattice passthrough)
         self._num_levels = num_levels
         self._overlap_mgr = overlap_mgr
         self._scaler = scaler
@@ -277,6 +279,16 @@ class MLGVTKWriter:
             rho_np = np.asarray(rho)
             u_np = np.asarray(u)
 
+        # Field-value unit mapping (output.units; identity when unset).
+        # spacing[0] = this block's spacing in L0 units (2^-level) —
+        # nu_t/body_force conversion is level-dependent.
+        rho_name, u_name = 'density', 'velocity'
+        if self.units is not None:
+            rho_name, rho_np = self.units.convert(rho_name, rho_np,
+                                                  spacing=spacing[0])
+            u_name, u_np = self.units.convert(u_name, u_np,
+                                              spacing=spacing[0])
+
         dtype = self._dtype
         vtk_type = self._vtk_type
 
@@ -294,8 +306,8 @@ class MLGVTKWriter:
         sx, sy, sz = spacing
 
         data_arrays = [
-            ('density', vtk_type, 1, rho_flat),
-            ('velocity', vtk_type, 3, u_interleaved),
+            (rho_name, vtk_type, 1, rho_flat),
+            (u_name, vtk_type, 3, u_interleaved),
         ]
 
         if solid_mask is not None:
@@ -314,6 +326,9 @@ class MLGVTKWriter:
                     field_np = field.get()
                 else:
                     field_np = np.asarray(field)
+                if self.units is not None:
+                    name, field_np = self.units.convert(name, field_np,
+                                                        spacing=spacing[0])
                 field_flat = np.ascontiguousarray(
                     field_np.transpose(2, 1, 0)
                 ).astype(dtype).tobytes()
