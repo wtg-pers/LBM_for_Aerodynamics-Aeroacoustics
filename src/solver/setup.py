@@ -333,28 +333,58 @@ class SimulationSetup:
         )
 
     def build_output_manager(self, manager_cls=None,
+                             blocks_meta=None,
                              **extra_kwargs) -> 'OutputManager':
         """Create OutputManager with all I/O components.
 
         manager_cls/extra_kwargs: the MPI driver passes MPIOutputManager
         plus its comm/cadence kwargs — same wiring, one pipeline.
 
+        blocks_meta: GLOBAL block geometry (uid/origin/spacing/shape/
+        level/index dicts, level-major) captured by the MPI driver from
+        the replicated build. Required when output.planes or
+        output.probes runs under MPI — the runner keeps topology only,
+        so the geometry must be handed over before the build is dropped.
+
         Returns:
             OutputManager ready for start() → process() → finalize()
         """
-        # Probes/planes are single-process channels (step 1): under MPI
-        # the sampling target is each rank's LOCAL view, so the base-class
-        # gather would read the wrong (or missing) nodes. A requested
-        # channel must never silently produce nothing — hard error, on
-        # every rank (the request flags are parsed rank-invariantly).
-        for _ch, _flag in (('probes', getattr(self, '_probe_cfg', None)),
-                           ('planes', getattr(self, '_plane_cfg', None))):
-            if manager_cls is not None and _flag:
-                raise ValueError(
-                    f"output.{_ch} is not supported under MPI yet: the "
-                    "channel needs owner-rank sampling through the "
-                    "partition map. Run single-process, or drop the "
-                    f"{_ch} block.")
+        # Probes/planes under MPI: swap the single-process managers for
+        # the distributed ones (owner-rank sampling through the
+        # replicated partition map). A requested channel must never
+        # silently produce nothing — missing geometry is a hard error,
+        # on every rank (the request flags are parsed rank-invariantly).
+        probe_mgr = getattr(self, 'probe_mgr', None)
+        plane_mgr = getattr(self, 'plane_mgr', None)
+        if manager_cls is not None:
+            _rank = int(extra_kwargs.get('rank', 0))
+            _nr = int(extra_kwargs.get('nr', 1))
+            if getattr(self, '_probe_cfg', None):
+                if blocks_meta is None:
+                    raise ValueError(
+                        "output.probes under MPI: the driver must pass "
+                        "blocks_meta (global block geometry) to "
+                        "build_output_manager")
+                from src.io.probe_writer import MPIPressureProbeManager
+                probe_mgr = MPIPressureProbeManager(
+                    self._probe_cfg, self._csv_dir,
+                    self._unit_converter, self._dimension,
+                    blocks_meta=blocks_meta, rank=_rank, n_ranks=_nr,
+                    comm=extra_kwargs.get('comm'))
+            if getattr(self, '_plane_cfg', None):
+                if blocks_meta is None:
+                    raise ValueError(
+                        "output.planes under MPI: the driver must pass "
+                        "blocks_meta (global block geometry) to "
+                        "build_output_manager")
+                from src.io.plane_writer import MPIPlaneWriterManager
+                plane_mgr = MPIPlaneWriterManager(
+                    self._plane_cfg, self._vtk_output_dir,
+                    self._unit_converter, self.field_units,
+                    precision=self._vtk_config.get('precision',
+                                                   'float32'),
+                    blocks_meta=blocks_meta,
+                    rank=_rank, n_ranks=_nr)
 
         cls = manager_cls or OutputManager
         mgr = cls(
@@ -366,8 +396,8 @@ class SimulationSetup:
             vtk_writer=self.vtk_writer,
             marker_vtk_writer=self.marker_vtk_writer,
             checkpoint_mgr=self.checkpoint_mgr,
-            probe_mgr=getattr(self, 'probe_mgr', None),
-            plane_mgr=getattr(self, 'plane_mgr', None),
+            probe_mgr=probe_mgr,
+            plane_mgr=plane_mgr,
             conservation_mgr=self.conservation_mgr,
             force_mgr=self.force_mgr,
             conv_monitor=self.conv_monitor,

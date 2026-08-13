@@ -54,6 +54,7 @@ TAG_FIELD = 4096        # + 8*uid   : VTK gathers (rho, u, nu_t)
 TAG_CKPT = 12288        # + 4*uid   : checkpoint f gather
 TAG_MACRO = 20480       # + 4*uid   : checkpoint/final rho+u gather
 TAG_VERIFY = 24576      # + 4*uid   : --verify assembly
+TAG_PROBE = 28672       # + rank    : probe column blocks, owner -> rank 0
 
 # Model state that every output channel reads. Broadcast from each block's
 # owners to the rest at reporting cadence (see sync_alm_reporting): with a
@@ -150,6 +151,10 @@ class DistributedMLGRunner:
         # are replicated) and hands it to from_range, so neighbor() can skip
         # ranks that hold nothing of this block.
         table = derive_block_ranges(src, self.axis, bounds)
+        # Kept for the output channels (plane strips): [uid][rank] ->
+        # (own_start, own_count) — replicated ints, so every rank can
+        # enumerate every other rank's pieces without communication.
+        self.range_table = table
         self.parts: List[Partition1D] = []
         for uid, b in enumerate(src):
             own_start, own_count = table[uid][rank]

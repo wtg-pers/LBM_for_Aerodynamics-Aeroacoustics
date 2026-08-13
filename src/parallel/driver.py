@@ -256,12 +256,34 @@ def _run(args, MPI):
         print(f"[mpi] cadence: vtk={vtk_every} ckpt={ckpt_every} "
               f"log={log_every} fields_last={vtk_fields_last or 'all'}",
               flush=True)
+    # Probe/plane channels (owner-rank sampling): the runner keeps
+    # topology only, so the GLOBAL block geometry must be captured from
+    # the replicated build here, while it still exists. Entry order is
+    # level-major = runner uid (the runner asserts uid == flat position).
+    blocks_meta = None
+    if (getattr(setup, '_plane_cfg', None)
+            or getattr(setup, '_probe_cfg', None)):
+        from src.io.probe_writer import grid_block_views
+        blocks_meta = [
+            {'uid': i,
+             'origin': tuple(float(v) for v in b['origin']),
+             'spacing': float(b['spacing']),
+             'shape': tuple(int(v) for v in b['shape']),
+             'level': int(b['level']), 'index': int(b['index']),
+             'name': b['name']}
+            for i, b in enumerate(grid_block_views(mlg))]
+
     output = setup.build_output_manager(
         manager_cls=MPIOutputManager,
+        blocks_meta=blocks_meta,
         comm=comm, rank=rank, nr=nr, mpi_mod=MPI,
         log_every=log_every, vtk_every=vtk_every, ckpt_every=ckpt_every,
         vtk_fields_last=vtk_fields_last,
         dense_csv_path=args.csv)
+    if getattr(setup, '_plane_cfg', None):
+        # solid-cell rest-state convention (volume channel parity) —
+        # the mask slices must be cut before the build is dropped
+        output.plane_mgr.capture_solid_masks(mlg)
 
     axis = None if args.axis == "auto" else "xyz".index(args.axis)
     transport = MPITransport(comm, cuda_aware=str(cuda_aware) == "1")

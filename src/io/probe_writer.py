@@ -41,10 +41,11 @@ Config (output.probes):
 Unknown keys and malformed points are hard errors: a typo must never
 silently disable a requested output channel.
 
-Scope: single-process runs (single-grid + MLG, 2D/3D). MPI is rejected at
-setup — under the distributed runner the probe's owner rank and its local
-index space need the partition map (ownership rule: sample on the owning
-rank), which is a follow-up step.
+Scope: single-process runs (single-grid + MLG, 2D/3D) use
+PressureProbeManager; the MPI runner uses MPIPressureProbeManager
+(owner-rank sampling through the replicated partition map; probes.csv
+stays ONE global file, assembled on rank 0 at flush cadence — the only
+communication in the output channels, a few KB per flush).
 
 Author: LBM Development Team
 Date: 2026-08
@@ -55,7 +56,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-__all__ = ["parse_probe_config", "PressureProbeManager", "grid_block_views"]
+__all__ = ["parse_probe_config", "PressureProbeManager",
+           "MPIPressureProbeManager", "grid_block_views"]
 
 
 def grid_block_views(target: Any) -> List[Dict[str, Any]]:
@@ -138,6 +140,44 @@ def parse_probe_config(output_cfg: Dict[str, Any],
 
     return {'points': points, 'units': units,
             'interval': interval, 'flush_every': flush_every}
+
+
+def _locate_point(pid: int, p_lu: Tuple[float, ...],
+                  blocks: List[Dict[str, Any]], dim: int) -> Dict[str, Any]:
+    """Nearest node on the finest block containing the point.
+
+    Works on metadata alone (origin/spacing/shape/level/name) — under
+    MPI `blocks` is the GLOBAL replicated list, so every rank resolves
+    every probe to the same (block, node). The winning block dict is
+    returned under 'block' (the single-process caller reads .sim off
+    it; the MPI caller reads .uid)."""
+    best = None
+    for b in blocks:
+        idx = tuple(
+            int(round((p_lu[d] - b['origin'][d]) / b['spacing']))
+            for d in range(dim))
+        inside = all(0 <= idx[d] <= b['shape'][d] - 1
+                     for d in range(dim))
+        if inside and (best is None or b['level'] > best['level']):
+            best = {'pid': pid, 'block': b, 'idx': idx,
+                    'level': b['level'], 'name': b['name'],
+                    'shape': b['shape'], 'origin': b['origin'],
+                    'spacing': b['spacing']}
+    if best is None:
+        raise ValueError(
+            f"output.probes.points[{pid}] = {p_lu} (L0 lu) lies "
+            "outside every grid block")
+    best['snapped_lu'] = tuple(
+        best['origin'][d] + best['idx'][d] * best['spacing']
+        for d in range(dim))
+    if best['level'] > 0:
+        gap = min(min(best['idx'][d], best['shape'][d] - 1 - best['idx'][d])
+                  for d in range(dim))
+        if gap < _EDGE_GUARD:
+            print(f"  WARNING: probe {pid} is {gap} node(s) from a "
+                  f"{best['name']} block face — inside/near the C2F "
+                  "coupling band; move it inward for clean acoustics")
+    return best
 
 
 class PressureProbeManager:
@@ -292,58 +332,246 @@ class PressureProbeManager:
     def _locate(self, pid: int, p_lu: Tuple[float, ...],
                 blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Nearest node on the finest block containing the point."""
-        best = None
-        for b in blocks:
-            idx = tuple(
-                int(round((p_lu[d] - b['origin'][d]) / b['spacing']))
-                for d in range(self._dim))
-            inside = all(0 <= idx[d] <= b['shape'][d] - 1
-                         for d in range(self._dim))
-            if inside and (best is None or b['level'] > best['level']):
-                best = {'pid': pid, 'sim': b['sim'], 'idx': idx,
-                        'level': b['level'], 'name': b['name'],
-                        'shape': b['shape'], 'origin': b['origin'],
-                        'spacing': b['spacing']}
-        if best is None:
-            raise ValueError(
-                f"output.probes.points[{pid}] = {p_lu} (L0 lu) lies "
-                "outside every grid block")
-        best['snapped_lu'] = tuple(
-            best['origin'][d] + best['idx'][d] * best['spacing']
-            for d in range(self._dim))
-        if best['level'] > 0:
-            gap = min(min(best['idx'][d], best['shape'][d] - 1 - best['idx'][d])
-                      for d in range(self._dim))
-            if gap < _EDGE_GUARD:
-                print(f"  WARNING: probe {pid} is {gap} node(s) from a "
-                      f"{best['name']} block face — inside/near the C2F "
-                      "coupling band; move it inward for clean acoustics")
+        best = _locate_point(pid, p_lu, blocks, self._dim)
+        best['sim'] = best['block']['sim']
         return best
 
     def _write_meta(self, records: List[Dict[str, Any]]) -> None:
         """Snapped positions + conversion constants (post-processing keys)."""
-        uc, dim = self._uc, self._dim
-        ax = 'xyz'[:dim]
-        cols = (['probe', 'level', 'block']
-                + [f'i{a}' for a in ax]
-                + [f'{a}_lu' for a in ax]
-                + [f'{a}_m' for a in ax]
-                + [f'req_{a}' for a in ax])
-        with open(self.meta_path, 'w') as f:
-            f.write("# pressure probe metadata\n")
-            f.write("# p_pa = cs_lu^2*(rho_lu - 1)*rho_phys"
-                    "*(dx_phys/dt_phys)^2 ; p' = p - mean(p) in post\n")
-            f.write(f"# dx_phys_m={uc.dx_phys:.9e}, "
-                    f"dt_phys_s={uc.dt_phys:.9e} (L0), "
-                    f"rho_phys={uc.rho_phys}, "
-                    f"p_conv_pa_per_drho={self._p_conv:.9e}\n")
-            f.write(f"# sample_interval={self.interval}, "
-                    f"fs_hz={self.fs_hz:.6e}\n")
-            f.write(','.join(cols) + '\n')
+        _write_meta_csv(self.meta_path, records, self._points_in, self._uc,
+                        self._dim, self.interval, self.fs_hz, self._p_conv)
+
+
+def _write_meta_csv(meta_path: str, records: List[Dict[str, Any]],
+                    points_in: List[Tuple[float, ...]], uc: Any, dim: int,
+                    interval: int, fs_hz: float, p_conv: float) -> None:
+    """probes_meta.csv — shared by the single-process and MPI managers."""
+    ax = 'xyz'[:dim]
+    cols = (['probe', 'level', 'block']
+            + [f'i{a}' for a in ax]
+            + [f'{a}_lu' for a in ax]
+            + [f'{a}_m' for a in ax]
+            + [f'req_{a}' for a in ax])
+    with open(meta_path, 'w') as f:
+        f.write("# pressure probe metadata\n")
+        f.write("# p_pa = cs_lu^2*(rho_lu - 1)*rho_phys"
+                "*(dx_phys/dt_phys)^2 ; p' = p - mean(p) in post\n")
+        f.write(f"# dx_phys_m={uc.dx_phys:.9e}, "
+                f"dt_phys_s={uc.dt_phys:.9e} (L0), "
+                f"rho_phys={uc.rho_phys}, "
+                f"p_conv_pa_per_drho={p_conv:.9e}\n")
+        f.write(f"# sample_interval={interval}, "
+                f"fs_hz={fs_hz:.6e}\n")
+        f.write(','.join(cols) + '\n')
+        for r in records:
+            row = ([str(r['pid']), str(r['level']), r['name']]
+                   + [str(i) for i in r['idx']]
+                   + [f'{c:.6f}' for c in r['snapped_lu']]
+                   + [f'{c * uc.dx_phys:.9e}' for c in r['snapped_lu']]
+                   + [f'{c:.6f}' for c in points_in[r['pid']]])
+            f.write(','.join(row) + '\n')
+
+
+# =====================================================================
+# MPI (distributed runner) path — owner-rank points
+# =====================================================================
+class MPIPressureProbeManager:
+    """Owner-rank probe sampling for the distributed (MPI) runner.
+
+    Point resolution runs on GLOBAL replicated metadata (_locate_point
+    over the captured block list), so every rank agrees on each probe's
+    (block uid, node); the OWNER is the one rank whose owned range of
+    that block contains the node along the decomposition axis. Owners
+    sample their probes into a device ring buffer exactly like the
+    single-process channel (GPU->GPU per step, no host sync).
+
+    probes.csv is ONE global file, so this is the only output channel
+    with communication — confined to the flush: every remote owner
+    sends its buffered columns (a few KB) to rank 0, which assembles
+    full rows and appends. The flush cadence is rank-invariant (the
+    sampled-step count is global), so the sends/recvs pair up without
+    any barrier; ranks that own no probe never send.
+    """
+
+    def __init__(self, cfg: Dict[str, Any], csv_dir: str,
+                 unit_converter: Any, dim: int,
+                 blocks_meta: List[Dict[str, Any]], rank: int,
+                 n_ranks: int, comm: Any) -> None:
+        """Same contract as PressureProbeManager plus:
+
+        blocks_meta: GLOBAL block list, level-major (entry index == uid),
+            captured by the driver before the replicated build is dropped.
+        rank/n_ranks/comm: this rank, world size, mpi4py communicator
+            (comm may be None when n_ranks == 1).
+        """
+        self._points_in = cfg['points']
+        self._units: str = cfg['units']
+        self.interval: int = cfg['interval']
+        self._flush_every: int = cfg['flush_every']
+        self._uc = unit_converter
+        self._dim = dim
+        self._meta = list(blocks_meta)
+        self._rank = int(rank)
+        self._nr = int(n_ranks)
+        self._comm = comm
+
+        self.csv_path = os.path.join(csv_dir, 'probes.csv')
+        self.meta_path = os.path.join(csv_dir, 'probes_meta.csv')
+
+        dxdt = unit_converter.dx_phys / unit_converter.dt_phys
+        self._p_conv: float = (unit_converter.cs ** 2
+                               * unit_converter.rho_phys * dxdt * dxdt)
+        self._rho0: float = 1.0
+        self.fs_hz: float = 1.0 / (self.interval * unit_converter.dt_phys)
+
+        self._bound = False
+        self._groups: List[Dict[str, Any]] = []
+        self._buf: Optional[Any] = None       # (flush_every, n_mine)
+        self._n_probes = len(self._points_in)
+        self._n_mine = 0
+        self._my_cols: List[int] = []         # probe ids of MY columns
+        self._owner_cols: Dict[int, List[int]] = {}   # rank -> probe ids
+        self._cursor: int = 0
+        self._steps: List[int] = []
+        self._rows_written: int = 0
+
+    # ── public (same surface as PressureProbeManager) ────────────
+    def sample(self, step: int, target: Any) -> None:
+        if step % self.interval != 0:
+            return
+        if not self._bound:
+            self._bind(target, append=(step > 0))
+        row = self._cursor
+        for g in self._groups:
+            self._buf[row, g['cols_b']] = g['view'][g['idx']]
+        self._steps.append(step)
+        self._cursor += 1
+        if self._cursor >= self._flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        """Assemble buffered rows on rank 0 and append to the CSV.
+
+        Pairwise: remote owners send, rank 0 receives in deterministic
+        (rank) order. No collective, no barrier — the cadence is already
+        globally synchronized by construction.
+        """
+        n = self._cursor
+        if n == 0:
+            return
+        mine = None
+        if self._n_mine:
+            v = self._buf[:n]
+            mine = v.get() if hasattr(v, 'get') else np.asarray(v)
+        if self._rank != 0:
+            if self._n_mine:
+                from src.parallel.runner import TAG_PROBE
+                self._comm.send(mine, dest=0,
+                                tag=TAG_PROBE + self._rank)
+        else:
+            vals = np.empty((n, self._n_probes), dtype=np.float64)
+            if mine is not None:
+                vals[:, self._my_cols] = mine
+            from src.parallel.runner import TAG_PROBE
+            for r in sorted(self._owner_cols):
+                if r == 0:
+                    continue
+                arr = self._comm.recv(source=r, tag=TAG_PROBE + r)
+                vals[:, self._owner_cols[r]] = arr
+            p_pa = (vals - self._rho0) * self._p_conv
+            steps = np.asarray(self._steps, dtype=np.float64)
+            t_s = steps * self._uc.dt_phys
+            out = np.column_stack([steps, t_s, p_pa])
+            with open(self.csv_path, 'a') as f:
+                np.savetxt(f, out, delimiter=',',
+                           fmt=['%d', '%.9e'] + ['%.9e'] * self._n_probes)
+            self._rows_written += n
+        self._cursor = 0
+        self._steps = []
+
+    def finalize(self) -> None:
+        if not self._bound:
+            return
+        self.flush()
+        if self._rank == 0:
+            print(f"  Probes: {self._rows_written} rows -> "
+                  f"{self.csv_path} (fs = {self.fs_hz:.1f} Hz)")
+
+    # ── private ──────────────────────────────────────────────────
+    def _bind(self, runner: Any, append: bool) -> None:
+        if runner is None or not hasattr(runner, 'range_table'):
+            raise ValueError(
+                "MPIPressureProbeManager.sample needs the distributed "
+                f"runner as target, got {type(runner).__name__}")
+        uc = self._uc
+        if self._units == 'm':
+            points_lu = [tuple(c / uc.dx_phys for c in p)
+                         for p in self._points_in]
+        else:
+            points_lu = [p for p in self._points_in]
+
+        axis = runner.axis
+        records = []
+        for pid, p in enumerate(points_lu):
+            rec = _locate_point(pid, p, self._meta, self._dim)
+            uid = rec['block']['uid']
+            starts_counts = runner.range_table[uid]
+            owner = next(
+                (r for r, (s, c) in enumerate(starts_counts)
+                 if c > 0 and s <= rec['idx'][axis] < s + c), None)
+            if owner is None:
+                raise RuntimeError(
+                    f"probe {pid}: node {rec['idx']} of block uid {uid} "
+                    "has no owner in the range table")
+            rec['uid'] = uid
+            rec['owner'] = owner
+            records.append(rec)
+            self._owner_cols.setdefault(owner, []).append(pid)
+
+        # ── my device-side groups (one gather per owned block) ──
+        self._my_cols = self._owner_cols.get(self._rank, [])
+        self._n_mine = len(self._my_cols)
+        by_uid: Dict[int, Dict[str, Any]] = {}
+        for buf_col, pid in enumerate(self._my_cols):
+            rec = records[pid]
+            g = by_uid.setdefault(rec['uid'], {'cols_b': [], 'idx_h': []})
+            g['cols_b'].append(buf_col)
+            own_start = runner.range_table[rec['uid']][self._rank][0]
+            idx = list(rec['idx'])
+            idx[axis] -= own_start          # owned-view frame
+            g['idx_h'].append(idx)
+        if self._n_mine:
+            import cupy
+            xp = cupy
+            for uid, g in by_uid.items():
+                L = runner.lv[uid]
+                part = runner.parts[uid]
+                own = part.owned_local()
+                idx_arr = np.asarray(g['idx_h'], dtype=np.int64)
+                self._groups.append({
+                    'view': L.rho[own],
+                    'cols_b': xp.asarray(np.asarray(g['cols_b'],
+                                                    dtype=np.int64)),
+                    'idx': tuple(xp.asarray(idx_arr[:, d])
+                                 for d in range(self._dim)),
+                })
+            self._buf = xp.empty((self._flush_every, self._n_mine),
+                                 dtype=xp.float64)
+
+        if self._rank == 0:
+            _write_meta_csv(self.meta_path, records, self._points_in, uc,
+                            self._dim, self.interval, self.fs_hz,
+                            self._p_conv)
+            if not append or not os.path.exists(self.csv_path):
+                header = 'step,time_s,' + ','.join(
+                    f'p{r["pid"]}_pa' for r in records)
+                with open(self.csv_path, 'w') as f:
+                    f.write(header + '\n')
             for r in records:
-                row = ([str(r['pid']), str(r['level']), r['name']]
-                       + [str(i) for i in r['idx']]
-                       + [f'{c:.6f}' for c in r['snapped_lu']]
-                       + [f'{c * uc.dx_phys:.9e}' for c in r['snapped_lu']]
-                       + [f'{c:.6f}' for c in self._points_in[r['pid']]])
-                f.write(','.join(row) + '\n')
+                pos = ','.join(f'{c:.2f}' for c in r['snapped_lu'])
+                print(f"  Probe {r['pid']}: {r['name']} node {r['idx']} "
+                      f"@ ({pos}) L0-lu  (owner rank {r['owner']})")
+            print(f"  Probe channel: {len(records)} probes, every "
+                  f"{self.interval} step(s), fs = {self.fs_hz:.1f} Hz "
+                  f"-> {self.csv_path}")
+        self._bound = True
