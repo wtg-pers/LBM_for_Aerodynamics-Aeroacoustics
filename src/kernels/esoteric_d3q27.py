@@ -148,6 +148,12 @@ def _wall_decl_src() -> str:
     const int dep_x = wall_mask & 3;
     const int dep_y = wall_mask & 12;
     const int dep_z = wall_mask & 48;
+    // openface (patch 08): EVERY face of a de-periodized axis owns a
+    // mailbox segment -- wall faces = reflection channel, open faces =
+    // INBOUND channel (replaces the severed wrap deposit; written by
+    // the band prescriber / zero for guarded eq-sponge rows).
+    const int dep_faces = (dep_x ? 3 : 0) | (dep_y ? 12 : 0)
+                        | (dep_z ? 48 : 0);
     const long long area_yz = (long long)Ny * Nz;
     const long long area_xz = (long long)Nx * Nz;
     const long long area_xy = (long long)Nx * Ny;
@@ -158,7 +164,7 @@ def _wall_decl_src() -> str:
                                   9*area_xz, 9*area_xy, 9*area_xy};
         for (int fc = 0; fc < 6; fc++) {
             moff[fc] = o;
-            if (wall_mask & (1 << fc)) o += seg[fc];
+            if (dep_faces & (1 << fc)) o += seg[fc];
         }
     }
 '''
@@ -196,12 +202,17 @@ _ESO_WALL_PAIR_TESTS = r'''
         }
         const int wup = fup & wall_mask;
         const int wdn = fdn & wall_mask;
-        long long mi = -1;
-        if (wdn) {
-            // multi-wall corner: ONE full reflection; the lowest face
-            // bit picks the segment (same pick at STORE and LOAD).
-            const int fc = (wdn & 1) ? 0 : (wdn & 2) ? 1 : (wdn & 4) ? 2
-                         : (wdn & 8) ? 3 : (wdn & 16) ? 4 : 5;
+        // openface (patch 08): mi covers ANY dep-face crossing of the
+        // +c_i move -- a wall hit takes priority (ONE full reflection;
+        // lowest wall bit), otherwise the open face's INBOUND slot.
+        // mi_up: the -c_i source crosses an OPEN dep face (wall side is
+        // the wup parity-swap) -> inbound slot for fhn[i]. Same index
+        // arithmetic at STORE/LOAD/gather/scatter keeps them coherent.
+        long long mi = -1, mi_up = -1;
+        if (fdn) {
+            const int pk = wdn ? wdn : fdn;
+            const int fc = (pk & 1) ? 0 : (pk & 2) ? 1 : (pk & 4) ? 2
+                         : (pk & 8) ? 3 : (pk & 16) ? 4 : 5;
             int p9; long long fa, c2;
             if (fc < 2)      { p9 = P9X[p]; fa = area_yz;
                                c2 = iy * (long long)Nz + iz; }
@@ -210,6 +221,19 @@ _ESO_WALL_PAIR_TESTS = r'''
             else             { p9 = P9Z[p]; fa = area_xy;
                                c2 = ix * (long long)Ny + iy; }
             mi = moff[fc] + (long long)p9 * fa + c2;
+        }
+        if (fup & ~wall_mask) {
+            const int ou = fup & ~wall_mask;
+            const int fc = (ou & 1) ? 0 : (ou & 2) ? 1 : (ou & 4) ? 2
+                         : (ou & 8) ? 3 : (ou & 16) ? 4 : 5;
+            int p9; long long fa, c2;
+            if (fc < 2)      { p9 = P9X[p]; fa = area_yz;
+                               c2 = iy * (long long)Nz + iz; }
+            else if (fc < 4) { p9 = P9Y[p]; fa = area_xz;
+                               c2 = ix * (long long)Nz + iz; }
+            else             { p9 = P9Z[p]; fa = area_xy;
+                               c2 = ix * (long long)Ny + iy; }
+            mi_up = moff[fc] + (long long)p9 * fa + c2;
         }
 '''
 
@@ -291,13 +315,15 @@ void esoteric_bgk_d3q27(
 ''' + _ESO_WALL_PAIR_TESTS + r'''
         if (is_odd) {
             fhn[i]   = (nb_up || wup) ? f[(i+1) * N + idx]
-                                      : f[i     * N + idx];
+                     : (mi_up >= 0) ? wall_mail[mi_up]
+                     : f[i     * N + idx];
             fhn[i+1] = (mi >= 0) ? wall_mail[mi]
                      : (nb_dn ? f[i     * N + j_i]
                               : f[(i+1) * N + j_i]);
         } else {
             fhn[i]   = (nb_up || wup) ? f[i     * N + idx]
-                                      : f[(i+1) * N + idx];
+                     : (mi_up >= 0) ? wall_mail[mi_up]
+                     : f[(i+1) * N + idx];
             fhn[i+1] = (mi >= 0) ? wall_mail[mi]
                      : (nb_dn ? f[(i+1) * N + j_i]
                               : f[i     * N + j_i]);
@@ -433,13 +459,16 @@ void esoteric_bgk_d3q27(
         long long nz = (iz + cz[i] + Nz) % Nz;
         long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
 ''' + _ESO_WALL_PAIR_TESTS + r'''
-        if (mi >= 0) wall_mail[mi] = fhn[i];  // wall hit: reflect at self
+        if (wdn) wall_mail[mi] = fhn[i];      // wall: reflect at self
+        // open-face crossing: outgoing exits the domain (dropped); the
+        // inbound slot belongs to the PRESCRIBER (band scatter), never
+        // the kernel.
         if (is_odd) {
-            if (mi < 0 && fdn == 0)
+            if (fdn == 0)
                 f[(i+1) * N + j_i] = fhn[i]; // dir i -> slot i+1 at neighbor
             f[i     * N + idx] = fhn[i+1];   // dir i+1 -> slot i at self
         } else {
-            if (mi < 0 && fdn == 0)
+            if (fdn == 0)
                 f[i     * N + j_i] = fhn[i]; // dir i -> slot i at neighbor
             f[(i+1) * N + idx] = fhn[i+1];   // dir i+1 -> slot i+1 at self
         }
@@ -629,25 +658,41 @@ def eso_seed_solid_bounce_ic(xp, f_mem, node_type, get_dir, t0: int) -> None:
             f_mem[slot_up][up] = f_i[up]
 
 
+def eso_dep_faces(wall_mask: int) -> int:
+    """Face bits of every DE-PERIODIZED axis (both faces of any axis
+    that carries at least one wall bit)."""
+    dep = 0
+    for a in range(3):
+        if wall_mask >> (2 * a) & 3:
+            dep |= 3 << (2 * a)
+    return dep
+
+
 def eso_wall_mail_layout(wall_mask: int, shape):
     """Host mirror of the kernels' face-mailbox layout arithmetic.
 
     Returns ({face_bit: (offset, area, (n1, n2), plane_axes)}, total_size)
-    over the WALL faces of `wall_mask`, with the fixed face order
-    xmin..zmax and uniform (9, area) f32 segments. MUST stay in lockstep
-    with _ESO_WALL_DECL (moff/seg) — the seeding and checkpoint code
-    index the same buffer the kernels do. plane_axes are the two axes
-    spanning the face plane in cell2d order (c2 = a1 * N2 + a2)."""
+    over EVERY face of the de-periodized axes (openface patch 08): wall
+    faces carry the reflection channel, non-wall ("open") faces carry
+    the INBOUND channel that replaces the severed wrap deposit — written
+    by the prescriber (C2F band scatter; zero for eq/sponge rows, whose
+    loads are overwritten anyway), read by the kernels' cross-face LOAD.
+    Fixed face order xmin..zmax, uniform (9, area) f32 segments. MUST
+    stay in lockstep with _ESO_WALL_DECL (moff/seg) — the seeding and
+    checkpoint code index the same buffer the kernels do. plane_axes are
+    the two axes spanning the face plane in cell2d order
+    (c2 = a1 * N2 + a2)."""
     Nx, Ny, Nz = (int(v) for v in shape)
     segs = [9 * Ny * Nz, 9 * Ny * Nz, 9 * Nx * Nz,
             9 * Nx * Nz, 9 * Nx * Ny, 9 * Nx * Ny]
     plane = [(Ny, Nz, (1, 2)), (Ny, Nz, (1, 2)),
              (Nx, Nz, (0, 2)), (Nx, Nz, (0, 2)),
              (Nx, Ny, (0, 1)), (Nx, Ny, (0, 1))]
+    dep = eso_dep_faces(wall_mask)
     out = {}
     off = 0
     for b in range(6):
-        if wall_mask >> b & 1:
+        if dep >> b & 1:
             n1, n2, axes = plane[b]
             out[b] = (off, n1 * n2, (n1, n2), axes)
             off += segs[b]
@@ -742,7 +787,16 @@ def eso_seed_wall_ic(xp, f_mem, wall_mail, wall_mask, get_dir,
                 f_mem[slot_up][row] = f_i          # uniform IC scalar
             else:
                 f_mem[slot_up][row] = f_i[row]
-        # ---- case A: +c_i crosses a wall face -> mailbox at own cell
+        # ---- case A + open-inbound (down side): +c_i crosses a dep
+        # face -> mailbox at own cell. Wall faces get the reflection
+        # value, open faces the IC's inbound population — the seed rule
+        # is the same either way (t0-1 deposit := IC of eso dir i+1).
+        # Kernel corner pick: wall-priority, then lowest bit — mirrored
+        # in the claim rule below.
+        def _picked(bit, crossed_bits):
+            wall_hits = [b for b in crossed_bits if wall_mask >> b & 1]
+            pool = wall_hits if wall_hits else crossed_bits
+            return min(pool) == bit
         f_ip = None
         for a in range(3):
             if c[a] == 0:
@@ -760,15 +814,49 @@ def eso_seed_wall_ic(xp, f_mem, wall_mail, wall_mask, get_dir,
                       or not hasattr(f_ip, "shape"))
             vals = f_ip if scalar else f_ip[tuple(row)]
             seg = wall_mail[off:off + 9 * area].reshape(9, n1, n2)
-            # kernel corner rule: a lower-bit wall face crossed by the
-            # same move claims the shared edge line
             claim = []
             for j2, b2 in enumerate(axes):
                 if c[b2] == 0:
                     continue
                 bit2 = 2 * b2 + (1 if c[b2] > 0 else 0)
-                if bit2 in layout and bit2 < bit:
+                if bit2 in layout and not _picked(bit, [bit, bit2]):
                     claim.append((j2, dims[b2] - 1 if c[b2] > 0 else 0))
+            if not claim:
+                seg[p9][:] = vals
+            else:
+                keep = xp.ones((n1, n2), dtype=bool)
+                for j2, edge in claim:
+                    line = [slice(None), slice(None)]
+                    line[j2] = edge
+                    keep[tuple(line)] = False
+                seg[p9][keep] = vals if scalar else vals[keep]
+        # ---- open-inbound (up side): -c_i crosses an OPEN dep face ->
+        # mi_up slot := IC of eso dir i (the fhn[i] the t0 LOAD reads).
+        # Wall faces on the up side use the parity-swap (case B above).
+        for a in range(3):
+            if c[a] == 0:
+                continue
+            bit = 2 * a + (0 if c[a] > 0 else 1)   # upstream face
+            if bit not in layout or (wall_mask >> bit & 1):
+                continue
+            off, area, (n1, n2), axes = layout[bit]
+            p9 = _AXIS_PAIR_SLOTS[a][p]
+            if f_i is None:
+                f_i = get_dir(_STD_TO_ESO[i])
+            row = [slice(None)] * 3
+            row[a] = 0 if c[a] > 0 else dims[a] - 1
+            scalar = (getattr(f_i, "ndim", 0) == 0
+                      or not hasattr(f_i, "shape"))
+            vals = f_i if scalar else f_i[tuple(row)]
+            seg = wall_mail[off:off + 9 * area].reshape(9, n1, n2)
+            claim = []
+            for j2, b2 in enumerate(axes):
+                if c[b2] == 0:
+                    continue
+                bit2 = 2 * b2 + (0 if c[b2] > 0 else 1)
+                if (bit2 in layout and not (wall_mask >> bit2 & 1)
+                        and bit2 < bit):
+                    claim.append((j2, 0 if c[b2] > 0 else dims[b2] - 1))
             if not claim:
                 seg[p9][:] = vals
             else:
@@ -1114,12 +1202,14 @@ extern "C" __global__ void eso_gather_region(
 """ + loop_pre + """
         if (is_odd) {
             out[o_i]  = wup ? f[(long long)(i + 1) * N + b0]
-                            : f[(long long)i * N + b0];
+                      : (mi_up >= 0) ? wall_mail[mi_up]
+                      : f[(long long)i * N + b0];
             out[o_ip] = (mi >= 0) ? wall_mail[mi]
                       : f[(long long)(i + 1) * N + bs];
         } else {
             out[o_i]  = wup ? f[(long long)i * N + b0]
-                            : f[(long long)(i + 1) * N + b0];
+                      : (mi_up >= 0) ? wall_mail[mi_up]
+                      : f[(long long)(i + 1) * N + b0];
             out[o_ip] = (mi >= 0) ? wall_mail[mi]
                       : f[(long long)i * N + bs];
         }
@@ -1132,14 +1222,23 @@ extern "C" __global__ void eso_scatter_region(
         + tables + head + """
     f[b0] = vals[idx];
 """ + loop_pre + """
+        // prescriber writes BOTH channels: wall reflection placement
+        // AND the open-face INBOUND slots (this is the band prescription
+        // path that used to ride the wrap deposit).
         if (mi >= 0) wall_mail[mi] = vals[o_ip];
+        // o_i placement mirrors the LOAD priority exactly: wall swap
+        // first (a wall-and-open corner reflects, PLAN full-reflection
+        // rule), open inbound second, normal slot last.
+        if (mi_up >= 0 && !wup) wall_mail[mi_up] = vals[o_i];
         if (is_odd) {
-            f[(long long)(wup ? (i + 1) : i) * N + b0] = vals[o_i];
-            if (mi < 0 && fdn == 0)
+            if (wup || mi_up < 0)
+                f[(long long)(wup ? (i + 1) : i) * N + b0] = vals[o_i];
+            if (fdn == 0)
                 f[(long long)(i + 1) * N + bs]  = vals[o_ip];
         } else {
-            f[(long long)(wup ? i : (i + 1)) * N + b0] = vals[o_i];
-            if (mi < 0 && fdn == 0)
+            if (wup || mi_up < 0)
+                f[(long long)(wup ? i : (i + 1)) * N + b0] = vals[o_i];
+            if (fdn == 0)
                 f[(long long)i * N + bs]        = vals[o_ip];
         }
     }
@@ -1160,14 +1259,23 @@ extern "C" __global__ void eso_scatter_region_ns(
     if (nt[b0] == 1) return;
     f[b0] = vals[idx];
 """ + loop_pre + """
+        // prescriber writes BOTH channels: wall reflection placement
+        // AND the open-face INBOUND slots (this is the band prescription
+        // path that used to ride the wrap deposit).
         if (mi >= 0) wall_mail[mi] = vals[o_ip];
+        // o_i placement mirrors the LOAD priority exactly: wall swap
+        // first (a wall-and-open corner reflects, PLAN full-reflection
+        // rule), open inbound second, normal slot last.
+        if (mi_up >= 0 && !wup) wall_mail[mi_up] = vals[o_i];
         if (is_odd) {
-            f[(long long)(wup ? (i + 1) : i) * N + b0] = vals[o_i];
-            if (mi < 0 && fdn == 0)
+            if (wup || mi_up < 0)
+                f[(long long)(wup ? (i + 1) : i) * N + b0] = vals[o_i];
+            if (fdn == 0)
                 f[(long long)(i + 1) * N + bs]  = vals[o_ip];
         } else {
-            f[(long long)(wup ? i : (i + 1)) * N + b0] = vals[o_i];
-            if (mi < 0 && fdn == 0)
+            if (wup || mi_up < 0)
+                f[(long long)(wup ? i : (i + 1)) * N + b0] = vals[o_i];
+            if (fdn == 0)
                 f[(long long)i * N + bs]        = vals[o_ip];
         }
     }
@@ -1401,13 +1509,15 @@ void esoteric_macro_d3q27(
 ''' + _ESO_WALL_PAIR_TESTS + r'''
         if (is_odd) {
             fhn[i]   = (nb_up || wup) ? f[(i+1) * N + idx]
-                                      : f[i     * N + idx];
+                     : (mi_up >= 0) ? wall_mail[mi_up]
+                     : f[i     * N + idx];
             fhn[i+1] = (mi >= 0) ? wall_mail[mi]
                      : (nb_dn ? f[i     * N + j_i]
                               : f[(i+1) * N + j_i]);
         } else {
             fhn[i]   = (nb_up || wup) ? f[i     * N + idx]
-                                      : f[(i+1) * N + idx];
+                     : (mi_up >= 0) ? wall_mail[mi_up]
+                     : f[(i+1) * N + idx];
             fhn[i+1] = (mi >= 0) ? wall_mail[mi]
                      : (nb_dn ? f[(i+1) * N + j_i]
                               : f[i     * N + j_i]);

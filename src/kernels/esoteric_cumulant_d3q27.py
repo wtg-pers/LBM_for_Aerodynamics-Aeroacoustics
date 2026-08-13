@@ -107,13 +107,15 @@ void esoteric_cumulant_d3q27(
 ''' + _ESO_WALL_PAIR_TESTS + r'''
         if (is_odd) {
             fhn[i]   = (nb_up || wup) ? f[(long long)(i+1) * N + idx]
-                                      : f[(long long)i     * N + idx];
+                     : (mi_up >= 0) ? wall_mail[mi_up]
+                     : f[(long long)i     * N + idx];
             fhn[i+1] = (mi >= 0) ? wall_mail[mi]
                      : (nb_dn ? f[(long long)i     * N + j_i]
                               : f[(long long)(i+1) * N + j_i]);
         } else {
             fhn[i]   = (nb_up || wup) ? f[(long long)i     * N + idx]
-                                      : f[(long long)(i+1) * N + idx];
+                     : (mi_up >= 0) ? wall_mail[mi_up]
+                     : f[(long long)(i+1) * N + idx];
             fhn[i+1] = (mi >= 0) ? wall_mail[mi]
                      : (nb_dn ? f[(long long)(i+1) * N + j_i]
                               : f[(long long)i     * N + j_i]);
@@ -398,13 +400,15 @@ void esoteric_cumulant_d3q27(
         long long nz = (iz + cz[i] + Nz) % Nz;
         long long j_i = nx * (long long)Ny * Nz + ny * (long long)Nz + nz;
 ''' + _ESO_WALL_PAIR_TESTS + r'''
-        if (mi >= 0) wall_mail[mi] = fhn[i];  // wall hit: reflect at self
+        if (wdn) wall_mail[mi] = fhn[i];      // wall: reflect at self
+        // open-face crossing: outgoing dropped; inbound slot belongs to
+        // the prescriber (band scatter), never the kernel.
         if (is_odd) {
-            if (mi < 0 && fdn == 0)
+            if (fdn == 0)
                 f[(long long)(i+1) * N + j_i] = fhn[i];
             f[(long long)i     * N + idx] = fhn[i+1];
         } else {
-            if (mi < 0 && fdn == 0)
+            if (fdn == 0)
                 f[(long long)i     * N + j_i] = fhn[i];
             f[(long long)(i+1) * N + idx] = fhn[i+1];
         }
