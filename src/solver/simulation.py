@@ -716,6 +716,7 @@ class Simulation:
                 self._eso_wall_face_q = {
                     b: q for b in range(6)
                     if self._eso_wall_mask >> b & 1}
+                self._check_qface_solid_clearance(node_type, NODE_SOLID)
                 print(f"  [esoteric] q-face wall pass: q={q} on "
                       f"{faces} (reflection plane = global ground)")
 
@@ -820,6 +821,39 @@ class Simulation:
             self._esoteric_is_cumulant = False
         self._use_esoteric = True
 
+
+    def _check_qface_solid_clearance(self, node_type, NODE_SOLID) -> None:
+        """q-face 벽(q != 0.5)과 body 재기록 패스의 합성은 미정의 — solid
+        셀이 q 벽 면의 2행 이내에 있으면 하드에러 (eso_wall/09 캐비앗 2).
+
+        근거: q-pass 는 벽 행의 deposit 을 재기록하고 그 이웃 행의
+        deposit 을 읽는데, solid 가 그 zone 에 있으면 IBB/HWBB 의 body
+        재기록과 같은 주소를 두 패스가 순서 의존적으로 만진다. halfway
+        (q=0.5) 벽은 기존 solid 분기와 합성이 증명돼 있어 무관."""
+        fq = getattr(self, '_eso_wall_face_q', None)
+        if not fq:
+            return
+        for b in fq:
+            a, is_max = b >> 1, b & 1
+            n = node_type.shape[a]
+            rows = [n - 1, n - 2] if is_max else [0, 1]
+            for r in rows:
+                sl = [slice(None)] * 3
+                sl[a] = r
+                row = node_type[tuple(sl)]
+                cnt = int((row == NODE_SOLID).sum())
+                if cnt:
+                    face = ('xmin', 'xmax', 'ymin', 'ymax',
+                            'zmin', 'zmax')[b]
+                    raise NotImplementedError(
+                        f"eso q-face wall '{face}' (q="
+                        f"{fq[b]}): {cnt} solid cell(s) within 2 rows "
+                        "of the wall face — the q-face rewrite and the "
+                        "body deposit-rewrite would touch overlapping "
+                        "addresses (undefined composition). Keep the "
+                        "body >= 2 cells off a flush fine wall "
+                        "(patch_notes/eso_wall/09).")
+
     def init_esoteric_metadata_host(self) -> None:
         """Distributed-init (patch 17 backlog #4): esoteric BC/node metadata
         ONLY, full-size on HOST numpy (~17 B/cell of RAM), zero device field
@@ -876,6 +910,7 @@ class Simulation:
                 self._eso_wall_face_q = {
                     b: q for b in range(6)
                     if self._eso_wall_mask >> b & 1}
+                self._check_qface_solid_clearance(node_type, NODE_SOLID)
         from src.collision.cumulant import CumulantCollision
         if isinstance(self.collision, CumulantCollision):
             self._eso_omega_bulk = float(self.collision.omega_bulk)
