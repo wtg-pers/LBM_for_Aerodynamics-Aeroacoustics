@@ -405,7 +405,8 @@ _ROTOR_DN_D  = 0.25        # 디스크 아래 [D] (ALM Gaussian 지지)
 
 def build_mlg_4level(config, d_lu0, half_xy_mm, l1_half_mm,
                      hover_h_mm=None, overlap_width=2, pad2=2.0,
-                     l1_zmin=2.0, wall_coupling_mode="allow",
+                     l1_zmin=2.0, l2_zmin=None,
+                     wall_coupling_mode="allow",
                      interpolation="cubic", filter_level=1,
                      flip_handedness=False):
     """v2/v3 가 공유하는 4레벨 구성. `config["mlg"]` 를 채우고 정보를 돌려준다.
@@ -449,6 +450,22 @@ def build_mlg_4level(config, d_lu0, half_xy_mm, l1_half_mm,
     r_hi = np.max([[b["x_max"], b["y_max"], b["z_max"]] for b in rotor_boxes], 0)
     l2_lo = np.floor(np.minimum(b_lo, r_lo) - pad2)
     l2_hi = np.ceil(np.maximum(b_hi, r_hi) + pad2)
+    # l2_zmin(v4): L2 를 지면 쪽으로 최대한 내리는 노브 [L0 lu].
+    # 하한은 **부모 내부**다: 두 독립 가드가 지킨다 — ①부모-포함 계약
+    # (setup._mlg_resolve_parent) ②중첩 검증기(validate_block_tree:
+    # 자식 영역이 부모의 C2F 밴드를 침범 금지 — 밴드 행은 L0 가 매 스텝
+    # 처방하므로 F2C 와 충돌). l1_zmin=2, ow=2 기준 하한 = 3(L0 lu) →
+    # L2 영역 z=3 + 자기 밴드(ow x L1셀 = 1 L0 lu) = **도메인 바닥이
+    # 지면 위 2 L0셀**. 완전 지면 flush 는 fine 벽 승계(open-face
+    # mailbox 일반화, eso_wall 이월) 필요. None = 기존 auto(v2/v3 비트
+    # 불변).
+    if l2_zmin is not None:
+        _lo_min = l1_zmin + int(overlap_width) / 2.0   # 부모 내부 하한
+        if l2_zmin < _lo_min:
+            raise ValueError(
+                f"l2_zmin={l2_zmin} < {_lo_min}: 부모(L1) 내부 하한 위반"
+                " — validate_block_tree 가 부모 밴드 침범을 막는다")
+        l2_lo[2] = float(l2_zmin)
 
     # L1: 기체 중심 기준 +-l1_half_mm, 바닥은 지면 위 l1_zmin
     half1 = l1_half_mm * mm2lu
@@ -458,7 +475,12 @@ def build_mlg_4level(config, d_lu0, half_xy_mm, l1_half_mm,
                       float(np.ceil(l2_hi[2] + 5.0))])
 
     ow = int(overlap_width)
-    if not ((l1_lo <= l2_lo - ow).all() and (l1_hi >= l2_hi + ow).all()):
+    chk_lo = l2_lo - ow
+    if l2_zmin is not None:
+        # 지면 적층: z 하한 컨테인먼트는 영역이 아니라 L1 도메인(밴드
+        # 포함 z>=0)이 담보 — z 성분만 L1 영역 하한으로 면제.
+        chk_lo[2] = max(chk_lo[2], l1_lo[2])
+    if not ((l1_lo <= chk_lo).all() and (l1_hi >= l2_hi + ow).all()):
         raise ValueError(
             f"L1 {l1_lo}..{l1_hi} 이 L2 {l2_lo}..{l2_hi} + 밴드({ow})를 담지 "
             f"못한다 — l1_half_mm 을 키우거나 hover 높이를 확인할 것")

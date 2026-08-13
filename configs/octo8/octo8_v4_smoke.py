@@ -19,13 +19,16 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _octo8_hover_base import (  # noqa: E402
-    build_config, build_mlg_4level, mlg_report)
+    build_config, build_mlg_4level, mlg_report,
+    ground_cad_mm, _BBOX_CTR_MM)
 
 RPM = 4000.0
 HOVER_H_MM = 900.0            # v4=450. dx 2배 -> 지면 여유를 lu 로 보존
 D_LU_0 = 10                   # v4 본 런 = 20. 여기만 다르다.
-HALF_XY_MM = 7000.0
-L1_HALF_MM = 5000.0
+CD_MM = 3822.0                # 버티포트 구역 치수 = v4 그대로
+PD_MM = 2622.72
+HALF_XY_MM = 2.6 * CD_MM / 2  # SA
+L1_HALF_MM = 2.0 * PD_MM / 2  # FATO
 N_RADIAL = 48
 N_REV = 1
 
@@ -40,6 +43,7 @@ config = build_config(rpm=RPM, n_rev=N_REV, n_radial=N_RADIAL,
 _info = build_mlg_4level(config, d_lu0=D_LU_0, half_xy_mm=HALF_XY_MM,
                          l1_half_mm=L1_HALF_MM, hover_h_mm=HOVER_H_MM,
                          overlap_width=2, pad2=2.0, l1_zmin=2.0,
+                         l2_zmin=3.0,             # ★ L2 지면 근접 = v4
                          wall_coupling_mode="allow",
                          flip_handedness=True)    # ★ 블록 이름 일치
 
@@ -64,6 +68,28 @@ config["output"]["planes"] = [
      "fields": ["p", "u"], "interval": 1}
     for name, ax, mm in _PLANES_MM
 ]
+
+# ★ v4 probe 22점 그대로 (지면 마이크 링, mm 사양 — 해상도에 자동 추종)
+_PROBES_MM = [
+    (-4530,     0), (-918,  4530), (0,  4530), (+918,  4530),
+    ( 4530,     0), (-918, -4530), (0, -4530), (+918, -4530),
+    ( -918,  2620), (0,  2620), (+918,  2620), ( 2620,     0),
+    ( -918, -2620), (0, -2620), (+918, -2620), (-2620,     0),
+    ( -918,  1310), (0,  1310), (+918,  1310),
+    ( +918, -1310), (0, -1310), (-918, -1310),
+]
+_PROBE_Z_MM = 126.0
+
+def _probe_lu(x_mm, y_mm):
+    cad = (x_mm + _BBOX_CTR_MM[0], y_mm,
+           ground_cad_mm(HOVER_H_MM) + _PROBE_Z_MM)
+    return [float(_info["origin"][d] + cad[d] * _info["mm2lu"])
+            for d in range(3)]
+
+config["output"]["probes"] = {
+    "points": [_probe_lu(x, y) for x, y in _PROBES_MM],
+    "units": "lu", "interval": 1, "flush_every": 200,
+}
 
 _tag = "result_octo8_v4_smoke"
 config["output"]["output_dir"] = "./%s/vtk" % _tag
