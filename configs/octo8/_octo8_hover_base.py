@@ -190,13 +190,26 @@ _LAYOUT = [
 ]
 
 
+def _layout(flip_handedness=False):
+    """로터 배치. flip_handedness=True 면 8기 전부 반대 방향(cw<->ccw).
+
+    이름 접미사가 핸디드니스를 인코딩하므로 이름도 함께 뒤집는다
+    (f1_ccw -> f1_cw). 위치·행 구조는 불변 — 방향 실험(v4)의 단일 노브.
+    """
+    if not flip_handedness:
+        return _LAYOUT
+    flip = {"cw": "ccw", "ccw": "cw"}
+    return [(name.rsplit("_", 1)[0] + "_" + flip[hand], x, y, flip[hand])
+            for name, x, y, hand in _LAYOUT]
+
+
 # =============================================================================
 # S3. CONFIG BUILDER
 # =============================================================================
 def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                  vtk_deg=30.0, vtk_fields_last_rev=5, wall_bc="ibb",
                  d_lu=None, half_xy_mm=None, side_bc="sponge", theta0=None,
-                 hover_h_mm=None):
+                 hover_h_mm=None, flip_handedness=False):
     """Octo-8 hover config.
 
     rpm                : 공칭 회전수(부호 없는 크기; 방향은 _LAYOUT이 결정)
@@ -221,6 +234,9 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
                          20셀 안에서 벽 제트를 **강제 감쇠**시켜 재려는 양을
                          훼손한다. 대가는 무반사성 상실이므로, 음향이 목적이 되면
                          다시 sponge(또는 무반사 BC)로 돌아와야 한다.
+    flip_handedness    : True 면 8기 전부 회전방향 반전(cw<->ccw, 이름 포함).
+                         위치는 불변. build_mlg_4level 에도 같은 값을 줄 것
+                         (로터 블록 이름 일치).
 
     d_lu=None, half_xy_mm=None 이면 모듈 상수를 그대로 써서 기존 config 들이
     비트 단위로 움직이지 않는다.
@@ -337,7 +353,8 @@ def build_config(rpm=5000.0, n_rev=40, n_radial=32,
 
     actuator_line = {
         "enabled": True,
-        "rotors": [_rotor_entry(i, *row) for i, row in enumerate(_LAYOUT)],
+        "rotors": [_rotor_entry(i, *row)
+                   for i, row in enumerate(_layout(flip_handedness))],
         "gaussian_cutoff": 3.0, "rho_ref": 1.0, "coeff_mode": "rotorcraft",
         "ramp_steps": STEPS_REV,
         "prandtl_loss": False,                       # 단일로터 캠페인 판정=notl
@@ -389,7 +406,8 @@ _ROTOR_DN_D  = 0.25        # 디스크 아래 [D] (ALM Gaussian 지지)
 def build_mlg_4level(config, d_lu0, half_xy_mm, l1_half_mm,
                      hover_h_mm=None, overlap_width=2, pad2=2.0,
                      l1_zmin=2.0, wall_coupling_mode="allow",
-                     interpolation="cubic", filter_level=1):
+                     interpolation="cubic", filter_level=1,
+                     flip_handedness=False):
     """v2/v3 가 공유하는 4레벨 구성. `config["mlg"]` 를 채우고 정보를 돌려준다.
 
         L0 D/d_lu0     far field          (도메인 전체)
@@ -417,7 +435,7 @@ def build_mlg_4level(config, d_lu0, half_xy_mm, l1_half_mm,
     up, dn = _ROTOR_UP_D * d_lu0, _ROTOR_DN_D * d_lu0
     rz = float(_lu([0.0, 0.0, ROTOR_Z_MM])[2])
     rotor_boxes = []
-    for name, x_mm, y_mm, _hand in _LAYOUT:
+    for name, x_mm, y_mm, _hand in _layout(flip_handedness):
         h = _lu([x_mm, y_mm, ROTOR_Z_MM])
         rotor_boxes.append({
             "name": name,
