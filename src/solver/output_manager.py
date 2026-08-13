@@ -894,6 +894,13 @@ class OutputManager:
                         _sfx = "" if _per[_b.level] <= 1 else f"_b{_b.index}"
                         extra[f'f_level_{_b.level}{_sfx}'] = \
                             self._f_checkpoint_cpu(_b.sim)
+                        # open-face track: a flush fine wall's mailbox is
+                        # per-level state — same key rule as f_level_*.
+                        if getattr(_b.sim, '_eso_wall_mask', 0):
+                            extra[f'wall_mask_L{_b.level}{_sfx}'] = \
+                                int(_b.sim._eso_wall_mask)
+                            extra[f'wall_mail_L{_b.level}{_sfx}'] = \
+                                _b.sim._eso_wall_mail
                 for k in ([] if _blks is not None else range(1, sim.num_levels)):
                     # Host-immediate per level: keeps the GPU transient bounded to ONE
                     # level's gather instead of retaining every level's physical copy

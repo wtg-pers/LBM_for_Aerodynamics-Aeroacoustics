@@ -181,6 +181,15 @@ class Simulation:
         self._eso_wall_mask: int = 0
         self._eso_wall_mail: Optional['npt.NDArray'] = None
         self._eso_from_checkpoint: bool = False   # set_distribution flag
+        # open-face track (eso_wall/08-09): band faces = coupling faces
+        # the MLG builder declares on fine sims (allowed opposite a wall
+        # on a de-periodized axis — the C2F scatter prescribes their
+        # inbound mailbox each substep). q scale = 0.5 * 2^level: the
+        # Bouzidi q that puts a FLUSH fine wall's reflection plane on
+        # the global ground (-0.5 dx0). 0.5 = halfway (L0; pass off).
+        self._eso_band_faces: int = 0
+        self._eso_wall_q_scale: float = 0.5
+        self._eso_wall_face_q: Optional[dict] = None
 
         # ── WALE pre-pass kernels (lazy init for sgs_model="wale") ──
         # The WALE eddy-viscosity needs u globally before collision so the
@@ -694,6 +703,21 @@ class Simulation:
                 if self._eso_wall_mask >> b & 1)
             print(f"  [esoteric] implicit domain wall {faces}: "
                   f"face mailbox {total * 4 / 1e6:.1f} MB")
+            # q-face pass (open-face track): a flush FINE wall needs
+            # Bouzidi q = 0.5*2^k to land on the global ground plane.
+            q = float(getattr(self, '_eso_wall_q_scale', 0.5))
+            if abs(q - 0.5) > 1e-12:
+                if not (0.5 < q <= 1.0):
+                    raise NotImplementedError(
+                        f"eso flush wall q={q}: only 0.5 < q <= 1.0 "
+                        "(one-hop Bouzidi, flush L1) is wired — a "
+                        "flush L2+ wall needs the 2-hop family "
+                        "(patch_notes/eso_wall/09, C option)")
+                self._eso_wall_face_q = {
+                    b: q for b in range(6)
+                    if self._eso_wall_mask >> b & 1}
+                print(f"  [esoteric] q-face wall pass: q={q} on "
+                      f"{faces} (reflection plane = global ground)")
 
         if not self._esoteric_f_already_set and not self._eso_from_checkpoint:
             # fresh IC only. Checkpoint restore skips BOTH seeders:
@@ -837,6 +861,21 @@ class Simulation:
         self._eso_bc_ux = bc_ux.ravel()
         self._eso_bc_uy = bc_uy.ravel()
         self._eso_bc_uz = bc_uz.ravel()
+        # q-face pass metadata (open-face track): the dist-init path
+        # must carry the SAME face-q dict the full init builds, or a
+        # flush fine wall silently runs halfway (-0.25 plane) under
+        # --dist-init only — the exact silent-divergence class patch 05
+        # caught on the replicated path.
+        if self._eso_wall_mask:
+            q = float(getattr(self, '_eso_wall_q_scale', 0.5))
+            if abs(q - 0.5) > 1e-12:
+                if not (0.5 < q <= 1.0):
+                    raise NotImplementedError(
+                        f"eso flush wall q={q}: only 0.5 < q <= 1.0 is "
+                        "wired (patch_notes/eso_wall/09, C option)")
+                self._eso_wall_face_q = {
+                    b: q for b in range(6)
+                    if self._eso_wall_mask >> b & 1}
         from src.collision.cumulant import CumulantCollision
         if isinstance(self.collision, CumulantCollision):
             self._eso_omega_bulk = float(self.collision.omega_bulk)
@@ -977,18 +1016,19 @@ class Simulation:
                             "— passthrough would consume stale "
                             "de-periodized slots. Use eq or sponge "
                             "there (patch_notes/eso_wall/PLAN.md)")
-                    if meth is None and not (sponge_bits >> b & 1):
+                    if (meth is None and not (sponge_bits >> b & 1)
+                            and not (getattr(self, '_eso_band_faces', 0)
+                                     >> b & 1)):
                         raise ValueError(
                             f"eso domain wall: face '{_FNAME[b]}' has "
                             "no BC opposite a wall on the same axis — "
                             "the axis is de-periodized, so the face "
-                            "needs a wall, eq, or sponge BC. On an MLG "
-                            "fine level this usually means the fine "
-                            "region sits FLUSH on a wall face (the "
-                            "wall was inherited, the opposite face is "
-                            "a coupling band) — keep the region off "
-                            "the wall (l1_zmin >= overlap_width). "
-                            "(patch_notes/eso_wall/PLAN.md)")
+                            "needs a wall, eq, sponge, or a DECLARED "
+                            "coupling-band face (_eso_band_faces, set "
+                            "by the MLG builder for flush fine walls; "
+                            "its inbound mailbox is prescribed by the "
+                            "C2F scatter each substep). "
+                            "(patch_notes/eso_wall/08-09)")
 
         for sb in getattr(self.bc_manager, 'sponge_layers', []):
             loc = getattr(getattr(sb, 'location', None), 'value', '')
@@ -1129,6 +1169,15 @@ class Simulation:
                 wall_mask=self._eso_wall_mask,
                 wall_mail=self._eso_wall_mail,
             )
+        # q-face wall pass (open-face track): rewrite the flush wall's
+        # halfway deposits with Bouzidi(q) — must precede any gather of
+        # this memory (same contract as the IBB rewrite below).
+        if self._eso_wall_face_q:
+            from src.kernels.esoteric_d3q27 import eso_wall_q_rewrite
+            eso_wall_q_rewrite(
+                self.xp, self.f, self._eso_wall_mail,
+                self._eso_wall_mask, self._eso_wall_face_q,
+                self._esoteric_step)
         # IBB (S5): overwrite toward-solid deposits of the step just run
         # with Bouzidi values (2-phase pass; parity = this step's index).
         if self._eso_ibb is not None:

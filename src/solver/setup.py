@@ -2228,10 +2228,11 @@ class SimulationSetup:
             if fc.method in _WALLS:
                 shift = 0.5 * (1.0 - blk.spacing)
                 print(f"    Level {blk.level} '{blk.name}': {loc} wall "
-                      f"(hwbb) — wall plane at -{0.5 * blk.spacing:g} L0 lu"
-                      f", {shift:g} L0 lu above the L0 wall plane "
-                      f"(half-cell convention; exact-plane face BC is the "
-                      f"registered follow-up)")
+                      f"(hwbb) — halfway plane at -{0.5 * blk.spacing:g} "
+                      f"L0 lu, {shift:g} L0 lu above the L0 wall plane. "
+                      f"STD path keeps this offset; the ESO path corrects "
+                      f"it to the exact global plane (q-face pass, "
+                      f"eso_wall/09)")
         return out
 
     def _build_mlg_simulation_3d(self) -> "MultiLevelGrid":
@@ -2387,10 +2388,24 @@ class SimulationSetup:
                 obstacle_bc=fine_obstacle_bc,
                 al_model=fine_al_k,
                 sgs_cfg=self._sgs_cfg,
-                # see sim_0: converts loudly; fine masks are rejected by
-                # the initializer's root-only wall guard.
+                # see sim_0: converts loudly. A FLUSH fine wall is
+                # legal since the open-face track (eso_wall/08-09):
+                # its band faces are declared below and its q-face pass
+                # puts the reflection plane on the global ground.
                 eso_wall_implicit_ok=True,
             )
+            # open-face declarations (eso_wall/09): coupling-band faces
+            # (= non-flush faces) may sit opposite an inherited wall on
+            # a de-periodized axis; q = 0.5*2^k for flush wall faces.
+            _FB = {'x_min': 0, 'x_max': 1, 'y_min': 2, 'y_max': 3,
+                   'z_min': 4, 'z_max': 5}
+            _flush = (getattr(_blk.region, 'flush_faces', {}) or {}) \
+                if _blk.region is not None else {}
+            sim_k._eso_band_faces = 0
+            for _fname, _bit in _FB.items():
+                if not _flush.get(_fname, False):
+                    sim_k._eso_band_faces |= 1 << _bit
+            sim_k._eso_wall_q_scale = 0.5 * (2 ** k)
             simulations.append(sim_k)
             _blk.sim = sim_k
             self._attach_coupling_skip(sim_k, fine_mask_k, level=k,

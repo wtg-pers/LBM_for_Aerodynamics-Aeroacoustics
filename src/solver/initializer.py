@@ -61,7 +61,6 @@ class SolverInitializer:
                 start_step = self._restart_mlg(sim, args)
             else:
                 start_step = self._initialize_mlg(sim)
-            self._check_mlg_wall_masks(sim)
         else:
             f, start_step = self._create_distribution(args)
 
@@ -247,34 +246,7 @@ class SolverInitializer:
         print(f"  Loaded step {completed_step}, resuming from step {start_step}")
         return f, start_step
 
-    def _check_mlg_wall_masks(self, mlg) -> None:
-        """eso implicit walls on MLG: ROOT level only (eso_wall patch 04).
-
-        A fine sim with a wall mask means one of its faces sits FLUSH on
-        an implicit wall face (flush-face BC inheritance converted it).
-        Its coupling band on that axis would need the wrap slots the
-        de-periodization severs — the open-face mailbox generalization
-        is pending. A hard error beats a silently EQ-degraded fine wall
-        under a real L0 wall (mixed semantics within one hierarchy).
-        octo8 keeps fine bottoms overlap_width off the ground by design
-        (l1_zmin), so only L0 carries the wall there.
-        """
-        if hasattr(mlg, 'iter_blocks'):
-            fine = [(b.level, getattr(b, 'label', f'L{b.level}'), b.sim)
-                    for b in mlg.iter_blocks() if b.level > 0]
-        else:
-            fine = [(k, f'L{k}', mlg.get_level(k))
-                    for k in range(1, mlg.num_levels)]
-        for lvl, label, s in fine:
-            if getattr(s, '_eso_wall_mask', 0):
-                raise NotImplementedError(
-                    f"eso domain wall on fine level {lvl} ({label}): a "
-                    "fine block flush on an implicit wall face is not "
-                    "supported — keep the fine region off the wall so "
-                    "the wall stays on L0 (octo8: l1_zmin = "
-                    "overlap_width). patch_notes/eso_wall/PLAN.md §4-5")
-
-    def _restore_wall_mail(self, sim, state) -> None:
+    def _restore_wall_mail(self, sim, state, key_base: str = 'L0') -> None:
         """eso domain-wall mailbox restore + series-consistency guard.
 
         The mailbox is checkpoint state OUTSIDE the 27N f slots
@@ -286,7 +258,7 @@ class SolverInitializer:
         mask = getattr(sim, '_eso_wall_mask', 0)
         if state is None:
             return
-        mail = state.get('wall_mail_L0')
+        mail = state.get(f'wall_mail_{key_base}')
         if mask and mail is None:
             raise RuntimeError(
                 "restart: this config has eso implicit domain walls but "
@@ -302,7 +274,7 @@ class SolverInitializer:
                 "fresh series (patch_notes/eso_wall/PLAN.md §2-4)")
         if not mask:
             return
-        ck_mask = int(state.get('wall_mask_L0', 0))
+        ck_mask = int(state.get(f'wall_mask_{key_base}', 0))
         if ck_mask and ck_mask != mask:
             raise RuntimeError(
                 f"restart: wall faces changed mid-series (checkpoint "
@@ -561,10 +533,9 @@ class SolverInitializer:
         _l0 = mlg.get_level(0)
         _restore(_l0, state['f'], "Level 0")
         _l0.step_count = start_step
-        # eso implicit-wall mailbox (extra_wall_mail_L0) + series-
-        # consistency guard — root level only (fine walls rejected by
-        # _check_mlg_wall_masks). Replicated: device inject; dist-init:
-        # host stash for the slab restore (both inside the helper).
+        # eso implicit-wall mailbox (extra_wall_mail_L*) + series-
+        # consistency guard. Replicated: device inject; dist-init: host
+        # stash for the slab restore (both inside the helper).
         self._restore_wall_mail(_l0, state)
 
         # ── Restore fine levels ──────────────────────────────────
@@ -597,6 +568,10 @@ class SolverInitializer:
                     "Restart with the same block layout / level count the "
                     "checkpoint was written with.")
             _restore(level_sim, state[key], f"Level {k}")
+            # open-face track: flush fine wall mailbox, per-level keys
+            # (key = 'f_level_{k}{sfx}' -> wall keys 'L{k}{sfx}')
+            self._restore_wall_mail(level_sim, state,
+                                    key_base='L' + key[len('f_level_'):])
 
         # ── ALM: fast-forward rotor kinematics (restart bug fix) ──
         # theta/time/_step_count previously reset to 0 on restart, which

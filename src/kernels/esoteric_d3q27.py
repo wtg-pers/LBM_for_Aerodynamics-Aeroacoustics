@@ -1119,6 +1119,166 @@ def eso_mem_force(xp, f_mem, node_type_flat, t_next: int, clip_bounds):
     return xp.asnumpy(out)
 
 
+# ============================================================
+# q-fraction face wall pass (open-face track Part 2, eso_wall/09).
+# A flush FINE level's halfway wall sits at node0 - 0.5*dx_k — a
+# per-level plane offset vs the global ground at -0.5*dx_0. Bouzidi
+# linear with q = 0.5*dx_0/dx_k (= 0.5*2^k in level-k cells) puts the
+# reflection plane exactly on the global ground. Same architecture as
+# the body IBB (S5): the fused kernel keeps its implicit halfway
+# deposit, and this sparse post-pass REWRITES the deposit with the
+# Bouzidi combination before the next LOAD consumes it.
+#   q >= 1/2 family (all we need; q = 0.5*2^k >= 0.5):
+#       val = 1/(2q) * f*_d(x) + (2q-1)/(2q) * f*_dbar(x)
+#   both reads are completed-step deposits at x or x + c (pair axis).
+#   q == 0.5 -> identity (halfway; pass skipped). q > 1 -> hard error
+#   (L2+ flush needs a 2-hop family — the registered C-option slot).
+# Deposit addresses (completed parity t_done, pair (i, i+1)):
+#   partner i+1 -> SELF,     slot = i   if t_done odd else i+1
+#   canonical i -> NEIGHBOR, slot = i+1 if t_done odd else i
+#   case A (canonical toward wall): d-deposit lives in wall_mail[mi].
+# Claim rule mirrors the kernels: a link crossing several wall faces
+# belongs to the lowest wall bit — only that face's pass touches it.
+# ============================================================
+
+_QFACE_KERNEL_CACHE = {}
+
+
+def _qface_kernel_source():
+    cxp = [CX_ESO[2 * p + 1] for p in range(13)]
+    cyp = [CY_ESO[2 * p + 1] for p in range(13)]
+    czp = [CZ_ESO[2 * p + 1] for p in range(13)]
+    px, py, pz = _AXIS_PAIR_SLOTS
+    fmt = lambda a: ", ".join(str(int(v)) for v in a)
+    return f"""
+extern "C" __global__ void eso_wall_q_face(
+    float* __restrict__ f,
+    float* __restrict__ wall_mail,
+    const int Nx, const int Ny, const int Nz,
+    const int t_odd,           // parity of the COMPLETED step
+    const int wall_mask,
+    const int face,            // 0..5, this pass's wall face
+    const float qa,            // 1/(2q)
+    const float qb,            // (2q-1)/(2q)
+    const long long seg_off)   // this face's mailbox segment offset
+{{
+    const int CXP[13] = {{{fmt(cxp)}}};
+    const int CYP[13] = {{{fmt(cyp)}}};
+    const int CZP[13] = {{{fmt(czp)}}};
+    const int P9X[13] = {{{fmt(px)}}};
+    const int P9Y[13] = {{{fmt(py)}}};
+    const int P9Z[13] = {{{fmt(pz)}}};
+    const int ax = face >> 1;              // 0=x 1=y 2=z
+    const int is_max = face & 1;
+    const int n1 = (ax == 0) ? Ny : Nx;
+    const int n2 = (ax == 2) ? Ny : Nz;
+    long long pidx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long M = (long long)n1 * n2;
+    if (pidx >= M) return;
+    const int a1 = (int)(pidx / n2);
+    const int a2 = (int)(pidx % n2);
+    int co[3];
+    co[ax] = is_max ? ((ax == 0 ? Nx : (ax == 1 ? Ny : Nz)) - 1) : 0;
+    if (ax == 0)      {{ co[1] = a1; co[2] = a2; }}
+    else if (ax == 1) {{ co[0] = a1; co[2] = a2; }}
+    else              {{ co[0] = a1; co[1] = a2; }}
+    const long long N = (long long)Nx * Ny * Nz;
+    const long long b0 = ((long long)co[0] * Ny + co[1]) * Nz + co[2];
+    const long long fa = M;                // this face's per-slot area
+    for (int p = 0; p < 13; p++) {{
+        int c[3];
+        c[0] = CXP[p]; c[1] = CYP[p]; c[2] = CZP[p];
+        if (c[ax] == 0) continue;
+        const int i = 2 * p + 1;
+        // canonical-toward-wall (case A) iff c[ax] points OUT this face
+        const int caseA = (is_max ? (c[ax] > 0) : (c[ax] < 0));
+        // wall faces crossed by the toward-wall move (claim set):
+        // case A -> the canonical move +c; case B -> the partner -c.
+        const int sx = caseA ? c[0] : -c[0];
+        const int sy = caseA ? c[1] : -c[1];
+        const int sz = caseA ? c[2] : -c[2];
+        int crossed = 0;
+        if (sx > 0 && co[0] == Nx - 1) crossed |= 2;
+        if (sx < 0 && co[0] == 0)      crossed |= 1;
+        if (sy > 0 && co[1] == Ny - 1) crossed |= 8;
+        if (sy < 0 && co[1] == 0)      crossed |= 4;
+        if (sz > 0 && co[2] == Nz - 1) crossed |= 32;
+        if (sz < 0 && co[2] == 0)      crossed |= 16;
+        const int cw = crossed & wall_mask;
+        if (cw == 0) continue;
+        const int pick = (cw & 1) ? 0 : (cw & 2) ? 1 : (cw & 4) ? 2
+                       : (cw & 8) ? 3 : (cw & 16) ? 4 : 5;
+        if (pick != face) continue;        // claimed by another wall
+        // partner-at-self slot (holds fhn[i+1] of the completed step)
+        const int slot_self = t_odd ? i : (i + 1);
+        // canonical-at-neighbor slot (holds fhn[i] of the completed step)
+        const int slot_nb = t_odd ? (i + 1) : i;
+        if (caseA) {{
+            const int p9 = (ax == 0) ? P9X[p] : (ax == 1) ? P9Y[p] : P9Z[p];
+            const long long mi = seg_off + (long long)p9 * fa + pidx;
+            const float d_dep = wall_mail[mi];
+            const float dbar = f[(long long)slot_self * N + b0];
+            wall_mail[mi] = qa * d_dep + qb * dbar;
+        }} else {{
+            int nb[3];
+            nb[0] = (co[0] + c[0] + Nx) % Nx;
+            nb[1] = (co[1] + c[1] + Ny) % Ny;
+            nb[2] = (co[2] + c[2] + Nz) % Nz;
+            const long long jb =
+                ((long long)nb[0] * Ny + nb[1]) * Nz + nb[2];
+            const float d_dep = f[(long long)slot_self * N + b0];
+            const float dbar = f[(long long)slot_nb * N + jb];
+            f[(long long)slot_self * N + b0] = qa * d_dep + qb * dbar;
+        }}
+    }}
+}}
+"""
+
+
+def eso_wall_q_rewrite(xp, f_mem, wall_mail, wall_mask: int, face_q,
+                       t_done: int) -> None:
+    """Rewrite the completed step's wall deposits with Bouzidi(q).
+
+    face_q: {face_bit: q} for wall faces needing q != 0.5. q must be in
+    (0.5, 1.0] — q > 1 (an L2+ flush wall) needs the 2-hop family and is
+    rejected loudly (open-face track C option). Call AFTER the fused
+    kernel of step t_done and BEFORE any gather/halo of this memory
+    (same ordering contract as the body-IBB rewrite).
+    """
+    import numpy as _np
+    todo = {b: float(q) for b, q in (face_q or {}).items()
+            if abs(float(q) - 0.5) > 1e-12}
+    if not todo:
+        return
+    for b, q in todo.items():
+        if not (0.5 < q <= 1.0):
+            raise NotImplementedError(
+                f"eso q-face wall: face bit {b} needs q={q} — only "
+                "0.5 < q <= 1.0 (one-hop Bouzidi) is wired; q > 1 "
+                "(flush L2+) needs the 2-hop family "
+                "(patch_notes/eso_wall/09, C option)")
+        if not (wall_mask >> b & 1):
+            raise ValueError(f"q-face {b} is not a wall face "
+                             f"(mask {wall_mask:#04x})")
+    if "k" not in _QFACE_KERNEL_CACHE:
+        src = _qface_kernel_source()
+        assert all(ord(ch) < 128 for ch in src)
+        _QFACE_KERNEL_CACHE["k"] = xp.RawKernel(src, "eso_wall_q_face")
+    ker = _QFACE_KERNEL_CACHE["k"]
+    Nx, Ny, Nz = f_mem.shape[1:]
+    lay, _tot = eso_wall_mail_layout(wall_mask, (Nx, Ny, Nz))
+    bs = 256
+    for b, q in sorted(todo.items()):
+        off, area, (n1, n2), _axes = lay[b]
+        qa = 1.0 / (2.0 * q)
+        qb = (2.0 * q - 1.0) / (2.0 * q)
+        ker(((area + bs - 1) // bs,), (bs,),
+            (f_mem, wall_mail, _np.int32(Nx), _np.int32(Ny), _np.int32(Nz),
+             _np.int32(int(t_done) & 1), _np.int32(wall_mask),
+             _np.int32(b), _np.float32(qa), _np.float32(qb),
+             _np.int64(off)))
+
+
 _REGION_KERNEL_CACHE = {}
 
 # Region-kernel twin of _ESO_WALL_PAIR_TESTS: same tests over the pair

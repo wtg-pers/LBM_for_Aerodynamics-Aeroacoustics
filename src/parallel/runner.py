@@ -261,11 +261,16 @@ class DistributedMLGRunner:
         # freed: the VTK gather is collective, so whether a block has an
         # eddy-viscosity channel may not depend on who owns it.
         self.has_nut: List[bool] = []
+        # per-block wall masks, read off the replicated build like has_nut:
+        # the ckpt mailbox gather is collective, so every rank (owner or
+        # not) must agree on which blocks carry wall state.
+        self.wall_masks: List[int] = []
         for uid, b in enumerate(src):
             lev = b.sim
             self.has_nut.append(
                 str((getattr(lev, "_sgs_cfg", None) or {}).get("model", "off"))
                 == "dyn_smag")
+            self.wall_masks.append(int(getattr(lev, '_eso_wall_mask', 0)))
             if self.owns[uid]:
                 ld = extract_level(lev, self.parts[uid])
                 self.lv.append(LocalLevel(

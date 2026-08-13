@@ -487,9 +487,10 @@ def build_mlg_4level(config, d_lu0, half_xy_mm, l1_half_mm,
     if not (l1_lo[0] >= ow and l1_hi[0] <= n[0] - 1 - ow):
         raise ValueError(
             "L1 이 도메인 면에 닿는다 — fine 레벨은 도메인 BC 가 없다")
-    if l1_lo[2] < ow:
+    if 0 < l1_lo[2] < ow:
         raise ValueError(
-            f"l1_zmin={l1_zmin} < overlap_width={ow}: 바닥 밴드가 안 잡힌다")
+            f"l1_zmin={l1_zmin} in (0, overlap_width={ow}): 바닥 밴드가 안 "
+            "잡힌다 — 0(지면 flush, 벽 승계 + q-face) 또는 >= ow(밴드-온-월)")
 
     def _box(name, lo, hi):
         return {"name": name,

@@ -115,6 +115,7 @@ def extract_level(lev, part=None) -> dict:
         wall_mask=getattr(lev, '_eso_wall_mask', 0),
         wall_mail=getattr(lev, '_eso_wall_mail', None),
         wall_mail_host=getattr(lev, '_dist_restart_wall_mail', None),
+        wall_face_q=getattr(lev, '_eso_wall_face_q', None),
     )
 
 
@@ -305,6 +306,7 @@ class LocalLevel:
                     "eso wall: dist-init restart without a checkpoint "
                     "mailbox (wall_mail_host) — the initializer's "
                     "series guard should have rejected this earlier")
+        self.wall_face_q = ld.get("wall_face_q")
         self.b_r = wrap_slice(ld["bc_rho"], part).ravel().copy()
         self.b_x = wrap_slice(ld["bc_ux"], part).ravel().copy()
         self.b_y = wrap_slice(ld["bc_uy"], part).ravel().copy()
@@ -408,4 +410,10 @@ class LocalLevel:
                             omega_5=self.w345[2], lambda_lim=self.lam,
                             wall_mask=self.wall_mask,
                             wall_mail=self.wall_mail, **kw)
+        if self.wall_face_q:
+            # q-face wall pass: same ordering contract as the IBB
+            # rewrite (before any halo post / coupling gather).
+            from src.kernels.esoteric_d3q27 import eso_wall_q_rewrite
+            eso_wall_q_rewrite(cp, self.mem, self.wall_mail,
+                               self.wall_mask, self.wall_face_q, self.t)
         self.t += 1

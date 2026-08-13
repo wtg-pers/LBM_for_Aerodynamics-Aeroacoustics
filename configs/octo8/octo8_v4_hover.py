@@ -115,8 +115,9 @@ config = build_config(rpm=RPM, n_rev=N_REV, n_radial=N_RADIAL,
 
 _info = build_mlg_4level(config, d_lu0=D_LU_0, half_xy_mm=HALF_XY_MM,
                          l1_half_mm=L1_HALF_MM, hover_h_mm=HOVER_H_MM,
-                         overlap_width=2, pad2=2.0, l1_zmin=2.0,
-                         l2_zmin=3.0,   # ★ L2 최저 허용(지면 위 2 L0셀=45.7mm)
+                         overlap_width=2, pad2=2.0,
+                         l1_zmin=0.0,   # ★ L1 지면 flush (벽 승계+q=1 face)
+                         l2_zmin=1.0,   # ★ L2 밴드 바닥 = 지면 위 0.5 L0셀(11.4mm)
                          wall_coupling_mode="allow",   # v3 과 동일 근거
                          flip_handedness=True)         # 블록 이름 일치
 
