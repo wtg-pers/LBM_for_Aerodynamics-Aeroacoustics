@@ -108,6 +108,13 @@ def extract_level(lev, part=None) -> dict:
         bc_ux=lev._eso_bc_ux.reshape(shape),
         bc_uy=lev._eso_bc_uy.reshape(shape),
         bc_uz=lev._eso_bc_uz.reshape(shape),
+        # eso implicit domain wall (§4-5b): mask + full-domain mailbox
+        # (device on the replicated path — fresh-seeded or restored;
+        # host via _dist_restart_wall_mail on a dist-init restart, the
+        # initializer's stash). LocalLevel wrap-slices its slab.
+        wall_mask=getattr(lev, '_eso_wall_mask', 0),
+        wall_mail=getattr(lev, '_eso_wall_mail', None),
+        wall_mail_host=getattr(lev, '_dist_restart_wall_mail', None),
     )
 
 
@@ -261,6 +268,43 @@ class LocalLevel:
                 get_dir = lambda q: float(ld["feq27"][q].ravel()[0])
             eso_seed_solid_bounce_ic(
                 cp, self.mem, self.nt.reshape(self.dims), get_dir, t0)
+        # ── eso implicit domain wall (§4-5b): slab-local mailbox ──
+        # Wall axes are undecomposed (runner guard), so the mailbox is
+        # cell-local state: slice it exactly like node_type (own+ghost,
+        # wrapped) and never exchange it — a ghost cell recomputes the
+        # same round trip from the same halo-synced f as its owner.
+        self.wall_mask = int(ld.get("wall_mask", 0))
+        self.wall_mail = None
+        if self.wall_mask:
+            from src.kernels.esoteric_d3q27 import (
+                eso_wall_mail_layout, eso_wall_mail_slab, eso_seed_wall_ic)
+            src_mail = ld.get("wall_mail")
+            if src_mail is None:
+                src_mail = ld.get("wall_mail_host")
+            gdims = tuple(ld["shape"])
+            if src_mail is not None:
+                lo = part.own_start - part.ghost
+                idx = cp.asarray(
+                    (np.arange(lo, lo + part.local_shape[part.axis])
+                     % gdims[part.axis]))
+                self.wall_mail = eso_wall_mail_slab(
+                    cp, cp.asarray(src_mail, dtype=cp.float32),
+                    self.wall_mask, gdims, part.axis, idx, self.dims)
+            elif t0 == 0:
+                # dist-init FRESH (uniform IC): seed the slab mailbox
+                # (case A) and the case-B swap slots — identical values
+                # to the roll-identity the uniform scatter already left,
+                # so the mem writes are idempotent.
+                _, tot = eso_wall_mail_layout(self.wall_mask, self.dims)
+                self.wall_mail = cp.zeros(tot, cp.float32)
+                eso_seed_wall_ic(
+                    cp, self.mem, self.wall_mail, self.wall_mask,
+                    lambda q: float(ld["feq27"][q].ravel()[0]), t0)
+            else:
+                raise RuntimeError(
+                    "eso wall: dist-init restart without a checkpoint "
+                    "mailbox (wall_mail_host) — the initializer's "
+                    "series guard should have rejected this earlier")
         self.b_r = wrap_slice(ld["bc_rho"], part).ravel().copy()
         self.b_x = wrap_slice(ld["bc_ux"], part).ravel().copy()
         self.b_y = wrap_slice(ld["bc_uy"], part).ravel().copy()
@@ -288,11 +332,17 @@ class LocalLevel:
             self.nut_in = cp.empty(n, cp.float32)
             self.nut = cp.zeros(n, cp.float32)
 
+    @property
+    def wall_args(self) -> dict:
+        """Slab-local implicit-wall view args for region gather/scatter."""
+        return {'wall_mask': self.wall_mask, 'wall_mail': self.wall_mail}
+
     def macro_pre_pass(self) -> None:
         """LOAD-only rho/u into self.rho/self.u (ALM sampling input)."""
         nx, ny, nz = self.dims
         self.mk.launch(self.mem, self.nt, self.rho.ravel(),
-                       self.u.reshape(3, -1), nx, ny, nz, self.t)
+                       self.u.reshape(3, -1), nx, ny, nz, self.t,
+                       wall_mask=self.wall_mask, wall_mail=self.wall_mail)
 
     def _sgs_mask_solid_u(self) -> None:
         """No-slip the SGS input u at SOLID cells (patch 12 F1e — same
@@ -331,7 +381,9 @@ class LocalLevel:
         kw = {}
         if self.sgs["model"] == "dyn_smag":
             self.mk.launch(self.mem, self.nt, self.rho_b, self.u_b,
-                           nx, ny, nz, self.t)
+                           nx, ny, nz, self.t,
+                           wall_mask=self.wall_mask,
+                           wall_mail=self.wall_mail)
             self._sgs_mask_solid_u()
             self.dk.launch(self.u_b[0], self.u_b[1], self.u_b[2],
                            self.nut_in, nx, ny, nz, dx=1.0,
@@ -343,7 +395,9 @@ class LocalLevel:
             self.ker.launch(self.mem, self.rho, self.u, self.nt, self.b_r,
                             self.b_x, self.b_y, self.b_z,
                             self.omega, nx, ny, nz,
-                            t_step=self.t, force=force, **kw)
+                            t_step=self.t, force=force,
+                            wall_mask=self.wall_mask,
+                            wall_mail=self.wall_mail, **kw)
         else:
             self.ker.launch(self.mem, self.rho, self.u, self.nt, self.b_r,
                             self.b_x, self.b_y, self.b_z,
@@ -351,5 +405,7 @@ class LocalLevel:
                             t_step=self.t, force=force,
                             Cs=float(self.sgs.get("Cs", 0.0)),
                             omega_3=self.w345[0], omega_4=self.w345[1],
-                            omega_5=self.w345[2], lambda_lim=self.lam, **kw)
+                            omega_5=self.w345[2], lambda_lim=self.lam,
+                            wall_mask=self.wall_mask,
+                            wall_mail=self.wall_mail, **kw)
         self.t += 1

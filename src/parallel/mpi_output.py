@@ -419,6 +419,32 @@ class MPIOutputManager(OutputManager):
                 cp.get_default_memory_pool().free_all_blocks()
             except Exception:
                 pass
+        # eso implicit-wall mailbox (L0-only until fine walls exist;
+        # eso_wall §4-5b): cell-local state OUTSIDE the f slots. Gather
+        # each rank's OWNED strips (collective — must run on every rank)
+        # and assemble the global buffer on rank 0 under the SAME npz
+        # keys as the single-GPU writer, so either reader restarts
+        # either file.
+        wall_mask = int(getattr(r.lv[0], 'wall_mask', 0)) \
+            if r.owns[0] else 0
+        wall_strips = None
+        if include_extra and wall_mask:
+            import cupy as cp
+            from src.kernels.esoteric_d3q27 import eso_wall_mail_layout
+            p0 = r.parts[0]
+            lay_l, _ = eso_wall_mail_layout(wall_mask,
+                                            tuple(p0.local_shape))
+            own_sl = slice(p0.ghost, p0.ghost + p0.own_count)
+            strips = {}
+            for bit, (off, area, (l1, l2), axes) in lay_l.items():
+                seg = r.lv[0].wall_mail[off:off + 9 * area] \
+                    .reshape(9, l1, l2)
+                sl = [slice(None)] * 3
+                sl[1 + axes.index(r.axis)] = own_sl
+                strips[bit] = cp.asnumpy(seg[tuple(sl)])
+            wall_strips = comm.gather(strips, root=0) if comm is not None \
+                else [strips]
+
         # Restore reads f only, so checkpoint rho/u are informational — but
         # "informational" is not a licence to differ from the single path.
         rho_c, u_c = self._gather_l0_macros()
@@ -442,6 +468,27 @@ class MPIOutputManager(OutputManager):
                     continue
                 sfx = "" if per[b.level] <= 1 else f"_b{b.index}"
                 extra[f"f_level_{b.level}{sfx}"] = f_blocks[uid]
+            if wall_mask:
+                import numpy as _np
+                from src.kernels.esoteric_d3q27 import eso_wall_mail_layout
+                p0 = r.parts[0]
+                g_dims = list(p0.local_shape)
+                g_dims[r.axis] = sum(c for _s, c in r.range_table[0])
+                lay_g, tot_g = eso_wall_mail_layout(wall_mask,
+                                                    tuple(g_dims))
+                gm = _np.zeros(tot_g, _np.float32)
+                for rk, st in enumerate(wall_strips):
+                    s0, cnt = r.range_table[0][rk]
+                    if cnt == 0 or not st:
+                        continue
+                    for bit, arr in st.items():
+                        off, area, (g1, g2), axes = lay_g[bit]
+                        seg = gm[off:off + 9 * area].reshape(9, g1, g2)
+                        sl = [slice(None)] * 3
+                        sl[1 + axes.index(r.axis)] = slice(s0, s0 + cnt)
+                        seg[tuple(sl)] = arr
+                extra["wall_mask_L0"] = wall_mask
+                extra["wall_mail_L0"] = gm
         return {'f': f_blocks[0], 'extra': extra,
                 'rho': rho_c, 'u': u_c}
 

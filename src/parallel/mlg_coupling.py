@@ -104,18 +104,24 @@ class RankLocalCouplingV1:
 
     # =================================================================
     def c2f(self, mem_c, mem_f, t_c: int, t_f: int, *, is_half_step: bool,
-            f_prev_sub_loc=None, nt_f=None) -> None:
+            f_prev_sub_loc=None, nt_f=None,
+            wall_c=None, wall_f=None) -> None:
         """Rank-local coarse->fine: strips ∩ owned-fine written in place.
 
         nt_f: fine slab node-type (raveled int8) — coupling writes carry
         FOREIGN values, which at SOLID cells land on live bounce-deposit
-        slots (patch 12); pass it so those entries are skipped."""
+        slots (patch 12); pass it so those entries are skipped.
+        wall_c/wall_f: slab-local implicit-wall view args of the coarse/
+        fine LocalLevel (eso_wall §4-5b) — gathers/scatters at wall rows
+        must go through the swap-slot/mailbox LOAD view, exactly as the
+        single-GPU MLG coupling does since patch 04."""
         if self._pf.own_count == 0:
             return
         gc, xp, a = self._gc, self._xp, self._a
+        wc, wf = (wall_c or {}), (wall_f or {})
         rng = self.coarse_block_range()
         region_loc = self.coarse_block_region_local()
-        f_sub = esoteric_gather_std_region(xp, mem_c, t_c, region_loc)
+        f_sub = esoteric_gather_std_region(xp, mem_c, t_c, region_loc, **wc)
 
         # temporal interp + f_eq/f_neq rescale (same primitives as coupling.py)
         if gc._fused_rescale is not None:
@@ -178,16 +184,19 @@ class RankLocalCouplingV1:
             dst = list(strip)
             dst[a] = slice(self._l_f(lo), self._l_f(hi))
             esoteric_scatter_std_region(xp, mem_f, vals, t_f, tuple(dst),
-                                        skip_solid_nt=nt_f)
+                                        skip_solid_nt=nt_f, **wf)
 
     # =================================================================
-    def f2c(self, mem_f, mem_c, t_f: int, t_c: int, nt_c=None) -> None:
+    def f2c(self, mem_f, mem_c, t_f: int, t_c: int, nt_c=None,
+            wall_c=None, wall_f=None) -> None:
         """Rank-local fine->coarse: excised ∩ owned-coarse written in place.
 
         nt_c: coarse slab node-type — the excised region contains the body
         on coarse levels; without the skip the restriction's solid-cell
-        values overwrite live bounce deposits (patch 12 root cause)."""
+        values overwrite live bounce deposits (patch 12 root cause).
+        wall_c/wall_f: see c2f (eso_wall §4-5b)."""
         gc, xp, a = self._gc, self._xp, self._a
+        wc, wf = (wall_c or {}), (wall_f or {})
         r = gc._region
         R = r.REFINE_RATIO
         ex = gc.excised_spatial_slices                    # global coarse
@@ -205,7 +214,8 @@ class RankLocalCouplingV1:
         g0 = 2 * (rr_lo - self._box_lo)
         g1 = 2 * (rr_hi - 1 - self._box_lo) + 1
         f_at[a] = slice(self._l_f(g0), self._l_f(g0) + (g1 - g0), R)
-        f_fine_at = esoteric_gather_std_region(xp, mem_f, t_f, tuple(f_at))
+        f_fine_at = esoteric_gather_std_region(xp, mem_f, t_f, tuple(f_at),
+                                               **wf)
 
         # same fused feq/fneq primitive as GridCoupling.fine_to_coarse —
         # the decomposition MUST share the production op or the two sides
@@ -222,4 +232,4 @@ class RankLocalCouplingV1:
         dst = list(ex)
         dst[a] = slice(self._l_c(w_lo), self._l_c(w_hi))
         esoteric_scatter_std_region(xp, mem_c, block, t_c, tuple(dst),
-                                    skip_solid_nt=nt_c)
+                                    skip_solid_nt=nt_c, **wc)

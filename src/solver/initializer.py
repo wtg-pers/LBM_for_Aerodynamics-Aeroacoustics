@@ -307,6 +307,24 @@ class SolverInitializer:
             raise RuntimeError(
                 f"restart: wall faces changed mid-series (checkpoint "
                 f"mask {ck_mask:#04x} vs config {mask:#04x})")
+        if getattr(sim, '_eso_wall_mail', None) is None:
+            # dist-init metadata path: no device allocation exists —
+            # validate against the layout and STASH the host array;
+            # extract_level hands it to LocalLevel, which wrap-slices
+            # its slab (eso_wall §4-5b).
+            import numpy as _np
+            from src.kernels.esoteric_d3q27 import eso_wall_mail_layout
+            _, tot = eso_wall_mail_layout(mask, tuple(sim.domain_shape))
+            arr = _np.asarray(mail, dtype=_np.float32).ravel()
+            if arr.size != tot:
+                raise RuntimeError(
+                    f"restart: wall mailbox size mismatch (checkpoint "
+                    f"{arr.size} vs layout {tot}) — grid or wall "
+                    "layout changed mid-series")
+            sim._dist_restart_wall_mail = arr
+            print(f"  [esoteric] wall mailbox staged for slab restore "
+                  f"({arr.size * 4 / 1e6:.1f} MB)")
+            return
         arr = sim.xp.asarray(mail, dtype=sim.xp.float32).ravel()
         if arr.shape != sim._eso_wall_mail.shape:
             raise RuntimeError(
@@ -543,11 +561,11 @@ class SolverInitializer:
         _l0 = mlg.get_level(0)
         _restore(_l0, state['f'], "Level 0")
         _l0.step_count = start_step
-        if not dist:
-            # eso implicit-wall mailbox (extra_wall_mail_L0) + series-
-            # consistency guard — root level only (fine walls rejected
-            # by _check_mlg_wall_masks).
-            self._restore_wall_mail(_l0, state)
+        # eso implicit-wall mailbox (extra_wall_mail_L0) + series-
+        # consistency guard — root level only (fine walls rejected by
+        # _check_mlg_wall_masks). Replicated: device inject; dist-init:
+        # host stash for the slab restore (both inside the helper).
+        self._restore_wall_mail(_l0, state)
 
         # ── Restore fine levels ──────────────────────────────────
         _blks = list(mlg.iter_blocks()) if hasattr(mlg, 'iter_blocks') else None

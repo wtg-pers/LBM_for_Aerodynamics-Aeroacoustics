@@ -237,15 +237,21 @@ def derive_block_ranges(blocks, axis: int, bounds: Sequence[int]) -> List[List[
     return out
 
 
-def choose_axis_balanced(level_shapes, pair_boxes, n_ranks, ghost=3):
+def choose_axis_balanced(level_shapes, pair_boxes, n_ranks, ghost=3,
+                         exclude_axes=()):
     """Axis + balanced bounds minimizing the worst-rank update share.
 
     The runner's production rule (M5). Falls back across axes: infeasible
     axes (cuts can't fit inside the innermost span) are rejected. Ties break
     to _AUTO_ORDER (halo-contiguity descending x, y, z).
-    """
+
+    exclude_axes: axes never considered — the runner passes the eso
+    implicit-wall axes (decomposing a wall axis puts the halo wrap where
+    the de-periodization severed traffic; hard-unsupported)."""
     best = None
     for ax in _AUTO_ORDER:
+        if ax in exclude_axes:
+            continue
         try:
             bounds = balance_cuts(level_shapes, pair_boxes, ax,
                                   n_ranks, ghost)
@@ -413,10 +419,14 @@ def tree_loads(blocks, axis: int, bounds: Sequence[int]) -> List[float]:
 
 
 def choose_axis_balanced_tree(blocks, n_ranks: int, ghost: int = 3,
-                              keep_whole=()):
-    """(axis, bounds) minimizing the worst-rank update share for a tree."""
+                              keep_whole=(), exclude_axes=()):
+    """(axis, bounds) minimizing the worst-rank update share for a tree.
+
+    exclude_axes: see choose_axis_balanced (eso implicit-wall axes)."""
     best = None
     for ax in _AUTO_ORDER:
+        if ax in exclude_axes:
+            continue
         try:
             bounds = balance_cuts_tree(blocks, ax, n_ranks, ghost, keep_whole)
         except ValueError:

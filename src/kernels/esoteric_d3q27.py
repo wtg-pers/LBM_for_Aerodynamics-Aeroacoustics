@@ -654,6 +654,39 @@ def eso_wall_mail_layout(wall_mask: int, shape):
     return out, off
 
 
+def eso_wall_mail_slab(xp, wall_mail, wall_mask, global_dims, part_axis,
+                       idx, local_dims):
+    """Slab-local mailbox sliced from a full-domain mailbox (MPI runner).
+
+    The wall axes are UNDECOMPOSED (the runner hard-errors otherwise), so
+    every wall-face plane contains the partition axis; slicing each
+    (9, n1, n2) face segment along that plane axis with the wrapped local
+    index array `idx` (own+ghost rows, same semantics as wrap_slice)
+    yields the slab's mailbox in the slab-local layout. Ghost entries are
+    consistent mirrors: a ghost cell computes the same mailbox round trip
+    from the same halo-synced f state as its owner, so no exchange is
+    ever needed (cell-local reflections).
+
+    wall_mail may be a device or host array; returns the xp of `idx`.
+    """
+    layout_g, tot_g = eso_wall_mail_layout(wall_mask, global_dims)
+    layout_l, tot_l = eso_wall_mail_layout(wall_mask, local_dims)
+    out = xp.empty(tot_l, dtype=xp.float32)
+    for bit, (off_g, area_g, (g1, g2), axes) in layout_g.items():
+        if part_axis not in axes:
+            raise ValueError(
+                f"eso_wall_mail_slab: partition axis {part_axis} is a "
+                f"wall axis of face bit {bit} — the runner must have "
+                "rejected this decomposition")
+        pos = axes.index(part_axis)                # 0 -> n1, 1 -> n2
+        seg_g = wall_mail[off_g:off_g + 9 * area_g].reshape(9, g1, g2)
+        seg_g = xp.asarray(seg_g)
+        off_l, area_l, (l1, l2), _ = layout_l[bit]
+        sliced = xp.take(seg_g, idx, axis=1 + pos)
+        out[off_l:off_l + 9 * area_l] = sliced.reshape(-1)
+    return out
+
+
 def eso_seed_wall_ic(xp, f_mem, wall_mail, wall_mask, get_dir,
                      t0: int) -> None:
     """Seed the implicit domain-wall state for a FRESH-IC memory build.

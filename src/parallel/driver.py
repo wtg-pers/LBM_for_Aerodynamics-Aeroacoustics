@@ -177,16 +177,6 @@ def _collect_solid_masks(mlg_obj):
 def _run(args, MPI):
     import numpy as np
 
-    # eso implicit domain walls are NOT wired into the distributed
-    # runner yet (LocalLevel passes no wall_mask/mailbox — PLAN §4-5b).
-    # The replicated build shares the MLG builders with the single-GPU
-    # path, which opted walls in at §4-5a; without this, an hwbb-face
-    # config builds FLUID wall rows whose mask the runner ignores —
-    # a silent PERIODIC leak through the ground, worse than the EQ
-    # degradation (caught by a 2-rank probe, eso_wall/05). Force the
-    # loud legacy degradation until §4-5b lands.
-    os.environ["LBM_ESO_WALL_DEGRADE"] = "1"
-
     # unified step semantics (C8): 0-based EXCLUSIVE range, exactly like
     # the single-GPU loop. --max-steps absolute > --extend relative >
     # config time.max_steps. --steps N is a deprecated alias of

@@ -347,12 +347,28 @@ class DistributedMLGRunner:
         from src.parallel.partition import (
             choose_axis_balanced, balance_cuts,
             choose_axis_balanced_tree, balance_cuts_tree)
+        # eso implicit domain walls (eso_wall §4-5b): a wall axis must not
+        # be the decomposition axis — the slab kernel's local wrap + halo
+        # exchange would reconnect exactly the traffic the wall's
+        # de-periodization severs. Wall faces live on the ROOT level only
+        # (fine walls are rejected at init). Auto selection skips wall
+        # axes; an explicit choice is a hard error (a 24^3 probe showed
+        # auto picking z on a z-wall case — patch 05).
+        wall_mask = getattr(src[0].sim, '_eso_wall_mask', 0)
+        wall_axes = tuple(a for a in range(3) if wall_mask >> (2 * a) & 3)
+        if axis is not None and int(axis) in wall_axes:
+            raise ValueError(
+                f"--axis {AXIS_NAME[int(axis)]} is an eso implicit-wall "
+                f"axis (wall_mask={wall_mask:#04x}) — decomposing along "
+                "a wall axis is unsupported; pick another axis "
+                "(patch_notes/eso_wall/PLAN.md §2-6)")
         if self.multiblock:
             keep = tuple(b.uid for b in src
                          if getattr(b.sim, "al_model", None) is not None) \
                 if self.cut_policy == "aligned" else ()
             if axis is None:
-                return choose_axis_balanced_tree(src, n_ranks, ghost, keep)
+                return choose_axis_balanced_tree(src, n_ranks, ghost, keep,
+                                                 exclude_axes=wall_axes)
             axis = int(axis)
             return axis, balance_cuts_tree(src, axis, n_ranks, ghost, keep)
         boxes = []
@@ -362,7 +378,8 @@ class DistributedMLGRunner:
                           (fdc.y_start, fdc.y_end),
                           (fdc.z_start, fdc.z_end)))
         if axis is None:
-            return choose_axis_balanced(shapes, boxes, n_ranks, ghost)
+            return choose_axis_balanced(shapes, boxes, n_ranks, ghost,
+                                        exclude_axes=wall_axes)
         axis = int(axis)
         return axis, balance_cuts(shapes, boxes, axis, n_ranks, ghost)
 
@@ -416,8 +433,11 @@ class DistributedMLGRunner:
         t0 = self._tic()
         uid, puid = child.uid, child.parent.uid
         reg = self.rlc[uid].coarse_block_region_local()
+        P = self.lv[puid]
         self._fprev[uid] = (esoteric_gather_std_region(
-            cp, self.lv[puid].mem, self.lv[puid].t, reg) if reg else None)
+            cp, P.mem, P.t, reg,
+            wall_mask=P.wall_mask, wall_mail=P.wall_mail)
+            if reg else None)
         self._toc("fprev", t0)
 
     def _advance_level(self, uid: int) -> None:
@@ -498,7 +518,9 @@ class DistributedMLGRunner:
                                   is_half_step=is_half,
                                   f_prev_sub_loc=(self._fprev[uid] if is_half
                                                   else None),
-                                  nt_f=self.lv[uid].nt_c2f)
+                                  nt_f=self.lv[uid].nt_c2f,
+                                  wall_c=self.lv[puid].wall_args,
+                                  wall_f=self.lv[uid].wall_args)
                 self._toc("coupling", t0)
                 self._touch(uid)      # c2f wrote our strips
             for g in b.children:
@@ -509,7 +531,9 @@ class DistributedMLGRunner:
             t0 = self._tic()
             self.rlc[uid].f2c(self.lv[uid].mem, self.lv[puid].mem,
                               self.lv[uid].t, self.lv[puid].t,
-                              nt_c=self.lv[puid].nt_f2c)
+                              nt_c=self.lv[puid].nt_f2c,
+                              wall_c=self.lv[puid].wall_args,
+                              wall_f=self.lv[uid].wall_args)
             self._toc("coupling", t0)
         if p_mine:
             self._touch(puid)         # f2c wrote the coarse excised rows
