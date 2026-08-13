@@ -180,6 +180,7 @@ class Simulation:
         self._eso_wall_implicit_ok: bool = eso_wall_implicit_ok
         self._eso_wall_mask: int = 0
         self._eso_wall_mail: Optional['npt.NDArray'] = None
+        self._eso_from_checkpoint: bool = False   # set_distribution flag
 
         # ── WALE pre-pass kernels (lazy init for sgs_model="wale") ──
         # The WALE eddy-viscosity needs u globally before collision so the
@@ -201,8 +202,19 @@ class Simulation:
     # Public Interface
     # =====================================================================
 
-    def set_distribution(self, f: 'npt.NDArray') -> None:
+    def set_distribution(self, f: 'npt.NDArray',
+                         from_checkpoint: bool = False) -> None:
         """Set distribution function and allocate work buffer.
+
+        from_checkpoint: f is a restored checkpoint state, NOT a fresh
+        IC. The esoteric init must then skip BOTH IC seeders (solid
+        bounce + domain wall): scattering the checkpointed std f at
+        parity 0 already reproduces every bounce/wall read bit-exactly
+        (gather/scatter LOAD-view fidelity), and seeding would overwrite
+        the true deposits with IC-rule values — the exact failure mode
+        the eso_seed_solid_bounce_ic docstring warns about (the single-
+        grid restart path used to call it anyway; fixed with the wall
+        track's §4-3).
 
         This is the bridge between Initialization and Execution:
         after calling this, advance() can be called.
@@ -219,6 +231,7 @@ class Simulation:
         """
         self.f = f
         self._is_ready = True
+        self._eso_from_checkpoint = bool(from_checkpoint)
 
         # ── Esoteric Pull (opt-in: env LBM_ESOTERIC=1, BGK D3Q27, GPU) ──
         # Single-buffer in-place streaming+collision+BC. NO _f_post buffer
@@ -479,16 +492,21 @@ class Simulation:
         """
         if self._use_esoteric and self.f is not None:
             if self._eso_wall_mask:
-                # The std gather has no slots for the wall mailbox and
-                # would emit stale wrap values at every wall row — a
-                # checkpoint written from it restarts silently wrong.
-                # npz extra key lands with PLAN step 4-3
-                # (patch_notes/eso_wall).
+                # Tripwire, NOT the checkpoint path: checkpoints stream
+                # the region gather (OutputManager._f_checkpoint_cpu) +
+                # the wall_mail_L0 extra key, which round-trips walls
+                # bit-exactly. This property's std image is only a LOAD-
+                # view bijection — wall-row cross entries carry stale /
+                # relocated reflection payload, NOT physical populations
+                # — so any consumer doing physics with it (forces, f
+                # export, coupling) would be silently wrong at walls.
+                # No such consumer exists for single-grid wall cases;
+                # keep it loud.
                 raise RuntimeError(
-                    "physical_f with eso implicit domain walls: not "
-                    "representable until the mailbox checkpoint key "
-                    "(patch_notes/eso_wall/PLAN.md sec 4-3). Disable "
-                    "checkpoints for wall cases meanwhile.")
+                    "physical_f with eso implicit domain walls: the std "
+                    "gather image is not physically meaningful at wall "
+                    "rows (checkpoints use the region gather + "
+                    "wall_mail key instead; patch_notes/eso_wall §4-3)")
             from src.kernels.esoteric_d3q27 import esoteric_gather_std
             return esoteric_gather_std(self.xp, self.f, self._esoteric_step)
         return self.f
@@ -655,22 +673,20 @@ class Simulation:
 
         if self._eso_wall_mask:
             if self._esoteric_f_already_set:
+                # MLG/dist restore hands over RAW esoteric memory — that
+                # path has no mailbox hand-off wiring (walls are single-
+                # grid-only until PLAN §4-5·6), so this must stay
+                # unreachable rather than run silently mailbox-less.
                 raise RuntimeError(
-                    "eso domain wall + checkpoint restore: the wall "
-                    "mailbox is state OUTSIDE the 27N f slots, so a "
-                    "restored f alone cannot reproduce the wall bounce. "
-                    "Save/restore (npz extra key) lands with PLAN "
-                    "step 4-3 (patch_notes/eso_wall); until then a wall "
-                    "series cannot restart.")
+                    "eso domain wall + raw-memory restore path: mailbox "
+                    "hand-off is only wired for the single-grid "
+                    "checkpoint restart (patch_notes/eso_wall §4-3)")
             # (9, face_area) f32 segment per wall face, fixed face order
-            # xmin..zmax — matches the in-kernel offset arithmetic.
-            # Zero mailbox = "no incoming from the wall at t0"; exact IC
-            # seeding (PLAN sec 2-3) lands with step 4-3 — until then a
-            # non-uniform IC carries a one-step near-wall transient.
-            seg = [9 * Ny * Nz, 9 * Ny * Nz, 9 * Nx * Nz,
-                   9 * Nx * Nz, 9 * Nx * Ny, 9 * Nx * Ny]
-            total = sum(seg[b] for b in range(6)
-                        if self._eso_wall_mask >> b & 1)
+            # xmin..zmax — eso_wall_mail_layout mirrors the in-kernel
+            # offset arithmetic (single source for seeding/checkpoint).
+            from src.kernels.esoteric_d3q27 import eso_wall_mail_layout
+            _, total = eso_wall_mail_layout(self._eso_wall_mask,
+                                            (Nx, Ny, Nz))
             self._eso_wall_mail = xp.zeros(total, dtype=xp.float32)
             faces = '+'.join(
                 n for b, n in enumerate(
@@ -679,12 +695,25 @@ class Simulation:
             print(f"  [esoteric] implicit domain wall {faces}: "
                   f"face mailbox {total * 4 / 1e6:.1f} MB")
 
-        if not self._esoteric_f_already_set:
-            # fresh IC only: seed the implicit-HWBB bounce slots. Restore
-            # (f already esoteric memory) keeps the checkpointed deposits.
+        if not self._esoteric_f_already_set and not self._eso_from_checkpoint:
+            # fresh IC only. Checkpoint restore skips BOTH seeders:
+            # scattering the checkpointed std f at parity 0 already
+            # reproduces every bounce/wall read bit-exactly (LOAD-view
+            # fidelity of the gather/scatter bijection; the in-flight
+            # wall reflection rides the wrapped row's std entries, the
+            # mailbox is restored separately). Seeding on restore would
+            # overwrite true deposits with IC-rule values — the exact
+            # corruption the solid seeder's docstring forbids (the
+            # single-grid restart path used to do it; eso_wall §4-3).
             eso_seed_solid_bounce_ic(
                 xp, self.f.reshape((27,) + self.domain_shape), node_type,
                 lambda q: f[q], 0)
+            if self._eso_wall_mask:
+                from src.kernels.esoteric_d3q27 import eso_seed_wall_ic
+                eso_seed_wall_ic(
+                    xp, self.f.reshape((27,) + self.domain_shape),
+                    self._eso_wall_mail, self._eso_wall_mask,
+                    lambda q: f[q], 0)
 
         self._eso_node_type = node_type.ravel()
         self._eso_bc_rho = bc_rho.ravel()

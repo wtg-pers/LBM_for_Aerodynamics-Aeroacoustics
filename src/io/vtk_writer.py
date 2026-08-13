@@ -217,9 +217,26 @@ class VTKWriter:
         
         # Collect data arrays: (name, vtk_type, num_components, data_bytes)
         data_arrays = []
-        
+
+        # Solid cells -> seeded rest state, in the lu frame, BEFORE unit
+        # conversion — the SAME convention as the MLG writer / MPI gather
+        # / plane channel (output-channel parity track). Without it the
+        # esoteric path emits path-dependent allocation garbage at solid
+        # cells (the kernel never writes rho/u there), which breaks any
+        # bit-parity comparison (eso_wall_restart_gate R3) and hands
+        # ParaView's colour bar the body.
+        mask_bool = None
+        if solid_mask is not None:
+            mask_bool = self._to_numpy(solid_mask).astype(bool)
+            if not mask_bool.any():
+                mask_bool = None
+
         if rho is not None:
-            name, rho_np = self._units_convert('density', self._to_numpy(rho))
+            rho_in = self._to_numpy(rho)
+            if mask_bool is not None:
+                rho_in = rho_in.copy()
+                rho_in[mask_bool] = 1.0
+            name, rho_np = self._units_convert('density', rho_in)
             rho_np = rho_np.astype(self.dtype)
 
             # Expand 2D to 3D if needed
@@ -233,7 +250,11 @@ class VTKWriter:
             # Pressure: p = ρ * c_s² = ρ / 3
 
         if u is not None:
-            name, u_np = self._units_convert('velocity', self._to_numpy(u))
+            u_in = self._to_numpy(u)
+            if mask_bool is not None:
+                u_in = u_in.copy()
+                u_in[:, mask_bool] = 0.0
+            name, u_np = self._units_convert('velocity', u_in)
             u_np = u_np.astype(self.dtype)
 
             # Expand 2D to 3D if needed

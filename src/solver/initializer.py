@@ -77,8 +77,14 @@ class SolverInitializer:
 
         # ── Step 3: Wire f into Simulation ───────────────────────
         if not is_mlg:
-            sim.set_distribution(f)
+            restored = getattr(self, '_single_restart_state', None)
+            # from_checkpoint: the eso init must skip the IC seeders on a
+            # restart (the scattered checkpoint f already holds the true
+            # bounce/wall deposits — seeding would overwrite them; see
+            # Simulation.set_distribution / eso_wall §4-3).
+            sim.set_distribution(f, from_checkpoint=restored is not None)
             sim.step_count = start_step
+            self._restore_wall_mail(sim, restored)
 
         # ── Step 4: Conservation initialization ──────────────────
         if os.environ.get("LBM_DIST_INIT", "0") == "1":
@@ -219,6 +225,7 @@ class SolverInitializer:
             raise RuntimeError("Cannot restart: checkpoints are disabled")
         setup.checkpoint_mgr.print_available()
         state = setup.checkpoint_mgr.load_latest()
+        self._single_restart_state = state
         f = xp.asarray(state['f'])
         completed_step = state['step']
         start_step = completed_step + 1
@@ -232,11 +239,55 @@ class SolverInitializer:
             setup.checkpoint_mgr = CheckpointManager(
                 output_dir=setup.checkpoint_dir, xp=xp)
         state = setup.checkpoint_mgr.load(path)
+        self._single_restart_state = state
         f = xp.asarray(state['f'])
         completed_step = state['step']
         start_step = completed_step + 1
         print(f"  Loaded step {completed_step}, resuming from step {start_step}")
         return f, start_step
+
+    def _restore_wall_mail(self, sim, state) -> None:
+        """eso domain-wall mailbox restore + series-consistency guard.
+
+        The mailbox is checkpoint state OUTSIDE the 27N f slots
+        (extra_wall_mail_L0, eso_wall §4-3). Silent mismatches here are
+        the restart-units-switch class of bug (a2f6abe): the wall
+        semantics changing mid-series must be a hard error, never a
+        quiet EQ/implicit mix.
+        """
+        mask = getattr(sim, '_eso_wall_mask', 0)
+        if state is None:
+            return
+        mail = state.get('wall_mail_L0')
+        if mask and mail is None:
+            raise RuntimeError(
+                "restart: this config has eso implicit domain walls but "
+                "the checkpoint carries no wall_mail_L0 key — it was "
+                "written by the EQ-degradation era (or a std run). A "
+                "series cannot switch wall semantics mid-way; start a "
+                "fresh series (patch_notes/eso_wall/PLAN.md §2-4)")
+        if not mask and mail is not None:
+            raise RuntimeError(
+                "restart: the checkpoint carries an eso wall mailbox "
+                "(wall_mail_L0) but this config builds no implicit wall "
+                "faces — wall semantics changed mid-series; start a "
+                "fresh series (patch_notes/eso_wall/PLAN.md §2-4)")
+        if not mask:
+            return
+        ck_mask = int(state.get('wall_mask_L0', 0))
+        if ck_mask and ck_mask != mask:
+            raise RuntimeError(
+                f"restart: wall faces changed mid-series (checkpoint "
+                f"mask {ck_mask:#04x} vs config {mask:#04x})")
+        arr = sim.xp.asarray(mail, dtype=sim.xp.float32).ravel()
+        if arr.shape != sim._eso_wall_mail.shape:
+            raise RuntimeError(
+                f"restart: wall mailbox size mismatch (checkpoint "
+                f"{arr.shape} vs config {sim._eso_wall_mail.shape}) — "
+                "grid or wall layout changed mid-series")
+        sim._eso_wall_mail[:] = arr
+        print(f"  [esoteric] wall mailbox restored "
+              f"({arr.size * 4 / 1e6:.1f} MB)")
 
     def _fresh_start(self, xp, setup) -> Tuple[Any, int]:
         print(f"\n[5] Initializing Flow Field (Fresh Start)...")

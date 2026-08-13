@@ -122,8 +122,11 @@ def _axis_pair_slots():
     return tabs
 
 
+_AXIS_PAIR_SLOTS = _axis_pair_slots()   # [axis][pair] -> slot or -1
+
+
 def _wall_decl_src() -> str:
-    px, py, pz = _axis_pair_slots()
+    px, py, pz = _AXIS_PAIR_SLOTS
     return r'''
     // ---- eso domain wall: axis de-periodization + face mailbox ----
     // patch_notes/eso_wall/PLAN.md sec 2. wall_mask face bits:
@@ -624,6 +627,124 @@ def eso_seed_solid_bounce_ic(xp, f_mem, node_type, get_dir, t0: int) -> None:
             rolled = xp.roll(f_ip, shift=ci, axis=axes)
             f_mem[slot_dn][dn] = rolled[dn]
             f_mem[slot_up][up] = f_i[up]
+
+
+def eso_wall_mail_layout(wall_mask: int, shape):
+    """Host mirror of the kernels' face-mailbox layout arithmetic.
+
+    Returns ({face_bit: (offset, area, (n1, n2), plane_axes)}, total_size)
+    over the WALL faces of `wall_mask`, with the fixed face order
+    xmin..zmax and uniform (9, area) f32 segments. MUST stay in lockstep
+    with _ESO_WALL_DECL (moff/seg) — the seeding and checkpoint code
+    index the same buffer the kernels do. plane_axes are the two axes
+    spanning the face plane in cell2d order (c2 = a1 * N2 + a2)."""
+    Nx, Ny, Nz = (int(v) for v in shape)
+    segs = [9 * Ny * Nz, 9 * Ny * Nz, 9 * Nx * Nz,
+            9 * Nx * Nz, 9 * Nx * Ny, 9 * Nx * Ny]
+    plane = [(Ny, Nz, (1, 2)), (Ny, Nz, (1, 2)),
+             (Nx, Nz, (0, 2)), (Nx, Nz, (0, 2)),
+             (Nx, Ny, (0, 1)), (Nx, Ny, (0, 1))]
+    out = {}
+    off = 0
+    for b in range(6):
+        if wall_mask >> b & 1:
+            n1, n2, axes = plane[b]
+            out[b] = (off, n1 * n2, (n1, n2), axes)
+            off += segs[b]
+    return out, off
+
+
+def eso_seed_wall_ic(xp, f_mem, wall_mail, wall_mask, get_dir,
+                     t0: int) -> None:
+    """Seed the implicit domain-wall state for a FRESH-IC memory build.
+
+    Same convention as eso_seed_solid_bounce_ic: every wall round trip is
+    defined at t0 as "the deposit of step t0-1 = the IC's incoming
+    population", which makes the step-t0 collision input at wall links
+    exactly the IC (std parity). Two seeds per crossing pair:
+
+      case B (the -c_i source crosses a wall): the LOAD's parity-swap
+        read at self -> slot (i if t0 even else i+1) on the wall row :=
+        IC of eso dir i. Without this, esoteric_scatter_std leaves the
+        WRAPPED opposite row's value there (identity only for a uniform
+        IC — the perturbed-IC twin leg of eso_wall_restart_gate catches
+        it).
+      case A (the +c_i target crosses a wall): mailbox[seg(face), p9,
+        cell2d] := IC of eso dir i+1. Parity-free (mailbox addressing
+        has no parity). The kernel's multi-wall corner rule (lowest face
+        bit claims the reflection) is replicated: a lower-bit wall face
+        claims the edge line it shares with a higher-bit one.
+
+    MUST NOT be called on checkpoint restore: the scattered std f plus
+    the restored raw mailbox already reproduce every wall read bit-
+    exactly (LOAD-view fidelity of the gather/scatter bijection; the
+    case-B in-flight reflection rides the wrapped row's std entries).
+
+    Args mirror eso_seed_solid_bounce_ic; wall_mail is the flat (device)
+    mailbox buffer allocated per eso_wall_mail_layout.
+    """
+    if not wall_mask:
+        return
+    even = (int(t0) % 2 == 0)
+    dims = f_mem.shape[1:]
+    layout, total = eso_wall_mail_layout(wall_mask, dims)
+    for p in range(13):
+        i = 2 * p + 1
+        c = (int(CX_ESO[i]), int(CY_ESO[i]), int(CZ_ESO[i]))
+        # ---- case B: -c_i crosses a wall face -> swap-read slot at self
+        slot_up = i if even else i + 1
+        f_i = None
+        for a in range(3):
+            if c[a] == 0:
+                continue
+            bit = 2 * a + (0 if c[a] > 0 else 1)   # upstream face
+            if not (wall_mask >> bit & 1):
+                continue
+            if f_i is None:
+                f_i = get_dir(_STD_TO_ESO[i])
+            row = [slice(None)] * 3
+            row[a] = 0 if c[a] > 0 else dims[a] - 1
+            row = tuple(row)
+            if getattr(f_i, "ndim", 0) == 0 or not hasattr(f_i, "shape"):
+                f_mem[slot_up][row] = f_i          # uniform IC scalar
+            else:
+                f_mem[slot_up][row] = f_i[row]
+        # ---- case A: +c_i crosses a wall face -> mailbox at own cell
+        f_ip = None
+        for a in range(3):
+            if c[a] == 0:
+                continue
+            bit = 2 * a + (1 if c[a] > 0 else 0)   # downstream face
+            if bit not in layout:
+                continue
+            off, area, (n1, n2), axes = layout[bit]
+            p9 = _AXIS_PAIR_SLOTS[a][p]
+            if f_ip is None:
+                f_ip = get_dir(_STD_TO_ESO[i + 1])
+            row = [slice(None)] * 3
+            row[a] = dims[a] - 1 if c[a] > 0 else 0
+            scalar = (getattr(f_ip, "ndim", 0) == 0
+                      or not hasattr(f_ip, "shape"))
+            vals = f_ip if scalar else f_ip[tuple(row)]
+            seg = wall_mail[off:off + 9 * area].reshape(9, n1, n2)
+            # kernel corner rule: a lower-bit wall face crossed by the
+            # same move claims the shared edge line
+            claim = []
+            for j2, b2 in enumerate(axes):
+                if c[b2] == 0:
+                    continue
+                bit2 = 2 * b2 + (1 if c[b2] > 0 else 0)
+                if bit2 in layout and bit2 < bit:
+                    claim.append((j2, dims[b2] - 1 if c[b2] > 0 else 0))
+            if not claim:
+                seg[p9][:] = vals
+            else:
+                keep = xp.ones((n1, n2), dtype=bool)
+                for j2, edge in claim:
+                    line = [slice(None), slice(None)]
+                    line[j2] = edge
+                    keep[tuple(line)] = False
+                seg[p9][keep] = vals if scalar else vals[keep]
 
 
 def convert_f_std_to_esoteric(xp, f_std: 'npt.NDArray') -> 'npt.NDArray':

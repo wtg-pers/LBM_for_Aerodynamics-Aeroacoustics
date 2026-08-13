@@ -861,8 +861,18 @@ class OutputManager:
         return f.get() if hasattr(f, 'get') else f
 
     def _build_checkpoint_extra(self, sim) -> dict:
-        """Build extra_data dict for MLG checkpoint (fine level f arrays)."""
+        """Build extra_data dict for MLG checkpoint (fine level f arrays)
+        and the eso domain-wall mailbox (single-grid, eso_wall §4-3)."""
         extra = {}
+        # eso implicit domain wall: the face mailbox is state OUTSIDE the
+        # 27N f slots (the std f gather is a LOAD-view bijection of those
+        # slots only) -> extra npz keys, validated on restore by the
+        # initializer. L{k} naming per PLAN §2-4; walls are single-grid-
+        # only until §4-5·6, so only L0 can carry a mask today.
+        root = sim.get_level(0) if hasattr(sim, 'get_level') else sim
+        if getattr(root, '_eso_wall_mask', 0):
+            extra['wall_mask_L0'] = int(root._eso_wall_mask)
+            extra['wall_mail_L0'] = root._eso_wall_mail
         if self.mlg_vtk_writer is not None:
             from src.grid.multi_level_grid import MultiLevelGrid
             if isinstance(sim, MultiLevelGrid):
