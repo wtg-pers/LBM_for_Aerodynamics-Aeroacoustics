@@ -284,6 +284,24 @@ class MLGVTKWriter:
             rho_np = np.asarray(rho)
             u_np = np.asarray(u)
 
+        # Solid cells -> seeded rest state, in the lu frame, BEFORE the
+        # unit conversion. One convention for every field output: the MPI
+        # gather (_mask_solid), the plane channel, and here. Without this
+        # the esoteric single-GPU path writes path-dependent solid garbage
+        # (std leaves near-rest bounce residue), so the same run disagrees
+        # with its own MPI twin and hands ParaView's colour bar the body.
+        # Copy first: np.asarray can alias the live sim arrays (CPU mode).
+        mask_np = None
+        if solid_mask is not None:
+            mask_np = (solid_mask.get() if hasattr(solid_mask, 'get')
+                       else np.asarray(solid_mask))
+            sm = mask_np.astype(bool)
+            if sm.any():
+                rho_np = rho_np.copy()
+                u_np = u_np.copy()
+                rho_np[sm] = 1.0
+                u_np[:, sm] = 0.0
+
         # Field-value unit mapping (output.units; identity when unset).
         # spacing[0] = this block's spacing in L0 units (2^-level) —
         # nu_t/body_force conversion is level-dependent.
@@ -315,11 +333,7 @@ class MLGVTKWriter:
             (u_name, vtk_type, 3, u_interleaved),
         ]
 
-        if solid_mask is not None:
-            if hasattr(solid_mask, 'get'):
-                mask_np = solid_mask.get()
-            else:
-                mask_np = np.asarray(solid_mask)
+        if mask_np is not None:
             mask_flat = np.ascontiguousarray(
                 mask_np.astype(np.int8).transpose(2, 1, 0)
             ).tobytes()
