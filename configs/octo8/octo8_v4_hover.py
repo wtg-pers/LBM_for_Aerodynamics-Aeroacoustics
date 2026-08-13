@@ -50,6 +50,20 @@ patch_notes/acoustic_probes/03): 각 랭크가 자기 슬랩 조각 .vti 를 직
 flush 때 rank0 이 csv 를 조립한다(단일GPU 와 비트 동일).
 클러스터 4랭크 실측은 아직 안 했다 — 로컬 2랭크 패리티/restart 만 실증.
 
+★★ 지면 벽 (0814, eso_wall 트랙 §4 완결)
+----------------------------------------
+zmin 'hwbb' 는 이제 **모든 경로(단일GPU/MLG/MPI/dist-init)에서 진짜
+halfway 벽**이다(implicit wall: 축 비주기화+face mailbox, 벽면 = 노드0
+−0.5, Couette 실측 −0.5000·tau 불변). v2/v3 시절의 EQ(u=0) 강등
+— tau 의존 slip, 실효 지면 ~0.7셀 위 — 은 소멸했다. **v4 = 지면 벽이
+진짜 hwbb 인 첫 본 런 시리즈**(PLAN §4-6). 함의:
+  * v3 계열 체크포인트로 v4 를 재시작할 수 없다(wall_mail_L0 키 부재
+    = 시리즈 가드 하드에러; 벽 의미론이 다른 시리즈는 섞이지 않는다).
+  * 분해축은 자동으로 z(벽 축)를 제외한다. --axis z 는 하드에러.
+  * 로컬 2랭크 스모크(octo8_v3_smoke, 0814): implicit wall + axis=y +
+    ckpt wall_mail_L0 + dist-restart 스테이징 전부 실증.
+정본 = patch_notes/eso_wall/ (01~07).
+
 Run (cluster, 4x24GB):
     LBM_ESOTERIC=1 mpirun -n 4 python main.py \\
         --config configs/octo8/octo8_v4_hover.py --gpu 0,1,2,3 \\
