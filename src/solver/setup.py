@@ -2117,6 +2117,25 @@ class SimulationSetup:
         from src.boundary.bc_config import parse_face_config
 
         dom_faces = blk.domain_faces
+        if dom_faces and blk.region is not None:
+            # domain_faces tests the ARRAY extent (global_box), which
+            # includes the C2F/F2C band: a region parked exactly
+            # overlap_width cells off a domain wall puts its BAND on the
+            # wall without being flush (octo8 v3 'outwash' z_min — the
+            # designed "ground layer stays L0" configuration). The
+            # coupling still owns such a face: the parent supplies the
+            # band every substep and the parent's own BC handles the
+            # wall. Only faces the OverlapRegion designates flush (band
+            # width 0 by design) take a fine-level BC.
+            _banded = [f for f in dom_faces
+                       if not blk.region.flush_faces.get(f, False)]
+            if _banded:
+                print(f"  MLG block '{blk.name}': face(s) "
+                      f"{', '.join(_banded)} touch the domain via the "
+                      f"coupling band only (region interior) — no fine "
+                      f"BC, parent coupling owns them")
+                dom_faces = tuple(f for f in dom_faces
+                                  if f not in _banded)
         if not dom_faces:
             return {}
 
@@ -2158,16 +2177,9 @@ class SimulationSetup:
                     f"sponge needs thickness x2^k and per-dt strength "
                     f"rescaling plus a band-overlap decision; keep the "
                     f"region off this face until that lands.")
-            # The C2F/F2C machinery must agree this face has no band —
-            # otherwise the coupling would overwrite the BC every substep.
-            if blk.region is not None \
-                    and not blk.region.flush_faces.get(face, False):
-                raise AssertionError(
-                    f"MLG block '{blk.name}': face {face} is domain-flush "
-                    f"by global_box but NOT flush in the parent frame — "
-                    f"nesting broke (this should be impossible; the "
-                    f"ancestor chain must reach the domain face for the "
-                    f"block to).")
+            # Band-only contact was filtered above, so every face here is
+            # flush by design — the coupling has no band to overwrite the
+            # BC with.
             entry = _copy.deepcopy(bc)
             entry['location'] = loc
             if 'velocity' in entry:
