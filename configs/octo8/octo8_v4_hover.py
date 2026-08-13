@@ -175,7 +175,9 @@ config["output"]["probes"] = {
     "points": [_probe_lu(x, y) for x, y in _PROBES_MM],
     "units": "lu",
     "interval": 1,            # 매 L0 스텝 (음향 시계열)
-    "flush_every": 1000,
+    # flush 전까지 csv 는 헤더만 보인다(정상). 0814 실측: flush 도달
+    # 순간 일괄 기록. 근실시간 모니터링을 위해 200 (비용 무시 가능).
+    "flush_every": 200,
 }
 
 _tag = "result_octo8_v4"
