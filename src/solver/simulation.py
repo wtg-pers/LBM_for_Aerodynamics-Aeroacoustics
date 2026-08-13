@@ -815,10 +815,26 @@ class Simulation:
             nonsolid = face != NODE_SOLID
             if 'wall' in method or 'bounce' in method:
                 face[nonsolid] = NODE_SOLID
+                print(f"  * eso domain wall '{loc}' ({method}): SOLID row "
+                      "-> wall at node0 +0.5 and one fluid row lost "
+                      "(std halfway puts it at -0.5). Proper-fix track: "
+                      "patch_notes/eso_wall/PLAN.md")
             elif 'neumann' in method:
                 face[nonsolid] = NODE_NEUMANN
             else:
                 face[nonsolid] = NODE_EQ_BC
+                if method == 'hwbb':
+                    # NOT a wall on this path: 'hwbb' matches neither
+                    # substring above, so it lands here as EQ(u=0) at
+                    # node0. Measured (eso_wall_couette_gate, tau 0.8):
+                    # effective wall z0 = +0.20 vs std halfway -0.50 —
+                    # a tau-DEPENDENT slip wall, not a clean half-cell.
+                    # Silent since the original port; loud until the
+                    # proper fix lands (patch_notes/eso_wall/PLAN.md).
+                    print(f"  * WARNING: eso face '{loc}' method 'hwbb' "
+                          "DEGRADES to EQ(u=0) at node0 — measured "
+                          "effective wall z0=+0.20 (tau 0.8) vs std "
+                          "-0.50. Track: patch_notes/eso_wall/PLAN.md")
                 dens = getattr(cfg, 'density', None)
                 if dens is not None:
                     bc_rho[sl] = float(dens)
