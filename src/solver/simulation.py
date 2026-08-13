@@ -900,7 +900,13 @@ class Simulation:
             nonsolid = face != NODE_SOLID
             is_wall_method = (method == 'hwbb' or 'wall' in method
                               or 'bounce' in method)
-            if is_wall_method and self._eso_wall_implicit_ok:
+            # LBM_ESO_WALL_DEGRADE: set by the MPI driver before the
+            # replicated/dist-init build — the distributed runner has no
+            # wall_mask/mailbox wiring yet (PLAN §4-5b), so an implicit
+            # wall there would run as a silent periodic leak. Forces the
+            # loud legacy degradation below instead.
+            if (is_wall_method and self._eso_wall_implicit_ok
+                    and not os.environ.get("LBM_ESO_WALL_DEGRADE")):
                 # eso_wall track proper fix: the row stays FLUID and the
                 # kernels reflect every wall-crossing link at the halfway
                 # plane node0 −0.5 (parity-swap / face mailbox) — std-
