@@ -61,6 +61,7 @@ Date: 2026-08
 """
 
 import glob
+import json
 import os
 import re
 import struct
@@ -483,6 +484,29 @@ def _write_vth_file(path: str, name: str, step: int, ax: int,
         f.write('\n'.join(lines))
 
 
+def _write_vth_series(p: Dict[str, Any]) -> None:
+    """<plane>.vth.series -- the time-series entry point for the AMR
+    view. A .pvd collection CANNOT reference AMR datasets (ParaView's
+    PVD reader has no vth dispatch -- errors on open, 0814 user
+    report), so the composed series uses the .series meta-file
+    mechanism instead (ParaView >= 5.5; the trailing .vth.series name
+    picks the AMR reader). Replaces the short-lived _amr.pvd, which is
+    removed if present so a broken index never lingers."""
+    vth_steps = sorted(p.get('written_vth', ()))
+    if not vth_steps:
+        return
+    doc = {"file-series-version": "1.0",
+           "files": [{"name": f"{p['name']}_{st:08d}.vth",
+                      "time": float(st)} for st in vth_steps]}
+    with open(os.path.join(p['dir'], f"{p['name']}.vth.series"),
+              'w') as f:
+        json.dump(doc, f, indent=1)
+    try:
+        os.remove(os.path.join(p['dir'], f"{p['name']}_amr.pvd"))
+    except OSError:
+        pass
+
+
 def _vti_nodes(path: str) -> Optional[Tuple[int, int, int]]:
     """Node counts from a .vti header (first 2 KB), or None."""
     try:
@@ -627,19 +651,7 @@ class PlaneWriterManager:
         lines += ['  </Collection>', '</VTKFile>', '']
         with open(os.path.join(p['dir'], f"{p['name']}.pvd"), 'w') as f:
             f.write('\n'.join(lines))
-        vth_steps = sorted(p.get('written_vth', ()))
-        if vth_steps:
-            al = ['<?xml version="1.0"?>',
-                  '<VTKFile type="Collection" version="0.1" '
-                  'byte_order="LittleEndian">',
-                  '  <Collection>']
-            for st in vth_steps:
-                al.append(f'    <DataSet timestep="{float(st)}" group="" '
-                          f'part="0" file="{p["name"]}_{st:08d}.vth"/>')
-            al += ['  </Collection>', '</VTKFile>', '']
-            with open(os.path.join(p['dir'],
-                                   f"{p['name']}_amr.pvd"), 'w') as f:
-                f.write('\n'.join(al))
+        _write_vth_series(p)
 
     def _bind(self, target: Any, append: bool) -> None:
         blocks = grid_block_views(target)
@@ -972,19 +984,7 @@ class MPIPlaneWriterManager:
         lines += ['  </Collection>', '</VTKFile>', '']
         with open(os.path.join(p['dir'], f"{p['name']}.pvd"), 'w') as f:
             f.write('\n'.join(lines))
-        vth_steps = sorted(p.get('written_vth', ()))
-        if vth_steps:
-            al = ['<?xml version="1.0"?>',
-                  '<VTKFile type="Collection" version="0.1" '
-                  'byte_order="LittleEndian">',
-                  '  <Collection>']
-            for st in vth_steps:
-                al.append(f'    <DataSet timestep="{float(st)}" group="" '
-                          f'part="0" file="{p["name"]}_{st:08d}.vth"/>')
-            al += ['  </Collection>', '</VTKFile>', '']
-            with open(os.path.join(p['dir'],
-                                   f"{p['name']}_amr.pvd"), 'w') as f:
-                f.write('\n'.join(al))
+        _write_vth_series(p)
 
     def _piece_table(self, pc: Dict[str, Any], ax: int, snapped: float,
                      runner: Any) -> List[Dict[str, Any]]:
