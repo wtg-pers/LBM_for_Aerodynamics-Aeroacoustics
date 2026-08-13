@@ -1288,6 +1288,12 @@ class SimulationSetup:
         vc = self._vtk_config
         vtk_enabled = (vc.get('enabled', True) and not args.no_vtk
                        and self.is_io_rank)
+        # The MLG writers (built later, in _setup_mlg[_2d]) need the SAME
+        # resolved dir and write-intent — a hardcoded './results/vtk'
+        # fallback there once pointed a --no-vtk run at a stale series in
+        # the CWD and the units guard killed every MPI rank on it.
+        self._vtk_output_dir = output_dir
+        self._vtk_write_enabled = bool(vtk_enabled)
         ckpt_enabled = self._checkpoint_config.get('enabled', True)
         if self.is_io_rank:
             setup_output_directories(
@@ -1949,11 +1955,9 @@ class SimulationSetup:
 
         # ── MLG VTK writer ───────────────────────────────────────
         from src.io.mlg_vtk_writer import MLGVTKWriter
-        vtk_out_dir = './results/vtk'
-        if self.vtk_writer is not None:
-            vtk_out_dir = self.vtk_writer.output_dir
         self._mlg_vtk_writer = MLGVTKWriter(
-            output_dir=vtk_out_dir,
+            output_dir=self._vtk_output_dir,
+            check_units=self._vtk_write_enabled,
             coarse_shape=(self.Nx, self.Ny, self.Nz),
             overlap_mgr=self._mlg_overlap_mgr,
             scaler=self._mlg_scaler,
@@ -2567,11 +2571,9 @@ class SimulationSetup:
 
         # ── MLG VTK writer (2D) ──────────────────────────────────
         from src.io.mlg_vtk_writer_2d import MLGVTKWriter2D
-        vtk_out_dir = './results/vtk'
-        if self.vtk_writer is not None:
-            vtk_out_dir = self.vtk_writer.output_dir
         self._mlg_vtk_writer = MLGVTKWriter2D(
-            output_dir=vtk_out_dir,
+            output_dir=self._vtk_output_dir,
+            check_units=self._vtk_write_enabled,
             coarse_shape=(self.Nx, self.Ny),
             overlap_mgr=self._mlg_overlap_mgr,
             scaler=self._mlg_scaler,

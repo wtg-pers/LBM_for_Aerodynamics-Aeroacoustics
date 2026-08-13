@@ -64,9 +64,13 @@ class MLGVTKWriter2D:
         num_levels: int,
         precision: str = 'float32',
         units: Optional[object] = None,
+        check_units: bool = True,
     ) -> None:
         self.output_dir = output_dir
         self.units = units  # FieldUnits (None = lattice passthrough)
+        # See MLGVTKWriter: False = metadata-only construction (--no-vtk /
+        # non-io MPI rank), existing series must not block the run.
+        self._check_units = check_units
         self._num_levels = num_levels
         self._overlap_mgr = overlap_mgr
         self._scaler = scaler
@@ -378,7 +382,7 @@ class MLGVTKWriter2D:
         self.time_steps.sort(key=lambda x: x[0])
         # A units switch against the existing per-level series is a hard
         # error (field names live in the .vti files, so probe one).
-        if self.time_steps and self.units is not None:
+        if self.time_steps and self.units is not None and self._check_units:
             import glob as _glob
             from src.io.field_units import assert_series_units
             vtis = sorted(_glob.glob(
