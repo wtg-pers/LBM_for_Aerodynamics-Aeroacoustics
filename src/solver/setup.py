@@ -2256,6 +2256,14 @@ class SimulationSetup:
             obstacle_bc=self.obstacle_bc,
             al_model=self.al_model if alm_target_level == 0 else None,
             sgs_cfg=self._sgs_cfg,
+            # eso implicit domain walls on MLG (eso_wall patch 04):
+            # ROOT-LEVEL walls only. Fine sims also get the flag so an
+            # inherited (flush) wall face converts loudly to a mask —
+            # the initializer then hard-errors on any fine-level mask
+            # (band-on-wall-axis is unsupported until the open-face
+            # mailbox generalization; octo8 keeps fine bottoms 2 lu off
+            # the ground by design, so only L0 carries the wall).
+            eso_wall_implicit_ok=True,
         )
         simulations.append(sim_0)
         self._attach_coupling_skip(sim_0, self._mask, level=0)
@@ -2379,6 +2387,9 @@ class SimulationSetup:
                 obstacle_bc=fine_obstacle_bc,
                 al_model=fine_al_k,
                 sgs_cfg=self._sgs_cfg,
+                # see sim_0: converts loudly; fine masks are rejected by
+                # the initializer's root-only wall guard.
+                eso_wall_implicit_ok=True,
             )
             simulations.append(sim_k)
             _blk.sim = sim_k

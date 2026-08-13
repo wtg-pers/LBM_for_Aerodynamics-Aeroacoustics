@@ -982,7 +982,12 @@ class Simulation:
                             f"eso domain wall: face '{_FNAME[b]}' has "
                             "no BC opposite a wall on the same axis — "
                             "the axis is de-periodized, so the face "
-                            "needs a wall, eq, or sponge BC "
+                            "needs a wall, eq, or sponge BC. On an MLG "
+                            "fine level this usually means the fine "
+                            "region sits FLUSH on a wall face (the "
+                            "wall was inherited, the opposite face is "
+                            "a coupling band) — keep the region off "
+                            "the wall (l1_zmin >= overlap_width). "
                             "(patch_notes/eso_wall/PLAN.md)")
 
         for sb in getattr(self.bc_manager, 'sponge_layers', []):

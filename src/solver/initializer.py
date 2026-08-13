@@ -61,6 +61,7 @@ class SolverInitializer:
                 start_step = self._restart_mlg(sim, args)
             else:
                 start_step = self._initialize_mlg(sim)
+            self._check_mlg_wall_masks(sim)
         else:
             f, start_step = self._create_distribution(args)
 
@@ -245,6 +246,33 @@ class SolverInitializer:
         start_step = completed_step + 1
         print(f"  Loaded step {completed_step}, resuming from step {start_step}")
         return f, start_step
+
+    def _check_mlg_wall_masks(self, mlg) -> None:
+        """eso implicit walls on MLG: ROOT level only (eso_wall patch 04).
+
+        A fine sim with a wall mask means one of its faces sits FLUSH on
+        an implicit wall face (flush-face BC inheritance converted it).
+        Its coupling band on that axis would need the wrap slots the
+        de-periodization severs — the open-face mailbox generalization
+        is pending. A hard error beats a silently EQ-degraded fine wall
+        under a real L0 wall (mixed semantics within one hierarchy).
+        octo8 keeps fine bottoms overlap_width off the ground by design
+        (l1_zmin), so only L0 carries the wall there.
+        """
+        if hasattr(mlg, 'iter_blocks'):
+            fine = [(b.level, getattr(b, 'label', f'L{b.level}'), b.sim)
+                    for b in mlg.iter_blocks() if b.level > 0]
+        else:
+            fine = [(k, f'L{k}', mlg.get_level(k))
+                    for k in range(1, mlg.num_levels)]
+        for lvl, label, s in fine:
+            if getattr(s, '_eso_wall_mask', 0):
+                raise NotImplementedError(
+                    f"eso domain wall on fine level {lvl} ({label}): a "
+                    "fine block flush on an implicit wall face is not "
+                    "supported — keep the fine region off the wall so "
+                    "the wall stays on L0 (octo8: l1_zmin = "
+                    "overlap_width). patch_notes/eso_wall/PLAN.md §4-5")
 
     def _restore_wall_mail(self, sim, state) -> None:
         """eso domain-wall mailbox restore + series-consistency guard.
@@ -482,7 +510,12 @@ class SolverInitializer:
                 level_sim.init_esoteric_metadata_host()
                 level_sim._dist_restart_f = arr_host
             else:
-                level_sim.set_distribution(xp.asarray(arr_host))
+                # from_checkpoint: skip the IC seeders — the scattered
+                # checkpoint f already holds the true bounce/wall
+                # deposits (same latent restore-seeding bug class as the
+                # single-grid path; eso_wall patch 02/04).
+                level_sim.set_distribution(xp.asarray(arr_host),
+                                           from_checkpoint=True)
             print(f"  {tag}: restored from checkpoint"
                   + (" (slab-scoped)" if dist else ""))
 
@@ -510,6 +543,11 @@ class SolverInitializer:
         _l0 = mlg.get_level(0)
         _restore(_l0, state['f'], "Level 0")
         _l0.step_count = start_step
+        if not dist:
+            # eso implicit-wall mailbox (extra_wall_mail_L0) + series-
+            # consistency guard — root level only (fine walls rejected
+            # by _check_mlg_wall_masks).
+            self._restore_wall_mail(_l0, state)
 
         # ── Restore fine levels ──────────────────────────────────
         _blks = list(mlg.iter_blocks()) if hasattr(mlg, 'iter_blocks') else None

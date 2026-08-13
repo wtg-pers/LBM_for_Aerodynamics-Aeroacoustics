@@ -61,6 +61,16 @@ if TYPE_CHECKING:
     from src.grid.coupling import GridCoupling
 
 
+def _eso_wall_args(sim):
+    """Implicit-domain-wall view args for the eso region gather/scatter
+    (eso_wall patch 04). MLG coupling must read/write wall rows through
+    the swap-slot/mailbox LOAD view, not the raw periodic bijection —
+    the raw view hands stale wrap values to the C2F interpolation at
+    wall rows (e.g. the octo8 bottom band reading L0's ground rows)."""
+    return {'wall_mask': getattr(sim, '_eso_wall_mask', 0),
+            'wall_mail': getattr(sim, '_eso_wall_mail', None)}
+
+
 class MultiLevelGrid:
     """Orchestrates nested time-stepping across M grid levels.
 
@@ -300,7 +310,8 @@ class MultiLevelGrid:
         if getattr(lev, '_use_esoteric', False):
             from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
             return esoteric_gather_std_region(
-                lev.xp, lev.f, lev._esoteric_step, sp)
+                lev.xp, lev.f, lev._esoteric_step, sp,
+                **_eso_wall_args(lev))
         return lev.f[(slice(None),) + sp]
 
     def _coupling_c2f(self, coupling, sim_coarse, sim_fine, *,
@@ -315,7 +326,8 @@ class MultiLevelGrid:
             from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
             f_c = esoteric_gather_std_region(
                 sim_coarse.xp, sim_coarse.f, sim_coarse._esoteric_step,
-                coupling.coarse_sub_spatial_slices)
+                coupling.coarse_sub_spatial_slices,
+                **_eso_wall_args(sim_coarse))
             c_is_sub = True
         else:
             f_c = sim_coarse.f
@@ -339,7 +351,8 @@ class MultiLevelGrid:
                 esoteric_scatter_std_region(
                     sim_fine.xp, sim_fine.f, vals,
                     sim_fine._esoteric_step, sp_sl,
-                    skip_solid_nt=skip_f)
+                    skip_solid_nt=skip_f,
+                    **_eso_wall_args(sim_fine))
         else:
             from src.grid.wall_coupling import wall_skip_nt
             coupling.coarse_to_fine(
@@ -357,7 +370,8 @@ class MultiLevelGrid:
             from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
             f_f = esoteric_gather_std_region(
                 sim_fine.xp, sim_fine.f, sim_fine._esoteric_step,
-                coupling.fine_at_coarse_spatial_slices)
+                coupling.fine_at_coarse_spatial_slices,
+                **_eso_wall_args(sim_fine))
             f_is_at = True
         else:
             f_f = sim_fine.f
@@ -374,7 +388,8 @@ class MultiLevelGrid:
             esoteric_scatter_std_region(
                 sim_coarse.xp, sim_coarse.f, block,
                 sim_coarse._esoteric_step, coupling.excised_spatial_slices,
-                skip_solid_nt=coupling_skip_nt(sim_coarse, 'f2c'))
+                skip_solid_nt=coupling_skip_nt(sim_coarse, 'f2c'),
+                **_eso_wall_args(sim_coarse))
         elif getattr(sim_coarse, '_use_surfel', False):
             # Surfel coarse level: the std restriction has no solid skip
             # and writes THROUGH the body. Fine dead cells hold rho = 0,
