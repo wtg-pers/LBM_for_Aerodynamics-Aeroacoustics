@@ -465,11 +465,20 @@ class PlaneWriterManager:
             if append:
                 for s in series:
                     p['written'].update(s.scan_existing())
-                # vtm/pvd of prior steps may predate a block-set change;
-                # rebuild them from what is actually on disk now.
-                for step in sorted(p['written']):
-                    self._write_vtm(p, step)
                 if p['written']:
+                    # A units switch against the existing slice series is
+                    # a hard error (same rule as the volume writers).
+                    if self._units is not None:
+                        from src.io.field_units import assert_series_units
+                        s0 = series[0]
+                        assert_series_units(
+                            os.path.join(s0.dir, s0.filename(
+                                max(p['written']))),
+                            self._units.mode)
+                    # vtm/pvd of prior steps may predate a block-set
+                    # change; rebuild from what is actually on disk now.
+                    for step in sorted(p['written']):
+                        self._write_vtm(p, step)
                     self._write_pvd(p)
             self._planes.append(p)
             lv_str = ('all' if pc['level'] == 'all' else f"L{pc['level']}")

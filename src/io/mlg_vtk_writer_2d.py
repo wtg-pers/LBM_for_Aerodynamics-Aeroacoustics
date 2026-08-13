@@ -376,6 +376,15 @@ class MLGVTKWriter2D:
                 step = int(match.group(1))
                 self.time_steps.append((float(step), filename))
         self.time_steps.sort(key=lambda x: x[0])
+        # A units switch against the existing per-level series is a hard
+        # error (field names live in the .vti files, so probe one).
+        if self.time_steps and self.units is not None:
+            import glob as _glob
+            from src.io.field_units import assert_series_units
+            vtis = sorted(_glob.glob(
+                os.path.join(self._level_dirs[0], '*.vti')))
+            if vtis:
+                assert_series_units(vtis[-1], self.units.mode)
 
     def get_info(self) -> str:
         lines = [f"MLGVTKWriter2D: {self._num_levels} levels"]

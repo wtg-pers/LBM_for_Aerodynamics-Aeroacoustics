@@ -35,7 +35,45 @@ Date: 2026-08
 
 from typing import Any, List, Tuple
 
-__all__ = ["FieldUnits"]
+__all__ = ["FieldUnits", "assert_series_units"]
+
+
+def assert_series_units(sample_path: str, mode: str) -> None:
+    """Hard-error when an existing .vti series conflicts with `mode`.
+
+    Restarting (or re-running without clear_previous) APPENDS to the
+    on-disk series: the PVD/vtm index merges old and new files, so a
+    units switch would put lattice `density` and physical `p_prime_pa`
+    inside ONE time series with no visible marker — every downstream
+    consumer (ParaView coloring, spectra scripts) silently reads a
+    mixed-unit signal. The checkpoint itself is unit-agnostic (lattice
+    f only), so the fix is never "can't restart" — it is: keep the
+    original units, or point the outputs at a fresh directory.
+
+    `sample_path` is one existing file of the series; unreadable or
+    marker-free files skip the check (never block a run on a stale
+    partial file).
+    """
+    try:
+        with open(sample_path, 'rb') as f:
+            head = f.read(4096).decode('ascii', errors='ignore')
+    except OSError:
+        return
+    if 'Name="density"' in head:
+        existing = 'lu'
+    elif 'Name="p_prime_pa"' in head:
+        existing = 'phys'
+    else:
+        return
+    if existing == mode:
+        return
+    raise ValueError(
+        f"output.units='{mode}' would append to an existing series "
+        f"written with units='{existing}' ({sample_path}). Mixing units "
+        "inside one time series is not allowed. Either keep units="
+        f"'{existing}', or write to a fresh output directory "
+        "(--results-dir / output.output_dir), or clear the old output "
+        "(--clear).")
 
 
 class FieldUnits:

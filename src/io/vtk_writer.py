@@ -130,10 +130,17 @@ class VTKWriter:
                 self.time_steps.append((float(step), filename))
         
         self.time_steps.sort(key=lambda x: x[0])
-        
+
         if self.time_steps:
             print(f"    Found {len(self.time_steps)} existing VTK files")
             print(f"    Step range: {int(self.time_steps[0][0])} -> {int(self.time_steps[-1][0])}")
+            # A units switch against the existing series is a hard error
+            # (the PVD would merge lattice and physical files silently).
+            if self.units is not None:
+                from src.io.field_units import assert_series_units
+                assert_series_units(
+                    os.path.join(self.output_dir, self.time_steps[-1][1]),
+                    self.units.mode)
     
     def _units_convert(self, name: str, arr: np.ndarray):
         """Apply the FieldUnits value/name mapping (identity when unset)."""
