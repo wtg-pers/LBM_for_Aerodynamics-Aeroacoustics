@@ -829,6 +829,61 @@ class AirfoilDatabase:
         grid = self.to_grid_format(**kwargs)
         return make_polar_query(*grid)
 
+    @classmethod
+    def from_grid(
+        cls,
+        alpha_grid: 'npt.NDArray',
+        re_grid: 'npt.NDArray',
+        CL_grid: 'npt.NDArray',
+        CD_grid: 'npt.NDArray',
+        name: str = "FromGrid",
+        extrapolate: bool = False,
+    ) -> 'AirfoilDatabase':
+        """Create AirfoilDatabase from BEMT grid format
+
+        Args:
+            alpha_grid: 2D meshgrid of α   [degrees]
+            re_grid:    2D meshgrid of Re   [dimensionless]
+            CL_grid:    2D array of CL      [dimensionless]
+            CD_grid:    2D array of CD      [dimensionless]
+            name:       Airfoil name
+            extrapolate: Apply Viterna to each Re slice
+
+        Returns:
+            AirfoilDatabase instance
+        """
+        alphas = np.asarray(alpha_grid[0, :], dtype=np.float64)
+        Res = np.asarray(re_grid[:, 0], dtype=np.float64)
+        CL = np.asarray(CL_grid, dtype=np.float64)
+        CD = np.asarray(CD_grid, dtype=np.float64)
+
+        # Handle transposed grids
+        if CL.shape == (alphas.size, Res.size):
+            CL, CD = CL.T, CD.T
+
+        db = cls(name=name)
+        for i, Re in enumerate(Res):
+            db.add_polar_from_arrays(
+                alpha=alphas, CL=CL[i, :], CD=CD[i, :],
+                Re=float(Re), extrapolate=extrapolate
+            )
+        return db
+
+    @classmethod
+    def from_bemt_pack(
+        cls,
+        pack: Tuple['npt.NDArray', 'npt.NDArray',
+                     'npt.NDArray', 'npt.NDArray'],
+        name: str = "FromBEMT",
+        extrapolate: bool = False,
+    ) -> 'AirfoilDatabase':
+        """Create from BEMT data pack tuple
+
+        Convenience for from_grid() using the standard
+        (Alpha, Re, CL, CD) tuple from gen_airfoil_polar().
+        """
+        return cls.from_grid(*pack, name=name, extrapolate=extrapolate)
+
     def load_bemt_csv(
         self, filepath: str,
         alpha_col: str = 'AoA(deg)',
