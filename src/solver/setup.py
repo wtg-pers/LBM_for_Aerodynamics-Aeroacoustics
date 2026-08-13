@@ -342,6 +342,17 @@ class SimulationSetup:
         Returns:
             OutputManager ready for start() → process() → finalize()
         """
+        # Probes are a single-process channel (step 1): under MPI the
+        # sampling target is each rank's LOCAL view, so the base-class
+        # gather would read the wrong (or missing) nodes. A requested
+        # channel must never silently produce nothing — hard error, on
+        # every rank (the request flag is parsed rank-invariantly).
+        if manager_cls is not None and getattr(self, '_probe_cfg', None):
+            raise ValueError(
+                "output.probes is not supported under MPI yet: the probe "
+                "needs owner-rank sampling through the partition map. "
+                "Run single-process, or drop the probes block.")
+
         cls = manager_cls or OutputManager
         mgr = cls(
             **extra_kwargs,
@@ -352,6 +363,7 @@ class SimulationSetup:
             vtk_writer=self.vtk_writer,
             marker_vtk_writer=self.marker_vtk_writer,
             checkpoint_mgr=self.checkpoint_mgr,
+            probe_mgr=getattr(self, 'probe_mgr', None),
             conservation_mgr=self.conservation_mgr,
             force_mgr=self.force_mgr,
             conv_monitor=self.conv_monitor,
@@ -1327,6 +1339,22 @@ class SimulationSetup:
         else:
             self.checkpoint_mgr = None
             print("  Checkpoint: disabled")
+
+        # ── Pressure probes (virtual microphones) ──
+        # Parsed on EVERY rank (the MPI guard in build_output_manager must
+        # see the request on all ranks to abort consistently); constructed
+        # only on the IO rank of a single-process run.
+        from src.io.probe_writer import parse_probe_config, PressureProbeManager
+        self._probe_cfg = parse_probe_config(oc, self._dimension)
+        self.probe_mgr = None
+        if self._probe_cfg is not None and self.is_io_rank:
+            self.probe_mgr = PressureProbeManager(
+                self._probe_cfg, self._csv_dir,
+                self._unit_converter, self._dimension)
+            n = len(self._probe_cfg['points'])
+            print(f"  Probes: {n} point(s), every "
+                  f"{self._probe_cfg['interval']} step(s) "
+                  f"-> {self.probe_mgr.csv_path}")
 
         # ── Rotor CSV ──
         # CSV is opened by SolverInitializer after start_step is known,

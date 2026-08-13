@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from src.io.vtk_writer import VTKWriter
     from src.io.marker_vtk_writer import MarkerVTPWriter
     from src.io.checkpoint import CheckpointManager
+    from src.io.probe_writer import PressureProbeManager
     from src.utilities.flux_utils import ConservationManager
     from src.utilities.force_calculator import ForceManager
     from src.utilities.convergence import ConvergenceMonitor
@@ -68,6 +69,7 @@ class OutputManager:
         vtk_writer: Optional['VTKWriter'] = None,
         marker_vtk_writer: Optional['MarkerVTPWriter'] = None,
         checkpoint_mgr: Optional['CheckpointManager'] = None,
+        probe_mgr: Optional['PressureProbeManager'] = None,
         # ── Monitors ──
         conservation_mgr: Optional['ConservationManager'] = None,
         force_mgr: Optional['ForceManager'] = None,
@@ -105,6 +107,7 @@ class OutputManager:
             vtk_writer: VTK domain writer (optional)
             marker_vtk_writer: Marker VTP writer for ALM (optional)
             checkpoint_mgr: Checkpoint save/load manager (optional)
+            probe_mgr: Pressure probe channel (optional)
             conservation_mgr: Mass conservation monitor (optional)
             force_mgr: MEM force calculator (optional)
             conv_monitor: Convergence/divergence monitor (optional)
@@ -129,6 +132,7 @@ class OutputManager:
         self.vtk_writer = vtk_writer
         self.marker_vtk_writer = marker_vtk_writer
         self.checkpoint_mgr = checkpoint_mgr
+        self.probe_mgr = probe_mgr
 
         # ── Monitors ──
         self.conservation_mgr = conservation_mgr
@@ -237,6 +241,12 @@ class OutputManager:
         # with keep_last_n it even pruned the emergency checkpoint).
         self._last_processed_step = step
 
+        # ─── 0. Pressure probes (every-step acoustic channel) ────
+        # Before every other channel: a device-buffer gather with no
+        # host sync, so it must never sit behind an interval gate.
+        if self.probe_mgr is not None:
+            self.probe_mgr.sample(step, sim)
+
         # ─── 1. Progress bar ──────────────────────────────────────
         self._update_progress(step, sim)
 
@@ -292,6 +302,10 @@ class OutputManager:
         # Close progress bar
         if self._pbar is not None:
             self._pbar.close()
+
+        # Probe tail: flush buffered rows before any summary/return path.
+        if self.probe_mgr is not None:
+            self.probe_mgr.finalize()
 
         elapsed = time.perf_counter() - self._start_time
         total_steps = self._end_step - self._start_step
