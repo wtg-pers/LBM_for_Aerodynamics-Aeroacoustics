@@ -102,7 +102,11 @@ config["output"]["planes"] = [
      "units": "lu",              # 전역 L0-lu (위에서 CAD mm 로부터 유도)
      "level": "all",             # 전 AMR 계층
      "fields": ["p", "u"],
-     "interval": 1}              # 매 L0 스텝
+     "interval": 1,              # 매 L0 스텝
+     # AMR(.vth/.vth.series)만 기록 — .vtm/.pvd 생략으로 6 planes x
+     # 매스텝의 색인 소파일 ~수십만 개 절감 (0818, 사용자 확정:
+     # ParaView 는 vth 계열만 사용)
+     "index": "vth"}
     for name, ax, mm in _PLANES_MM
 ]
 

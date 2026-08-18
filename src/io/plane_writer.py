@@ -45,8 +45,10 @@ Config (output.planes — a LIST, several planes allowed):
          "interval": 1,          # sample every N L0 steps
          "flush_every": 64,      # rows buffered per flush
          "buffer_mb": 96,        # device ring-buffer cap (clamps rows)
-         "name": "wave"},        # dir/file stem (default plane<i>)
-    ]
+         "name": "wave",         # dir/file stem (default plane<i>)
+         "index": "both"},       # "both" | "vth" | "vtm" — which index
+    ]                            #   families to write (see _INDEX_MODES;
+                                 #   "vth" saves one .vtm/step/plane)
 Unknown keys, a 2D domain, an empty level, or a position outside every
 block are hard errors (a requested channel must never silently vanish).
 
@@ -75,7 +77,17 @@ __all__ = ["parse_plane_config", "PlaneWriterManager",
            "MPIPlaneWriterManager"]
 
 _ALLOWED_KEYS = {"normal", "position", "units", "level", "fields",
-                 "interval", "flush_every", "buffer_mb", "name"}
+                 "interval", "flush_every", "buffer_mb", "name", "index"}
+
+# Which index families to write next to the .vti payload:
+#   "both" (default)  .vtm/.pvd AND .vth/.vth.series
+#   "vth"             AMR view only — at interval=1 this saves one .vtm
+#                     per plane per sampled step (octo8-scale: ~10^5
+#                     files), losing only the .vtm fallback for steps
+#                     whose strip layout no longer matches (rank-count
+#                     change on restart, crash-partial steps)
+#   "vtm"             multiblock view only (no AMR blanking)
+_INDEX_MODES = ("both", "vth", "vtm")
 
 # Device ring-buffer budget per plane [MB]. flush_every is CLAMPED so the
 # buffer never exceeds this: a production multi-level plane can reach
@@ -144,10 +156,16 @@ def parse_plane_config(output_cfg: Dict[str, Any],
         if not re.fullmatch(r'[A-Za-z0-9_\-]+', name):
             raise ValueError(
                 f"output.planes[{i}].name={name!r}: [A-Za-z0-9_-] only")
+        index = pc.get('index', 'both')
+        if index not in _INDEX_MODES:
+            raise ValueError(
+                f"output.planes[{i}].index={index!r}: use "
+                f"{'|'.join(_INDEX_MODES)}")
         planes.append({'normal': normal, 'position': float(pc['position']),
                        'units': units, 'level': level, 'fields': fields,
                        'interval': interval, 'flush_every': flush_every,
-                       'buffer_mb': buffer_mb, 'name': name})
+                       'buffer_mb': buffer_mb, 'name': name,
+                       'index': index})
     names = [p['name'] for p in planes]
     if len(set(names)) != len(names):
         raise ValueError(f"output.planes: duplicate name(s) in {names}")
@@ -507,6 +525,30 @@ def _write_vth_series(p: Dict[str, Any]) -> None:
         pass
 
 
+def _write_pvd_file(p: Dict[str, Any]) -> None:
+    """Time-series indexes for one plane, honouring the `index` knob:
+    <plane>.pvd over the .vtm series (skipped for index='vth') and
+    <plane>.vth.series (skips itself when no .vth was written)."""
+    if p.get('index', 'both') != 'vth':
+        lines = ['<?xml version="1.0"?>',
+                 '<VTKFile type="Collection" version="0.1" '
+                 'byte_order="LittleEndian">',
+                 '  <Collection>']
+        for step in sorted(p['written']):
+            lines.append(f'    <DataSet timestep="{float(step)}" group="" '
+                         f'part="0" file="{p["name"]}_{step:08d}.vtm"/>')
+        lines += ['  </Collection>', '</VTKFile>', '']
+        with open(os.path.join(p['dir'], f"{p['name']}.pvd"), 'w') as f:
+            f.write('\n'.join(lines))
+    _write_vth_series(p)
+
+
+def _entry_point(p: Dict[str, Any]) -> str:
+    """The file a user opens for this plane's time series (summary line)."""
+    ext = ('.vth.series' if p.get('index', 'both') == 'vth' else '.pvd')
+    return os.path.join(p['dir'], p['name'] + ext)
+
+
 def _vti_nodes(path: str) -> Optional[Tuple[int, int, int]]:
     """Node counts from a .vti header (first 2 KB), or None."""
     try:
@@ -530,7 +572,7 @@ def _index_hist_vth(p: Dict[str, Any], steps) -> None:
     .vtm-only view — the .vtm rebuild tolerates layout changes, an
     AMR index cannot."""
     geo = p.get('vth_geo')
-    if not geo:
+    if not geo or p.get('index', 'both') == 'vtm':
         return
     probe = next((e for e in geo if re.search(r's\d+$', e['tag'])),
                  geo[0])
@@ -599,8 +641,7 @@ class PlaneWriterManager:
         for p in self._planes:
             self._flush_plane(p)
             print(f"  Plane '{p['name']}': {len(p['written'])} steps x "
-                  f"{len(p['series'])} block(s) -> "
-                  f"{os.path.join(p['dir'], p['name'] + '.pvd')}")
+                  f"{len(p['series'])} block(s) -> {_entry_point(p)}")
 
     # ── private ──────────────────────────────────────────────────
     def _flush_plane(self, p: Dict[str, Any]) -> None:
@@ -618,7 +659,7 @@ class PlaneWriterManager:
 
     def _write_vth(self, p: Dict[str, Any], step: int) -> None:
         geo = p.get('vth_geo')
-        if not geo:
+        if not geo or p.get('index', 'both') == 'vtm':
             return
         _write_vth_file(
             os.path.join(p['dir'], f"{p['name']}_{step:08d}.vth"),
@@ -628,6 +669,8 @@ class PlaneWriterManager:
     def _write_vtm(self, p: Dict[str, Any], step: int) -> None:
         """Per-step multiblock collecting every block slice (fine drawn
         over coarse in load order; no blanking — 2D MLG .vtm precedent)."""
+        if p.get('index', 'both') == 'vth':
+            return
         lines = ['<?xml version="1.0"?>',
                  '<VTKFile type="vtkMultiBlockDataSet" version="1.0" '
                  'byte_order="LittleEndian">',
@@ -641,17 +684,7 @@ class PlaneWriterManager:
             f.write('\n'.join(lines))
 
     def _write_pvd(self, p: Dict[str, Any]) -> None:
-        lines = ['<?xml version="1.0"?>',
-                 '<VTKFile type="Collection" version="0.1" '
-                 'byte_order="LittleEndian">',
-                 '  <Collection>']
-        for step in sorted(p['written']):
-            lines.append(f'    <DataSet timestep="{float(step)}" group="" '
-                         f'part="0" file="{p["name"]}_{step:08d}.vtm"/>')
-        lines += ['  </Collection>', '</VTKFile>', '']
-        with open(os.path.join(p['dir'], f"{p['name']}.pvd"), 'w') as f:
-            f.write('\n'.join(lines))
-        _write_vth_series(p)
+        _write_pvd_file(p)
 
     def _bind(self, target: Any, append: bool) -> None:
         blocks = grid_block_views(target)
@@ -695,6 +728,7 @@ class PlaneWriterManager:
             p = {'name': pc['name'], 'dir': series[0].dir,
                  'series': series, 'interval': pc['interval'],
                  'flush_every': eff_flush, 'ax': ax,
+                 'index': pc['index'],
                  'vth_geo': [
                      {'level': s_.level, 'tag': s_.tag,
                       'origin': s_.origin, 'spacing': s_.spacing,
@@ -727,7 +761,7 @@ class PlaneWriterManager:
             print(f"  Plane '{pc['name']}': {pc['normal']}={snapped:.2f} "
                   f"L0-lu, levels={lv_str} -> {len(series)} block "
                   f"series, fields={pc['fields']}, every "
-                  f"{pc['interval']} step(s)")
+                  f"{pc['interval']} step(s), index={pc['index']}")
             print(f"    disk {row_bytes / 1e6:.2f} MB/sampled-step | "
                   f"buffer {nbytes / 1e6:.1f} MB = {eff_flush} rows"
                   f"{clamp}")
@@ -868,8 +902,7 @@ class MPIPlaneWriterManager:
             self._flush_plane(p)
             if self._rank == 0:
                 print(f"  Plane '{p['name']}': {len(p['written'])} steps "
-                      f"x {len(p['pieces'])} piece(s) -> "
-                      f"{os.path.join(p['dir'], p['name'] + '.pvd')}")
+                      f"x {len(p['pieces'])} piece(s) -> {_entry_point(p)}")
 
     # ── private ──────────────────────────────────────────────────
     def _flush_plane(self, p: Dict[str, Any]) -> None:
@@ -889,7 +922,7 @@ class MPIPlaneWriterManager:
 
     def _write_vth(self, p: Dict[str, Any], step: int) -> None:
         geo = p.get('vth_geo')
-        if not geo:
+        if not geo or p.get('index', 'both') == 'vtm':
             return
         _write_vth_file(
             os.path.join(p['dir'], f"{p['name']}_{step:08d}.vth"),
@@ -941,6 +974,8 @@ class MPIPlaneWriterManager:
     def _write_vtm(self, p: Dict[str, Any], step: int) -> None:
         """Per-step multiblock over ALL ranks' pieces (piece-table
         order = (uid, rank), fine drawn over coarse in load order)."""
+        if p.get('index', 'both') == 'vth':
+            return
         lines = ['<?xml version="1.0"?>',
                  '<VTKFile type="vtkMultiBlockDataSet" version="1.0" '
                  'byte_order="LittleEndian">',
@@ -960,6 +995,8 @@ class MPIPlaneWriterManager:
         restart may follow a run with a different rank count, whose
         strip split (and so piece names) differs from the current
         table. Those steps keep their own pieces."""
+        if p.get('index', 'both') == 'vth':
+            return
         lines = ['<?xml version="1.0"?>',
                  '<VTKFile type="vtkMultiBlockDataSet" version="1.0" '
                  'byte_order="LittleEndian">',
@@ -974,17 +1011,7 @@ class MPIPlaneWriterManager:
             f.write('\n'.join(lines))
 
     def _write_pvd(self, p: Dict[str, Any]) -> None:
-        lines = ['<?xml version="1.0"?>',
-                 '<VTKFile type="Collection" version="0.1" '
-                 'byte_order="LittleEndian">',
-                 '  <Collection>']
-        for step in sorted(p['written']):
-            lines.append(f'    <DataSet timestep="{float(step)}" group="" '
-                         f'part="0" file="{p["name"]}_{step:08d}.vtm"/>')
-        lines += ['  </Collection>', '</VTKFile>', '']
-        with open(os.path.join(p['dir'], f"{p['name']}.pvd"), 'w') as f:
-            f.write('\n'.join(lines))
-        _write_vth_series(p)
+        _write_pvd_file(p)
 
     def _piece_table(self, pc: Dict[str, Any], ax: int, snapped: float,
                      runner: Any) -> List[Dict[str, Any]]:
@@ -1147,6 +1174,7 @@ class MPIPlaneWriterManager:
             p = {'name': pc['name'], 'dir': out_dir, 'series': series,
                  'pieces': pieces, 'interval': pc['interval'],
                  'flush_every': eff_flush, 'ax': ax, 'vth_geo': vgeo,
+                 'index': pc['index'],
                  'seam_j': ([d for d in range(3) if d != ax].index(axis)
                             if ax != axis else -1),
                  'cursor': 0, 'steps': [], 'written': set()}
@@ -1180,7 +1208,8 @@ class MPIPlaneWriterManager:
                       f"{snapped:.2f} L0-lu, levels={lv_str} -> "
                       f"{len(pieces)} piece(s) over {self._nr} rank(s) "
                       f"(rank0 owns {mine}), fields={pc['fields']}, "
-                      f"every {pc['interval']} step(s)")
+                      f"every {pc['interval']} step(s), "
+                      f"index={pc['index']}")
                 print(f"    disk {total_mb:.2f} MB/sampled-step | "
                       f"rank0 buffer {nbytes / 1e6:.1f} MB = "
                       f"{eff_flush} rows{clamp}")
