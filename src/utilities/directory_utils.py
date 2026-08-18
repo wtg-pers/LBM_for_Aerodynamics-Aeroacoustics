@@ -13,37 +13,47 @@ import glob
 from typing import List, Optional
 
 
-def clear_directory(directory: str, patterns: List[str], 
-                    verbose: bool = True) -> int:
+def clear_directory(directory: str, patterns: List[str],
+                    verbose: bool = True, recursive: bool = False) -> int:
     """Clear files matching patterns from a directory
-    
+
     Removes files that match any of the specified glob patterns.
-    Does not remove subdirectories.
-    
+    Never removes directories themselves.
+
     Args:
         directory: Target directory path
         patterns: List of glob patterns (e.g., ['*.vti', '*.pvd', '*.csv'])
         verbose: Print warnings for files that couldn't be removed
-        
+        recursive: Also sweep matching files in every subdirectory. The
+            output tree is nested (planes/<name>/, level*/, vth/,
+            markers/, blade_diagnostics/), so a top-level-only sweep
+            leaves stale files behind in exactly the channels that
+            matter (2026-08-18 audit).
+
     Returns:
         Number of files successfully removed
-        
+
     Examples:
         >>> clear_directory('./results', ['*.vti', '*.pvd'])
         Removed 25 files
         25
-        
+
         >>> clear_directory('./checkpoints', ['*.npz'], verbose=False)
         3
     """
     if not os.path.exists(directory):
         return 0
-    
+
     removed_count = 0
-    
+
     for pattern in patterns:
-        # Find files matching pattern
-        files = glob.glob(os.path.join(directory, pattern))
+        # Find files matching pattern ('**' matches zero-or-more dirs,
+        # so the recursive form covers the top level too)
+        if recursive:
+            files = glob.glob(os.path.join(directory, '**', pattern),
+                              recursive=True)
+        else:
+            files = glob.glob(os.path.join(directory, pattern))
         
         for filepath in files:
             # Skip directories
@@ -111,10 +121,16 @@ def setup_output_directories(output_dir: Optional[str],
         vtk_sweep = (sweep_dirs[0] if sweep_dirs else output_dir)
         ckpt_sweep = (sweep_dirs[1] if sweep_dirs else checkpoint_dir)
 
-        # Clear VTK files
+        # Clear VTK-family files. Recursive + full extension set: the
+        # tree nests (planes/<name>/, level*/, vth/, markers/) and the
+        # channels write .vtm/.vth/.vth.series/.vtp indexes alongside
+        # the .vti payload — a top-level {vti,vtk,pvd} sweep left all
+        # of those stale (2026-08-18 audit).
         if vtk_sweep:
-            vtk_patterns = ['*.vti', '*.vtk', '*.pvd']
-            vtk_count = clear_directory(vtk_sweep, vtk_patterns, verbose=False)
+            vtk_patterns = ['*.vti', '*.vtk', '*.pvd', '*.vtm',
+                            '*.vth', '*.vth.series', '*.vtp']
+            vtk_count = clear_directory(vtk_sweep, vtk_patterns,
+                                        verbose=False, recursive=True)
             if verbose and vtk_count > 0:
                 print(f"    Removed {vtk_count} VTK files from {vtk_sweep}")
 
@@ -127,10 +143,12 @@ def setup_output_directories(output_dir: Optional[str],
                 print(f"    Removed {ckpt_count} checkpoint files "
                       f"from {ckpt_sweep}")
 
-        # Clear CSV files
+        # Clear CSV files (recursive: blade_diagnostics/<marker>.csv
+        # live in a subdirectory — same stale-sweep gap as the VTK tree)
         if csv_dir:
             csv_patterns = ['*.csv']
-            csv_count = clear_directory(csv_dir, csv_patterns, verbose=False)
+            csv_count = clear_directory(csv_dir, csv_patterns,
+                                        verbose=False, recursive=True)
             if verbose and csv_count > 0:
                 print(f"    Removed {csv_count} CSV files from {csv_dir}")
 
