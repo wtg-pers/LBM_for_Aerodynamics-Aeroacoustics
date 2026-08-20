@@ -144,6 +144,24 @@ class DistributedMLGRunner:
                                                  n_ranks, ghost)
         bounds = self.bounds
 
+        # surfel MPI (patch 64): z-cut only (62 sec. 1 registration) and
+        # ghost >= 4 — the bridge chain consumes 4 ghost cells/substep
+        # (advect 1 + facet cell spread 2 + trilinear 1; the slab build's
+        # sample-envelope assert measures the real need and re-raises).
+        has_surfel = any(
+            getattr(getattr(b.sim, 'obstacle_bc', None), 'kind', None)
+            == 'surfel' for b in src)
+        if has_surfel and n_ranks > 1:
+            if self.axis != 2:
+                raise ValueError(
+                    "surfel + MPI is registered for the z (span) cut only "
+                    "— pass --axis z (patch_notes/surfel/62 sec. 1)")
+            if ghost < 4:
+                raise ValueError(
+                    "surfel + MPI needs --ghost 4: the surfel stencil "
+                    "chain consumes 4 ghost cells per substep "
+                    "(patch_notes/surfel/64 sec. 8)")
+
         # ── per-block partitions ─────────────────────────────────
         # Child ranges are DERIVED from the parent BLOCK's range with the same
         # fine_range_from_coarse the coupling asserts on, so coupling regions
@@ -271,14 +289,27 @@ class DistributedMLGRunner:
                 str((getattr(lev, "_sgs_cfg", None) or {}).get("model", "off"))
                 == "dyn_smag")
             self.wall_masks.append(int(getattr(lev, '_eso_wall_mask', 0)))
+            is_surfel = getattr(getattr(lev, 'obstacle_bc', None),
+                                'kind', None) == 'surfel'
             if self.owns[uid]:
-                ld = extract_level(lev, self.parts[uid])
-                self.lv.append(LocalLevel(
-                    ld, self.parts[uid],
-                    t0=self.completed_step * (2 ** b.level)))
-                del ld
+                if is_surfel:
+                    from src.parallel.surfel_level import SurfelSlabLevel
+                    self.lv.append(SurfelSlabLevel(
+                        lev, self.parts[uid],
+                        t0=self.completed_step * (2 ** b.level)))
+                else:
+                    ld = extract_level(lev, self.parts[uid])
+                    self.lv.append(LocalLevel(
+                        ld, self.parts[uid],
+                        t0=self.completed_step * (2 ** b.level)))
+                    del ld
             else:
                 self.lv.append(None)
+            if is_surfel and self.owns[uid] \
+                    and getattr(self.lv[-1], '_full', False):
+                # single-rank surfel wraps the replicated sim ITSELF —
+                # its arrays are live production state, never freed here
+                continue
             for a in ("f", "f_post", "f_prev", "rho", "u",
                       "_eso_node_type", "_coupling_skip_nt", "_eso_bc_rho",
                       "_eso_bc_ux", "_eso_bc_uy", "_eso_bc_uz"):
@@ -538,7 +569,9 @@ class DistributedMLGRunner:
                               self.lv[uid].t, self.lv[puid].t,
                               nt_c=self.lv[puid].nt_f2c,
                               wall_c=self.lv[puid].wall_args,
-                              wall_f=self.lv[uid].wall_args)
+                              wall_f=self.lv[uid].wall_args,
+                              surfel_live_c=getattr(
+                                  self.lv[puid], 'surfel_live', None))
             self._toc("coupling", t0)
         if p_mine:
             self._touch(puid)         # f2c wrote the coarse excised rows
@@ -626,6 +659,10 @@ class DistributedMLGRunner:
         uid = self.body_block
         if uid is None or not self.owns[uid]:
             return np.zeros(3)        # this rank holds none of the body block
+        if hasattr(self.lv[uid], 'sb'):
+            # surfel slab (patch 64): facet-ledger force, owned facets
+            # only — the MEM/HWBB formula is not the surfel channel.
+            return self.lv[uid].last_force()
         if self.ibb[uid] is not None:
             # IBB: deposits are already REWRITTEN (Bouzidi values) — the
             # HWBB whole-domain kernel would read 2*val != f* + val. The

@@ -147,6 +147,13 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     n_ax = full_shape[axis]
     idx = np.arange(own_start - ghost, own_start + own_count + ghost) % n_ax
     W = idx.size
+    if W > n_ax:
+        raise ValueError(
+            f"slab surfel: window own {own_count} + 2*ghost {ghost} = {W} "
+            f"exceeds the axis extent {n_ax} — the wrap window would "
+            f"duplicate cells. Axis too thin for this rank count/ghost "
+            f"(production note: span Nz=16 gives L0 z=16 = exactly "
+            f"feasible at 2 ranks; Nz=14 is NOT — patch 64)")
     slab_shape = tuple(W if a == axis else full_shape[a] for a in range(3))
     n_slab = int(np.prod(slab_shape))
     inv = np.full(n_ax, -1, dtype=np.int64)
@@ -178,6 +185,11 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
         return out
 
     k = sb.kernel
+    if getattr(k, 'wm_mode', 0) != 0:
+        raise NotImplementedError(
+            "slab surfel: the wall-model input filter carries per-facet "
+            "state (u_wm/utau_prev) that is not margin-exchanged — wm off "
+            "only under MPI (patch 64 sec. 9)")
     # ── facet filter: keep iff ALL CSR cells inside the window ──────
     # The CSR is facet-major contiguous ((facet, pair) key order), so
     # per-facet segments are [fac_lo[f], fac_lo[f+1]) and reduceat is

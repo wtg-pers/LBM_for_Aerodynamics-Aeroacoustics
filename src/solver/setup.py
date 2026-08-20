@@ -1029,11 +1029,10 @@ class SimulationSetup:
                       "(patch_notes/surfel/63 V1)")
             from src.solver.entry import detect_world_size
             if detect_world_size() > 1:
-                raise NotImplementedError(
-                    "wall_bc='surfel' + MPI is unsupported: the surfel "
-                    "advect REPLACES streaming, and halo exchange is wired "
-                    "to the streaming step — single GPU only in S8a "
-                    "(patch_notes/surfel/48)")
+                # patch 64: z-slab surfel MPI — the runner enforces the
+                # specifics (axis=z, ghost>=4) and builds slab-scoped
+                # bridge Simulations (src/parallel/surfel_level.py).
+                print("  [surfel] MPI z-slab path (patch_notes/surfel/64)")
             alm_cfg = self.config.get('actuator_line', {})
             if isinstance(alm_cfg, dict) and alm_cfg.get('enabled', False):
                 raise NotImplementedError(

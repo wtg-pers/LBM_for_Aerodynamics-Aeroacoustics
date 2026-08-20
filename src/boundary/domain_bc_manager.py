@@ -79,12 +79,35 @@ class DomainBCManager:
         # Phase 1: Parse configuration
         # =====================================================================
         self.face_configs: List[FaceConfig] = parse_all_boundaries(boundaries_config)
-        
+
         if verbose:
             print(f"  Parsed {len(self.face_configs)} boundary faces:")
             for fc in self.face_configs:
                 self._print_face_config(fc)
-        
+
+        self._build_from_faces(verbose)
+
+    @classmethod
+    def for_shape(cls, other: 'DomainBCManager', xp, lattice,
+                  domain_shape: Tuple[int, ...]) -> 'DomainBCManager':
+        """Same parsed faces, different shape (surfel MPI slab, patch 64).
+
+        Bit-compatibility argument: periodic faces carry no BC and do not
+        count for edge/corner classification, so on a cut along a
+        PERIODIC axis every non-cut face's node treatment is uniform
+        along that axis — the slab rebuild applies the exact per-row
+        operations of the full-domain manager on every owned row.
+        """
+        m = cls.__new__(cls)
+        m.xp, m.lattice = xp, lattice
+        m.domain_shape, m.dim = domain_shape, lattice.dim
+        m.face_configs = other.face_configs
+        m._build_from_faces(verbose=False)
+        return m
+
+    def _build_from_faces(self, verbose: bool) -> None:
+        """Phases 2-4: node map + face/sponge BCs + corner BC (shape-bound)."""
+        xp, lattice, domain_shape = self.xp, self.lattice, self.domain_shape
         # =====================================================================
         # Phase 2: Build node map (flat/edge/corner classification)
         # =====================================================================

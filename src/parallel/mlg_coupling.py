@@ -188,13 +188,18 @@ class RankLocalCouplingV1:
 
     # =================================================================
     def f2c(self, mem_f, mem_c, t_f: int, t_c: int, nt_c=None,
-            wall_c=None, wall_f=None) -> None:
+            wall_c=None, wall_f=None, surfel_live_c=None) -> None:
         """Rank-local fine->coarse: excised ∩ owned-coarse written in place.
 
         nt_c: coarse slab node-type — the excised region contains the body
         on coarse levels; without the skip the restriction's solid-cell
         values overwrite live bounce deposits (patch 12 root cause).
-        wall_c/wall_f: see c2f (eso_wall §4-5b)."""
+        wall_c/wall_f: see c2f (eso_wall §4-5b).
+        surfel_live_c: coarse slab live mask (flat) — SURFEL coarse level
+        (patch 64): replaces the hwbb skip with the patch-50 semantics
+        (finite-only fine feedback + dead re-zero), mirroring the single-
+        GPU bridge branch in MultiLevelGrid._coupling_f2c bit-for-bit
+        (same pointwise ops on the same windows)."""
         gc, xp, a = self._gc, self._xp, self._a
         wc, wf = (wall_c or {}), (wall_f or {})
         r = gc._region
@@ -217,6 +222,50 @@ class RankLocalCouplingV1:
         f_fine_at = esoteric_gather_std_region(xp, mem_f, t_f, tuple(f_at),
                                                **wf)
 
+        # ── span-through z: WRAP filter margins (patch 64 sec. 10) ──
+        # The single-GPU f_neq filter is z-PERIODIC on z-flush regions
+        # (coupling._filter_f_neq, xp.roll — the 0812 seam-periodicity
+        # patch). The box clamp above turns that roll into a FALSE wrap
+        # between the local block's own edge rows: the rows written next
+        # to the GLOBAL z-ends read the cut-side margin instead of the
+        # true periodic neighbor (measured: G2 step-1 divergence at each
+        # rank's wrap-side own rows, cut side clean). Fix: gather the
+        # true wrap margin row(s) — present in this rank's fine slab
+        # GHOSTS — and concatenate, so the roll's block-edge wrap only
+        # ever touches unwritten margin rows. Wrap arithmetic is over
+        # the STRIDED coarse-co-located rows (period n_c), NOT linear
+        # fine index — with the odd node-based nf (2n-1) a linear 2*c
+        # extension would alias fine row 1 for the wrap of row 0.
+        pad_lo = pad_hi = 0
+        span_z = (a == 2
+                  and getattr(gc, '_flush_faces', {}).get('z_min', False)
+                  and gc._flush_faces.get('z_max', False))
+        if span_z:
+            n_c = self._box_hi + 1 - self._box_lo
+
+            def _fine_margin_row(m_c):
+                g = 2 * ((m_c - self._box_lo) % n_c)
+                loc = (g - (self._pf.own_start - self._pf.ghost)) \
+                    % self._nf_ax
+                if not (0 <= loc < self._pf.local_shape[a]):
+                    raise ValueError(
+                        "span-z F2C wrap margin row outside the fine "
+                        "slab window — ghost too small for the filter")
+                r_at = list(gc.fine_at_coarse_spatial_slices)
+                r_at[a] = slice(loc, loc + 1)
+                return esoteric_gather_std_region(
+                    xp, mem_f, t_f, tuple(r_at), **wf)
+
+            parts = [f_fine_at]
+            if w_lo - 1 < self._box_lo:
+                parts.insert(0, _fine_margin_row(w_lo - 1))
+                pad_lo = 1
+            if w_hi + 1 > self._box_hi + 1:
+                parts.append(_fine_margin_row(w_hi))
+                pad_hi = 1
+            if pad_lo or pad_hi:
+                f_fine_at = xp.concatenate(parts, axis=1 + a)
+
         # same fused feq/fneq primitive as GridCoupling.fine_to_coarse —
         # the decomposition MUST share the production op or the two sides
         # split by kernel-vs-elementwise rounding (few f32 ulps, G-M2b)
@@ -227,9 +276,21 @@ class RankLocalCouplingV1:
         # excised extraction: global excised offsets within the box on the
         # non-split axes (gc._excised_local_slices), write-rows on the axis.
         exl = list(gc._excised_local_slices[1:])          # spatial, box-local
-        exl[a] = slice(w_lo - rr_lo, w_hi - rr_lo)
+        exl[a] = slice(w_lo - rr_lo + pad_lo, w_hi - rr_lo + pad_lo)
         block = recon[(slice(None),) + tuple(exl)]
         dst = list(ex)
         dst[a] = slice(self._l_c(w_lo), self._l_c(w_hi))
-        esoteric_scatter_std_region(xp, mem_c, block, t_c, tuple(dst),
-                                    skip_solid_nt=nt_c, **wc)
+        if surfel_live_c is not None:
+            cur = esoteric_gather_std_region(xp, mem_c, t_c, tuple(dst),
+                                             **wc)
+            block = xp.where(xp.isnan(block),
+                             cur.astype(block.dtype, copy=False), block)
+            live = surfel_live_c.reshape(mem_c.shape[1:])[tuple(dst)]
+            block = xp.where((live > 0)[None], block,
+                             block.dtype.type(0.0))
+            esoteric_scatter_std_region(
+                xp, mem_c, block.astype(cur.dtype, copy=False), t_c,
+                tuple(dst), **wc)
+        else:
+            esoteric_scatter_std_region(xp, mem_c, block, t_c, tuple(dst),
+                                        skip_solid_nt=nt_c, **wc)

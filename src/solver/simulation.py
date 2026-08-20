@@ -1429,6 +1429,29 @@ class Simulation:
         self._esoteric_step = 0
         self._use_esoteric = True
 
+    def adopt_esoteric_surfel_slab(self, mem: 'npt.NDArray',
+                                   t0: int) -> None:
+        """Adopt an ALREADY-esoteric slab memory (surfel MPI, patch 64).
+
+        The MPI runner extracts a wrap-sliced slab of the replicated
+        build's eso mem (the bridge converted it at parity 0) — no
+        conversion here, only adoption + the std-side allocations the
+        bridge chain needs (mirrors the set_distribution tail: _f_post
+        and the SGS nu_t buffer).
+        """
+        xp = self.xp
+        if mem.dtype != xp.float32:
+            raise ValueError("esoteric surfel slab must be float32")
+        self.f = mem
+        self._esoteric_step = int(t0)
+        self._use_esoteric = True
+        self._is_ready = True
+        self._f_post = xp.empty_like(mem)
+        if self._sgs_cfg["model"] in ("smagorinsky", "wale", "dyn_smag"):
+            self.nu_t = xp.zeros(self.domain_shape, dtype=mem.dtype)
+        else:
+            self.nu_t = None
+
     def _advance_surfel_esoteric(self) -> None:
         """V1 bridge step: self.f is eso-RESIDENT between steps (parity =
         self._esoteric_step); each step gathers the physical std field,
