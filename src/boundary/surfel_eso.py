@@ -117,6 +117,264 @@ def stage_and_deposit_boxes(M: np.ndarray, stage_margin: int = 2,
     return stage, dep
 
 
+def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
+                      ghost: int = 3):
+    """Slab-filtered SurfelBoundary clone (patch 64 sec. 2).
+
+    Slices the BUILT full-domain surfel state onto a wrap window
+    [own_start-ghost, own_start+own_count+ghost) along `axis` — never
+    rebuilds geometry (the prism march's periodic wrap would be wrong at
+    slab edges; slicing is bit-faithful to the replicated build). The
+    build_slab_ibb pattern (runner S6) applied to the surfel stack.
+
+    Facets are kept iff ALL their CSR cells lie inside the window; the
+    build asserts that every facet relevant to OWN-correct output (any
+    cell within own+-1) is kept, and that the wall-law sample envelope
+    of those facets stays inside the window along the slab axis.
+
+    Returns a SlabSurfelBoundary whose hot chain (sanitize/mask/tau_sgs/
+    inject/apply_and_advect/zero_dead) is the production one on slab
+    arrays. Surface output (write_surface/facet_traction) is guarded off
+    — the MPI surface channel is a follow-up (64 sec. 7).
+    """
+    from types import SimpleNamespace
+    from src.boundary.surfel_boundary import SurfelBoundary
+    from src.kernels.surfel_d3q27 import SurfelKernelD3Q27
+    from src.boundary.surfel_transport import N_PAIR
+
+    xp = sb.xp
+    full_shape = sb.shape
+    n_ax = full_shape[axis]
+    idx = np.arange(own_start - ghost, own_start + own_count + ghost) % n_ax
+    W = idx.size
+    slab_shape = tuple(W if a == axis else full_shape[a] for a in range(3))
+    n_slab = int(np.prod(slab_shape))
+    inv = np.full(n_ax, -1, dtype=np.int64)
+    inv[idx] = np.arange(W)
+
+    def cells_slice(arr):
+        """(…, N) device/host array -> (…, N_slab), wrap window on axis."""
+        lead = arr.shape[:-1]
+        a3 = arr.reshape(lead + full_shape)
+        take = [slice(None)] * (len(lead) + 3)
+        mod = np if isinstance(arr, np.ndarray) else xp
+        take[len(lead) + axis] = mod.asarray(idx)
+        return a3[tuple(take)].reshape(lead + (n_slab,)).copy()
+
+    def remap_flat(cells_global):
+        """Global flat cell index -> slab flat; -1 outside the window."""
+        c = np.asarray(cells_global.get() if hasattr(cells_global, 'get')
+                       else cells_global, dtype=np.int64)
+        Nx, Ny, Nz = full_shape
+        z = c % Nz
+        y = (c // Nz) % Ny
+        x = c // (Ny * Nz)
+        co = np.stack([x, y, z])
+        w = inv[co[axis]]
+        co = co.copy()
+        co[axis] = w
+        out = (co[0] * slab_shape[1] + co[1]) * slab_shape[2] + co[2]
+        out[w < 0] = -1
+        return out
+
+    k = sb.kernel
+    # ── facet filter: keep iff ALL CSR cells inside the window ──────
+    # The CSR is facet-major contiguous ((facet, pair) key order), so
+    # per-facet segments are [fac_lo[f], fac_lo[f+1]) and reduceat is
+    # exact — no python loop (span16 L3 has O(1e5) facets).
+    indptr_h = np.asarray(k.indptr.get())
+    cell_h = np.asarray(k.cell.get(), dtype=np.int64)
+    wgt_h = np.asarray(k.wgt.get())
+    cell_slab = remap_flat(cell_h)
+    n_f = k.n_f
+    seg = indptr_h.reshape(-1)                      # (n_f*N_PAIR + 1,)
+    fac_lo = seg[:-1].reshape(n_f, N_PAIR)[:, 0]
+    if fac_lo[0] != 0 or not (np.diff(fac_lo) >= 0).all():
+        raise AssertionError("surfel CSR is not facet-major contiguous")
+    keep = np.minimum.reduceat(cell_slab, fac_lo) >= 0
+    kept = np.flatnonzero(keep)
+
+    # own-relevance assertion: facets with any cell at own+-1 must be kept
+    Nz_ = full_shape[2]
+    ax_of = (cell_h % Nz_ if axis == 2 else
+             (cell_h // Nz_) % full_shape[1] if axis == 1 else
+             cell_h // (full_shape[1] * Nz_))
+    rel = ((ax_of - (own_start - 1)) % n_ax) < (own_count + 2)
+    facet_rel = np.logical_or.reduceat(rel, fac_lo)
+    bad = facet_rel & ~keep
+    if bad.any():
+        raise ValueError(
+            f"slab surfel: {int(bad.sum())} facets touch the own range "
+            f"but have cells outside the window — ghost {ghost} too small")
+
+    # wall-law sample envelope along the slab axis (kernel samples at
+    # cen + sample_h*n with trilinear support 1). Checked only for OWN-
+    # relevant facets — window-edge ghost facets are recomputed junk the
+    # deposit never uses, and their envelope legitimately leaves the
+    # window.
+    cen_h = np.asarray(k.cen.get())
+    nrm_h = np.asarray(k.nrm.get())
+    chk = np.flatnonzero(keep & facet_rel)
+    reach = (float(k.f.sample_h) + float(k.h_law)) * np.abs(
+        nrm_h[chk][:, axis]) + 1.0
+    pos_w = (cen_h[chk][:, axis] - (own_start - ghost)) % n_ax
+    if ((pos_w - reach < 0) | (pos_w + reach > W)).any():
+        raise ValueError(
+            "slab surfel: wall-law sample envelope of an own-relevant "
+            f"facet escapes the window along axis {axis} — raise ghost "
+            f"above {ghost} (normals have a large slab-axis component)")
+
+    # CSR rebuild for kept facets — vectorized row mask over the
+    # facet-major arrays (key order preserved by construction)
+    facet_of_row = np.repeat(np.arange(n_f), np.diff(fac_lo, append=seg[-1]))
+    row_keep = keep[facet_of_row]
+    new_cell = cell_slab[row_keep]
+    new_wgt = wgt_h[row_keep]
+    counts_all = np.diff(seg)                       # per (facet, pair) key
+    key_keep = np.repeat(keep, N_PAIR)
+    new_indptr = np.concatenate(
+        [[0], np.cumsum(counts_all[key_keep], dtype=np.int64)])
+
+    # ── slab kernel (shared RawKernels; per-facet rows filtered) ────
+    sk = SurfelKernelD3Q27.__new__(SurfelKernelD3Q27)
+    sk._k = k._k
+    sk.block = k.block
+    for name in ('mode', 'law_id', 'law_iters', 'h_law', 'nu',
+                 'y_plus_min', 'fric_dir', 'fb_mode', 'wm_mode', 'wm_tf',
+                 '_per'):
+        setattr(sk, name, getattr(k, name))
+    sk.n_f = int(kept.size)
+    sk.shape = slab_shape
+    sk.N = n_slab
+    sk.indptr = xp.asarray(new_indptr)
+    sk.cell = xp.asarray(new_cell.astype(np.int32))
+    sk.wgt = xp.asarray(new_wgt)
+    sk.nrm = xp.asarray(np.ascontiguousarray(nrm_h[kept]))
+    sk.area = k.area[xp.asarray(kept)].copy()
+    cen_slab = cen_h[kept].copy()
+    cen_slab[:, axis] = (cen_slab[:, axis] - (own_start - ghost)) % n_ax
+    sk.cen = xp.asarray(np.ascontiguousarray(cen_slab))
+    sk.Vsum = k.Vsum[xp.asarray(kept)].copy()
+    sk.g_field = cells_slice(k.g_field)
+    sk.G_in = xp.zeros((sk.n_f, 27), dtype=xp.float64)
+    sk.G_out = xp.zeros((sk.n_f, 27), dtype=xp.float64)
+    sk.Q = xp.zeros((27, n_slab), dtype=xp.float64)
+    sk.tau_out = xp.zeros(sk.n_f, dtype=xp.float64)
+    sk.fb_out = xp.zeros(sk.n_f, dtype=xp.uint8)
+    sk.u_wm = xp.zeros((sk.n_f, 3), dtype=xp.float64)
+    sk.utau_prev = xp.zeros(sk.n_f, dtype=xp.float64)
+    sk._wm_seed = 1
+    sk.f = SimpleNamespace(
+        sample_h=k.f.sample_h,
+        cdotn=np.ascontiguousarray(np.asarray(k.f.cdotn)[kept]))
+
+    # ── slab boundary object ────────────────────────────────────────
+    out = SlabSurfelBoundary.__new__(SlabSurfelBoundary)
+    out.xp = xp
+    out.shape = slab_shape
+    out.kernel = sk
+    out.n_facets = sk.n_f
+    out.d_live = cells_slice(sb.d_live)
+    out.d_dead = cells_slice(sb.d_dead)
+    out.d_dV = cells_slice(sb.d_dV)
+    out.dV_h = cells_slice(np.ascontiguousarray(
+        sb.dV_h.reshape(-1))).reshape(slab_shape)
+    out.live_h = cells_slice(np.ascontiguousarray(
+        sb.live_h.reshape(-1))).reshape(slab_shape)
+    out._solid_mask_dev = None
+    out._d_CC = None
+    out._force = None
+    for name in ('params', 'dv_min', 'tau_model_on', 'collide_path',
+                 'q_inf', 'p_ref', 'coord_origin', 'coord_spacing'):
+        setattr(out, name, getattr(sb, name))
+    out._taum_summary = getattr(sb, '_taum_summary', '')
+    out.facets = sk.f                       # hot chain reads sample_h only
+    out.surfels = None
+    out.triangles_lu = None                 # write_surface guarded off
+
+    # tau-model band: window filter + facet-column filter of W
+    if getattr(sb, 'tau_model_on', False):
+        tb_slab = remap_flat(sb.d_tb_cells)
+        rows = np.flatnonzero(tb_slab >= 0)
+        out.d_tb_cells = xp.asarray(tb_slab[rows])
+        out.d_tb_fs = sb.d_tb_fs[xp.asarray(rows)].copy()
+        out.d_tb_normal = sb.d_tb_normal[xp.asarray(rows)].copy()
+        out.d_tb_C = sb.d_tb_C
+        out.d_tb_Wl = sb.d_tb_Wl
+        Wh = sb._tb_W.get()                 # cupyx csr -> scipy (build-time)
+        Ws = Wh[rows][:, kept]
+        # own-relevant band rows must not have lost any facet column
+        tb_ax = np.asarray(sb.d_tb_cells.get()
+                           if hasattr(sb.d_tb_cells, 'get')
+                           else sb.d_tb_cells, dtype=np.int64)
+        if axis == 2:
+            tb_axof = tb_ax % Nz_
+        elif axis == 1:
+            tb_axof = (tb_ax // Nz_) % full_shape[1]
+        else:
+            tb_axof = tb_ax // (full_shape[1] * Nz_)
+        rel_rows = ((tb_axof[rows] - (own_start - 2)) % n_ax) < \
+            (own_count + 4)
+        lost = np.asarray((Wh[rows].sum(axis=1) - Ws.sum(axis=1))
+                          ).reshape(-1)
+        if (rel_rows & (np.abs(lost) > 0)).any():
+            raise ValueError(
+                "slab surfel: own-relevant tau-band rows reference "
+                "facets outside the window — ghost too small")
+        import cupyx.scipy.sparse as _cs
+        out._tb_W = _cs.csr_matrix(Ws.tocsr())
+        out._sig_last = None
+    else:
+        out._sig_last = None
+
+    # ownership (deterministic across ranks): facet anchor = its FIRST
+    # CSR cell's slab-axis coordinate, owned iff inside the own range
+    anchor_ax = ax_of[fac_lo[kept]]
+    out.facet_owned = xp.asarray(
+        (((anchor_ax - own_start) % n_ax) < own_count))
+    out.facet_gids = kept
+    out.slab_axis = axis
+    return out
+
+
+from src.boundary.surfel_boundary import SurfelBoundary as _SB  # noqa: E402
+
+
+class SlabSurfelBoundary(_SB):
+    """SurfelBoundary on a wrap-window slab (patch 64).
+
+    Built ONLY by build_slab_surfel (never __init__). Differences from
+    the full object: `last_force` sums OWNED facets only (ghost-strip
+    facets are deterministic duplicates — the cross-rank Allreduce then
+    counts the body force once; the partial-sum order makes this an
+    ulp-level match to the 1-rank sum, not bitwise — 64 sec. 3), and the
+    surface output channel is guarded off until the MPI surface gather.
+    """
+
+    def last_force(self):
+        if getattr(self, '_force', None) is None:
+            return np.zeros(3)              # no facet pass yet this run
+        k = self.kernel
+        xp = self.xp
+        from src.boundary.surfel_transport import C27 as _C
+        cdotn = xp.asarray(k.f.cdotn)
+        own = self.facet_owned[:, None]
+        G = ((k.G_in * (cdotn < 0) - k.G_out * (cdotn > 0)) * own
+             ).sum(axis=0)
+        F = xp.asarray(_C.astype(np.float64)).T @ G
+        return np.asarray(F.get() if hasattr(F, 'get') else F, dtype=float)
+
+    def write_surface(self, path: str) -> int:
+        raise NotImplementedError(
+            "slab surfel: surface output is the MPI surface-gather "
+            "follow-up (patch_notes/surfel/64 sec. 7)")
+
+    def facet_traction(self, *a, **k):
+        raise NotImplementedError(
+            "slab surfel: facet_traction is rank-local — use the MPI "
+            "surface gather (patch_notes/surfel/64 sec. 7)")
+
+
 def verify_containment(M: np.ndarray, stage: Region, dep: Region) -> None:
     """Raise unless R ⊆ deposit box and sources(deposit) ⊆ stage box.
 
