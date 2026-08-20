@@ -252,7 +252,14 @@ class Simulation:
                 and len(self.domain_shape) == 3):
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
-            if isinstance(self.collision, (BGKCollision, CumulantCollision)):
+            if self._use_surfel:
+                # patch_notes/surfel/63 V1 bridge: eso RESIDENCY only.
+                # The std surfel chain still runs every step on a gathered
+                # field, so the standard allocations below (_f_post, SGS
+                # buffers) are still required — no early return for this
+                # combination.
+                self._init_esoteric_bridge(f)
+            elif isinstance(self.collision, (BGKCollision, CumulantCollision)):
                 # IBB is supported on the single-GPU esoteric path since S5
                 # (two-phase deposit-rewrite pass built in _init_esoteric).
                 # Init failure used to warn and continue on the standard
@@ -261,7 +268,7 @@ class Simulation:
                 # driver._fail_fast_config history). Esoteric was requested
                 # explicitly (env/config), so failure is fatal.
                 self._init_esoteric(f)
-        if self._use_esoteric:
+        if self._use_esoteric and not self._use_surfel:
             return  # single-buffer: skip _f_post / SGS / fused setup below
 
         self._f_post = self.xp.empty_like(f)
@@ -469,7 +476,10 @@ class Simulation:
             Post-collision f, shape (Q, Nx, Ny[, Nz])  [dimensionless]
         """
         if self._use_esoteric:
-            return None
+            # surfel residency bridge (patch_notes/surfel/63): the std
+            # chain still runs per step, so a real post-collision buffer
+            # exists — only the pure eso paths are single-buffer.
+            return self._f_post if self._use_surfel else None
         return self._f_post
 
     def eso_body_force(self) -> 'npt.NDArray':
@@ -609,10 +619,10 @@ class Simulation:
             # own path and composes with nothing else in S8a
             # (patch_notes/surfel/46 sec. 1; guards raised in setup).
             if self._use_esoteric:
-                raise RuntimeError(
-                    "wall_bc='surfel' does not support esoteric streaming "
-                    "(re-evaluated after S8c — patch_notes/surfel/46)")
-            if self._surfel_use_kernel():
+                # 46 sec. 3 deferral lifted by the V1 residency bridge
+                # (patch_notes/surfel/63; MPI stays guarded in setup).
+                self._advance_surfel_esoteric()
+            elif self._surfel_use_kernel():
                 self._advance_surfel_kernel()
             else:
                 self._advance_surfel()
@@ -1394,6 +1404,54 @@ class Simulation:
         self.bc_manager.apply_all(self.f, self._f_post)
 
         self.step_count += 1
+
+    # =====================================================================
+    # Esoteric+surfel V1 residency bridge (patch_notes/surfel/63)
+    # =====================================================================
+
+    def _init_esoteric_bridge(self, f: 'npt.NDArray') -> None:
+        """Eso residency for the surfel path (63 V1): convert the std IC
+        to Esoteric memory and keep the parity counter — NOTHING else.
+
+        Deliberately not _init_esoteric: no fused kernel, no node_type/BC
+        arrays, no wall mailbox, and above all no solid-bounce IC seeder —
+        surfel dead cells hold f = 0 by convention and seeding HWBB
+        deposits into their slots would surface as nonzero dead-cell
+        populations on the very first gather.
+        """
+        from src.kernels.esoteric_d3q27 import esoteric_scatter_std
+        xp = self.xp
+        if f.dtype != xp.float32:
+            raise ValueError(
+                f"esoteric surfel bridge is float32-only (got {f.dtype}); "
+                "use precision: float32 or disable LBM_ESOTERIC")
+        self.f = esoteric_scatter_std(xp, f, 0)
+        self._esoteric_step = 0
+        self._use_esoteric = True
+
+    def _advance_surfel_esoteric(self) -> None:
+        """V1 bridge step: self.f is eso-RESIDENT between steps (parity =
+        self._esoteric_step); each step gathers the physical std field,
+        runs the EXACT std surfel advance on it, and scatters the result
+        so the next load reads it.
+
+        Gather/scatter round-trip identity = gate s14 E1, end-to-end
+        bit-parity vs the std path = s14 E3/E4. The fused eso kernel is
+        NOT launched in V1 (full staging); the box-restricted sandwich
+        that launches it lands with the slab filter (62 (2)) where the
+        same restriction is needed for MPI anyway.
+        """
+        from src.kernels.esoteric_d3q27 import (
+            esoteric_gather_std, esoteric_scatter_std)
+        xp = self.xp
+        t = self._esoteric_step
+        self.f = esoteric_gather_std(xp, self.f, t)
+        if self._surfel_use_kernel():
+            self._advance_surfel_kernel()
+        else:
+            self._advance_surfel()
+        self.f = esoteric_scatter_std(xp, self.f, t + 1)
+        self._esoteric_step += 1
 
     def _advance_fused(self) -> None:
         """Fused CUDA kernel path (no ALM): macro + collision in 1 launch."""

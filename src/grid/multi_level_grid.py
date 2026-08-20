@@ -376,7 +376,41 @@ class MultiLevelGrid:
         else:
             f_f = sim_fine.f
             f_is_at = False
-        if getattr(sim_coarse, '_use_esoteric', False):
+        if getattr(sim_coarse, '_use_esoteric', False) \
+                and getattr(sim_coarse, '_use_surfel', False):
+            # Surfel coarse level under the eso residency bridge
+            # (patch_notes/surfel/63): the patch-50 surfel F2C semantics
+            # (finite-only fine feedback + dead re-zero) MUST win over the
+            # hwbb-style skip_solid_nt branch below — the branch order
+            # alone routed the bridge there, which scattered the
+            # restriction's NaN (fine dead rho = 0) raw into the excised
+            # block (first activated by the mlg2 bridge smoke, step 0).
+            # Same patch-50 fix, phrased as read-modify-write on the
+            # physical view (the coarse mem is eso-resident): writing
+            # physical zeros at dead cells is well-defined — dead f = 0
+            # IS the surfel convention (no bounce deposits to protect,
+            # unlike the hwbb aliasing case).
+            from src.kernels.esoteric_d3q27 import (
+                esoteric_gather_std_region, esoteric_scatter_std_region)
+            xp = sim_coarse.xp
+            block = coupling.fine_to_coarse(
+                f_f, None, f_fine_is_at_coarse=f_is_at,
+                return_excised=True)
+            sl = coupling.excised_spatial_slices
+            cur = esoteric_gather_std_region(
+                xp, sim_coarse.f, sim_coarse._esoteric_step, sl,
+                **_eso_wall_args(sim_coarse))
+            merged = xp.where(xp.isnan(block),
+                              cur.astype(block.dtype, copy=False), block)
+            live = sim_coarse.obstacle_bc.d_live.reshape(
+                sim_coarse.domain_shape)[sl]
+            merged = xp.where((live > 0)[None], merged,
+                              merged.dtype.type(0.0))
+            esoteric_scatter_std_region(
+                xp, sim_coarse.f, merged.astype(cur.dtype, copy=False),
+                sim_coarse._esoteric_step, sl,
+                **_eso_wall_args(sim_coarse))
+        elif getattr(sim_coarse, '_use_esoteric', False):
             from src.kernels.esoteric_d3q27 import esoteric_scatter_std_region
             block = coupling.fine_to_coarse(
                 f_f, None, f_fine_is_at_coarse=f_is_at, return_excised=True)

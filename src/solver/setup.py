@@ -1022,9 +1022,11 @@ class SimulationSetup:
             if self.lattice.dim != 3:
                 raise ValueError("wall_bc='surfel' is D3Q27-only")
             if _os.environ.get('LBM_ESOTERIC', '0') == '1':
-                raise RuntimeError(
-                    "wall_bc='surfel' + esoteric streaming is deferred to "
-                    "after S8c (patch_notes/surfel/46 sec. 3)")
+                # 46 sec. 3 deferral lifted: V1 residency bridge (gather ->
+                # std surfel chain -> scatter, patch_notes/surfel/63).
+                # MPI stays guarded below until the slab filter (62 (2)).
+                print("  [surfel] esoteric residency bridge active "
+                      "(patch_notes/surfel/63 V1)")
             from src.solver.entry import detect_world_size
             if detect_world_size() > 1:
                 raise NotImplementedError(

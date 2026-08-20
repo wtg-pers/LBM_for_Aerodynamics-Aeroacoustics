@@ -526,7 +526,11 @@ class OutputManager:
         else:
             lvl = sim
 
-        if getattr(lvl, '_use_esoteric', False):
+        if getattr(lvl, '_use_esoteric', False) \
+                and not getattr(lvl, '_use_surfel', False):
+            # surfel + eso is the residency bridge (patch_notes/surfel/
+            # 63): its force is the facet ledger fed by the std chain,
+            # NOT the HWBB MEM formula — route it like the std path.
             return None, lvl.eso_body_force()
         return lvl.f_post, None
 
