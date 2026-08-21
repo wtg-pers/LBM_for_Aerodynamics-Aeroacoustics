@@ -559,7 +559,13 @@ class SurfelKernelD3Q27:
             n_post, self.indptr, self.cell, self.wgt, self.nrm, self.G_in,
             cp.int32(self.n_f), cp.int64(self.N)))
 
-        tw = tau_w if tau_w is not None else cp.zeros(1, dtype=cp.float64)
+        if tau_w is not None:
+            tw = tau_w
+        else:
+            tw = getattr(self, '_d_tw0', None)
+            if tw is None:
+                tw = cp.zeros(1, dtype=cp.float64)
+                self._d_tw0 = tw
         self._k['surfel_scatter'](gf, blk, (
             self.G_in, self.nrm, self.area, self.cen, rho, u, live, tw,
             self.G_out, self.tau_out, self.fb_out,
@@ -597,8 +603,19 @@ class SurfelKernelD3Q27:
             self.G_out, self.Vsum, self.indptr, self.cellc, self.wgt,
             self.nrm, self.Q, cp.int32(self.n_f), cp.int64(self.n_sup)))
 
-        cdotn = cp.asarray(self.f.cdotn)
-        force = (cp.asarray(C27.astype(np.float64)).T
+        # device-cached constants (64 sec. 19b): cp.asarray of the HOST
+        # cdotn here was a synchronous (n_f, 27) f64 H2D upload on EVERY
+        # apply — ~650 MB/coarse step at span16, each blocking the
+        # stream. Lazy getattr: slab clones are built via __new__.
+        cdotn = getattr(self, '_d_cdotn', None)
+        if cdotn is None:
+            cdotn = cp.asarray(self.f.cdotn)
+            self._d_cdotn = cdotn
+        C27T = getattr(self, '_d_C27T', None)
+        if C27T is None:
+            C27T = cp.asarray(C27.astype(np.float64)).T
+            self._d_C27T = C27T
+        force = (C27T
                  @ (self.G_in * (cdotn < 0) - self.G_out * (cdotn > 0)).sum(
                      axis=0))
         return self.Q, force
