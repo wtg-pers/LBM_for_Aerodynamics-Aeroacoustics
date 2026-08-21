@@ -194,8 +194,13 @@ def band_needed_gids(sb, axis: int, own_start: int, own_count: int,
 
 
 def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
-                      ghost: int = 3):
+                      ghost: int = 3, consume: bool = False):
     """Slab-filtered SurfelBoundary clone (patch 64 sec. 2).
+
+    consume=True releases the full build's g_field (216 B/node, the
+    single largest device array) the moment its slab slice exists —
+    for the production one-slab-per-rank path (64 sec. 15). Leave False
+    when several slabs are built from one replicated build (gate E6).
 
     Slices the BUILT full-domain surfel state onto a wrap window
     [own_start-ghost, own_start+own_count+ghost) along `axis` — never
@@ -350,6 +355,12 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     sk.cen = xp.asarray(np.ascontiguousarray(cen_slab))
     sk.Vsum = k.Vsum[xp.asarray(kept)].copy()
     sk.g_field = cells_slice(k.g_field)
+    if consume:
+        # Full g_field is the largest full-build array still resident
+        # and nothing below reads it — the post-build release in
+        # SurfelSlabLevel only frees it AFTER the tau-band section,
+        # whose 2.3 MB alloc sat on the card ceiling (64 sec. 15).
+        k.g_field = None
     sk.G_in = xp.zeros((sk.n_f, 27), dtype=xp.float64)
     sk.G_out = xp.zeros((sk.n_f, 27), dtype=xp.float64)
     sk.Q = None                        # lazy, like the full kernel (64 §13)

@@ -45,9 +45,27 @@ class SurfelSlabLevel:
             self.surfel_live = sb_full.d_live
             live_h = sb_full.live_h
         else:
+            # f window slice FIRST (64 sec. 15): the full-domain f
+            # (216 B/node, 6.35 GiB at span16 L3) used to stay resident
+            # through the whole slab-surfel build while only its window
+            # survives it. Slicing here and dropping the full array buys
+            # the build the full-minus-window difference in headroom;
+            # the eso/std conversion itself stays where it was (after
+            # the full-surfel release below).
+            idx = cp.asarray(
+                np.arange(part.own_start - part.ghost,
+                          part.own_start + part.own_count + part.ghost)
+                % n_ax)
+            take = [slice(None)] * 4
+            take[1 + part.axis] = idx
+            f_slab = cp.ascontiguousarray(lev.f[tuple(take)])
+            was_eso = bool(getattr(lev, '_use_esoteric', False))
+            lev.f = None
+            cp.get_default_memory_pool().free_all_blocks()
+
             self.sb = build_slab_surfel(
                 sb_full, part.axis, part.own_start, part.own_count,
-                ghost=part.ghost)
+                ghost=part.ghost, consume=True)
             slab_shape = self.sb.shape
             self.surfel_live = self.sb.d_live
             live_h = self.sb.live_h
@@ -78,25 +96,19 @@ class SurfelSlabLevel:
                     setattr(sb_full, a_, None)
             cp.get_default_memory_pool().free_all_blocks()
 
-            idx = cp.asarray(
-                np.arange(part.own_start - part.ghost,
-                          part.own_start + part.own_count + part.ghost)
-                % n_ax)
-            take = [slice(None)] * 4
-            take[1 + part.axis] = idx
-            if getattr(lev, '_use_esoteric', False):
-                # window slice of the full eso mem: interior-identical to
-                # a slab-local conversion; the ghost-rim slot difference
-                # is refreshed by the first sync (E6 halo model)
-                mem = cp.ascontiguousarray(lev.f[tuple(take)])
+            if was_eso:
+                # window slice of the full eso mem (taken above):
+                # interior-identical to a slab-local conversion; the
+                # ghost-rim slot difference is refreshed by the first
+                # sync (E6 halo model)
+                mem = f_slab
             else:
                 # MPI build keeps f STANDARD (64 sec. 13): convert THIS
                 # slab only. Parity t0 is even by construction (fresh 0;
                 # restarts are even-checkpoint-only — 64 sec. 12 G5).
                 from src.kernels.esoteric_d3q27 import esoteric_scatter_std
-                slab_std = cp.ascontiguousarray(lev.f[tuple(take)])
-                mem = esoteric_scatter_std(cp, slab_std, t0)
-                del slab_std
+                mem = esoteric_scatter_std(cp, f_slab, t0)
+            del f_slab
 
             from src.solver.simulation import Simulation
             from src.boundary.domain_bc_manager import DomainBCManager
