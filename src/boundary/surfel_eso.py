@@ -236,13 +236,19 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     inv[idx] = np.arange(W)
 
     def cells_slice(arr):
-        """(…, N) device/host array -> (…, N_slab), wrap window on axis."""
+        """(…, N) device/host array -> (…, N_slab), wrap window on axis.
+
+        Fancy indexing already materializes a fresh contiguous array —
+        a trailing .copy() here DOUBLED the allocation and was the exact
+        3.66 GB request of the span16 L3-slab OOM (patch 64 sec. 14).
+        """
         lead = arr.shape[:-1]
         a3 = arr.reshape(lead + full_shape)
         take = [slice(None)] * (len(lead) + 3)
         mod = np if isinstance(arr, np.ndarray) else xp
         take[len(lead) + axis] = mod.asarray(idx)
-        return a3[tuple(take)].reshape(lead + (n_slab,)).copy()
+        return mod.ascontiguousarray(
+            a3[tuple(take)].reshape(lead + (n_slab,)))
 
     def remap_flat(cells_global):
         """Global flat cell index -> slab flat; -1 outside the window."""

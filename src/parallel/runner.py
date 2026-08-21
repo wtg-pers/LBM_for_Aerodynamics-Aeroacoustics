@@ -306,9 +306,11 @@ class DistributedMLGRunner:
                     # symmetry across ranks is exactly what a hang needs
                     # shown (send size here == peer's n_recv, and vice
                     # versa, or the taum collect blocks forever)
+                    pu = cp.get_default_memory_pool().used_bytes() / 2**30
                     print(f"[mpi] surfel slab {b.label} rank{rank}: "
                           f"{L.sb.n_facets:,} facets, taum wires "
-                          f"{wires or 'off'}", file=sys.stderr, flush=True)
+                          f"{wires or 'off'}, pool {pu:.1f} GiB",
+                          file=sys.stderr, flush=True)
                 else:
                     ld = extract_level(lev, self.parts[uid])
                     self.lv.append(LocalLevel(

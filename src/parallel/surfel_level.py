@@ -49,6 +49,35 @@ class SurfelSlabLevel:
                 sb_full, part.axis, part.own_start, part.own_count,
                 ghost=part.ghost)
             slab_shape = self.sb.shape
+            self.surfel_live = self.sb.d_live
+            live_h = self.sb.live_h
+
+            # tau-band margin exchange wires (patch 64 stage ii) — must
+            # precede the full-surfel release below (reads full CSR / W)
+            self.taum = None
+            self._tt = None
+            if getattr(self.sb, 'tau_model_on', False):
+                self._taum_wire(sb_full, part)
+
+            # Release the FULL-build surfel DEVICE arrays (64 sec. 13/14):
+            # g_field alone is 216 B/node full-domain. Ordering is load-
+            # bearing — releasing BEFORE the slab mem conversion keeps
+            # the L3 peak from stacking (full surfel + slab arrays +
+            # conversion transient) on one card, which was the second
+            # span16 OOM. Host state (live_h, dV_h, facets) survives for
+            # the driver's solid-mask collection.
+            k_full = sb_full.kernel
+            for a_ in ('g_field', 'Q', 'indptr', 'cell', 'wgt', 'nrm',
+                       'area', 'cen', 'Vsum', 'G_in', 'G_out', 'tau_out',
+                       'fb_out', 'u_wm', 'utau_prev'):
+                setattr(k_full, a_, None)
+            for a_ in ('d_live', 'd_dead', 'd_dV', '_solid_mask_dev',
+                       '_tb_W', 'd_tb_cells', 'd_tb_fs', 'd_tb_normal',
+                       '_tb_tau_ext'):
+                if hasattr(sb_full, a_):
+                    setattr(sb_full, a_, None)
+            cp.get_default_memory_pool().free_all_blocks()
+
             idx = cp.asarray(
                 np.arange(part.own_start - part.ghost,
                           part.own_start + part.own_count + part.ghost)
@@ -87,35 +116,10 @@ class SurfelSlabLevel:
                 sgs_cfg=getattr(lev, '_sgs_cfg', None),
             )
             self.sim.adopt_esoteric_surfel_slab(mem, t0)
-            self.surfel_live = self.sb.d_live
-            live_h = self.sb.live_h
-        # tau-band margin exchange wires (patch 64 stage ii): per unique
-        # neighbor, the OWNED facets whose tau_out the neighbor's band
-        # references — both sides derive the sets from the replicated
-        # build, so they agree without communication.
-        self.taum = None
-        self._tt = None
-        if not self._full and getattr(self.sb, 'tau_model_on', False):
-            self._taum_wire(sb_full, part)
 
-        if not self._full:
-            # Release the FULL-build surfel DEVICE arrays (64 sec. 13):
-            # g_field alone is 216 B/node full-domain — kept alive, the
-            # run state re-adds the whole single-GPU footprint on top of
-            # the slabs. Host state (live_h, dV_h, facets) survives for
-            # the driver's solid-mask collection. Must come AFTER the
-            # taum wire (it reads the full CSR / W).
-            k_full = sb_full.kernel
-            for a_ in ('g_field', 'Q', 'indptr', 'cell', 'wgt', 'nrm',
-                       'area', 'cen', 'Vsum', 'G_in', 'G_out', 'tau_out',
-                       'fb_out', 'u_wm', 'utau_prev'):
-                setattr(k_full, a_, None)
-            for a_ in ('d_live', 'd_dead', 'd_dV', '_solid_mask_dev',
-                       '_tb_W', 'd_tb_cells', 'd_tb_fs', 'd_tb_normal',
-                       '_tb_tau_ext'):
-                if hasattr(sb_full, a_):
-                    setattr(sb_full, a_, None)
-            cp.get_default_memory_pool().free_all_blocks()
+        if self._full:
+            self.taum = None
+            self._tt = None
 
         self.dims = tuple(int(d) for d in self.sim.domain_shape)
         # runner diagnostics: nt==1 marks SOLID (body_block scan)
