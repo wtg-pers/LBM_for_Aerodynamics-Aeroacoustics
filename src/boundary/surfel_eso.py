@@ -354,13 +354,35 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     cen_slab[:, axis] = (cen_slab[:, axis] - (own_start - ghost)) % n_ax
     sk.cen = xp.asarray(np.ascontiguousarray(cen_slab))
     sk.Vsum = k.Vsum[xp.asarray(kept)].copy()
-    sk.g_field = cells_slice(k.g_field)
+    # g/Q support compaction on the slab (64 sec. 18): slab support =
+    # full support cells inside the wrap window, re-addressed to slab
+    # dense ids by the SAME wrap arithmetic as the CSR (remap_flat) —
+    # window fidelity to the full g (E6's bitwise contract) needs the
+    # full support, not just kept facets' cells (ghost-region g carries
+    # dropped facets' sweeps).
+    sup_slab_all = remap_flat(k.sup)
+    keep_cols = np.flatnonzero(sup_slab_all >= 0)
+    order = np.argsort(sup_slab_all[keep_cols], kind='stable')
+    cols = keep_cols[order]
+    sk.sup = sup_slab_all[cols]                  # slab dense ids, sorted
+    sk.n_sup = int(cols.size)
+    qmap_slab = np.full(n_slab, -1, dtype=np.int32)
+    qmap_slab[sk.sup] = np.arange(sk.n_sup, dtype=np.int32)
+    sk.qmap = xp.asarray(qmap_slab)
+    sk.cellc = xp.asarray(qmap_slab[new_cell])
+    if (qmap_slab[new_cell] < 0).any():
+        raise AssertionError(
+            "slab surfel: a kept CSR cell is outside the g/Q support")
+    sk.g_field = k.g_field[:, xp.asarray(cols)]   # fancy = fresh array
     if consume:
-        # Full g_field is the largest full-build array still resident
-        # and nothing below reads it — the post-build release in
-        # SurfelSlabLevel only frees it AFTER the tau-band section,
-        # whose 2.3 MB alloc sat on the card ceiling (64 sec. 15).
+        # Full g_field/qmap are dead weight past this point and the
+        # post-build release in SurfelSlabLevel comes only AFTER the
+        # tau-band section (64 sec. 15) — drop them now. qmap is the
+        # 4 B/node dense one; g_field is compact but still the largest
+        # per-level survivor.
         k.g_field = None
+        k.qmap = None
+        k.cellc = None
     sk.G_in = xp.zeros((sk.n_f, 27), dtype=xp.float64)
     sk.G_out = xp.zeros((sk.n_f, 27), dtype=xp.float64)
     sk.Q = None                        # lazy, like the full kernel (64 §13)

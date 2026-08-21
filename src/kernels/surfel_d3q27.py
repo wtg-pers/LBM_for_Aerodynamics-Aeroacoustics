@@ -407,13 +407,19 @@ extern "C" __global__ void surfel_distribute(
 
 extern "C" __global__ void surfel_advect(
     const float*  __restrict__ n_post,     // (27, N)
-    const double* __restrict__ g_field,    // (27, N)
-    const double* __restrict__ Q,          // (27, N)
+    const double* __restrict__ g_field,    // (27, n_sup) COMPACT
+    const double* __restrict__ Q,          // (27, n_sup) COMPACT
+    const int*    __restrict__ qmap,       // (N,) dense -> support, -1 off
+    const long long n_sup,
     const double* __restrict__ dV,         // (N,)
     const unsigned char* __restrict__ live,// (N,)
     float*        __restrict__ n_new,      // (27, N) out
     const int Nx, const int Ny, const int Nz)
 {
+    // g/Q live on the facet-support band only (a few % of the box); the
+    // dense (27, N) f64 pair was 7.6 GiB of the span16 L3 advance peak
+    // (patch 64 sec. 18). Off-band both are exactly 0.0 by construction
+    // (zeros-init + on-band writes), so the -1 branch is bit-identical.
     const long long N = (long long)Nx * Ny * Nz;
     const long long y = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (y >= N) return;
@@ -422,6 +428,7 @@ extern "C" __global__ void surfel_advect(
     const int ix = (int)(y / ((long long)Nz * Ny));
     const int lv = (int)live[y];
     const double idv = lv ? (1.0 / dV[y]) : 0.0;
+    const int my = qmap[y];
 
     for (int i = 0; i < 27; ++i) {
         int sx = ix - CX[i]; sx += (sx < 0) ? Nx : ((sx >= Nx) ? -Nx : 0);
@@ -429,9 +436,13 @@ extern "C" __global__ void surfel_advect(
         int sz = kz - CZ[i]; sz += (sz < 0) ? Nz : ((sz >= Nz) ? -Nz : 0);
         const long long s = ((long long)sx * Ny + sy) * Nz + sz;
         const long long off = (long long)i * N;
-        const double src = (dV[s] - g_field[off + s])
-                         * (double)n_post[off + s];
-        n_new[off + y] = (float)(lv ? (src + Q[off + y]) * idv : 0.0);
+        const int ms = qmap[s];
+        const double gf = (ms >= 0)
+            ? g_field[(long long)i * n_sup + ms] : 0.0;
+        const double qq = (lv && my >= 0)
+            ? Q[(long long)i * n_sup + my] : 0.0;
+        const double src = (dV[s] - gf) * (double)n_post[off + s];
+        n_new[off + y] = (float)(lv ? (src + qq) * idv : 0.0);
     }
 }
 """
@@ -468,15 +479,26 @@ class SurfelKernelD3Q27:
         self.area = cp.asarray(np.ascontiguousarray(facets.area))
         self.cen = cp.asarray(np.ascontiguousarray(facets.centroid))
         self.Vsum = cp.asarray(np.ascontiguousarray(facets.Vsum))
+        # g/Q support compaction (64 sec. 18): both fields live ONLY on
+        # the transport-table cells — g is pair_cell_sums over the SAME
+        # tables (structurally zero elsewhere), Q's atomics target the
+        # same CSR. Dense (27, N) f64 was ~93% zeros at span16 scale.
+        sup = np.unique(self._csr_cell).astype(np.int64)
+        self.sup = sup                       # host: slab builds slice it
+        self.n_sup = int(sup.size)
+        qmap = np.full(self.N, -1, dtype=np.int32)
+        qmap[sup] = np.arange(self.n_sup, dtype=np.int32)
+        self.qmap = cp.asarray(qmap)
+        self.cellc = cp.asarray(qmap[self._csr_cell])    # compact CSR
         self.g_field = cp.asarray(np.ascontiguousarray(
-            facets.g_field.reshape(27, -1)))
+            facets.g_field.reshape(27, -1)[:, sup]))     # (27, n_sup)
         self.G_in = cp.zeros((self.n_f, 27), dtype=cp.float64)
         self.G_out = cp.zeros((self.n_f, 27), dtype=cp.float64)
-        # Q is 216 B/node of PER-STEP scratch — allocated on first apply,
-        # not at build: the MPI replicated build holds every level's
-        # surfel state at once and the eager Q alone was ~10.9 GB of the
-        # span16 24 GiB build OOM (patch 64 sec. 13). Allocation timing
-        # only — apply always precedes advect (gate s13 pins the chain).
+        # Q is PER-STEP scratch on the support band (216 B/support-cell
+        # since 64 sec. 18) — allocated on first apply, not at build: the
+        # MPI replicated build holds every level's surfel state at once
+        # (64 sec. 13). Allocation timing only — apply always precedes
+        # advect (gate s13 pins the chain).
         self.Q = None
         self.tau_out = cp.zeros(self.n_f, dtype=cp.float64)
         self.fb_out = cp.zeros(self.n_f, dtype=cp.uint8)
@@ -566,12 +588,14 @@ class SurfelKernelD3Q27:
                 # alloc) — enclosing-frame locals included via gc.
                 self._census_done = True
                 _census_dump(f"pre-Q N={self.N} n_f={self.n_f}")
-            self.Q = cp.zeros((27, self.N), dtype=cp.float64)
+            self.Q = cp.zeros((27, self.n_sup), dtype=cp.float64)
         else:
             self.Q.fill(0)
+        # distribute writes Q through COMPACT indices (64 sec. 18): the
+        # kernel is unchanged — cellc in the cell slot, n_sup as N.
         self._k['surfel_distribute'](gp, blk, (
-            self.G_out, self.Vsum, self.indptr, self.cell, self.wgt,
-            self.nrm, self.Q, cp.int32(self.n_f), cp.int64(self.N)))
+            self.G_out, self.Vsum, self.indptr, self.cellc, self.wgt,
+            self.nrm, self.Q, cp.int32(self.n_f), cp.int64(self.n_sup)))
 
         cdotn = cp.asarray(self.f.cdotn)
         force = (cp.asarray(C27.astype(np.float64)).T
@@ -584,5 +608,6 @@ class SurfelKernelD3Q27:
         nx, ny, nz = self.shape
         grid = ((self.N + self.block - 1) // self.block,)
         self._k['surfel_advect'](grid, (self.block,), (
-            n_post, self.g_field, self.Q, dV, live, n_new,
+            n_post, self.g_field, self.Q, self.qmap,
+            cp.int64(self.n_sup), dV, live, n_new,
             cp.int32(nx), cp.int32(ny), cp.int32(nz)))

@@ -325,7 +325,7 @@ class DistributedMLGRunner:
                 # single-rank surfel wraps the replicated sim ITSELF —
                 # its arrays are live production state, never freed here
                 continue
-            for a in ("f", "f_post", "f_prev", "rho", "u",
+            for a in ("f", "f_post", "f_prev", "rho", "u", "nu_t",
                       "_eso_node_type", "_coupling_skip_nt", "_eso_bc_rho",
                       "_eso_bc_ux", "_eso_bc_uy", "_eso_bc_uz"):
                 if hasattr(lev, a):
