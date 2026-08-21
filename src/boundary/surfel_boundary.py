@@ -419,8 +419,17 @@ class SurfelBoundary:
         restriction writes feq(rho=0/0) through the body (patch 50) —
         mask-multiply would keep the NaN (NaN * 0 = NaN, the documented
         trap); indexed assignment removes it.
+
+        Integer indices, not the bool mask: CuPy's boolean scatter runs
+        a scan over the (Q, N)-broadcast mask — a full f-sized temp
+        EVERY substep, and the span16 rank1 run OOM (64 sec. 16). The
+        index cache is lazy (slab clones are built via __new__).
         """
-        f.reshape(f.shape[0], -1)[:, self.d_dead] = 0.0
+        idx = getattr(self, '_d_dead_idx', None)
+        if idx is None:
+            idx = self.xp.flatnonzero(self.d_dead)
+            self._d_dead_idx = idx
+        f.reshape(f.shape[0], -1)[:, idx] = 0.0
 
     def apply_and_advect(self, f_post, f_new, rho, u):
         """Facet exchange then volumetric transport (replaces streaming).

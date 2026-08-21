@@ -173,6 +173,16 @@ class SurfelSlabLevel:
             raise NotImplementedError(
                 "surfel slab + ALM body force is S8b+ scope")
         self.sim.advance()
+        # Per-advance scratch discipline (64 sec. 16): Q (216 B/node
+        # f64, fill(0)-ed at every apply) and _f_post (fully rewritten
+        # by the collide kernel every advance) carry NO cross-substep
+        # state — both re-materialize through their existing lazy paths.
+        # Left resident they stack per LEVEL (Q+f_post of L0-L2 alone
+        # was 5.1 GiB under the L3 advance = the span16 run-state OOM);
+        # freed here the run peak holds one level's scratch, and the
+        # pool round-trip is noise next to the advance itself.
+        self.sim._f_post = None
+        self.sb.kernel.Q = None
 
     # ── tau-band margin exchange (patch 64 stage ii) ─────────────────
     def _taum_wire(self, sb_full, part) -> None:

@@ -1462,7 +1462,10 @@ class Simulation:
         self._esoteric_step = int(t0)
         self._use_esoteric = True
         self._is_ready = True
-        self._f_post = xp.empty_like(mem)
+        # _f_post stays lazy (64 sec. 13 guard in _advance_surfel_esoteric):
+        # an eager copy here is 108 B/node resident per slab level from
+        # build time on — part of the span16 run-state OOM (64 sec. 16).
+        self._f_post = None
         if self._sgs_cfg["model"] in ("smagorinsky", "wale", "dyn_smag"):
             self.nu_t = xp.zeros(self.domain_shape, dtype=mem.dtype)
         else:

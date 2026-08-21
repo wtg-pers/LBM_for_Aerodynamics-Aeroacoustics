@@ -618,6 +618,16 @@ class DistributedMLGRunner:
         for g in root.children:       # tree-driven, see _advance_block
             self._post(0)             # L0 bands ride under the child's advance
             self._advance_block(g)
+        if not getattr(self, '_pool_printed', False):
+            self._pool_printed = True
+            # run-state observability (64 sec. 16): held == the pool
+            # high-water of the first coarse step = the run peak the
+            # span16 OOMs hid until the crash. stderr, like slab prints.
+            mp = cp.get_default_memory_pool()
+            print(f"[mpi] rank{self.rank} pool after first coarse step: "
+                  f"used {mp.used_bytes() / 2**30:.1f} / held "
+                  f"{mp.total_bytes() / 2**30:.1f} GiB",
+                  file=sys.stderr, flush=True)
 
     def run(self, n_coarse: int, log_every: int = 0, on_log=None) -> dict:
         t0 = time.perf_counter()
