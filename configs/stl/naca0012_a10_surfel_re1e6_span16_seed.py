@@ -18,9 +18,13 @@ Known gap at launch (62 sec. 7 / 64): the MPI path writes NO surface
 VTK — P3 (Cf topology) is deferred to the surface-gather follow-up;
 P0/P1 (L3 .vti), P2 (force history) and P4 (Cl) are all produced.
 
-Run (cluster, ONE node with 2x24 GiB):
+Run (cluster, ONE node with 2x24 GiB). `--mca pml ucx` is REQUIRED —
+without it OpenMPI 5.x drops the UCX PML and the halo runs the ob1
+slow path (~1.4 GB/s measured: halo_complete was 80% of a 3.1 s/step
+run, 64 sec. 19c; the hpc_upgrade runbook 18 flag was lost in the
+sec. 12 transcription):
     cd /home/users/wtg1/_hd2/00_LBM_solver/0730
-    LBM_ESOTERIC=1 mpirun -n 2 python main.py --mpi \\
+    LBM_ESOTERIC=1 mpirun --mca pml ucx -n 2 python main.py --mpi \\
         --config configs/stl/naca0012_a10_surfel_re1e6_span16_seed.py \\
         --axis z --ghost 4 --cuda-aware 1 --gpu 0,1
 
