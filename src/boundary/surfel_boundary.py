@@ -307,7 +307,8 @@ class SurfelBoundary:
             f"(unresolved {self._taum_y1_unresolved}), "
             f"fs {FS_CLASSES_VERSION} nodes(0.5)=[{nodes}]")
 
-    def inject_tau_model(self, f_post, u, tau_bar: float) -> None:
+    def inject_tau_model(self, f_post, u, tau_bar: float,
+                         tau_vec=None) -> None:
         """Post-collision Hermite-2 injection, BEFORE the facet apply.
 
         Order is load-bearing (patch 27, measured): apply-first lets the
@@ -332,7 +333,12 @@ class SurfelBoundary:
         that = t / xp.maximum(tn, xp.float32(1e-30))[:, None]
         ok = (tn > 1e-10).astype(xp.float32)
 
-        tau_cell = self._tb_W @ self.kernel.tau_out   # (M,) f64
+        # tau_vec: the MPI slab passes an EXTENDED per-facet vector whose
+        # extra (phantom) slots carry exchange-received tau_out of facets
+        # outside the slab window (patch 64 stage ii); default = the
+        # kernel's own state, bit-identical to before the parameter.
+        src = self.kernel.tau_out if tau_vec is None else tau_vec
+        tau_cell = self._tb_W @ src                   # (M,) f64
         sig = tau_cell.astype(xp.float32) * self.d_tb_fs * ok
         dPi = -(sig / xp.float32(tau_bar))            # (M,)
 

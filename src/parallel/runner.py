@@ -28,6 +28,7 @@ initializer (documented follow-up, not needed for the M5 validation).
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import Dict, List, Optional
 
@@ -54,6 +55,7 @@ TAG_FIELD = 4096        # + 8*uid   : VTK gathers (rho, u, nu_t)
 TAG_CKPT = 12288        # + 4*uid   : checkpoint f gather
 TAG_MACRO = 20480       # + 4*uid   : checkpoint/final rho+u gather
 TAG_VERIFY = 24576      # + 4*uid   : --verify assembly
+TAG_TAUM = 26624        # + uid     : surfel tau-band margin exchange (64 ii)
 TAG_PROBE = 28672       # + rank    : probe column blocks, owner -> rank 0
 
 # Model state that every output channel reads. Broadcast from each block's
@@ -297,6 +299,16 @@ class DistributedMLGRunner:
                     self.lv.append(SurfelSlabLevel(
                         lev, self.parts[uid],
                         t0=self.completed_step * (2 ** b.level)))
+                    L = self.lv[-1]
+                    wires = [(nb, int(w['send_rows'].size), w['n_recv'])
+                             for nb, w in (L.taum or [])]
+                    # stderr: rank>0 stdout is silenced, and wire-size
+                    # symmetry across ranks is exactly what a hang needs
+                    # shown (send size here == peer's n_recv, and vice
+                    # versa, or the taum collect blocks forever)
+                    print(f"[mpi] surfel slab {b.label} rank{rank}: "
+                          f"{L.sb.n_facets:,} facets, taum wires "
+                          f"{wires or 'off'}", file=sys.stderr, flush=True)
                 else:
                     ld = extract_level(lev, self.parts[uid])
                     self.lv.append(LocalLevel(
@@ -329,6 +341,10 @@ class DistributedMLGRunner:
                                     tag_base=TAG_HALO + 4 * uid)
                 if self.owns[uid] else None
                 for uid in range(self.nb)]
+            for uid in range(self.nb):
+                L = self.lv[uid]
+                if L is not None and getattr(L, 'taum', None):
+                    L.taum_bind(transport, rank, TAG_TAUM + uid)
         self.rlc: List[Optional[RankLocalCouplingV1]] = [None] * self.nb
         for uid, b in enumerate(src):
             if b.parent is None or not self.owns[uid]:
@@ -371,6 +387,8 @@ class DistributedMLGRunner:
                 n_l = self.ibb[uid].n_links if self.ibb[uid] is not None else 0
                 print(f"[mpi] eso IBB {b.label}: {n_l:,} slab links "
                       f"(rank {rank})", flush=True)
+        print(f"[mpi] runner ready (rank {rank})", file=sys.stderr,
+              flush=True)
 
     # ── decomposition ────────────────────────────────────────────────
     def _decompose(self, src, shapes, axis, n_ranks, ghost):
@@ -446,6 +464,8 @@ class DistributedMLGRunner:
             return
         t0 = self._tic()
         self.ex[uid].post(self.lv[uid].mem, self.lv[uid].t)
+        if getattr(self.lv[uid], 'taum', None):
+            self.lv[uid].taum_post()      # tau_out margins ride the halo slot
         self._posted[uid] = True
         self._toc("halo_post", t0)
 
@@ -455,8 +475,16 @@ class DistributedMLGRunner:
         if not self._posted[uid]:
             t0 = self._tic()
             self.ex[uid].post(self.lv[uid].mem, self.lv[uid].t)
+            if getattr(self.lv[uid], 'taum', None):
+                self.lv[uid].taum_post()
             self._toc("halo_post", t0)
         t0 = self._tic()
+        if getattr(self.lv[uid], 'taum', None):
+            # BEFORE the halo complete: its flush waits on the rendezvous
+            # taum sends, which only match at the peer's taum collect —
+            # collecting first keeps every rank's collects ahead of any
+            # rank's flush (surfel_level.taum_complete).
+            self.lv[uid].taum_complete()
         self.ex[uid].complete(self.lv[uid].mem, self.lv[uid].t)
         self._posted[uid] = False
         self._fresh[uid] = True

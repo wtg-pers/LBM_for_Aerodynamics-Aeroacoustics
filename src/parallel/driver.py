@@ -361,8 +361,19 @@ def _run(args, MPI):
     runner.last_interval = None
 
     output.start(start_step, end_step)
+    # hang watchdog (debug aid): LBM_HANG_DUMP=<path-prefix> dumps every
+    # thread's Python stack to <prefix>.rank<r> after 180 s WITHOUT step
+    # progress (the timer re-arms per step, so it only fires on a hang).
+    _hd = None
+    if os.environ.get("LBM_HANG_DUMP"):
+        import faulthandler
+        _hd = open(f"{os.environ['LBM_HANG_DUMP']}.rank{rank}", "w")
+        faulthandler.dump_traceback_later(180, file=_hd)
     for step in range(start_step, end_step):
         runner.step_coarse()
+        if _hd is not None:
+            import faulthandler
+            faulthandler.dump_traceback_later(180, file=_hd)
         if output.process(step, runner) == 'stop':
             break
     cp.cuda.runtime.deviceSynchronize()

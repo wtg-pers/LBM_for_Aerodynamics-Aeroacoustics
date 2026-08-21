@@ -117,6 +117,82 @@ def stage_and_deposit_boxes(M: np.ndarray, stage_margin: int = 2,
     return stage, dep
 
 
+def _facet_segments(k):
+    """(seg, fac_lo) of the kernel CSR (facet-major, asserted)."""
+    from src.boundary.surfel_transport import N_PAIR
+    seg = np.asarray(k.indptr.get() if hasattr(k.indptr, 'get')
+                     else k.indptr).reshape(-1)
+    fac_lo = seg[:-1].reshape(k.n_f, N_PAIR)[:, 0]
+    if fac_lo[0] != 0 or not (np.diff(fac_lo) >= 0).all():
+        raise AssertionError("surfel CSR is not facet-major contiguous")
+    return seg, fac_lo
+
+
+def _cells_axis(k, full_shape, axis) -> np.ndarray:
+    """Per-CSR-cell global axis coordinate (host)."""
+    cell_h = np.asarray(k.cell.get() if hasattr(k.cell, 'get') else k.cell,
+                        dtype=np.int64)
+    Nz = full_shape[2]
+    if axis == 2:
+        return cell_h % Nz
+    if axis == 1:
+        return (cell_h // Nz) % full_shape[1]
+    return cell_h // (full_shape[1] * Nz)
+
+
+def _window_inv(n_ax: int, own_start: int, own_count: int,
+                ghost: int) -> np.ndarray:
+    idx = np.arange(own_start - ghost, own_start + own_count + ghost) % n_ax
+    inv = np.full(n_ax, -1, dtype=np.int64)
+    inv[idx] = np.arange(idx.size)
+    return inv
+
+
+def facet_keep_mask(sb, axis: int, own_start: int, own_count: int,
+                    ghost: int) -> np.ndarray:
+    """Bool per FULL-build facet: all CSR cells inside the wrap window.
+
+    The exchange wiring (patch 64 stage ii) evaluates this for NEIGHBOR
+    windows too — both ranks derive each other's sets from the same
+    replicated build, so the sets agree without communication.
+    """
+    k = sb.kernel
+    _seg, fac_lo = _facet_segments(k)
+    ax = _cells_axis(k, sb.shape, axis)
+    inv = _window_inv(sb.shape[axis], own_start, own_count, ghost)
+    return np.minimum.reduceat(inv[ax], fac_lo) >= 0
+
+
+def facet_anchor_axis(sb, axis: int) -> np.ndarray:
+    """Global axis coord of each facet's FIRST CSR cell (ownership anchor)."""
+    k = sb.kernel
+    _seg, fac_lo = _facet_segments(k)
+    return _cells_axis(k, sb.shape, axis)[fac_lo]
+
+
+def band_needed_gids(sb, axis: int, own_start: int, own_count: int,
+                     ghost: int) -> np.ndarray:
+    """Facet gids the tau-band W rows INSIDE the window reference.
+
+    == the tau_ext column set of the slab built on that window (the slab
+    build uses the same row filter and the same W), so the wire builder
+    can evaluate any rank's needed set from the replicated build.
+    """
+    tb = np.asarray(sb.d_tb_cells.get() if hasattr(sb.d_tb_cells, 'get')
+                    else sb.d_tb_cells, dtype=np.int64)
+    Nz = sb.shape[2]
+    if axis == 2:
+        ax = tb % Nz
+    elif axis == 1:
+        ax = (tb // Nz) % sb.shape[1]
+    else:
+        ax = tb // (sb.shape[1] * Nz)
+    inv = _window_inv(sb.shape[axis], own_start, own_count, ghost)
+    rows = np.flatnonzero(inv[ax] >= 0)
+    W = sb._tb_W.get()
+    return np.unique(W[rows].tocoo().col)
+
+
 def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
                       ghost: int = 3):
     """Slab-filtered SurfelBoundary clone (patch 64 sec. 2).
@@ -304,7 +380,13 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     out.surfels = None
     out.triangles_lu = None                 # write_surface guarded off
 
-    # tau-model band: window filter + facet-column filter of W
+    # tau-model band (patch 64 stage ii): window row filter + PHANTOM
+    # column extension. tau_out is one-substep persistent per-facet state
+    # (64 sec. 9: finite ghost cannot close it), so the W column space is
+    # extended to EVERY facet the kept rows reference — columns whose
+    # facet lies outside the window become phantom slots fed exclusively
+    # by the per-substep neighbor exchange (SurfelSlabLevel.taum_*), and
+    # kept-but-neighbor-owned columns are refreshed by the same exchange.
     if getattr(sb, 'tau_model_on', False):
         tb_slab = remap_flat(sb.d_tb_cells)
         rows = np.flatnonzero(tb_slab >= 0)
@@ -314,27 +396,21 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
         out.d_tb_C = sb.d_tb_C
         out.d_tb_Wl = sb.d_tb_Wl
         Wh = sb._tb_W.get()                 # cupyx csr -> scipy (build-time)
-        Ws = Wh[rows][:, kept]
-        # own-relevant band rows must not have lost any facet column
-        tb_ax = np.asarray(sb.d_tb_cells.get()
-                           if hasattr(sb.d_tb_cells, 'get')
-                           else sb.d_tb_cells, dtype=np.int64)
-        if axis == 2:
-            tb_axof = tb_ax % Nz_
-        elif axis == 1:
-            tb_axof = (tb_ax // Nz_) % full_shape[1]
-        else:
-            tb_axof = tb_ax // (full_shape[1] * Nz_)
-        rel_rows = ((tb_axof[rows] - (own_start - 2)) % n_ax) < \
-            (own_count + 4)
-        lost = np.asarray((Wh[rows].sum(axis=1) - Ws.sum(axis=1))
-                          ).reshape(-1)
-        if (rel_rows & (np.abs(lost) > 0)).any():
-            raise ValueError(
-                "slab surfel: own-relevant tau-band rows reference "
-                "facets outside the window — ghost too small")
+        Wr = Wh[rows]
+        needed = np.unique(Wr.tocoo().col)  # global gids, sorted
+        kept_pos = np.full(n_f, -1, dtype=np.int64)
+        kept_pos[kept] = np.arange(kept.size)
+        loc = kept_pos[needed]
+        local_slots = np.flatnonzero(loc >= 0)
+        phantom_slots = np.flatnonzero(loc < 0)
+        out.tb_needed_gids = needed
+        out.tb_phantom_gids = needed[phantom_slots]
+        out.d_tb_local_slots = xp.asarray(local_slots)
+        out.d_tb_local_rows = xp.asarray(loc[local_slots])
+        out.d_tb_phantom_slots = xp.asarray(phantom_slots)
+        out._tb_tau_ext = xp.zeros(needed.size, dtype=xp.float64)
         import cupyx.scipy.sparse as _cs
-        out._tb_W = _cs.csr_matrix(Ws.tocsr())
+        out._tb_W = _cs.csr_matrix(Wr[:, needed].tocsr())
         out._sig_last = None
     else:
         out._sig_last = None
@@ -362,6 +438,18 @@ class SlabSurfelBoundary(_SB):
     ulp-level match to the 1-rank sum, not bitwise — 64 sec. 3), and the
     surface output channel is guarded off until the MPI surface gather.
     """
+
+    def inject_tau_model(self, f_post, u, tau_bar: float) -> None:
+        """Band injection through the EXTENDED tau vector (stage ii).
+
+        Kept columns are copied from the kernel state (the exchange has
+        already overwritten neighbor-owned kept rows in kernel.tau_out);
+        phantom columns keep whatever taum_complete received. Step 0 (no
+        exchange yet) is all-zeros on both = the single-GPU convention.
+        """
+        ext = self._tb_tau_ext
+        ext[self.d_tb_local_slots] = self.kernel.tau_out[self.d_tb_local_rows]
+        super().inject_tau_model(f_post, u, tau_bar, tau_vec=ext)
 
     def last_force(self):
         if getattr(self, '_force', None) is None:
