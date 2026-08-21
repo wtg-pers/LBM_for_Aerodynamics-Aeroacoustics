@@ -1078,6 +1078,11 @@ class SimulationSetup:
                 nu_lu=float(ctx.get('nu_lu', self.nu_lu)),
                 cfg=scfg,
             )
+            if self.xp.__name__ == 'cupy':
+                # return the build transients (prism tables, band w_norm)
+                # to the driver between per-level surfel builds — the
+                # span16 4-level build runs at a few-GB margin (64 §13)
+                self.xp.get_default_memory_pool().free_all_blocks()
             if ctx.get('region') is not None:
                 # S8a-2 hard guards: span-through prism needs boundary-
                 # flush z faces; no surfel stencil may touch the C2F/F2C

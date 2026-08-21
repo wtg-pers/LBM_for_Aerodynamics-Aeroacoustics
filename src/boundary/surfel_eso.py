@@ -346,7 +346,7 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     sk.g_field = cells_slice(k.g_field)
     sk.G_in = xp.zeros((sk.n_f, 27), dtype=xp.float64)
     sk.G_out = xp.zeros((sk.n_f, 27), dtype=xp.float64)
-    sk.Q = xp.zeros((27, n_slab), dtype=xp.float64)
+    sk.Q = None                        # lazy, like the full kernel (64 §13)
     sk.tau_out = xp.zeros(sk.n_f, dtype=xp.float64)
     sk.fb_out = xp.zeros(sk.n_f, dtype=xp.uint8)
     sk.u_wm = xp.zeros((sk.n_f, 3), dtype=xp.float64)

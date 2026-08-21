@@ -26,7 +26,8 @@ class SurfelSlabLevel:
     """LocalLevel-interface adapter over a slab-scoped bridge Simulation."""
 
     def __init__(self, lev, part, t0: int = 0) -> None:
-        if not getattr(lev, '_use_esoteric', False):
+        import os
+        if os.environ.get('LBM_ESOTERIC', '0') != '1':
             raise RuntimeError(
                 "surfel MPI runs on the eso residency bridge — launch "
                 "with LBM_ESOTERIC=1 (patch_notes/surfel/63)")
@@ -36,6 +37,9 @@ class SurfelSlabLevel:
         if self._full:
             # single-rank: the replicated build's sim IS the validated
             # bridge — reuse it whole (bit-trivially the 1-GPU path)
+            if not getattr(lev, '_use_esoteric', False):
+                raise RuntimeError(
+                    "single-rank surfel slab expects the bridged sim")
             self.sim = lev
             self.sb = sb_full
             self.surfel_live = sb_full.d_live
@@ -51,7 +55,19 @@ class SurfelSlabLevel:
                 % n_ax)
             take = [slice(None)] * 4
             take[1 + part.axis] = idx
-            mem = cp.ascontiguousarray(lev.f[tuple(take)])
+            if getattr(lev, '_use_esoteric', False):
+                # window slice of the full eso mem: interior-identical to
+                # a slab-local conversion; the ghost-rim slot difference
+                # is refreshed by the first sync (E6 halo model)
+                mem = cp.ascontiguousarray(lev.f[tuple(take)])
+            else:
+                # MPI build keeps f STANDARD (64 sec. 13): convert THIS
+                # slab only. Parity t0 is even by construction (fresh 0;
+                # restarts are even-checkpoint-only — 64 sec. 12 G5).
+                from src.kernels.esoteric_d3q27 import esoteric_scatter_std
+                slab_std = cp.ascontiguousarray(lev.f[tuple(take)])
+                mem = esoteric_scatter_std(cp, slab_std, t0)
+                del slab_std
 
             from src.solver.simulation import Simulation
             from src.boundary.domain_bc_manager import DomainBCManager
@@ -81,6 +97,25 @@ class SurfelSlabLevel:
         self._tt = None
         if not self._full and getattr(self.sb, 'tau_model_on', False):
             self._taum_wire(sb_full, part)
+
+        if not self._full:
+            # Release the FULL-build surfel DEVICE arrays (64 sec. 13):
+            # g_field alone is 216 B/node full-domain — kept alive, the
+            # run state re-adds the whole single-GPU footprint on top of
+            # the slabs. Host state (live_h, dV_h, facets) survives for
+            # the driver's solid-mask collection. Must come AFTER the
+            # taum wire (it reads the full CSR / W).
+            k_full = sb_full.kernel
+            for a_ in ('g_field', 'Q', 'indptr', 'cell', 'wgt', 'nrm',
+                       'area', 'cen', 'Vsum', 'G_in', 'G_out', 'tau_out',
+                       'fb_out', 'u_wm', 'utau_prev'):
+                setattr(k_full, a_, None)
+            for a_ in ('d_live', 'd_dead', 'd_dV', '_solid_mask_dev',
+                       '_tb_W', 'd_tb_cells', 'd_tb_fs', 'd_tb_normal',
+                       '_tb_tau_ext'):
+                if hasattr(sb_full, a_):
+                    setattr(sb_full, a_, None)
+            cp.get_default_memory_pool().free_all_blocks()
 
         self.dims = tuple(int(d) for d in self.sim.domain_shape)
         # runner diagnostics: nt==1 marks SOLID (body_block scan)

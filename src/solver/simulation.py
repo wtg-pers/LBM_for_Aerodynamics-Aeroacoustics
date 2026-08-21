@@ -253,12 +253,21 @@ class Simulation:
             from src.collision.bgk import BGKCollision
             from src.collision.cumulant import CumulantCollision
             if self._use_surfel:
-                # patch_notes/surfel/63 V1 bridge: eso RESIDENCY only.
-                # The std surfel chain still runs every step on a gathered
-                # field, so the standard allocations below (_f_post, SGS
-                # buffers) are still required — no early return for this
-                # combination.
-                self._init_esoteric_bridge(f)
+                from src.solver.entry import detect_world_size
+                if detect_world_size() > 1:
+                    # MPI (patch 64 sec. 13): keep f STANDARD through the
+                    # replicated build — each rank's slab converts its own
+                    # window (surfel_level), which removes the full-field
+                    # conversion transient from the build peak. The full
+                    # sim never advances under MPI; _use_esoteric stays
+                    # False here and the slab Simulation adopts esoteric
+                    # residency itself.
+                    self._mpi_surfel_defer = True
+                else:
+                    # patch_notes/surfel/63 V1 bridge: eso RESIDENCY only.
+                    # The std surfel chain still runs every step on a
+                    # gathered field, so the std allocations below stay.
+                    self._init_esoteric_bridge(f)
             elif isinstance(self.collision, (BGKCollision, CumulantCollision)):
                 # IBB is supported on the single-GPU esoteric path since S5
                 # (two-phase deposit-rewrite pass built in _init_esoteric).
@@ -271,7 +280,14 @@ class Simulation:
         if self._use_esoteric and not self._use_surfel:
             return  # single-buffer: skip _f_post / SGS / fused setup below
 
-        self._f_post = self.xp.empty_like(f)
+        if (self._use_esoteric and self._use_surfel) \
+                or getattr(self, '_mpi_surfel_defer', False):
+            # bridge (patch 63): f_post is per-step scratch — first-advance
+            # lazy. The MPI replicated build never advances, and its eager
+            # f_post was 5.6 GB of the span16 build OOM (patch 64 sec. 13).
+            self._f_post = None
+        else:
+            self._f_post = self.xp.empty_like(f)
 
         # ── SGS eddy-viscosity output buffer ──
         # Allocate iff a non-trivial SGS model is in use, so the kernel can
@@ -1469,6 +1485,8 @@ class Simulation:
         xp = self.xp
         t = self._esoteric_step
         self.f = esoteric_gather_std(xp, self.f, t)
+        if self._f_post is None:          # lazy (64 §13 build-peak fix)
+            self._f_post = xp.empty_like(self.f)
         if self._surfel_use_kernel():
             self._advance_surfel_kernel()
         else:

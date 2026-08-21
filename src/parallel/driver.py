@@ -93,6 +93,11 @@ def _fail_fast_config(setup, mlg) -> None:
     # a level-0-only check let a fine-level fallback slip through to a
     # broken distributed run (observed: L3 eso-init OOM on a 94M case).
     for b in mlg.iter_blocks():
+        if getattr(b.sim, '_mpi_surfel_defer', False):
+            # surfel level under MPI: the replicated build deliberately
+            # keeps f standard and each rank's SLAB adopts esoteric
+            # residency itself (patch 64 sec. 13 build-peak fix)
+            continue
         if not getattr(b.sim, '_use_esoteric', False):
             raise ValueError(
                 f"[mpi] config error: esoteric-pull is not active on "

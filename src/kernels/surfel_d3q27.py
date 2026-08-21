@@ -441,7 +441,12 @@ class SurfelKernelD3Q27:
             facets.g_field.reshape(27, -1)))
         self.G_in = cp.zeros((self.n_f, 27), dtype=cp.float64)
         self.G_out = cp.zeros((self.n_f, 27), dtype=cp.float64)
-        self.Q = cp.zeros((27, self.N), dtype=cp.float64)
+        # Q is 216 B/node of PER-STEP scratch — allocated on first apply,
+        # not at build: the MPI replicated build holds every level's
+        # surfel state at once and the eager Q alone was ~10.9 GB of the
+        # span16 24 GiB build OOM (patch 64 sec. 13). Allocation timing
+        # only — apply always precedes advect (gate s13 pins the chain).
+        self.Q = None
         self.tau_out = cp.zeros(self.n_f, dtype=cp.float64)
         self.fb_out = cp.zeros(self.n_f, dtype=cp.uint8)
         self._per = tuple(int(p) for p in facets.periodic)
@@ -521,7 +526,10 @@ class SurfelKernelD3Q27:
 
         self._wm_seed = 0          # only the first pass seeds the filter
 
-        self.Q.fill(0)
+        if self.Q is None:
+            self.Q = cp.zeros((27, self.N), dtype=cp.float64)
+        else:
+            self.Q.fill(0)
         self._k['surfel_distribute'](gp, blk, (
             self.G_out, self.Vsum, self.indptr, self.cell, self.wgt,
             self.nrm, self.Q, cp.int32(self.n_f), cp.int64(self.N)))
