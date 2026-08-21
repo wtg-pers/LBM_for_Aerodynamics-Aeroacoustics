@@ -49,6 +49,37 @@ for _p in range(N_PAIR):
     PAIR_IDX[_p] = (_ip, int(OPP27[_ip]))
 
 
+def _census_dump(tag: str, top: int = 40) -> None:
+    """Print every live device array grouped by (dtype, shape) — the
+    mem-census doctrine's run-state instrument (64 sec. 17). gc-global:
+    in-flight locals of enclosing frames are visible too."""
+    import gc
+    import os
+    import sys
+    import cupy as cp
+    mp = cp.get_default_memory_pool()
+    rows, seen = {}, set()
+    for o in gc.get_objects():
+        if isinstance(o, cp.ndarray):
+            base = o.base if o.base is not None else o
+            if id(base) in seen:
+                continue
+            seen.add(id(base))
+            key = (str(base.dtype), base.shape)
+            n, b = rows.get(key, (0, 0))
+            rows[key] = (n + 1, b + base.nbytes)
+    pid = os.getpid()
+    lines = [f"[census pid{pid}] {tag}: used {mp.used_bytes() / 2**30:.2f}"
+             f" / held {mp.total_bytes() / 2**30:.2f} GiB"]
+    tot = 0
+    for (dt, shp), (n, b) in sorted(rows.items(), key=lambda kv: -kv[1][1])[:top]:
+        tot += b
+        lines.append(f"[census pid{pid}]   {b / 2**30:7.3f} GiB  x{n:<3d} "
+                     f"{dt:<9s} {shp}")
+    lines.append(f"[census pid{pid}]   top-{top} sum {tot / 2**30:.2f} GiB")
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
 def _ints(a):
     return ", ".join(str(int(v)) for v in np.asarray(a).ravel())
 
@@ -527,6 +558,14 @@ class SurfelKernelD3Q27:
         self._wm_seed = 0          # only the first pass seeds the filter
 
         if self.Q is None:
+            import os
+            if (os.environ.get('LBM_MEM_CENSUS') == '2'
+                    and not getattr(self, '_census_done', False)):
+                # measurement instrument (64 sec. 17): dump every live
+                # device array at the exact span16 death instant (pre-Q
+                # alloc) — enclosing-frame locals included via gc.
+                self._census_done = True
+                _census_dump(f"pre-Q N={self.N} n_f={self.n_f}")
             self.Q = cp.zeros((27, self.N), dtype=cp.float64)
         else:
             self.Q.fill(0)

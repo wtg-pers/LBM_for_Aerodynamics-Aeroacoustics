@@ -28,6 +28,7 @@ initializer (documented follow-up, not needed for the M5 validation).
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from typing import Dict, List, Optional
@@ -609,6 +610,15 @@ class DistributedMLGRunner:
     # ── public API ───────────────────────────────────────────────────
     def step_coarse(self) -> None:
         """One L0 step (= 2^k substeps on level k), lockstep across ranks."""
+        try:
+            self._step_coarse()
+        except cp.cuda.memory.OutOfMemoryError:
+            # measurement over inference (the mem-census doctrine): on a
+            # run-state OOM dump what is actually resident, THEN die.
+            self._mem_census("at OOM")
+            raise
+
+    def _step_coarse(self) -> None:
         root = self.blocks[0]
         self._sync(0)
         for g in root.children:
@@ -628,6 +638,38 @@ class DistributedMLGRunner:
                   f"used {mp.used_bytes() / 2**30:.1f} / held "
                   f"{mp.total_bytes() / 2**30:.1f} GiB",
                   file=sys.stderr, flush=True)
+            if os.environ.get('LBM_MEM_CENSUS', '0') == '1':
+                self._mem_census("after first coarse step")
+
+    def _mem_census(self, tag: str, top: int = 40) -> None:
+        """Per-array device-memory census of everything reachable from the
+        runner (64 sec. 17 instrument, env LBM_MEM_CENSUS=1 for the
+        healthy-path dump; the OOM path always dumps). stderr, per rank."""
+        import gc
+        mp = cp.get_default_memory_pool()
+        rows = {}
+        seen = set()
+        for o in gc.get_objects():
+            if isinstance(o, cp.ndarray):
+                base = o.base if o.base is not None else o
+                if id(base) in seen:
+                    continue
+                seen.add(id(base))
+                key = (str(base.dtype), base.shape)
+                n, b = rows.get(key, (0, 0))
+                rows[key] = (n + 1, b + base.nbytes)
+        top_rows = sorted(rows.items(), key=lambda kv: -kv[1][1])[:top]
+        lines = [f"[mpi] rank{self.rank} mem census {tag}: "
+                 f"used {mp.used_bytes() / 2**30:.2f} / held "
+                 f"{mp.total_bytes() / 2**30:.2f} GiB"]
+        tot = 0
+        for (dt, shp), (n, b) in top_rows:
+            tot += b
+            lines.append(f"[mpi] rank{self.rank}   {b / 2**30:7.3f} GiB"
+                         f"  x{n:<3d} {dt:<9s} {shp}")
+        lines.append(f"[mpi] rank{self.rank}   top-{top} sum "
+                     f"{tot / 2**30:.2f} GiB")
+        print("\n".join(lines), file=sys.stderr, flush=True)
 
     def run(self, n_coarse: int, log_every: int = 0, on_log=None) -> dict:
         t0 = time.perf_counter()

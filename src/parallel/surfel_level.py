@@ -183,6 +183,15 @@ class SurfelSlabLevel:
         # pool round-trip is noise next to the advance itself.
         self.sim._f_post = None
         self.sb.kernel.Q = None
+        # ...and RETURN the freed blocks to the device (64 sec. 17): the
+        # census pinned the 4th span16 OOM on pool-HELD churn, not live
+        # arrays — L0-L2 advances leave ~6.5 GiB of freed Q/std/f_post
+        # fragments (largest 1.85) that can never serve L3's contiguous
+        # 3.78 GiB f64 Q, while they starve cudaMalloc of device room
+        # (cluster CuPy raises without an effective free-and-retry).
+        # Cost: tens of large cudaMalloc/Free per coarse step — noise
+        # next to the advances themselves.
+        cp.get_default_memory_pool().free_all_blocks()
 
     # ── tau-band margin exchange (patch 64 stage ii) ─────────────────
     def _taum_wire(self, sb_full, part) -> None:
