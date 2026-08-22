@@ -1403,6 +1403,20 @@ class Simulation:
         """Shared surfel tail: band injection -> facet apply -> advect ->
         domain BCs (order per patch 27)."""
 
+        # 2a. sustained trip strip (patch 66): post-collision kick, BEFORE
+        #     the facet gather so the wall flux sees one consistent field.
+        #     _trip is None unless config trip_forcing is enabled — the
+        #     attribute default keeps every existing run bit-identical.
+        tf = getattr(self, '_trip', None)
+        if tf is not None:
+            # substep counter: eso bridge keeps global time across
+            # restarts (t0 = completed L0 steps * 2^level); the std
+            # path's step_count has the same pre-increment semantics.
+            tf.apply(self._f_post,
+                     getattr(self, '_esoteric_step', None)
+                     if getattr(self, '_use_esoteric', False)
+                     else self.step_count)
+
         # 2b. tau-model band injection (S8b): post-collision, BEFORE the
         #     facet apply — the order is load-bearing (patch 27: apply-
         #     first drains the injected flux outside the facet force

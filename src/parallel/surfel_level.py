@@ -129,6 +129,27 @@ class SurfelSlabLevel:
             )
             self.sim.adopt_esoteric_surfel_slab(mem, t0)
 
+            # sustained trip (patch 66): rebuild on the wrap window —
+            # GLOBAL z rows via the same modulo as the slab slice, so
+            # both ranks evaluate the identical field on shared/ghost
+            # rows with zero communication (gate T3). Caches are lazy;
+            # the replicated sim's copy never advances and never builds.
+            ta = getattr(lev, '_trip_args', None)
+            if ta is not None:
+                from src.utilities.trip_forcing import TripForcing
+                dx, org = float(ta['dx']), ta['origin']
+                rows = (np.arange(part.own_start - part.ghost,
+                                  part.own_start + part.own_count
+                                  + part.ghost) % n_ax)
+                self.sim._trip = TripForcing(
+                    lev.xp, ta['cfg'],
+                    org[0] + np.arange(slab_shape[0]) * dx,
+                    org[1] + np.arange(slab_shape[1]) * dx,
+                    org[2] + rows * dx,
+                    level=int(ta['level']),
+                    lattice=lev.bc_manager.lattice)
+                lev._trip = None
+
         if self._full:
             self.taum = None
             self._tt = None

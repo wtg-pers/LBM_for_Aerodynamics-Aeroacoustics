@@ -2241,6 +2241,47 @@ class SimulationSetup:
                       f"eso_wall/09)")
         return out
 
+    def _attach_trip_forcing(self, simulations) -> None:
+        """Sustained trip strip (patch 66): attach a TripForcing to every
+        surfel level whose box the global strip intersects. Runtime
+        forcing, so this runs on FRESH AND RESTARTED builds alike (the
+        IC seed is init-only; the trip is not). Config block absent or
+        disabled = no attribute = bit-identical (gate T1).
+        """
+        tcfg = self.config.get('trip_forcing', {})
+        if not (isinstance(tcfg, dict) and tcfg.get('enabled', False)):
+            return
+        if self.lattice.dim != 3:
+            raise NotImplementedError("trip_forcing is 3D-only")
+        import numpy as np
+        from src.utilities.trip_forcing import TripForcing
+        cfg = dict(tcfg)
+        cfg.setdefault('span_z_lu', float(self.Nz))
+        n_att = 0
+        for k, sim in enumerate(simulations):
+            if getattr(getattr(sim, 'obstacle_bc', None),
+                       'kind', None) != 'surfel':
+                continue
+            origin = ((0.0, 0.0, 0.0) if k == 0
+                      else tuple(float(o)
+                                 for o in self._mlg_level_origins[k]))
+            dx = (1.0 if k == 0
+                  else float(self._mlg_scaler.get_level_units(k).dx))
+            shp = sim.domain_shape
+            xg = origin[0] + np.arange(shp[0], dtype=np.float64) * dx
+            yg = origin[1] + np.arange(shp[1], dtype=np.float64) * dx
+            zg = origin[2] + np.arange(shp[2], dtype=np.float64) * dx
+            sim._trip = TripForcing(self.xp, cfg, xg, yg, zg,
+                                    level=k, lattice=self.lattice)
+            # the MPI slab rebuilds the trip on its wrap window from
+            # these args (surfel_level) — caches are lazy on both sides
+            sim._trip_args = {'cfg': cfg, 'origin': origin, 'dx': dx,
+                              'level': k}
+            n_att += 1
+        print(f"  [trip] sustained strip attached to {n_att} level(s): "
+              f"amp={cfg['amp_lu']:g} [L0 lu], box_xy={cfg['box_lu']}, "
+              f"modes={cfg['n_modes']}, seed={cfg['seed']}")
+
     def _build_mlg_simulation_3d(self) -> "MultiLevelGrid":
 
         xp = self.xp
@@ -2434,6 +2475,8 @@ class SimulationSetup:
         mlg = MultiLevelGrid.from_tree(self._mlg_root)
         print(f"\n  MultiLevelGrid assembled:")
         print(f"  {mlg.summary()}")
+
+        self._attach_trip_forcing(simulations)
 
         # ── Update al_model to fine-level for OutputManager ──────
         if len(_blk_alms) == 1:
