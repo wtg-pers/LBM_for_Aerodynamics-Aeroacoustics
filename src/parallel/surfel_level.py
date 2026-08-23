@@ -87,7 +87,8 @@ class SurfelSlabLevel:
             k_full = sb_full.kernel
             for a_ in ('g_field', 'Q', 'qmap', 'cellc', 'indptr', 'cell',
                        'wgt', 'nrm', 'area', 'cen', 'Vsum', 'G_in',
-                       'G_out', 'tau_out', 'fb_out', 'u_wm', 'utau_prev'):
+                       'G_out', 'tau_out', 'fb_out', 'rho_out', 'u_wm',
+                       'utau_prev'):
                 setattr(k_full, a_, None)
             for a_ in ('d_live', 'd_dead', 'd_dV', '_solid_mask_dev',
                        '_tb_W', 'd_tb_cells', 'd_tb_fs', 'd_tb_normal',

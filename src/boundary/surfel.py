@@ -636,7 +636,8 @@ class SurfelFacets:
         return self._force
 
     # ------------------------------------------------------------------
-    def facet_traction(self, G_in=None, G_out=None) -> Dict[str, np.ndarray]:
+    def facet_traction(self, G_in=None, G_out=None,
+                       rho_a=None) -> Dict[str, np.ndarray]:
         """Per-facet surface load, on the GEOMETRY (not the lattice).
 
         Eq. (9) IS the momentum flux through a facet, so this is the
@@ -683,12 +684,17 @@ class SurfelFacets:
         f_body, trac, pn, tau = traction_kinematics(
             G_in, G_out, self.is_in, self.is_out, self.area, self.normal)
         dp = (self._df * self._shell_b * np.array(_SHELLS)).sum(axis=1) / 6.0
-        rho_a = self._state[0]
+        # rho_a: pass EXPLICITLY from the CUDA kernel's rho_out (patch
+        # 70) — self._state is the python-pass state the kernel never
+        # writes (the same trap as G_in/G_out above). Without it the
+        # production surface Cp silently fell back to -pn (68 sec. 0).
+        if rho_a is None:
+            rho_a = self._state[0]
         if rho_a is None:
             p_state = np.full(self.n_f, np.nan)
             p_use = -pn
         else:
-            p_state = rho_a * THETA
+            p_state = np.asarray(rho_a, dtype=np.float64) * THETA
             p_use = p_state
         return {'force': f_body, 'traction': trac, 'p': -pn, 'tau': tau,
                 'tau_mag': np.linalg.norm(tau, axis=1), 'dp': dp,

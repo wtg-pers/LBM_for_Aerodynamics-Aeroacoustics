@@ -506,12 +506,13 @@ class SurfelBoundary:
         area-weighted onto the original STL triangles, immune to sliver
         noise (surfel_surface_writer docstring).
 
-        Cp caveat (patch 68 sec. 0): p_state/dp come from the PYTHON
-        facet pass (`_state`, `_df`), which the CUDA kernel never
-        writes — on this production path facet_traction therefore
-        returns p_use = -pn (normal traction, spurious dp included)
-        and dp = 0. Cf is unaffected. Restoring p_state here means
-        exporting rho_a from the scatter kernel (registered follow-up).
+        Cp (patch 70): p_state = rho^a theta from the kernel's
+        rho_out (the facet-state sample) — passed explicitly, since
+        the python-pass `_state` is never written on this path (68
+        sec. 0 found Cp silently falling back to -pn, dp-polluted).
+        `dp` still comes from the python `_df` and stays 0 here; the
+        p - p_state difference in the file IS the dp the traction
+        carries (Eq. 23).
         """
         from src.io.surfel_surface_writer import (
             aggregate_to_triangles, write_triangle_surface,
@@ -526,12 +527,17 @@ class SurfelBoundary:
                      G_in=G_in, G_out=G_out,
                      area=np.asarray(self.facets.area),
                      normal=np.asarray(self.facets.normal))
-        t = self.facets.facet_traction(G_in=G_in, G_out=G_out)
+        # p_state from the kernel's facet-state sample (patch 70);
+        # no-slip (mode 0) takes no sample -> host convention p = -pn
+        rho_a = (np.asarray(self.kernel.rho_out.get(), dtype=np.float64)
+                 if self.kernel.mode != 0 else None)
+        t = self.facets.facet_traction(G_in=G_in, G_out=G_out, rho_a=rho_a)
         import os as _os
         if _os.environ.get('LBM_SURF_DUMP'):          # gate U1 forensics
-            full = np.empty((self.n_facets, 8))
-            full[:, 0] = t['p_use']; full[:, 1:4] = t['tau']
+            full = np.empty((self.n_facets, 9))
+            full[:, 0] = t['p']; full[:, 1:4] = t['tau']
             full[:, 4] = t['tau_mag']; full[:, 5:8] = t['traction']
+            full[:, 8] = t['p_use']
             np.save(path + '.facets.npy', full)
         fields = {'p_use': t['p_use'], 'dp': t['dp'],
                   'tau_mag': t['tau_mag'], 'tau': t['tau'],

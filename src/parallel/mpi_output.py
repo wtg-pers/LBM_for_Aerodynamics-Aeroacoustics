@@ -424,7 +424,7 @@ class MPIOutputManager(OutputManager):
             gids, vals = sb.surface_payload()
         else:
             gids, vals = (np.zeros(0, dtype=np.int64),
-                          np.zeros((0, 8)))
+                          np.zeros((0, 9)))
         if self._nr > 1:
             parts = self._comm.gather((gids, vals), root=0)
         else:

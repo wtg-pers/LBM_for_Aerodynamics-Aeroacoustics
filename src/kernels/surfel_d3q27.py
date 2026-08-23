@@ -226,7 +226,10 @@ extern "C" __global__ void surfel_scatter(
     double*       __restrict__ utau_prev,  // (n_f,) previous step, wm_mode 1
     const int wm_mode, const double wm_tf, const int wm_seed,
     const int Nx, const int Ny, const int Nz,
-    const int px, const int py, const int pz)
+    const int px, const int py, const int pz,
+    double*       __restrict__ rho_out)    // (n_f,) rho^a of the facet
+                                           // state sample (p_state =
+                                           // rho^a theta, patch 70)
 {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_f) return;
@@ -248,12 +251,14 @@ extern "C" __global__ void surfel_scatter(
         for (int i = 0; i < 27; ++i) G_out[base + i] = go[i];
         if (tau_out) tau_out[a] = 0.0;
         if (fb_out)  fb_out[a] = 1;
+        if (rho_out) rho_out[a] = 0.0;     // no sample in no-slip (host: NaN)
         return;
     }
 
     double st[5];
     sample_state(rho, uf, live, cen, nrm, a, h, Nx, Ny, Nz, px, py, pz, st);
     double ur = st[0], ux = st[1], uy = st[2], uz = st[3];
+    if (rho_out) rho_out[a] = ur;
     const double un = ux*nx + uy*ny + uz*nz;           // Eq. (12): u_n = 0
     ux -= un*nx; uy -= un*ny; uz -= un*nz;
 
@@ -502,6 +507,10 @@ class SurfelKernelD3Q27:
         self.Q = None
         self.tau_out = cp.zeros(self.n_f, dtype=cp.float64)
         self.fb_out = cp.zeros(self.n_f, dtype=cp.uint8)
+        # rho^a of the facet-state sample (patch 70): the surface
+        # writer's p_state = rho^a theta — the pressure Eq. (20)
+        # intends, free of the Eq. (24) dp the normal traction carries.
+        self.rho_out = cp.zeros(self.n_f, dtype=cp.float64)
         self._per = tuple(int(p) for p in facets.periodic)
         # Physics scalars are REQUIRED facet attributes (surfel_boundary
         # always sets them): a getattr default here (nu=1/6 ~ tau=1!) would
@@ -581,7 +590,7 @@ class SurfelKernelD3Q27:
             cp.int32(self._wm_seed),
             cp.int32(nx), cp.int32(ny), cp.int32(nz),
             cp.int32(self._per[0]), cp.int32(self._per[1]),
-            cp.int32(self._per[2])))
+            cp.int32(self._per[2]), self.rho_out))
 
         self._wm_seed = 0          # only the first pass seeds the filter
 
