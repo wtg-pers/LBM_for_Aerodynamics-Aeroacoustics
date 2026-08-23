@@ -61,6 +61,16 @@ if TYPE_CHECKING:
     from src.grid.coupling import GridCoupling
 
 
+def _rest_feq_27(xp, dtype):
+    """D3Q27 rest-state equilibrium (rho=1, u=0) = the lattice weights,
+    in surfel_transport's C27 ordering (patch 74 C2F dead fill)."""
+    import numpy as _np
+    from src.boundary.surfel_transport import C27 as _C27
+    w = _np.array([8 / 27, 2 / 27, 1 / 54, 1 / 216])[
+        _np.einsum('qd,qd->q', _C27, _C27)]
+    return xp.asarray(w.astype(_np.dtype(dtype).type))
+
+
 def _eso_wall_args(sim):
     """Implicit-domain-wall view args for the eso region gather/scatter
     (eso_wall patch 04). MLG coupling must read/write wall rows through
@@ -332,6 +342,32 @@ class MultiLevelGrid:
         else:
             f_c = sim_coarse.f
             c_is_sub = False
+        if getattr(sim_fine, '_use_surfel', False) \
+                and getattr(getattr(sim_fine, 'obstacle_bc', None),
+                            'partial_body', False) \
+                and getattr(sim_coarse, '_use_surfel', False):
+            # Partial-body fine level (patch 74): the C2F band crosses
+            # the body, so interpolation stencils reach coarse DEAD
+            # cells (surfel convention f = 0) — rho of the interpolant
+            # collapses and the fine collide NaNs (measured: first NaN
+            # exactly at the first post-C2F substep). Fill dead coarse
+            # cells with the rest-state equilibrium (bounded, weights):
+            # the polluted interpolants land only within the coupling
+            # stencil reach of the wall, where the FINE facets impose
+            # the physics. Whole-body fine levels never reach dead
+            # coarse cells here (band guard geometry) — no-op there.
+            xp = sim_coarse.xp
+            if c_is_sub:
+                sub = coupling.coarse_sub_spatial_slices
+                dead_c = ~sim_coarse.obstacle_bc.d_live.reshape(
+                    sim_coarse.domain_shape)[sub].astype(bool)
+                w = _rest_feq_27(xp, f_c.dtype)
+                f_c = xp.where(dead_c[None], w[:, None, None, None], f_c)
+            else:
+                dead_c = ~sim_coarse.obstacle_bc.d_live.reshape(
+                    sim_coarse.domain_shape).astype(bool)
+                w = _rest_feq_27(xp, f_c.dtype)
+                f_c = xp.where(dead_c[None], w[:, None, None, None], f_c)
         if getattr(sim_fine, '_use_esoteric', False):
             from src.kernels.esoteric_d3q27 import esoteric_scatter_std_region
             strips: list = []

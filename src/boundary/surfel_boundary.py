@@ -489,13 +489,56 @@ class SurfelBoundary:
         F = getattr(self, '_force', None)
         if F is None:
             return np.zeros(3)
+        merge = getattr(self, '_force_merge', None)
+        if merge:
+            # partial-body partition (patch 74): this (topmost) level's
+            # owned force + every coarser level's owned force in THIS
+            # level's lattice units (area scaling)
+            tot = self._own_force_lu()
+            for bc, sc in merge:
+                tot = tot + bc._own_force_lu() * float(sc)
+            return tot
+        return self._own_force_lu()
+
+    def _own_force_lu(self):
+        """Owned-facet force in this level's lu (all facets when no
+        partition) — the pre-74 last_force arithmetic otherwise."""
+        F = getattr(self, '_force', None)
+        if F is None:
+            return np.zeros(3)
+        own = getattr(self, 'd_facet_owned', None)
+        if own is not None:
+            # cross-level partition (patch 74): facets whose triangle a
+            # finer level owns are excluded — the same owned-only ledger
+            # the MPI slab uses for the rank partition (64 sec. 3)
+            k = self.kernel
+            xp = self.xp
+            cdotn = getattr(k, '_d_cdotn', None)
+            if cdotn is None:
+                cdotn = xp.asarray(k.f.cdotn)
+            G = ((k.G_in * (cdotn < 0) - k.G_out * (cdotn > 0))
+                 * own[:, None]).sum(axis=0)
+            F = xp.asarray(C27.astype(np.float64)).T @ G
         return np.asarray(F.get() if hasattr(F, 'get') else F, dtype=float)
+
+    def set_facet_ownership(self, tri_owned_by_finer) -> int:
+        """Partial-body partition (patch 74): mark facets whose FULL-STL
+        triangle id is in `tri_owned_by_finer` as not owned here. Returns
+        the number of facets handed over."""
+        tid = np.asarray(self.surfels['tri_id'], dtype=np.int64)
+        if getattr(self, 'tri_global', None) is not None:
+            tid = np.asarray(self.tri_global)[tid]     # local -> full ids
+        taken = np.isin(tid, np.asarray(tri_owned_by_finer, dtype=np.int64))
+        self.facet_owned_h = ~taken
+        self.d_facet_owned = self.xp.asarray(self.facet_owned_h.astype(
+            np.float64))
+        return int(taken.sum())
 
     def facet_traction(self, *a, **k):
         return self.facets.facet_traction(*a, **k)
 
     # ------------------------------------------------------------- surface
-    def write_surface(self, path: str) -> int:
+    def write_surface(self, path: str, extra=None) -> int:
         """Write per-triangle surface loads (Cp/Cf) as legacy-VTK POLYDATA.
 
         S8o writer on the production path. The traction MUST come from the
@@ -545,14 +588,82 @@ class SurfelBoundary:
         if self.q_inf:
             fields['Cp'] = (t['p_use'] - self.p_ref) / float(self.q_inf)
             fields['Cf'] = t['tau_mag'] / float(self.q_inf)
-        a_tri, agg = aggregate_to_triangles(self.surfels, fields,
-                                            self.n_faces)
+        a_tri, agg, is_sum = self.surface_contribution(fields)
+        if extra:
+            if not is_sum:
+                raise AssertionError("surface merge needs partition sums")
+            for a2, agg2, _ in extra:
+                # partial-body merge (patch 74): other levels' owned
+                # triangles, already in FULL-STL index space (sums add)
+                a_tri = a_tri + a2
+                for k in agg:
+                    agg[k] = agg[k] + agg2[k]
+        if is_sum:
+            inv = 1.0 / np.maximum(a_tri, 1e-300)
+            for k in agg:
+                agg[k] = agg[k] * (inv[:, None] if agg[k].ndim == 2
+                                   else inv)
         # level-local -> global (L0 lu) frame; identity on a single grid
-        verts, faces = self.triangles_lu
+        verts, faces = self.full_triangles_lu()
         verts_out = (np.asarray(verts, dtype=np.float64)
                      * float(self.coord_spacing)
                      + np.asarray(self.coord_origin, dtype=np.float64))
         return write_triangle_surface(path, (verts_out, faces), a_tri, agg)
+
+    def full_triangles_lu(self):
+        """(verts, faces) in the FULL STL index space (the clipped
+        level keeps the full vertex array — only faces were dropped)."""
+        full = getattr(self, '_full_triangles_lu', None)
+        return full if full is not None else self.triangles_lu
+
+    def surface_contribution(self, fields=None):
+        """Area-weighted SUMS per full-STL triangle of this level's
+        OWNED facets (patch 74) — (a_tri_sum, {field: weighted sum}).
+        Normalised by the caller once every level has contributed; for a
+        whole-body level with no partition this equals the single-level
+        aggregate after normalisation."""
+        from src.io.surfel_surface_writer import aggregate_to_triangles
+        if fields is None:
+            G_in = np.asarray(self.kernel.G_in.get(), dtype=np.float64)
+            G_out = np.asarray(self.kernel.G_out.get(), dtype=np.float64)
+            rho_a = (np.asarray(self.kernel.rho_out.get(), dtype=np.float64)
+                     if self.kernel.mode != 0 else None)
+            t = self.facets.facet_traction(G_in=G_in, G_out=G_out,
+                                           rho_a=rho_a)
+            fields = {'p_use': t['p_use'], 'dp': t['dp'],
+                      'tau_mag': t['tau_mag'], 'tau': t['tau'],
+                      'traction': t['traction']}
+            if self.q_inf:
+                fields['Cp'] = (t['p_use'] - self.p_ref) / float(self.q_inf)
+                fields['Cf'] = t['tau_mag'] / float(self.q_inf)
+        own = getattr(self, 'facet_owned_h', None)
+        surf = self.surfels
+        if own is not None or getattr(self, 'tri_global', None) is not None:
+            tid = np.asarray(surf['tri_id'], dtype=np.int64)
+            if getattr(self, 'tri_global', None) is not None:
+                tid = np.asarray(self.tri_global)[tid]
+            area = np.asarray(surf['area'], dtype=np.float64)
+            if own is not None:
+                area = np.where(own, area, 0.0)       # unowned: zero weight
+            surf = {'tri_id': tid, 'area': area}
+            n_faces = int(self.n_faces_full)
+            a_tri, agg = aggregate_to_triangles(surf, fields, n_faces)
+            # aggregate_to_triangles normalises; undo to return SUMS.
+            # Areas are LEVEL-lu^2 — rescale to L0 lu^2 (coord_spacing
+            # = this level's dx in L0 lu) so the cross-level merge sums
+            # one unit; intensive fields are unaffected (sum/area
+            # cancels the factor within the level).
+            sc2 = float(self.coord_spacing) ** 2
+            a_tri = a_tri * sc2
+            for k in agg:
+                agg[k] = agg[k] * (a_tri[:, None] if agg[k].ndim == 2
+                                   else a_tri)
+            return a_tri, agg, True
+        # whole-body level, no partition: the plain normalised aggregate
+        # (the pre-74 writer's exact arithmetic — no sum/normalise
+        # round trip, so existing surface files stay bitwise)
+        a_tri, agg = aggregate_to_triangles(surf, fields, self.n_faces)
+        return a_tri, agg, False
 
     # ------------------------------------------------------------- reporting
     def summary(self) -> str:
@@ -564,6 +675,56 @@ class SurfelBoundary:
         if self._taum_summary:
             s += "\n            " + self._taum_summary
         return s
+
+
+def clip_triangles_to_level(triangles_lu, shape, region, h_law: float,
+                            sample_h: float, margin: float = 2.0):
+    """Partial-body level (patch 74): keep only the STL triangles whose
+    surfel stencils can live entirely OUTSIDE this level's C2F/F2C
+    coupling bands — the finest-wins ownership rule.
+
+    MLG already runs bodies cut by a fine-box face (IBB/HWBB: seam
+    links suppressed, octo8 fuselage). Ownership follows the MLG
+    rule — finest wins: every triangle inside the EXCISED region
+    (fine_region, where the coarse level stops computing and takes
+    the fine solution back through F2C) is fine-owned. The only
+    triangles this level cannot own are those whose surfel stencil
+    (prism cells + wall-law sample at h·n) reaches into the C2F
+    OVERLAP BUFFER — the outer `overlap_width` coarse cells of the fine
+    box that are NOT fine solution but the coarse field interpolated
+    in every substep as the fine level's boundary condition. A facet
+    there would have its exchange overwritten and its sample read the
+    interpolant. Those few triangles stay with the coarse parent (its
+    facet set is the full wing and it computes there). Partition by
+    triangle: fine-owned iff every vertex sits at least
+    `overlap band + reach + margin` fine cells inside the non-flush
+    faces of the fine grid.
+
+    Dropping a triangle also drops its share of dV/g_field on the cells
+    it cut — those cells lie inside the band by construction, so on
+    this level they are coupling-owned (never advected freely).
+
+    Returns (verts, faces_kept, keep_mask_over_faces).
+    """
+    verts = np.asarray(triangles_lu[0], dtype=np.float64)
+    faces = np.asarray(triangles_lu[1])
+    ratio = int(getattr(region, 'REFINE_RATIO', 2))
+    fr, fd = region.fine_region, region.fine_domain_coarse
+    flush = getattr(region, 'flush_faces', {}) or {}
+    reach = max(float(h_law), float(sample_h)) + 1.0 + float(margin)
+    ok = np.ones(len(faces), dtype=bool)
+    for ax_i, ax in enumerate('xyz'):
+        w_lo = (getattr(fr, f'{ax}_start') - getattr(fd, f'{ax}_start')) \
+            * ratio
+        w_hi = (getattr(fd, f'{ax}_end') - getattr(fr, f'{ax}_end')) \
+            * ratio
+        n_ax = int(shape[ax_i])
+        v = verts[faces][:, :, ax_i]                  # (n_faces, 3)
+        if w_lo > 0 and not flush.get(f'{ax}_min', False):
+            ok &= (v.min(axis=1) >= w_lo + reach)
+        if w_hi > 0 and not flush.get(f'{ax}_max', False):
+            ok &= (v.max(axis=1) <= n_ax - 1 - w_hi - reach)
+    return verts, faces[ok], ok
 
 
 def check_level_coupling_bands(sb: SurfelBoundary, region,
@@ -626,9 +787,16 @@ def check_level_coupling_bands(sb: SurfelBoundary, region,
     samp_xyz = (np.asarray(sb.facets.centroid, dtype=np.float64)
                 + np.asarray(sb.facets.normal, dtype=np.float64) * reach)
 
-    checks = (('prism-coupled cell', csr_xyz),
-              ('partial (dV<1) cell', part_xyz),
-              (f'wall-law sample point (reach {reach:g} cells)', samp_xyz))
+    if getattr(sb, 'partial_body', False):
+        # partial-body level (patch 74): the body crosses the box faces
+        # BY DESIGN — facets, cut cells and sample points in the C2F
+        # band are the wall meeting its coupling boundary condition
+        # (the band supplies outer flow; wall_coupling exclude handles
+        # the near-wall write pollution). Nothing to refuse.
+        return
+    checks = [('prism-coupled cell', csr_xyz),
+              (f'wall-law sample point (reach {reach:g} cells)', samp_xyz),
+              ('partial (dV<1) cell', part_xyz)]
     for ax_i, ax, w_lo, w_hi in widths:
         n_ax = sb.shape[ax_i]
         for name, xyz in checks:

@@ -1072,12 +1072,140 @@ class SimulationSetup:
             # structural fix (cut-cell merging) is the registered
             # follow-up. Config may still override.
             scfg.setdefault('dv_min', 1e-2)
+            # Partial-body level (patch 74): a fine box that cuts the
+            # body keeps only the triangles whose surfel stencils clear
+            # its coupling bands (finest-wins partition); the parent
+            # level keeps the full wing. Opt-in: without the flag the
+            # band guard below still REFUSES a cut body (bit-identical
+            # for every existing run).
+            # Partial-body level (patch 74): the box cuts the body. The
+            # facet set is NOT clipped — the surfel build handles a body
+            # leaving the grid natively (facets exist only for in-grid
+            # cells; edge-clipped prisms stay mass-consistent through
+            # Vsum, the Eq. 7 '<= 1' case), so the wall runs unbroken to
+            # the box face. Triangle clipping was measured to blow up in
+            # one substep: partial facet coverage (a dropped triangle's
+            # cells keep dV < 1 but lose its flux) and wall-less
+            # live/dead interfaces are both structural holes. Facets in
+            # the C2F band are LEGITIMATE here (the band supplies the
+            # outer flow as a BC; the facet supplies the wall) — the
+            # band guard is skipped below, and near-wall C2F pollution
+            # is the wall_coupling exclude mode's existing job.
+            # Ownership (accounting only) is partitioned later: this
+            # level owns the triangles inside its fine_region (= the
+            # excised region where MLG already deems the fine solution
+            # authoritative), the parent keeps the band triangles.
+            partial = bool(scfg.pop('partial_body', False))
+            if partial:
+                # patch 74: sliver amplification floor. The C2F band
+                # crosses the wall, so band interpolants (bounded but
+                # wall-inconsistent) feed cut cells whose advect divides
+                # by dV — dv_min 1e-2 leaves gains up to 100x and the
+                # measured blow-up cells all sat at dV 0.01-0.04. Floor
+                # HALF: gain <= 2. Cost is geometric only (the facet
+                # force ledger never uses dV; dropped slivers are the
+                # registered volume-bookkeeping stairstep, patch 50) —
+                # a half-cell wall displacement at slivers, i.e. the
+                # parent level's own resolution.
+                if float(scfg.get('dv_min', 1e-2)) < 0.5:
+                    scfg['dv_min'] = 0.5
+            if partial and scfg.get('tau_model', False):
+                # patch 74 first scope: the tau-band injects one-substep
+                # persistent stress into cells the C2F band rewrites —
+                # the level-crossing tau_out exchange (the slab stage-ii
+                # analogue) is registered follow-up work. OFF here only;
+                # whole-body levels keep their configured band. Measured:
+                # tau ON on the partial level diverges, OFF is clean.
+                print(f"  [surfel] partial-body L{ctx.get('level')}: "
+                      f"tau_model forced OFF (74 first scope)")
+                scfg['tau_model'] = False
+            if partial:
+                # march-axis validity (patch 74): the volumetric march
+                # pins each line by max(dV)=1 and requires one fully
+                # fluid cell per line. A box the body CROSSES along the
+                # march axis has interior lines that never leave the
+                # body — measured: chordwise march on the LE box marked
+                # the wing core live (36k cells, first-substep blow-up).
+                # Pick the first axis (configured first) whose lines all
+                # contain solid-free cells, using the level mask.
+                import numpy as _np
+                from src.boundary.surfel_boundary import _DEFAULTS as _SD
+                _solid = _np.asarray(mask.get() if hasattr(mask, 'get')
+                                     else mask, dtype=bool)
+                _dil = _solid.copy()
+                for _ax in range(3):
+                    for _sh in (1, -1):
+                        _dil |= _np.roll(_solid, _sh, axis=_ax)
+                _cand = [int(scfg.get('march_axis', _SD['march_axis']))]
+                _cand += [a for a in (1, 2, 0) if a not in _cand]
+                for _ax in _cand:
+                    _other = tuple(a for a in range(3) if a != _ax)
+                    _viol = int((_dil.all(axis=_ax)).sum())
+                    if _viol == 0:
+                        if _ax != _cand[0]:
+                            print(f"  [surfel] partial-body: march_axis "
+                                  f"{_cand[0]} has body-spanning lines — "
+                                  f"switched to axis {_ax}")
+                        scfg['march_axis'] = _ax
+                        break
+                else:
+                    raise ValueError(
+                        "surfel partial_body: every march axis has lines "
+                        "fully inside the body — the box cannot resolve "
+                        "dV (enlarge the box on at least one axis)")
             sb = SurfelBoundary(
                 self.xp, tuple(int(s) for s in mask.shape),
                 geom_info['triangles_lu'],
                 nu_lu=float(ctx.get('nu_lu', self.nu_lu)),
                 cfg=scfg,
             )
+            sb.partial_body = partial
+            if partial:
+                # invariant: with a valid march every cut cell is cut by
+                # a present facet (whole-body levels measure exactly 0)
+                import numpy as _np
+                _has = _np.zeros(int(_np.prod(sb.shape)), dtype=bool)
+                _has[_np.unique(sb.facets._t_cell)] = True
+                # tolerance: the march's f64 line accumulation leaves
+                # far-field fluid at 1 - eps (band-guard convention)
+                _fl = int((sb.live_h.ravel()
+                           & (sb.dV_h.ravel() < 1.0 - 1e-9)
+                           & ~_has).sum())
+                import os as _os2
+                if _fl and _os2.environ.get('LBM_PARTIAL_SOFT') == '1':
+                    print(f"  [surfel] SOFT: {_fl} facet-less cut cells "
+                          f"on L{ctx.get('level')} (march axis "
+                          f"{scfg.get('march_axis')})")
+                elif _fl:
+                    raise AssertionError(
+                        f"surfel partial_body: {_fl} facet-less cut "
+                        f"cells — dV/facet inconsistency (march axis or "
+                        f"geometry problem)")
+            sb.tri_global = None
+            sb.n_faces_full = sb.n_faces
+            sb.tri_owned = None
+            if partial and ctx.get('region') is not None:
+                import numpy as _np
+                reg = ctx['region']
+                fr, fd = reg.fine_region, reg.fine_domain_coarse
+                ratio = int(getattr(reg, 'REFINE_RATIO', 2))
+                v, f = geom_info['triangles_lu']
+                cen = _np.asarray(v)[_np.asarray(f)].mean(axis=1)
+                own = _np.ones(len(f), dtype=bool)
+                for ax_i, ax in enumerate('xyz'):
+                    lo = (getattr(fr, f'{ax}_start')
+                          - getattr(fd, f'{ax}_start')) * ratio
+                    hi_band = (getattr(fd, f'{ax}_end')
+                               - getattr(fr, f'{ax}_end')) * ratio
+                    n_ax = int(mask.shape[ax_i])
+                    if lo > 0:
+                        own &= cen[:, ax_i] >= lo
+                    if hi_band > 0:
+                        own &= cen[:, ax_i] <= n_ax - 1 - hi_band
+                sb.tri_owned = _np.flatnonzero(own)
+                print(f"  [surfel] partial-body L{ctx.get('level')}: "
+                      f"{own.sum():,} of {own.size:,} triangles "
+                      f"fine-owned (fine_region interior)")
             if self.xp.__name__ == 'cupy':
                 # return the build transients (prism tables, band w_norm)
                 # to the driver between per-level surfel builds — the
@@ -2241,6 +2369,57 @@ class SimulationSetup:
                       f"eso_wall/09)")
         return out
 
+    def _partition_surfel_ownership(self, simulations) -> None:
+        """Partial-body levels (patch 74): finest wins. Walk surfel
+        levels top-down; every triangle a finer level owns (its clipped
+        face set, full-STL ids) is handed over by all coarser levels —
+        their facets on those triangles drop out of the force ledger
+        and the surface output (the coarse solution there is F2C-
+        overwritten fine data anyway). No-op when no level is clipped
+        (every existing run: no partition, bit-identical)."""
+        import numpy as _np
+        surf = [(k, s) for k, s in enumerate(simulations)
+                if getattr(getattr(s, 'obstacle_bc', None), 'kind', None)
+                == 'surfel']
+        if not any(getattr(s.obstacle_bc, 'tri_owned', None) is not None
+                   for _, s in surf):
+            return
+        owned_by_finer = _np.zeros(0, dtype=_np.int64)
+        for k, s in sorted(surf, key=lambda t: -t[0]):
+            sb = s.obstacle_bc
+            mine = (_np.asarray(sb.tri_owned)
+                    if getattr(sb, 'tri_owned', None) is not None
+                    else _np.arange(sb.n_faces))
+            # not-owned = finer-owned + (partial level) its own band
+            # triangles outside fine_region — both excluded from THIS
+            # level's ledger/surface
+            not_mine = _np.union1d(
+                owned_by_finer,
+                _np.setdiff1d(_np.arange(sb.n_faces), mine,
+                              assume_unique=False))
+            if not_mine.size:
+                n = sb.set_facet_ownership(not_mine)
+                print(f"  [surfel] L{k}: {n:,} facets excluded from the "
+                      f"ledger ({not_mine.size:,} triangles not owned "
+                      f"here)")
+            owned_by_finer = _np.union1d(
+                owned_by_finer,
+                _np.setdiff1d(mine, owned_by_finer))
+        # surface output: the topmost level writes the whole wing,
+        # merging the coarser levels' owned contributions (output layer)
+        self._surfel_levels_for_surface = [s.obstacle_bc for _, s in
+                                           sorted(surf, key=lambda t: t[0])]
+        # force: the topmost level's ledger (what ForceManager reads)
+        # adds every coarser level's OWNED-facet force, rescaled to the
+        # top level's lattice units — facet force ~ area ~ dx^2, so
+        # F_top = F_j * (2^top / 2^j)^2 (velocity is level-invariant
+        # under acoustic scaling; the MLG force rebind uses the same
+        # 2^k length scaling for the reference).
+        k_top, s_top = max(surf, key=lambda t: t[0])
+        s_top.obstacle_bc._force_merge = [
+            (s.obstacle_bc, (2.0 ** (k_top - k)) ** 2)
+            for k, s in surf if k < k_top]
+
     def _attach_trip_forcing(self, simulations) -> None:
         """Sustained trip strip (patch 66): attach a TripForcing to every
         surfel level whose box the global strip intersects. Runtime
@@ -2477,6 +2656,7 @@ class SimulationSetup:
         print(f"  {mlg.summary()}")
 
         self._attach_trip_forcing(simulations)
+        self._partition_surfel_ownership(simulations)
 
         # ── Update al_model to fine-level for OutputManager ──────
         if len(_blk_alms) == 1:

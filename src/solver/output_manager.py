@@ -605,6 +605,13 @@ class OutputManager:
         MPI manager overrides with the collective gather."""
         if target is None or not hasattr(target, 'iter_blocks'):
             return
+        self._write_surfel_surface(step, target)
+
+    def _write_surfel_surface(self, step: int, target) -> None:
+        """Surfel surface file: the topmost surfel level writes it.
+        Partial-body levels (patch 74): every coarser surfel level's
+        OWNED-facet contribution is merged so the file covers the whole
+        wing with the finest-owned load on each triangle."""
         import os as _os
         surf = [b for b in reversed(list(target.iter_blocks()))
                 if getattr(getattr(b.sim, 'obstacle_bc', None),
@@ -613,11 +620,19 @@ class OutputManager:
             return
         top = max(b.level for b in surf)
         sel = [b for b in surf if b.level == top]
+        partitioned = any(getattr(b.sim.obstacle_bc, 'facet_owned_h',
+                                  None) is not None for b in surf)
         for b in sel:
             tag = "" if len(sel) == 1 else f"_b{b.index}"
-            b.sim.obstacle_bc.write_surface(_os.path.join(
-                self.mlg_vtk_writer.output_dir,
-                f"surface{tag}_{step:08d}.vtk"))
+            path = _os.path.join(self.mlg_vtk_writer.output_dir,
+                                 f"surface{tag}_{step:08d}.vtk")
+            extra = None
+            if partitioned:
+                extra = [c.sim.obstacle_bc.surface_contribution()
+                         for c in surf if c.level < top
+                         and getattr(c.sim.obstacle_bc, '_force', None)
+                         is not None]
+            b.sim.obstacle_bc.write_surface(path, extra=extra)
 
     def _write_vtk(self, step: int, sim: 'Simulation') -> None:
         """Write VTK output (domain + markers) at output_interval."""
@@ -660,13 +675,7 @@ class OutputManager:
                                     'kind', None) == 'surfel'] \
                     if hasattr(target, 'iter_blocks') else []
                 if _surf:
-                    _top = max(b.level for b in _surf)
-                    _sel = [b for b in _surf if b.level == _top]
-                    for _b in _sel:
-                        _tag = "" if len(_sel) == 1 else f"_b{_b.index}"
-                        _b.sim.obstacle_bc.write_surface(_os.path.join(
-                            self.mlg_vtk_writer.output_dir,
-                            f"surface{_tag}_{step:08d}.vtk"))
+                    self._write_surfel_surface(step, target)
                 # Write ALM markers (before returning)
                 if (self.marker_vtk_writer is not None
                         and self.al_model is not None):
