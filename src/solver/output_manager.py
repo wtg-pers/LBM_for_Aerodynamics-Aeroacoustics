@@ -403,6 +403,12 @@ class OutputManager:
                                        or isinstance(target, MultiLevelGrid)):
                 self.mlg_vtk_writer.write(
                     step=final_step, mlg=target, time=float(final_step))
+            # final surfel surface loads (patch 68): the cadence path
+            # wrote them mid-run; the final snapshot used to drop them —
+            # the 10k span runs ended with no surface file at the
+            # verdict step. OUTSIDE the rank-0-only branch: the MPI
+            # override is collective (every rank ships owned facets).
+            self._write_final_surface(final_step, target)
 
         # ── Final VTK (single grid only) ──
         if self.vtk_writer is not None and self.mlg_vtk_writer is None:
@@ -593,6 +599,25 @@ class OutputManager:
         gathers -> assembled duck views on rank 0, None elsewhere (skip the
         write, then meet the barrier)."""
         return sim
+
+    def _write_final_surface(self, step: int, target) -> None:
+        """Single-GPU surfel surface at the final step (patch 68); the
+        MPI manager overrides with the collective gather."""
+        if target is None or not hasattr(target, 'iter_blocks'):
+            return
+        import os as _os
+        surf = [b for b in reversed(list(target.iter_blocks()))
+                if getattr(getattr(b.sim, 'obstacle_bc', None),
+                           'kind', None) == 'surfel']
+        if not surf:
+            return
+        top = max(b.level for b in surf)
+        sel = [b for b in surf if b.level == top]
+        for b in sel:
+            tag = "" if len(sel) == 1 else f"_b{b.index}"
+            b.sim.obstacle_bc.write_surface(_os.path.join(
+                self.mlg_vtk_writer.output_dir,
+                f"surface{tag}_{step:08d}.vtk"))
 
     def _write_vtk(self, step: int, sim: 'Simulation') -> None:
         """Write VTK output (domain + markers) at output_interval."""

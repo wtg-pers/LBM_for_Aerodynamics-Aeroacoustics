@@ -416,8 +416,21 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
         setattr(out, name, getattr(sb, name))
     out._taum_summary = getattr(sb, '_taum_summary', '')
     out.facets = sk.f                       # hot chain reads sample_h only
-    out.surfels = None
-    out.triangles_lu = None                 # write_surface guarded off
+    # MPI surface channel (patch 68): the rank-0 assembly needs the FULL
+    # build's triangle map + STL — host references only (zero device
+    # bytes), kept on every rank (cheap; the writer runs on rank 0).
+    # Per-facet traction inputs for the OWNED rows ride along as host
+    # arrays (area/normal already host-side in the full facets).
+    out.surfels = sb.surfels
+    out.triangles_lu = sb.triangles_lu
+    out.n_faces = int(getattr(sb, 'n_faces', 0))
+    out.n_facets_full = int(n_f)
+    out._h_area = np.ascontiguousarray(np.asarray(sb.facets.area)[kept])
+    out._h_normal = np.ascontiguousarray(
+        np.asarray(sb.facets.normal)[kept])
+    out._h_is_in = np.ascontiguousarray(np.asarray(sb.facets.is_in)[kept])
+    out._h_is_out = np.ascontiguousarray(
+        np.asarray(sb.facets.is_out)[kept])
 
     # tau-model band (patch 64 stage ii): window row filter + PHANTOM
     # column extension. tau_out is one-substep persistent per-facet state
@@ -503,15 +516,90 @@ class SlabSurfelBoundary(_SB):
         F = xp.asarray(_C.astype(np.float64)).T @ G
         return np.asarray(F.get() if hasattr(F, 'get') else F, dtype=float)
 
+    # ── MPI surface channel (patch 68) ────────────────────────────────
+    # Owned-facet traction payload -> rank-0 assembly -> the single-GPU
+    # writer. Ownership partitions the facet set across ranks (64 sec. 3),
+    # so every global facet arrives exactly once; the traction arithmetic
+    # is the shared primitive (surfel.traction_kinematics) on the owned
+    # subset -> the assembled arrays are bitwise the 1-GPU evaluation.
+    _SURF_COLS = 8       # p, tau(3), tau_mag, traction(3)
+
+    def surface_payload(self):
+        """(gids int64 (n_own,), vals f64 (n_own, 8)) of OWNED facets, or
+        (empty, empty) before the first facet pass."""
+        if getattr(self, '_force', None) is None:
+            return (np.zeros(0, dtype=np.int64),
+                    np.zeros((0, self._SURF_COLS)))
+        from src.boundary.surfel import traction_kinematics
+        own = np.asarray(self.facet_owned.get()
+                         if hasattr(self.facet_owned, 'get')
+                         else self.facet_owned, dtype=bool)
+        k = self.kernel
+        G_in = np.asarray(k.G_in.get(), dtype=np.float64)[own]
+        G_out = np.asarray(k.G_out.get(), dtype=np.float64)[own]
+        import os as _os
+        if _os.environ.get('LBM_SURF_DUMP'):
+            np.savez(f"{_os.environ['LBM_SURF_DUMP']}_G_rank{_os.getpid()}.npz",
+                     gids=np.asarray(self.facet_gids)[own], G_in=G_in,
+                     G_out=G_out, area=self._h_area[own],
+                     normal=self._h_normal[own])
+        _, trac, pn, tau = traction_kinematics(
+            G_in, G_out, self._h_is_in[own], self._h_is_out[own],
+            self._h_area[own], self._h_normal[own])
+        vals = np.empty((own.sum(), self._SURF_COLS))
+        vals[:, 0] = -pn
+        vals[:, 1:4] = tau
+        vals[:, 4] = np.linalg.norm(tau, axis=1)
+        vals[:, 5:8] = trac
+        return np.asarray(self.facet_gids, dtype=np.int64)[own], vals
+
+    def write_surface_assembled(self, path: str, gids, vals) -> int:
+        """Rank-0: scatter the gathered owned rows into the FULL facet
+        order and write through the single-GPU triangle writer.
+
+        Field set mirrors SurfelBoundary.write_surface on the CUDA path:
+        p_use = -pn (the normal traction; the python-path p_state is not
+        available on the kernel path either — 68 sec. 0), dp = 0.
+        """
+        from src.io.surfel_surface_writer import (
+            aggregate_to_triangles, write_triangle_surface)
+        n_f = self.n_facets_full
+        gids = np.asarray(gids, dtype=np.int64)
+        if gids.size != n_f or np.unique(gids).size != n_f:
+            raise AssertionError(
+                f"MPI surface gather: {gids.size} rows for {n_f} facets "
+                f"({np.unique(gids).size} unique) — ownership is not a "
+                "partition (gate U3)")
+        full = np.empty((n_f, self._SURF_COLS))
+        full[gids] = vals
+        import os as _os
+        if _os.environ.get('LBM_SURF_DUMP'):
+            np.save(path + '.facets.npy', full)       # gate U1 forensics
+        p_use = full[:, 0]
+        tau_mag = full[:, 4]
+        fields = {'p_use': p_use, 'dp': np.zeros(n_f),
+                  'tau_mag': tau_mag, 'tau': full[:, 1:4],
+                  'traction': full[:, 5:8]}
+        if self.q_inf:
+            fields['Cp'] = (p_use - self.p_ref) / float(self.q_inf)
+            fields['Cf'] = tau_mag / float(self.q_inf)
+        a_tri, agg = aggregate_to_triangles(self.surfels, fields,
+                                            self.n_faces)
+        verts, faces = self.triangles_lu
+        verts_out = (np.asarray(verts, dtype=np.float64)
+                     * float(self.coord_spacing)
+                     + np.asarray(self.coord_origin, dtype=np.float64))
+        return write_triangle_surface(path, (verts_out, faces), a_tri, agg)
+
     def write_surface(self, path: str) -> int:
         raise NotImplementedError(
-            "slab surfel: surface output is the MPI surface-gather "
-            "follow-up (patch_notes/surfel/64 sec. 7)")
+            "slab surfel: use the collective MPI surface gather "
+            "(MPIOutputManager._write_surface, patch 68)")
 
     def facet_traction(self, *a, **k):
         raise NotImplementedError(
-            "slab surfel: facet_traction is rank-local — use the MPI "
-            "surface gather (patch_notes/surfel/64 sec. 7)")
+            "slab surfel: facet_traction is rank-local — use "
+            "surface_payload()/write_surface_assembled() (patch 68)")
 
 
 def verify_containment(M: np.ndarray, stage: Region, dep: Region) -> None:

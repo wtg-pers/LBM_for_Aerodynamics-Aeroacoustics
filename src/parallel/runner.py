@@ -286,6 +286,8 @@ class DistributedMLGRunner:
         # the ckpt mailbox gather is collective, so every rank (owner or
         # not) must agree on which blocks carry wall state.
         self.wall_masks: List[int] = []
+        self.is_surfel: List[bool] = []
+        self.surface_meta: Dict[int, object] = {}
         for uid, b in enumerate(src):
             lev = b.sim
             self.has_nut.append(
@@ -294,6 +296,18 @@ class DistributedMLGRunner:
             self.wall_masks.append(int(getattr(lev, '_eso_wall_mask', 0)))
             is_surfel = getattr(getattr(lev, 'obstacle_bc', None),
                                 'kind', None) == 'surfel'
+            # rank-invariant surfel flag + rank-0 host metadata for the
+            # MPI surface channel (patch 68): the writer needs the full
+            # build's triangle map on rank 0 only — host refs, no device
+            # bytes, so they survive the per-level release below.
+            self.is_surfel.append(bool(is_surfel))
+            if is_surfel and rank == 0:
+                ob = lev.obstacle_bc
+                self.surface_meta[uid] = {
+                    a: getattr(ob, a, None)
+                    for a in ('surfels', 'triangles_lu', 'n_faces',
+                              'q_inf', 'p_ref', 'coord_origin',
+                              'coord_spacing', 'n_facets')}
             if self.owns[uid]:
                 if is_surfel:
                     from src.parallel.surfel_level import SurfelSlabLevel

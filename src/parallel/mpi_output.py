@@ -392,8 +392,65 @@ class MPIOutputManager(OutputManager):
             if (self.marker_vtk_writer is not None
                     and self.al_model is not None):
                 self._write_markers(step)
+        if fields:
+            self._write_surface(step)        # COLLECTIVE (patch 68)
         if self._nr > 1:
             self._comm.Barrier()
+
+    def _write_final_surface(self, step, target) -> None:
+        """finalize seam: collective on every rank (target is rank-0
+        only and unused here)."""
+        self._write_surface(step)
+
+    def _write_surface(self, step) -> None:
+        """COLLECTIVE surfel surface loads (patch 68): every rank ships
+        its OWNED facets' traction rows, rank 0 assembles the full facet
+        order and writes the single-GPU file (surface_<step>.vtk, top
+        surfel level — the 1-GPU convention in OutputManager)."""
+        r = self._runner
+        if r is None:
+            return
+        # rank-invariant choice: the top surfel level from the replicated
+        # tree flags (the runner holds no sims — memory contract)
+        tops = [b.level for u, b in enumerate(r.blocks) if r.is_surfel[u]]
+        if not tops:
+            return
+        top = max(tops)
+        uid = next(u for u, b in enumerate(r.blocks)
+                   if b.level == top and r.is_surfel[u])
+        L = r.lv[uid] if r.owns[uid] else None
+        sb = getattr(L, 'sb', None) if L is not None else None
+        if sb is not None and hasattr(sb, 'surface_payload'):
+            gids, vals = sb.surface_payload()
+        else:
+            gids, vals = (np.zeros(0, dtype=np.int64),
+                          np.zeros((0, 8)))
+        if self._nr > 1:
+            parts = self._comm.gather((gids, vals), root=0)
+        else:
+            parts = [(gids, vals)]
+        if not self._io_rank:
+            return
+        gids = np.concatenate([p[0] for p in parts])
+        vals = np.concatenate([p[1] for p in parts])
+        if gids.size == 0:
+            return                         # no facet pass yet (step 0)
+        # the writer object: rank 0's own slab if it owns the level,
+        # else any replicated-build boundary (host metadata only)
+        writer = sb
+        if writer is None or not hasattr(writer, 'write_surface_assembled'):
+            meta = r.surface_meta[uid]        # rank-0 host metadata
+            from src.boundary.surfel_eso import SlabSurfelBoundary
+            writer = SlabSurfelBoundary.__new__(SlabSurfelBoundary)
+            for a in ('surfels', 'triangles_lu', 'n_faces', 'q_inf',
+                      'p_ref', 'coord_origin', 'coord_spacing'):
+                setattr(writer, a, meta[a])
+            writer.n_facets_full = int(meta['n_facets'])
+        import os
+        outdir = (self.mlg_vtk_writer.output_dir
+                  if self.mlg_vtk_writer is not None else '.')
+        writer.write_surface_assembled(
+            os.path.join(outdir, f"surface_{step:08d}.vtk"), gids, vals)
 
     # ── seam overrides: checkpoint ──────────────────────────────────
 

@@ -44,6 +44,37 @@ THETA = 1.0 / 3.0
 _SHELLS = (1, 2, 3)
 
 
+def traction_kinematics(G_in, G_out, is_in, is_out, area, normal):
+    """Per-facet (force, traction, p = -n.t, tau) from the G buffers.
+
+    The facet_traction primitive, factored so a facet SUBSET (the MPI
+    slab's owned facets, patch 68) evaluates the identical arithmetic —
+    same expressions in the same order, so the rank-0 assembly of owned
+    rows is bitwise the single-GPU full evaluation.
+    """
+    # Row-independent reductions ONLY: a BLAS matmul / einsum changes
+    # its blocking with the row count, so a facet subset would differ
+    # from the full evaluation at the ulp (measured: MPI surface files
+    # rel 5e-9 off the 1-GPU ones). Explicit per-column sums in a fixed
+    # order make every row's result independent of which rows are
+    # present.
+    G = G_in * is_in - G_out * is_out                     # (n, 27)
+    f_body = np.zeros((G.shape[0], 3))
+    for d in range(3):
+        acc = np.zeros(G.shape[0])
+        for i in range(27):
+            c = C27[i, d]
+            if c != 0.0:
+                acc = acc + G[:, i] * c
+        f_body[:, d] = acc
+    a = np.maximum(area, 1e-300)[:, None]
+    trac = f_body / a
+    pn = (trac[:, 0] * normal[:, 0] + trac[:, 1] * normal[:, 1]
+          + trac[:, 2] * normal[:, 2])
+    tau = trac - pn[:, None] * normal
+    return f_body, trac, pn, tau
+
+
 def equilibrium(rho, u):
     """Second-order equilibrium; satisfies Eq. (13) exactly (gate s0 [Q]).
 
@@ -649,11 +680,8 @@ class SurfelFacets:
                 raise RuntimeError("call apply()/scatter() first, or pass "
                                    "G_in and G_out explicitly")
             G_in, G_out = self._last['G_in'], self._last['G_out']
-        f_body = ((G_in * self.is_in - G_out * self.is_out) @ C27)
-        area = np.maximum(self.area, 1e-300)[:, None]
-        trac = f_body / area
-        pn = np.einsum('ij,ij->i', trac, self.normal)
-        tau = trac - pn[:, None] * self.normal
+        f_body, trac, pn, tau = traction_kinematics(
+            G_in, G_out, self.is_in, self.is_out, self.area, self.normal)
         dp = (self._df * self._shell_b * np.array(_SHELLS)).sum(axis=1) / 6.0
         rho_a = self._state[0]
         if rho_a is None:

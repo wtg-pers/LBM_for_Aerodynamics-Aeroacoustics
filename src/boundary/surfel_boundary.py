@@ -504,9 +504,14 @@ class SurfelBoundary:
         writes (recurring mistake #4; the same trap the force readout hit
         in patch 48). Triangle-level aggregation is the user-facing form:
         area-weighted onto the original STL triangles, immune to sliver
-        noise (surfel_surface_writer docstring). Cp is built from p_use =
-        p_state in wallmodel mode (the normal traction carries the
-        spurious dp — patch 07, ~79% of signal).
+        noise (surfel_surface_writer docstring).
+
+        Cp caveat (patch 68 sec. 0): p_state/dp come from the PYTHON
+        facet pass (`_state`, `_df`), which the CUDA kernel never
+        writes — on this production path facet_traction therefore
+        returns p_use = -pn (normal traction, spurious dp included)
+        and dp = 0. Cf is unaffected. Restoring p_state here means
+        exporting rho_a from the scatter kernel (registered follow-up).
         """
         from src.io.surfel_surface_writer import (
             aggregate_to_triangles, write_triangle_surface,
@@ -515,7 +520,19 @@ class SurfelBoundary:
             return 0                       # no facet pass yet this run
         G_in = np.asarray(self.kernel.G_in.get(), dtype=np.float64)
         G_out = np.asarray(self.kernel.G_out.get(), dtype=np.float64)
+        import os as _os
+        if _os.environ.get('LBM_SURF_DUMP'):          # gate U1 forensics
+            np.savez(f"{_os.environ['LBM_SURF_DUMP']}_G_full.npz",
+                     G_in=G_in, G_out=G_out,
+                     area=np.asarray(self.facets.area),
+                     normal=np.asarray(self.facets.normal))
         t = self.facets.facet_traction(G_in=G_in, G_out=G_out)
+        import os as _os
+        if _os.environ.get('LBM_SURF_DUMP'):          # gate U1 forensics
+            full = np.empty((self.n_facets, 8))
+            full[:, 0] = t['p_use']; full[:, 1:4] = t['tau']
+            full[:, 4] = t['tau_mag']; full[:, 5:8] = t['traction']
+            np.save(path + '.facets.npy', full)
         fields = {'p_use': t['p_use'], 'dp': t['dp'],
                   'tau_mag': t['tau_mag'], 'tau': t['tau'],
                   'traction': t['traction']}
