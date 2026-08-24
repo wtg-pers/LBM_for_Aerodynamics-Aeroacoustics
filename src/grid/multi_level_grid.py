@@ -61,6 +61,25 @@ if TYPE_CHECKING:
     from src.grid.coupling import GridCoupling
 
 
+def _release_surfel_scratch(sim) -> None:
+    """Per-advance scratch discipline for single-GPU surfel bridge
+    levels (patch 75 — the same lifecycle rule SurfelSlabLevel.advance
+    applies on the MPI path since 64 sec. 16): _f_post is fully
+    rewritten by the collide kernel every advance and kernel.Q is
+    fill(0)-ed at every apply, so neither carries cross-substep state —
+    both re-materialize through their existing lazy paths. Left
+    resident they stack per LEVEL (~108 B/node each): the span16+LE-L4
+    single-GPU run held every level's f_post at once (~7 GiB) and
+    OOMed. Ref-drop only — no pool flush (64 sec. 19)."""
+    if not (getattr(sim, '_use_surfel', False)
+            and getattr(sim, '_use_esoteric', False)):
+        return
+    sim._f_post = None
+    k = getattr(getattr(sim, 'obstacle_bc', None), 'kernel', None)
+    if k is not None:
+        k.Q = None
+
+
 def _rest_feq_27(xp, dtype):
     """D3Q27 rest-state equilibrium (rho=1, u=0) = the lattice weights,
     in surfel_transport's C27 ordering (patch 74 C2F dead fill)."""
@@ -521,6 +540,7 @@ class MultiLevelGrid:
         # ── Advance coarse level (full domain) ───────────────────
         with _prof(self._pn_adv[0]):
             root.sim.advance()
+        _release_surfel_scratch(root.sim)
 
         # ── Recursively advance all finer blocks ─────────────────
         for ch in root.children:
@@ -684,6 +704,7 @@ class MultiLevelGrid:
             # Advance (collide + stream)
             with _prof(self._pn_adv[lv]):
                 b.sim.advance()
+            _release_surfel_scratch(b.sim)
 
             # C→F AFTER advance: it acts as the boundary condition.
             # half-step -> temporal interpolation against the parent snapshot;

@@ -74,10 +74,18 @@ def run_single(args):
 
     output.start(start_step, end_step)
 
-    for step in range(start_step, end_step):
-        sim.advance()
-        if output.process(step, sim) == 'stop':
-            break
+    try:
+        for step in range(start_step, end_step):
+            sim.advance()
+            if output.process(step, sim) == 'stop':
+                break
+    except Exception as e:
+        # run-state OOM forensics (patch 75, the runner's 64 sec. 17
+        # hook on the single-GPU path): dump what is resident, THEN die
+        if type(e).__name__ == 'OutOfMemoryError':
+            from src.kernels.surfel_d3q27 import _census_dump
+            _census_dump(f"single-GPU OOM at step {step}")
+        raise
 
     # [4] Finalize
     return output.finalize(sim)
