@@ -913,18 +913,19 @@ class SimulationSetup:
 
         n = attach_coupling_skip(sim, solid_mask, self._wall_coupling)
         if n == 0 and level in getattr(self, '_partial_skip_levels', ()):
-            # patch 77: partial-body surfel level under the STRICT global
-            # policy — attach the level-local C2F skip (solid + 1 fluid
-            # margin) so the band never writes through the wall. Scoped
-            # to THIS level only; every other level's coupling untouched.
-            from src.grid.wall_coupling import build_coupling_skip
-            skip = build_coupling_skip(self.xp, solid_mask, 1)
-            if skip is not None:
-                sim._coupling_skip_nt = skip
-                sim._coupling_skip_dirs = ('c2f',)
-                n = int(skip.sum())
-                print(f"    [wall_coupling] L{level}: partial-body local "
-                      f"C2F skip attached ({n:,} cells)")
+            # patch 77 (2nd iteration): NO local C2F skip on the partial
+            # surfel level. The margin-1 skip starved the wall-adjacent
+            # band cells of their only inflow (74's measured 'cut-skip
+            # backfire') and the L4 near-wall layer slowly destabilized
+            # (~55 coarse steps, whole x-extent). On a SURFEL level the
+            # skip is unnecessary: C2F writes into dead cells are healed
+            # by zero_dead every substep, writes onto cut cells are
+            # bounded by the 0.5 dv floor, and interpolation THROUGH the
+            # wall is handled by the C2F dead fill. Solid-write hygiene
+            # that hwbb needs (patch 12) does not apply here.
+            print(f"    [wall_coupling] L{level}: partial-body surfel — "
+                  f"no coupling skip (band cells keep their C2F supply; "
+                  f"zero_dead heals solid writes)")
         if n:
             tag = f"L{level}" + (f" '{label}'" if label else "")
             n_solid = int(solid_mask.sum())
@@ -2503,27 +2504,12 @@ class SimulationSetup:
                 continue
             blk = next(b for b in self._mlg_blocks if b.level == k + 1)
             fr = blk.region.fine_region      # in PARENT (level-k) coords
-            cells = _np2.asarray(sb_p.d_tb_cells.get(), dtype=_np2.int64)
-            shp = sb_p.shape
-            cz = cells % shp[2]
-            cy = (cells // shp[2]) % shp[1]
-            cx = cells // (shp[1] * shp[2])
-            # parent-local box: block origins are absolute; fine_region
-            # is already in the parent's own index space for chain MLG
-            inside = ((cx >= fr.x_start) & (cx <= fr.x_end)
-                      & (cy >= fr.y_start) & (cy <= fr.y_end)
-                      & (cz >= fr.z_start) & (cz <= fr.z_end))
-            if not inside.any():
-                continue
-            keep = _np2.flatnonzero(~inside)
-            xp_ = sb_p.xp
-            sb_p.d_tb_cells = sb_p.d_tb_cells[xp_.asarray(keep)]
-            sb_p.d_tb_fs = sb_p.d_tb_fs[xp_.asarray(keep)]
-            sb_p.d_tb_normal = sb_p.d_tb_normal[xp_.asarray(keep)]
-            sb_p._tb_W = sb_p._tb_W[keep]
-            print(f"  [surfel] L{k}: tau-band rows inside the partial "
-                  f"L{k+1} box excised ({int(inside.sum()):,} of "
-                  f"{inside.size:,} cells — finest wins)")
+            # NOTE (patch 77 iteration): an earlier variant ALSO excised
+            # the parent's tau-band rows inside the child's box. With
+            # the F2C wall-shell exclusion below, the parent OWNS its
+            # near-wall shell there — excising its band recreated the
+            # band-less near-wall regime and the run still blew at
+            # ~100 steps (measured). The band stays intact.
             # F2C wall-shell exclusion (patch 77): the partial child's
             # near-wall constitution (0.5 sliver floor, skipped band,
             # different BL regime) is NOT what this parent's facet

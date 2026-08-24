@@ -380,13 +380,20 @@ class MultiLevelGrid:
                 sub = coupling.coarse_sub_spatial_slices
                 dead_c = ~sim_coarse.obstacle_bc.d_live.reshape(
                     sim_coarse.domain_shape)[sub].astype(bool)
-                w = _rest_feq_27(xp, f_c.dtype)
-                f_c = xp.where(dead_c[None], w[:, None, None, None], f_c)
             else:
                 dead_c = ~sim_coarse.obstacle_bc.d_live.reshape(
                     sim_coarse.domain_shape).astype(bool)
-                w = _rest_feq_27(xp, f_c.dtype)
-                f_c = xp.where(dead_c[None], w[:, None, None, None], f_c)
+            w = _rest_feq_27(xp, f_c.dtype)
+            f_c = xp.where(dead_c[None], w[:, None, None, None], f_c)
+            if f_prev is not None and c_is_sub:
+                # fill f_prev's dead cells the SAME way (patch 77 iter):
+                # the half-step temporal interpolation mixes f_prev and
+                # f_c — an unfilled f_prev (dead f = 0, zero_dead state)
+                # alternated the interpolant between w27 and w27/2 every
+                # substep, a 2-substep oscillating forcing pumped into
+                # the wall-band interpolants.
+                f_prev = xp.where(dead_c[None], w[:, None, None, None],
+                                  f_prev.astype(f_c.dtype, copy=False))
         if getattr(sim_fine, '_use_esoteric', False):
             from src.kernels.esoteric_d3q27 import esoteric_scatter_std_region
             strips: list = []
