@@ -4,9 +4,11 @@ The LE suction-peak deficit (~20 %, patches 69-71) is h-invariant and
 dp-clean — the resolution arm. This config adds a 5th level (dx/16 of
 L0) over the leading edge only: x/c -0.04..+0.15, wrapping the LE and
 both surfaces, cutting the wing at its downstream face (partial-body
-surfel, patch 74: full-STL facet build, finest-wins ownership by
-fine_region, C2F dead fill, march-axis auto-pick, dv_min 0.5 sliver
-floor, tau_model forced OFF on the partial level only).
+surfel — AUTO-detected per level from the box cutting the STL, patch
+77: full-STL facet build, finest-wins ownership, C2F dead fill +
+level-local C2F skip, march-axis auto-pick, dv_min 0.5 sliver floor
+and tau_model OFF on the PARTIAL level only; L0-L3 keep the exact
+patch-67 trip configuration).
 
 SINGLE GPU (the partial-body + MPI slab wiring is a registered
 follow-up): span16 (52M) + LE L4 (~16M) ~ 14 GiB, fits 24 GiB.
@@ -40,13 +42,7 @@ levels.append({"region": {"x_min": 297, "x_max": 316,
                           "z_min": 0, "z_max": 15}})
 mlg["levels"] = levels
 mlg["num_levels"] = 5
-mlg["wall_coupling"] = {"mode": "exclude", "wall_margin": 1,
-                        "apply_to": "c2f"}
 config["mlg"] = mlg
-config["internal_geometry"] = dict(config["internal_geometry"])
-config["internal_geometry"]["stl"] = dict(config["internal_geometry"]["stl"])
-config["internal_geometry"]["stl"]["surfel"] = dict(
-    config["internal_geometry"]["stl"]["surfel"], partial_body=True)
 
 _folder = "results_naca0012_a10_surfel_re1e6_span16_trip_le4"
 config["output"] = dict(config["output"],

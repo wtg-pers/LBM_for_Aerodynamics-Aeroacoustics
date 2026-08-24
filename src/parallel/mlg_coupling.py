@@ -62,6 +62,9 @@ class RankLocalCouplingV1:
     #: patch 76: coarse-slab live mask (3D, device) for the partial-body
     #: C2F dead fill; None = whole-body level (no-op, bit-preserving)
     _dead_fill_live = None
+    #: patch 77: coarse-slab F2C wall-shell keep mask (flat, device);
+    #: None = whole-body pair (no-op)
+    _f2c_wall_keep = None
 
     def __init__(self, gc, part_c, part_f, xp) -> None:
         if part_c.axis != part_f.axis:
@@ -301,6 +304,12 @@ class RankLocalCouplingV1:
                                              **wc)
             block = xp.where(xp.isnan(block),
                              cur.astype(block.dtype, copy=False), block)
+            if self._f2c_wall_keep is not None:
+                k3 = self._f2c_wall_keep.reshape(
+                    mem_c.shape[1:])[tuple(dst)]
+                block = xp.where((k3 > 0)[None],
+                                 cur.astype(block.dtype, copy=False),
+                                 block)
             live = surfel_live_c.reshape(mem_c.shape[1:])[tuple(dst)]
             block = xp.where((live > 0)[None], block,
                              block.dtype.type(0.0))

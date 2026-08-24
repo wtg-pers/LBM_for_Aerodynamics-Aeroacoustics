@@ -403,6 +403,8 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     out.kernel = sk
     out.n_facets = sk.n_f
     out.d_live = cells_slice(sb.d_live)
+    _fk = getattr(sb, 'f2c_wall_keep', None)
+    out.f2c_wall_keep = cells_slice(_fk) if _fk is not None else None
     out.d_dead = cells_slice(sb.d_dead)
     out.d_dV = cells_slice(sb.d_dV)
     out.dV_h = cells_slice(np.ascontiguousarray(

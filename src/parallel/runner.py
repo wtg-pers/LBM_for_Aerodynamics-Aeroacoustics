@@ -379,6 +379,8 @@ class DistributedMLGRunner:
                 # mask in slab-local 3D coords
                 self.rlc[uid]._dead_fill_live = \
                     Lc.sb.d_live.reshape(Lc.dims)
+                self.rlc[uid]._f2c_wall_keep = getattr(
+                    Lc.sb, 'f2c_wall_keep', None)
         self._fprev: List[Optional[object]] = [None] * self.nb
         self.profile = None          # dict -> per-section seconds (opt-in)
         # halo scheduling state (backlog #5): ghosts_fresh -> skip idempotent

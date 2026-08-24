@@ -850,6 +850,25 @@ class SimulationSetup:
         solid_np = _np.asarray(solid_np, dtype=bool)
         report = body_coupling_band_report(solid_np, region)
         policy = self._wall_coupling
+        # partial-body surfel level (patch 77): the body crossing the
+        # band is the DESIGN (finest-wins partial refinement) — accept
+        # without demanding the global wall_coupling mode, and flag the
+        # level so _attach_coupling_skip force-attaches its own local
+        # C2F skip (the global exclude knob polluted EVERY level's
+        # coupling in the first LE-L4 run).
+        _enabled_bc = [v for v in self.config.get(
+            'internal_geometry', {}).values()
+            if isinstance(v, dict) and v.get('enabled', False)]
+        _is_surfel_geom = bool(_enabled_bc) and \
+            _enabled_bc[0].get('wall_bc', 'hwbb').lower() == 'surfel'
+        if report['violations'] and _is_surfel_geom:
+            faces = ', '.join(f"{face} ({n} solid cells)"
+                              for face, n in report['violations'])
+            print(f"    [wall_coupling] Level {k}: partial-body surfel "
+                  f"level — body crosses the band on {faces}; local C2F "
+                  f"skip auto-attached (patch 77)")
+            self._partial_skip_levels.add(int(k))
+            report = dict(report, violations=[])
         if report['violations']:
             faces = ', '.join(
                 f"{face} ({n} solid cells)"
@@ -893,6 +912,19 @@ class SimulationSetup:
         from src.grid.wall_coupling import attach_coupling_skip
 
         n = attach_coupling_skip(sim, solid_mask, self._wall_coupling)
+        if n == 0 and level in getattr(self, '_partial_skip_levels', ()):
+            # patch 77: partial-body surfel level under the STRICT global
+            # policy — attach the level-local C2F skip (solid + 1 fluid
+            # margin) so the band never writes through the wall. Scoped
+            # to THIS level only; every other level's coupling untouched.
+            from src.grid.wall_coupling import build_coupling_skip
+            skip = build_coupling_skip(self.xp, solid_mask, 1)
+            if skip is not None:
+                sim._coupling_skip_nt = skip
+                sim._coupling_skip_dirs = ('c2f',)
+                n = int(skip.sum())
+                print(f"    [wall_coupling] L{level}: partial-body local "
+                      f"C2F skip attached ({n:,} cells)")
         if n:
             tag = f"L{level}" + (f" '{label}'" if label else "")
             n_solid = int(solid_mask.sum())
@@ -1095,7 +1127,19 @@ class SimulationSetup:
             # level owns the triangles inside its fine_region (= the
             # excised region where MLG already deems the fine solution
             # authoritative), the parent keeps the band triangles.
-            partial = bool(scfg.pop('partial_body', False))
+            # Partial-body detection (patch 77): AUTOMATIC, per level —
+            # a level is partial iff its box CUTS the body (cut_faces,
+            # already detected above). The former config knob
+            # 'partial_body' applied through the shared surfel dict to
+            # EVERY level, silently forcing tau_model OFF and the 0.5
+            # sliver floor on the whole hierarchy (the LE-L4 run froze:
+            # Cd -0.089, fluctuations dead). The knob is rejected now.
+            if 'partial_body' in scfg:
+                raise ValueError(
+                    "surfel config: 'partial_body' is not a knob "
+                    "(patch 77) — a level is partial-body iff its box "
+                    "cuts the STL (detected automatically); remove it")
+            partial = bool(cut_faces)
             if partial:
                 # patch 74: sliver amplification floor. The C2F band
                 # crosses the wall, so band interpolants (bounded but
@@ -1107,18 +1151,16 @@ class SimulationSetup:
                 # registered volume-bookkeeping stairstep, patch 50) —
                 # a half-cell wall displacement at slivers, i.e. the
                 # parent level's own resolution.
-                if float(scfg.get('dv_min', 1e-2)) < 0.5:
-                    scfg['dv_min'] = 0.5
-            if partial and scfg.get('tau_model', False):
-                # patch 74 first scope: the tau-band injects one-substep
-                # persistent stress into cells the C2F band rewrites —
-                # the level-crossing tau_out exchange (the slab stage-ii
-                # analogue) is registered follow-up work. OFF here only;
-                # whole-body levels keep their configured band. Measured:
-                # tau ON on the partial level diverges, OFF is clean.
-                print(f"  [surfel] partial-body L{ctx.get('level')}: "
-                      f"tau_model forced OFF (74 first scope)")
-                scfg['tau_model'] = False
+                import os as _os3
+                _floor = float(_os3.environ.get('LBM_PARTIAL_DVMIN', 0.5))
+                if float(scfg.get('dv_min', 1e-2)) < _floor:
+                    scfg['dv_min'] = _floor
+            # patch 77: tau_model STAYS ON for partial levels — the 74
+            # force-OFF predated the local C2F skip and the dead fill,
+            # and the tau-less L4 fed the parent an alien near-wall
+            # regime (F2C garbage growth, L3 blow-up at coarse step 14).
+            # The injection/C2F conflict is confined to the band rows
+            # inside the outer C2F strips — those rows are excised below.
             if partial:
                 # march-axis validity (patch 74): the volumetric march
                 # pins each line by max(dV)=1 and requires one fully
@@ -1160,6 +1202,42 @@ class SimulationSetup:
                 cfg=scfg,
             )
             sb.partial_body = partial
+            if partial and getattr(sb, 'tau_model_on', False) \
+                    and ctx.get('region') is not None:
+                # excise the tau-band rows inside this level's own C2F
+                # band (outer overlap strips on non-flush faces): C2F
+                # rewrites those cells every substep and the injection
+                # there is the measured 74 conflict. Interior rows keep
+                # the full band (they see no C2F).
+                import numpy as _np
+                reg = ctx['region']
+                fr, fd = reg.fine_region, reg.fine_domain_coarse
+                ratio = int(getattr(reg, 'REFINE_RATIO', 2))
+                cells = _np.asarray(sb.d_tb_cells.get(), dtype=_np.int64)
+                shp = sb.shape
+                cz = cells % shp[2]
+                cy = (cells // shp[2]) % shp[1]
+                cx = cells // (shp[1] * shp[2])
+                keepm = _np.ones(cells.size, dtype=bool)
+                for ax_i, (cc, ax) in enumerate(zip((cx, cy, cz), 'xyz')):
+                    w_lo = (getattr(fr, f'{ax}_start')
+                            - getattr(fd, f'{ax}_start')) * ratio
+                    w_hi = (getattr(fd, f'{ax}_end')
+                            - getattr(fr, f'{ax}_end')) * ratio
+                    n_ax = int(shp[ax_i])
+                    if w_lo > 0:
+                        keepm &= cc >= w_lo
+                    if w_hi > 0:
+                        keepm &= cc <= n_ax - 1 - w_hi
+                if not keepm.all():
+                    keep = _np.flatnonzero(keepm)
+                    sb.d_tb_cells = sb.xp.asarray(cells[keep])
+                    sb.d_tb_fs = sb.d_tb_fs[sb.xp.asarray(keep)]
+                    sb.d_tb_normal = sb.d_tb_normal[sb.xp.asarray(keep)]
+                    sb._tb_W = sb._tb_W[keep]
+                    print(f"  [surfel] partial-body L{ctx.get('level')}: "
+                          f"{int((~keepm).sum()):,} tau-band rows in the "
+                          f"C2F strips excised ({keepm.size:,} total)")
             if partial:
                 # invariant: with a valid march every cut cell is cut by
                 # a present facet (whole-body levels measure exactly 0)
@@ -1999,6 +2077,7 @@ class SimulationSetup:
         # Stored as instance variables so _build_mlg_simulation() can access
         # them for fine-level obstacle coordinate transformation.
         self._mlg_level_origins = [(0.0, 0.0, 0.0)]   # Level 0 origin
+        self._partial_skip_levels = set()             # patch 77
         self._mlg_level_spacings = [(1.0, 1.0, 1.0)]  # Level 0 spacing
 
         from src.grid.block_tree import GridBlock, validate_block_tree
@@ -2405,6 +2484,70 @@ class SimulationSetup:
             owned_by_finer = _np.union1d(
                 owned_by_finer,
                 _np.setdiff1d(mine, owned_by_finer))
+        # tau-band excision under a PARTIAL child (patch 77): the
+        # parent's band cells inside the child's fine_region are not the
+        # parent's to evolve (finest wins; F2C rewrites them anyway) —
+        # measured: the L3 band rows inside the LE-L4 box blew up at
+        # coarse step 14 (persistent tau_out state x per-substep F2C
+        # rewrite feedback). Whole-body children are untouched (the
+        # L2-under-L3 configuration ran stably for the whole campaign —
+        # bit-preserving there).
+        import numpy as _np2
+        for k, sim in surf:
+            child = next((s2 for k2, s2 in surf if k2 == k + 1), None)
+            if child is None or not getattr(child.obstacle_bc,
+                                            'partial_body', False):
+                continue
+            sb_p = sim.obstacle_bc
+            if not getattr(sb_p, 'tau_model_on', False):
+                continue
+            blk = next(b for b in self._mlg_blocks if b.level == k + 1)
+            fr = blk.region.fine_region      # in PARENT (level-k) coords
+            cells = _np2.asarray(sb_p.d_tb_cells.get(), dtype=_np2.int64)
+            shp = sb_p.shape
+            cz = cells % shp[2]
+            cy = (cells // shp[2]) % shp[1]
+            cx = cells // (shp[1] * shp[2])
+            # parent-local box: block origins are absolute; fine_region
+            # is already in the parent's own index space for chain MLG
+            inside = ((cx >= fr.x_start) & (cx <= fr.x_end)
+                      & (cy >= fr.y_start) & (cy <= fr.y_end)
+                      & (cz >= fr.z_start) & (cz <= fr.z_end))
+            if not inside.any():
+                continue
+            keep = _np2.flatnonzero(~inside)
+            xp_ = sb_p.xp
+            sb_p.d_tb_cells = sb_p.d_tb_cells[xp_.asarray(keep)]
+            sb_p.d_tb_fs = sb_p.d_tb_fs[xp_.asarray(keep)]
+            sb_p.d_tb_normal = sb_p.d_tb_normal[xp_.asarray(keep)]
+            sb_p._tb_W = sb_p._tb_W[keep]
+            print(f"  [surfel] L{k}: tau-band rows inside the partial "
+                  f"L{k+1} box excised ({int(inside.sum()):,} of "
+                  f"{inside.size:,} cells — finest wins)")
+            # F2C wall-shell exclusion (patch 77): the partial child's
+            # near-wall constitution (0.5 sliver floor, skipped band,
+            # different BL regime) is NOT what this parent's facet
+            # machinery is consistent with — restricting it into the
+            # parent's wall shell grew to a blow-up in ~14 coarse steps
+            # (measured, band-height cells over the LE box). The parent
+            # KEEPS ITS OWN near-wall solution: keep-mask = solid
+            # dilated by 3 fluid layers; F2C accepts the child only
+            # beyond it. The parent's wall physics there is the
+            # campaign-validated one, and the box-interior surface
+            # force is L4-owned regardless.
+            solid = ~_np2.asarray(sb_p.live_h, dtype=bool)
+            dil = solid.copy()
+            for _ in range(3):
+                nx_ = dil.copy()
+                for ax3 in range(3):
+                    for sh in (1, -1):
+                        nx_ |= _np2.roll(dil, sh, axis=ax3)
+                dil = nx_
+            sb_p.f2c_wall_keep = sb_p.xp.asarray(
+                dil.astype(_np2.uint8).ravel())
+            print(f"  [surfel] L{k}: F2C wall-shell keep mask "
+                  f"({int(dil.sum()):,} cells = solid+3 layers)")
+
         # surface output: the topmost level writes the whole wing,
         # merging the coarser levels' owned contributions (output layer)
         self._surfel_levels_for_surface = [s.obstacle_bc for _, s in
@@ -2437,9 +2580,22 @@ class SimulationSetup:
         cfg = dict(tcfg)
         cfg.setdefault('span_z_lu', float(self.Nz))
         n_att = 0
+        surfel_ks = [k for k, s2 in enumerate(simulations)
+                     if getattr(getattr(s2, 'obstacle_bc', None),
+                                'kind', None) == 'surfel']
+        top_k = max(surfel_ks) if surfel_ks else -1
         for k, sim in enumerate(simulations):
             if getattr(getattr(sim, 'obstacle_bc', None),
                        'kind', None) != 'surfel':
+                continue
+            if k != top_k:
+                # patch 77: trip on the FINEST surfel level only. The
+                # coarse copies were tolerated as "washed by F2C", but
+                # with a partial finest level the coarse kick + per-
+                # substep F2C mixing at the strip destabilized L3
+                # (blow-up exactly over the strip x-range, coarse step
+                # 14-15) — and the finest copy is the physically
+                # operative one anyway (finest wins).
                 continue
             origin = ((0.0, 0.0, 0.0) if k == 0
                       else tuple(float(o)

@@ -457,6 +457,14 @@ class MultiLevelGrid:
                 **_eso_wall_args(sim_coarse))
             merged = xp.where(xp.isnan(block),
                               cur.astype(block.dtype, copy=False), block)
+            keep = getattr(sim_coarse.obstacle_bc, 'f2c_wall_keep', None)
+            if keep is not None:
+                # patch 77: partial-child F2C wall-shell exclusion —
+                # the coarse level keeps its own near-wall solution
+                k3 = keep.reshape(sim_coarse.domain_shape)[sl]
+                merged = xp.where((k3 > 0)[None],
+                                  cur.astype(merged.dtype, copy=False),
+                                  merged)
             live = sim_coarse.obstacle_bc.d_live.reshape(
                 sim_coarse.domain_shape)[sl]
             merged = xp.where((live > 0)[None], merged,
