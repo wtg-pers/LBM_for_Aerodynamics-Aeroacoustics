@@ -1438,7 +1438,7 @@ class SimulationSetup:
         if _units_mode not in ('lu', 'phys'):
             raise ValueError(
                 f"output.units={_units_mode!r}: use 'phys' (default — "
-                "p_prime_pa/velocity_ms) or 'lu' (lattice)")
+                "p_pa/velocity_ms) or 'lu' (lattice)")
         self.field_units = FieldUnits(_units_mode, self._unit_converter)
         for _ln in self.field_units.summary_lines():
             print(_ln)  # captured -> setup_log.txt (summary repeats it)

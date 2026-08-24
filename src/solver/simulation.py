@@ -1386,13 +1386,27 @@ class Simulation:
 
         n = self._sck_rho.size
         q = self.f.shape[0]
+        # nu_t export (user finding 0824): the fused kernel always
+        # computes nu_t (Stiebler decomposition) but only STORES it when
+        # given a buffer — the surfel launch passed None, so the VTK
+        # nu_t field stayed at its allocated zeros while the physics ran
+        # (gate s13 [K] pins in-kernel SGS == host). Pure extra store:
+        # f is bit-identical.
+        nu_t_flat = (self.nu_t.reshape(-1)
+                     if self.nu_t is not None else None)
         self._surfel_ck.launch(
             self.f.reshape(q, -1), self._f_post.reshape(q, -1),
             self._sck_rho, self._sck_u, None,
             1.0 / self.tau,
             float(self.collision.omega_bulk),
             float(self.collision.omega_3),
-            n, Cs=float(self._sgs_cfg["Cs"]))
+            n, Cs=float(self._sgs_cfg["Cs"]),
+            nu_t_out=nu_t_flat)
+        if nu_t_flat is not None:
+            # dead cells hold f = 0 -> the kernel's moment chain writes
+            # NaN nu_t there; assignment-zero like zero_dead (output-
+            # only field, but NaN poisons ParaView ranges and gathers)
+            sb.zero_dead_scalar(nu_t_flat)
         self.rho = self._sck_rho.reshape(self.domain_shape)
         self.u = self._sck_u.reshape((3,) + self.domain_shape)
         sb.zero_dead(self._f_post)

@@ -33,7 +33,7 @@ would leave the coarse levels without a node on the plane.
 Coordinates follow the volume writers exactly: origins/spacings in the
 global L0-lu frame, so plane files overlay the .vth volume output. Field
 VALUES follow output.units via the shared FieldUnits (phys default:
-p_prime_pa / velocity_ms — both level-invariant constants).
+p_pa / velocity_ms — both level-invariant constants).
 
 Config (output.planes — a LIST, several planes allowed):
     "planes": [

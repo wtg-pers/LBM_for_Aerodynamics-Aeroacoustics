@@ -3,7 +3,7 @@ Field unit conversion for output channels — the single source of truth.
 
 output.units selects what VALUES the field writers emit:
 
-    "phys" (default)  physical fields — p_prime_pa [Pa], velocity_ms [m/s], ...
+    "phys" (default)  physical fields — p_pa [Pa], velocity_ms [m/s], ...
     "lu"              raw lattice fields — density, velocity [dx/dt], ...
 
 Only field VALUES change. COORDINATES stay in the global L0-lu frame in
@@ -13,18 +13,19 @@ coordinates keep matching ParaView regardless of the unit choice.
 Conversions (rho0 = 1, isothermal EOS p = cs^2 rho), at level k with
 block spacing s = 2^-k (in L0 units):
 
-    p_prime_pa    = cs^2 (rho_lu - 1) * rho_phys * (dx/dt)^2   [level-invariant]
+    p_pa          = cs^2 * rho_lu * rho_phys * (dx/dt)^2       [level-invariant]
 
-NAMING CAVEAT (user finding, 2026-08-24): p_prime_pa is the deviation
-from the FIXED lattice reference rho = 1 — a gauge pressure, NOT the
-acoustic fluctuation p'. The domain-mean rho drifts (measured ~1.5e-4
-= ~7 Pa here) and the steady aero field is spatially non-uniform, so
-no global constant subtraction yields p'. Extract p' in post as
-p_prime_pa minus a PER-POSITION windowed time mean — exact, because
-the map is affine in rho. The (rho - 1) form itself is load-bearing:
-absolute pressure is defined only up to a constant in weakly-
-compressible LBM, and an absolute-scale f32 field (~47 kPa) would
-eat ~Pa fluctuations in the mantissa.
+PRESSURE CONVENTION (user directive 2026-08-24, replacing the old
+"p_prime_pa" field): p_pa is the ABSOLUTE lattice-EOS pressure. The
+old (rho-1)-referenced field posed as a fluctuation it is not — the
+domain-mean rho drifts (measured ~1.5e-4 = ~7 Pa) and the steady aero
+field is spatially non-uniform, so no constant-referenced field is an
+acoustic p'. Extract p' in POST as p_pa minus a PER-POSITION windowed
+time mean (the user-verified procedure). f32 quantisation at the
+absolute scale (~47 kPa) is ~6 mPa — identical to the floor set by
+the f32 rho state itself, so nothing is lost vs the old gauge form.
+Readers of OLD files: the p_prime_pa name may still appear there;
+p_pa = p_prime_pa + cs^2 * rho_phys * (dx/dt)^2.
     velocity_ms   = u_lu * dx/dt                               [level-invariant]
     nu_t_m2s      = nu_t_lu * (dx^2/dt) * s                    [level-DEPENDENT]
     body_force_nm3= f_lu * (rho_phys dx/dt^2) / s              [level-DEPENDENT]
@@ -54,7 +55,7 @@ def assert_series_units(sample_path: str, mode: str) -> None:
 
     Restarting (or re-running without clear_previous) APPENDS to the
     on-disk series: the PVD/vtm index merges old and new files, so a
-    units switch would put lattice `density` and physical `p_prime_pa`
+    units switch would put lattice `density` and physical `p_pa`
     inside ONE time series with no visible marker — every downstream
     consumer (ParaView coloring, spectra scripts) silently reads a
     mixed-unit signal. The checkpoint itself is unit-agnostic (lattice
@@ -72,8 +73,8 @@ def assert_series_units(sample_path: str, mode: str) -> None:
         return
     if 'Name="density"' in head:
         existing = 'lu'
-    elif 'Name="p_prime_pa"' in head:
-        existing = 'phys'
+    elif 'Name="p_pa"' in head or 'Name="p_prime_pa"' in head:
+        existing = 'phys'          # p_prime_pa = pre-0824 series
     else:
         return
     if existing == mode:
@@ -98,7 +99,7 @@ class FieldUnits:
 
     #: name -> (phys name, scale kind)
     _PHYS = {
-        'density':    ('p_prime_pa',     'pressure'),
+        'density':    ('p_pa',           'pressure'),
         'velocity':   ('velocity_ms',    'velocity'),
         'nu_t':       ('nu_t_m2s',       'viscosity'),
         'body_force': ('body_force_nm3', 'force_density'),
@@ -136,7 +137,13 @@ class FieldUnits:
             return name, arr
         out_name, kind = self._PHYS[name]
         if kind == 'pressure':
-            return out_name, (arr - self.rho0) * self.p_conv
+            # ABSOLUTE lattice-EOS pressure (user directive 0824): the
+            # old (rho - rho0) "p_prime_pa" posed as a fluctuation it is
+            # not (mean rho drifts, steady field non-uniform). f32 cost
+            # of the absolute scale is ~6 mPa quantisation — the same
+            # floor the f32 state itself sets. Acoustic p' stays a
+            # POST step: subtract a per-position windowed time mean.
+            return out_name, arr * self.p_conv
         if kind == 'velocity':
             return out_name, arr * self.vel_conv
         if kind == 'viscosity':
@@ -153,14 +160,11 @@ class FieldUnits:
         ]
         if self.mode == 'phys':
             lines += [
-                f"          fields: p_prime_pa = cs^2*(rho-1)*{uc.rho_phys}"
-                f"*(dx/dt)^2  [x{self.p_conv:.6e}]",
-                "          (p_prime_pa = GAUGE vs the rho=1 reference, "
-                "NOT acoustic p' — mean rho drifts",
-                "           and the steady aero field is non-uniform; "
-                "for p' subtract a per-position",
-                "           windowed TIME mean in post — exact, the map "
-                "is linear in rho)",
+                f"          fields: p_pa = cs^2*rho*{uc.rho_phys}"
+                f"*(dx/dt)^2  [x{self.p_conv:.6e}]  (absolute, lattice "
+                "EOS reference)",
+                "          (acoustic p' = p_pa minus a per-position "
+                "windowed TIME mean, in post)",
                 f"                  velocity_ms [x{self.vel_conv:.6e}], "
                 f"nu_t_m2s [x{self.nu_conv:.6e} * 2^-level]",
                 "          (p'/u: ONE constant for every AMR level; "
@@ -172,7 +176,7 @@ class FieldUnits:
             lines += [
                 "          ParaView recipe (lattice -> physical; p'/u "
                 "constants valid on EVERY AMR level):",
-                f"            p' [Pa]  = (density - 1) * {self.p_conv:.6e}",
+                f"            p [Pa]   = density * {self.p_conv:.6e}",
                 f"            u [m/s]  = velocity * {self.vel_conv:.6e}",
                 f"            nu_t [m2/s] = nu_t * {self.nu_conv:.6e}"
                 " * 2^-level  (level-dependent!)",

@@ -431,6 +431,15 @@ class SurfelBoundary:
             self._d_dead_idx = idx
         f.reshape(f.shape[0], -1)[:, idx] = 0.0
 
+    def zero_dead_scalar(self, a_flat):
+        """Zero one flat per-cell scalar on dead cells (assignment,
+        NaN-safe) — the zero_dead convention for auxiliary fields."""
+        idx = getattr(self, '_d_dead_idx', None)
+        if idx is None:
+            idx = self.xp.flatnonzero(self.d_dead)
+            self._d_dead_idx = idx
+        a_flat[idx] = 0.0
+
     def apply_and_advect(self, f_post, f_new, rho, u):
         """Facet exchange then volumetric transport (replaces streaming).
 
