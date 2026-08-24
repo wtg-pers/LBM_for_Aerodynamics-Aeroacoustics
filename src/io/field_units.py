@@ -14,6 +14,17 @@ Conversions (rho0 = 1, isothermal EOS p = cs^2 rho), at level k with
 block spacing s = 2^-k (in L0 units):
 
     p_prime_pa    = cs^2 (rho_lu - 1) * rho_phys * (dx/dt)^2   [level-invariant]
+
+NAMING CAVEAT (user finding, 2026-08-24): p_prime_pa is the deviation
+from the FIXED lattice reference rho = 1 — a gauge pressure, NOT the
+acoustic fluctuation p'. The domain-mean rho drifts (measured ~1.5e-4
+= ~7 Pa here) and the steady aero field is spatially non-uniform, so
+no global constant subtraction yields p'. Extract p' in post as
+p_prime_pa minus a PER-POSITION windowed time mean — exact, because
+the map is affine in rho. The (rho - 1) form itself is load-bearing:
+absolute pressure is defined only up to a constant in weakly-
+compressible LBM, and an absolute-scale f32 field (~47 kPa) would
+eat ~Pa fluctuations in the mantissa.
     velocity_ms   = u_lu * dx/dt                               [level-invariant]
     nu_t_m2s      = nu_t_lu * (dx^2/dt) * s                    [level-DEPENDENT]
     body_force_nm3= f_lu * (rho_phys dx/dt^2) / s              [level-DEPENDENT]
@@ -144,6 +155,12 @@ class FieldUnits:
             lines += [
                 f"          fields: p_prime_pa = cs^2*(rho-1)*{uc.rho_phys}"
                 f"*(dx/dt)^2  [x{self.p_conv:.6e}]",
+                "          (p_prime_pa = GAUGE vs the rho=1 reference, "
+                "NOT acoustic p' — mean rho drifts",
+                "           and the steady aero field is non-uniform; "
+                "for p' subtract a per-position",
+                "           windowed TIME mean in post — exact, the map "
+                "is linear in rho)",
                 f"                  velocity_ms [x{self.vel_conv:.6e}], "
                 f"nu_t_m2s [x{self.nu_conv:.6e} * 2^-level]",
                 "          (p'/u: ONE constant for every AMR level; "
