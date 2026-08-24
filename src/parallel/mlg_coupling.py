@@ -59,6 +59,10 @@ def fine_range_from_coarse(part_c, box_lo: int, box_hi: int,
 class RankLocalCouplingV1:
     """C2F/F2C for one adjacent level pair on one rank's local slabs."""
 
+    #: patch 76: coarse-slab live mask (3D, device) for the partial-body
+    #: C2F dead fill; None = whole-body level (no-op, bit-preserving)
+    _dead_fill_live = None
+
     def __init__(self, gc, part_c, part_f, xp) -> None:
         if part_c.axis != part_f.axis:
             raise ValueError("coarse/fine partitions must share the axis")
@@ -122,6 +126,18 @@ class RankLocalCouplingV1:
         rng = self.coarse_block_range()
         region_loc = self.coarse_block_region_local()
         f_sub = esoteric_gather_std_region(xp, mem_c, t_c, region_loc, **wc)
+        if self._dead_fill_live is not None:
+            # partial-body fine level (patch 76 = the runner port of the
+            # patch-74 C2F dead fill): the band crosses the body, so the
+            # interpolation stencil reaches coarse DEAD cells (surfel
+            # f = 0 -> rho collapse -> NaN on the fine level). Fill them
+            # with the rest-state equilibrium — same constant as the
+            # single-GPU MultiLevelGrid fill, so own strips stay bit-
+            # comparable.
+            from src.grid.multi_level_grid import _rest_feq_27
+            dead = ~self._dead_fill_live[region_loc].astype(bool)
+            w27 = _rest_feq_27(xp, f_sub.dtype)
+            f_sub = xp.where(dead[None], w27[:, None, None, None], f_sub)
 
         # temporal interp + f_eq/f_neq rescale (same primitives as coupling.py)
         if gc._fused_rescale is not None:

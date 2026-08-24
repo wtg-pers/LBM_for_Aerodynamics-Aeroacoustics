@@ -402,6 +402,84 @@ class MPIOutputManager(OutputManager):
         only and unused here)."""
         self._write_surface(step)
 
+    def _write_surface_partial(self, step) -> None:
+        """COLLECTIVE multi-level surface merge (patch 76)."""
+        import os
+        r = self._runner
+        surf_uids = [u for u in range(r.nb) if r.is_surfel[u]]
+        parts_by_uid = {}
+        for u in surf_uids:                # same order on every rank
+            L = r.lv[u] if r.owns[u] else None
+            sb = getattr(L, 'sb', None) if L is not None else None
+            if sb is not None and hasattr(sb, 'surface_payload'):
+                g, v = sb.surface_payload()
+            else:
+                g, v = (np.zeros(0, dtype=np.int64), np.zeros((0, 9)))
+            if self._nr > 1:
+                parts = self._comm.gather((g, v), root=0)
+            else:
+                parts = [(g, v)]
+            if self._io_rank:
+                parts_by_uid[u] = (
+                    np.concatenate([p[0] for p in parts]),
+                    np.concatenate([p[1] for p in parts]))
+        if not self._io_rank:
+            return
+        from src.io.surfel_surface_writer import (
+            aggregate_to_triangles, write_triangle_surface)
+        total_a, total, n_faces = None, None, None
+        for u in surf_uids:
+            gids, vals = parts_by_uid[u]
+            if gids.size == 0:
+                continue
+            if np.unique(gids).size != gids.size:
+                raise AssertionError(
+                    f"MPI surface gather: duplicate facet gids on level "
+                    f"block uid {u} — rank ownership is not a partition")
+            meta = r.surface_meta[u]
+            tid = np.asarray(meta['surfels']['tri_id'],
+                             dtype=np.int64)[gids]
+            sc2 = float(meta['coord_spacing']) ** 2
+            area = np.asarray(meta['surfels']['area'],
+                              dtype=np.float64)[gids] * sc2
+            p_use = vals[:, 8]
+            fields = {'p_use': p_use, 'dp': np.zeros(gids.size),
+                      'tau_mag': vals[:, 4], 'tau': vals[:, 1:4],
+                      'traction': vals[:, 5:8]}
+            if meta['q_inf']:
+                fields['Cp'] = ((p_use - meta['p_ref'])
+                                / float(meta['q_inf']))
+                fields['Cf'] = vals[:, 4] / float(meta['q_inf'])
+            n_faces = int(meta['n_faces'])
+            a_tri, agg = aggregate_to_triangles(
+                {'tri_id': tid, 'area': area}, fields, n_faces)
+            for k in agg:                  # normalised -> weighted sums
+                agg[k] = agg[k] * (a_tri[:, None] if agg[k].ndim == 2
+                                   else a_tri)
+            if total is None:
+                total_a, total = a_tri, agg
+            else:
+                total_a = total_a + a_tri
+                for k in total:
+                    total[k] = total[k] + agg[k]
+        if total is None:
+            return                          # no facet pass yet (step 0)
+        inv = 1.0 / np.maximum(total_a, 1e-300)
+        for k in total:
+            total[k] = total[k] * (inv[:, None] if total[k].ndim == 2
+                                   else inv)
+        top_u = max(surf_uids, key=lambda u: r.blocks[u].level)
+        meta = r.surface_meta[top_u]
+        verts, faces = meta['triangles_lu']
+        verts_out = (np.asarray(verts, dtype=np.float64)
+                     * float(meta['coord_spacing'])
+                     + np.asarray(meta['coord_origin'], dtype=np.float64))
+        outdir = (self.mlg_vtk_writer.output_dir
+                  if self.mlg_vtk_writer is not None else '.')
+        write_triangle_surface(
+            os.path.join(outdir, f"surface_{step:08d}.vtk"),
+            (verts_out, faces), total_a, total)
+
     def _write_surface(self, step) -> None:
         """COLLECTIVE surfel surface loads (patch 68): every rank ships
         its OWNED facets' traction rows, rank 0 assembles the full facet
@@ -414,6 +492,15 @@ class MPIOutputManager(OutputManager):
         # tree flags (the runner holds no sims — memory contract)
         tops = [b.level for u, b in enumerate(r.blocks) if r.is_surfel[u]]
         if not tops:
+            return
+        if any(getattr(r, 'is_surfel_partial', [])):
+            # partial-body levels (patch 76): ownership partitions facets
+            # by rank x LEVEL — every surfel level ships its owned rows
+            # and rank 0 merges the per-triangle sums (the MPI port of
+            # the single-GPU patch-74 surface merge). Intensive fields
+            # (Cp/Cf/p/tau) are level-invariant; only area carries lu^2
+            # and is rescaled to L0 lu^2 before summing.
+            self._write_surface_partial(step)
             return
         top = max(tops)
         uid = next(u for u, b in enumerate(r.blocks)

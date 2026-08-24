@@ -287,6 +287,7 @@ class DistributedMLGRunner:
         # not) must agree on which blocks carry wall state.
         self.wall_masks: List[int] = []
         self.is_surfel: List[bool] = []
+        self.is_surfel_partial: List[bool] = []
         self.surface_meta: Dict[int, object] = {}
         for uid, b in enumerate(src):
             lev = b.sim
@@ -301,6 +302,8 @@ class DistributedMLGRunner:
             # build's triangle map on rank 0 only — host refs, no device
             # bytes, so they survive the per-level release below.
             self.is_surfel.append(bool(is_surfel))
+            self.is_surfel_partial.append(bool(is_surfel and getattr(
+                lev.obstacle_bc, 'partial_body', False)))
             if is_surfel and rank == 0:
                 ob = lev.obstacle_bc
                 self.surface_meta[uid] = {
@@ -368,6 +371,14 @@ class DistributedMLGRunner:
                 continue
             self.rlc[uid] = RankLocalCouplingV1(
                 b.coupling, self.parts[b.parent.uid], self.parts[uid], cp)
+            Lf, Lc = self.lv[uid], self.lv[b.parent.uid]
+            if (hasattr(Lf, 'sb') and getattr(Lf.sb, 'partial_body', False)
+                    and Lc is not None and hasattr(Lc, 'sb')):
+                # patch 76: partial-body C2F dead fill (runner port of
+                # the patch-74 MultiLevelGrid fill) — coarse slab live
+                # mask in slab-local 3D coords
+                self.rlc[uid]._dead_fill_live = \
+                    Lc.sb.d_live.reshape(Lc.dims)
         self._fprev: List[Optional[object]] = [None] * self.nb
         self.profile = None          # dict -> per-section seconds (opt-in)
         # halo scheduling state (backlog #5): ghosts_fresh -> skip idempotent
@@ -758,7 +769,20 @@ class DistributedMLGRunner:
         if hasattr(self.lv[uid], 'sb'):
             # surfel slab (patch 64): facet-ledger force, owned facets
             # only — the MEM/HWBB formula is not the surfel channel.
-            return self.lv[uid].last_force()
+            # Partial-body levels (patch 76): ownership is a rank x
+            # LEVEL partition, so the body force is the sum over every
+            # owned surfel level's (rank&level)-owned ledger, area-
+            # rescaled to the body block's lu ((2^dk)^2); the caller's
+            # Allreduce then completes both partitions at once.
+            k_body = self.blocks[uid].level
+            F = np.zeros(3)
+            for u2 in range(self.nb):
+                L2 = self.lv[u2] if self.owns[u2] else None
+                if L2 is None or not hasattr(L2, 'sb'):
+                    continue
+                sc = (2.0 ** (k_body - self.blocks[u2].level)) ** 2
+                F = F + np.asarray(L2.last_force(), dtype=float) * sc
+            return F
         if self.ibb[uid] is not None:
             # IBB: deposits are already REWRITTEN (Bouzidi values) — the
             # HWBB whole-domain kernel would read 2*val != f* + val. The

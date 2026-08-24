@@ -475,6 +475,15 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
         (((anchor_ax - own_start) % n_ax) < own_count))
     out.facet_gids = kept
     out.slab_axis = axis
+    # partial-body level partition (patch 76): the LEVEL-ownership mask
+    # (finest-wins, patch 74) rides along, sliced to kept rows; the
+    # ledger/surface then use rank-owned AND level-owned. Rank-invariant
+    # (computed on the replicated build).
+    out.partial_body = bool(getattr(sb, 'partial_body', False))
+    fo = getattr(sb, 'facet_owned_h', None)
+    out.level_owned = (xp.asarray(fo[kept]) if fo is not None else None)
+    out.tri_owned = getattr(sb, 'tri_owned', None)
+    out.n_faces_full = int(getattr(sb, 'n_faces_full', sb.n_faces))
     return out
 
 
@@ -511,7 +520,12 @@ class SlabSurfelBoundary(_SB):
         xp = self.xp
         from src.boundary.surfel_transport import C27 as _C
         cdotn = xp.asarray(k.f.cdotn)
-        own = self.facet_owned[:, None]
+        own_m = self.facet_owned
+        lo = getattr(self, 'level_owned', None)
+        if lo is not None:
+            # patch 76: rank partition x level partition (finest wins)
+            own_m = own_m & lo
+        own = own_m[:, None]
         G = ((k.G_in * (cdotn < 0) - k.G_out * (cdotn > 0)) * own
              ).sum(axis=0)
         F = xp.asarray(_C.astype(np.float64)).T @ G
@@ -535,6 +549,10 @@ class SlabSurfelBoundary(_SB):
         own = np.asarray(self.facet_owned.get()
                          if hasattr(self.facet_owned, 'get')
                          else self.facet_owned, dtype=bool)
+        lo = getattr(self, 'level_owned', None)
+        if lo is not None:
+            own = own & np.asarray(lo.get() if hasattr(lo, 'get') else lo,
+                                   dtype=bool)
         k = self.kernel
         G_in = np.asarray(k.G_in.get(), dtype=np.float64)[own]
         G_out = np.asarray(k.G_out.get(), dtype=np.float64)[own]

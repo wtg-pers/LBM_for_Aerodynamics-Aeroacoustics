@@ -163,8 +163,22 @@ class SurfelSlabLevel:
         # coupling_skip_nt falls through to None there (no _eso_node_type
         # on bridge sims), and the F2C solid handling is the surfel merge
         # branch (patch-50 semantics), not skip_solid_nt.
-        self.nt_c2f = None
-        self.nt_f2c = None
+        # wall-aware coupling skip (patch 76): the single-GPU C2F skips
+        # the fine cells flagged by mlg.wall_coupling (exclude mode:
+        # solid + wall margin) — without the same skip the slab C2F
+        # writes coarse interpolant into the wall-adjacent fluid layer
+        # and the runs diverge (measured: partial-L4 smoke, dead cells
+        # +w27 fill and a global cascade). Sliced from the replicated
+        # build exactly like LocalLevel does; None under strict policy
+        # (whole-body regressions bit-preserved).
+        _cs = getattr(lev, '_coupling_skip_nt', None)
+        _dirs = tuple(getattr(lev, '_coupling_skip_dirs', ()))
+        if _cs is not None and not self._full:
+            from src.parallel.local_level import wrap_slice
+            _cs = wrap_slice(_cs.reshape(lev.domain_shape),
+                             part).ravel().copy()
+        self.nt_c2f = _cs if (_cs is not None and 'c2f' in _dirs) else None
+        self.nt_f2c = _cs if (_cs is not None and 'f2c' in _dirs) else None
         self.wall_mask = 0
         self.wall_mail = None
 
