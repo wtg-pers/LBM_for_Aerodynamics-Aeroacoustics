@@ -227,9 +227,11 @@ extern "C" __global__ void surfel_scatter(
     const int wm_mode, const double wm_tf, const int wm_seed,
     const int Nx, const int Ny, const int Nz,
     const int px, const int py, const int pz,
-    double*       __restrict__ rho_out)    // (n_f,) rho^a of the facet
+    double*       __restrict__ rho_out,    // (n_f,) rho^a of the facet
                                            // state sample (p_state =
                                            // rho^a theta, patch 70)
+    const double* __restrict__ gamma_a)    // (n_f,) intermittency
+                                           // (patch 80); ones = Musker
 {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_f) return;
@@ -324,7 +326,18 @@ extern "C" __global__ void surfel_scatter(
             const double yp = h_law*ut/nu;
             const int clean = (sl[4] > 0.5);
             if (!(clean && yp > y_plus_min && Ut > 0.0)) fallback = 1;
-            if (!fallback)          tw = sl[0]*ut*ut;
+            if (!fallback) {
+                // intermittency blend (patch 80): tau_w = (1-g) tau_lam
+                // + g tau_Musker; tau_lam = the SAME linear viscous
+                // stress the fallback uses, at the SAME h_law sample.
+                // g >= 1 short-circuits to the bare Musker product so a
+                // gamma-less run stays BIT-identical (gate G1). Host
+                // mirror: SurfelFacets.wall_law_tau.
+                const double g = gamma_a[a];
+                const double tm = sl[0]*ut*ut;
+                tw = (g >= 1.0) ? tm
+                   : (1.0 - g)*(sl[0]*nu*fabs(Ut)/h_law) + g*tm;
+            }
             else if (fb_mode == 1) {                 // viscous sublayer
                 if (clean) {
                     tw = sl[0]*nu*fabs(Ut)/h_law;
@@ -511,6 +524,13 @@ class SurfelKernelD3Q27:
         # writer's p_state = rho^a theta — the pressure Eq. (20)
         # intends, free of the Eq. (24) dp the normal traction carries.
         self.rho_out = cp.zeros(self.n_f, dtype=cp.float64)
+        # per-facet intermittency (patch 80): ones = pure Musker, and the
+        # kernel short-circuits g >= 1, so the default is bit-neutral.
+        gam = getattr(facets, 'gamma', None)
+        self.gamma = (cp.asarray(np.ascontiguousarray(
+                          np.asarray(gam, dtype=np.float64)))
+                      if gam is not None
+                      else cp.ones(self.n_f, dtype=cp.float64))
         self._per = tuple(int(p) for p in facets.periodic)
         # Physics scalars are REQUIRED facet attributes (surfel_boundary
         # always sets them): a getattr default here (nu=1/6 ~ tau=1!) would
@@ -590,7 +610,7 @@ class SurfelKernelD3Q27:
             cp.int32(self._wm_seed),
             cp.int32(nx), cp.int32(ny), cp.int32(nz),
             cp.int32(self._per[0]), cp.int32(self._per[1]),
-            cp.int32(self._per[2]), self.rho_out))
+            cp.int32(self._per[2]), self.rho_out, self.gamma))
 
         self._wm_seed = 0          # only the first pass seeds the filter
 

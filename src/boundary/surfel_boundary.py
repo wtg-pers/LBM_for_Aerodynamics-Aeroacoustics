@@ -35,7 +35,7 @@ from typing import Tuple
 
 import numpy as np
 
-from src.boundary.surfel import SurfelFacets
+from src.boundary.surfel import SurfelFacets, build_facet_intermittency
 from src.boundary.surfel_geometry import build_surfels
 from src.boundary.surfel_transport import (
     C27, build_prism_tables, fluid_fraction_by_march,
@@ -49,6 +49,10 @@ _DEFAULTS = dict(
     friction_dir='log', fallback='viscous', mode='wallmodel',
     dv_min=1e-6, march_axis=2, orient='as_is',
     tau_model=False, collide='kernel',
+    # patch 80: {"suction"|"pressure": {"x_tr", "width"}} in x/c —
+    # per-facet gamma blend tau=(1-g)tau_lam+g tau_Musker. None = pure
+    # Musker, bit-identical (kernel short-circuits g >= 1).
+    intermittency=None,
 )
 
 #: D3Q27 weights in surfel_transport's C27 ordering, derived from |c|^2
@@ -117,6 +121,22 @@ class SurfelBoundary:
             friction_dir=p['friction_dir'], fallback=p['fallback'],
             wm_filter=None,
         )
+        if p['intermittency'] is not None:
+            # BEFORE the kernel wrapper: it snapshots facets.gamma.
+            self.facets.gamma = build_facet_intermittency(
+                self.facets.centroid, self.facets.normal,
+                p['intermittency'])
+            g = self.facets.gamma
+            # AREA-weighted fractions: facet COUNT follows the STL's
+            # graded triangulation (LE/TE-dense), so counts overstate
+            # the laminar share by ~1.5x on this mesh (patch 80).
+            a = self.facets.area
+            asum = max(float(a.sum()), 1e-300)
+            print(f"  [surfel] intermittency (area frac): "
+                  f"lam(g<0.5) {float(a[g < 0.5].sum())/asum:.3f}, "
+                  f"ramp {float(a[(g > 0.0) & (g < 1.0)].sum())/asum:.3f},"
+                  f" turb(g==1) {float(a[g >= 1.0].sum())/asum:.3f} "
+                  f"({g.size} facets)")
         self.kernel = SurfelKernelD3Q27(self.facets)
         self.N = self.kernel.N
         if self.N != int(np.prod(self.shape)):

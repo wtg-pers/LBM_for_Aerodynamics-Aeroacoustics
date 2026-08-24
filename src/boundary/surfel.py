@@ -86,6 +86,53 @@ def equilibrium(rho, u):
             * (1.0 + cu / THETA + 0.5 * (cu / THETA) ** 2 - 0.5 * usq / THETA))
 
 
+def build_facet_intermittency(centroid, normal, spec):
+    """Per-facet intermittency gamma from chord-frame geometry (patch 80).
+
+    Forced/natural transition at a KNOWN station lets gamma be geometry
+    (the experimental trip-strip logic) instead of a transport equation:
+    tau_w = (1-g) tau_lam + g tau_Musker with g = smoothstep in x/c.
+
+    Chord frame comes from the facet cloud itself — no config angle:
+    e_c = principal axis of the centroids' airfoil-plane (x, y) scatter,
+    oriented downstream (+x); e_n = the left normal (lift-up for flow
+    along +x at positive alpha). Side is classified by the OUTWARD
+    facet normal's e_n sign, which stays correct around the nose where
+    the centroid offset changes sign. x/c is the e_c projection
+    normalized to the cloud's own [min, max] = the true chord extent.
+
+    spec: {"suction"|"pressure": {"x_tr": float, "width": float}} in
+    x/c units; gamma ramps 0 -> 1 over [x_tr - w/2, x_tr + w/2]. A side
+    without an entry stays fully turbulent (g = 1).
+    """
+    unknown = set(spec) - {'suction', 'pressure'}
+    if unknown:
+        raise ValueError(f"intermittency: unknown sides {sorted(unknown)}")
+    xy = np.asarray(centroid, dtype=np.float64)[:, :2]
+    d = xy - xy.mean(axis=0)
+    _, vecs = np.linalg.eigh(d.T @ d)
+    e_c = vecs[:, -1]
+    if e_c[0] < 0.0:
+        e_c = -e_c
+    e_n = np.array([-e_c[1], e_c[0]])
+    s = d @ e_c
+    xc = (s - s.min()) / max(float(s.max() - s.min()), 1e-300)
+    upper = np.asarray(normal, dtype=np.float64)[:, :2] @ e_n >= 0.0
+    gam = np.ones(xy.shape[0], dtype=np.float64)
+    for side, sel in (('suction', upper), ('pressure', ~upper)):
+        ps = spec.get(side)
+        if ps is None:
+            continue
+        bad = set(ps) - {'x_tr', 'width'}
+        if bad:
+            raise ValueError(f"intermittency.{side}: unknown keys "
+                             f"{sorted(bad)}")
+        w = max(float(ps['width']), 1e-300)
+        t = np.clip((xc[sel] - (float(ps['x_tr']) - 0.5 * w)) / w, 0.0, 1.0)
+        gam[sel] = t * t * (3.0 - 2.0 * t)
+    return gam
+
+
 class SurfelFacets:
     """Facet dynamics over one level's surfels (host numpy reference)."""
 
@@ -245,6 +292,12 @@ class SurfelFacets:
         #: Eq. (23)-(24) volume correction -- REFUTED guess, keep False
         self.vol_correction = bool(vol_correction)
         self.law = law
+        #: per-facet intermittency (patch 80). None = pure Musker; an
+        #: (n_f,) array blends tau_w = (1-g) tau_lam + g tau_Musker in
+        #: wall_law_tau (kernel mirror in surfel_d3q27). Set by
+        #: SurfelBoundary from the config's `intermittency` spec BEFORE
+        #: the kernel wrapper is built.
+        self.gamma = None
         self.h_law = float(h_law)
         self.nu = float(nu)
         self.y_plus_min = float(y_plus_min)
@@ -561,6 +614,14 @@ class SurfelFacets:
         clean = wsum > 0.5
         gated = clean & (y_plus > self.y_plus_min) & (U_t > 0.0)
         tau_w = rho_l * u_tau ** 2
+        if self.gamma is not None:
+            # intermittency blend (patch 80): tau_w = (1-g) tau_lam +
+            # g tau_Musker, tau_lam = the same linear viscous stress the
+            # fallback uses, at the same h_law sample. g >= 1 rows keep
+            # the pure Musker product bit-exactly (kernel mirror).
+            g = self.gamma
+            t_lam = rho_l * self.nu * np.abs(U_t) / self.h_law
+            tau_w = np.where(g >= 1.0, tau_w, (1.0 - g) * t_lam + g * tau_w)
         if self.fallback == "viscous":
             # molecular stress from the same sample where the log law is not
             # usable; falls to 0 continuously as U_t -> 0. Where the stencil
