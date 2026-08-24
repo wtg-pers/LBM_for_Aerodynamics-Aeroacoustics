@@ -26,9 +26,10 @@ cycle), giving a uniform series with fs = 1 / (interval * dt_phys(L0)).
 UNITS
 -----
 The CSV stores p in Pa relative to the lattice reference density rho0 = 1:
-    p_pa = cs_lu^2 * rho_lu * rho_phys * (dx_phys / dt_phys)^2   (ABSOLUTE,
-    lattice-EOS reference; user directive 0824 — acoustic p' is a POST
-    step: subtract a per-position windowed time mean)
+    p_pa = cs_lu^2 * (rho_lu - 1) * rho_phys * (dx_phys / dt_phys)^2
+    (GAUGE vs the rho=1 freestream state — the only physical pressure in
+    weakly-compressible LBM; settled 0824. Acoustic p' is a POST step:
+    subtract a per-position windowed time mean.)
 p' is deliberately NOT formed here: subtract the per-probe time mean in
 post (ParaView Calculator / numpy), where the averaging window is a
 post-processing choice, not a solver one.
@@ -258,7 +259,7 @@ class PressureProbeManager:
             return
         vals = self._buf[:self._cursor]
         vals = vals.get() if hasattr(vals, 'get') else np.asarray(vals)
-        p_pa = vals * self._p_conv
+        p_pa = (vals - self._rho0) * self._p_conv
         steps = np.asarray(self._steps, dtype=np.float64)
         t_s = steps * self._uc.dt_phys
         out = np.column_stack([steps, t_s, p_pa])
@@ -480,7 +481,7 @@ class MPIPressureProbeManager:
                     continue
                 arr = self._comm.recv(source=r, tag=TAG_PROBE + r)
                 vals[:, self._owner_cols[r]] = arr
-            p_pa = vals * self._p_conv
+            p_pa = (vals - self._rho0) * self._p_conv
             steps = np.asarray(self._steps, dtype=np.float64)
             t_s = steps * self._uc.dt_phys
             out = np.column_stack([steps, t_s, p_pa])
