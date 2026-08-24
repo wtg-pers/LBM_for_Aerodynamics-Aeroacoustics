@@ -74,6 +74,14 @@ def run_single(args):
 
     output.start(start_step, end_step)
 
+    # return build-era pool churn to the driver once before stepping
+    # (patch 75b): the first coarse step's big bridge allocations
+    # otherwise contend with fragmented build leftovers at tight margins
+    _xp = getattr(sim, 'xp', None) \
+        or getattr(getattr(sim, 'get_level', lambda k: None)(0), 'xp', None)
+    if getattr(_xp, '__name__', '') == 'cupy':
+        _xp.get_default_memory_pool().free_all_blocks()
+
     try:
         for step in range(start_step, end_step):
             sim.advance()

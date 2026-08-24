@@ -1503,7 +1503,8 @@ class Simulation:
         t = self._esoteric_step
         self.f = esoteric_gather_std(xp, self.f, t)
         if self._f_post is None:          # lazy (64 §13 build-peak fix)
-            self._f_post = xp.empty_like(self.f)
+            from src.kernels.esoteric_d3q27 import _empty_like_retry
+            self._f_post = _empty_like_retry(xp, self.f)
         if self._surfel_use_kernel():
             self._advance_surfel_kernel()
         else:

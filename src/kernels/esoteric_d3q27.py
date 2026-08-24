@@ -926,6 +926,26 @@ def esoteric_scatter_physical(xp, f_phys: 'npt.NDArray', t_step: int) -> 'npt.ND
     return init_f_esoteric(xp, f_phys, t_start=t_step)
 
 
+def _empty_like_retry(xp, a):
+    """empty_like with a free-and-retry on OOM (patch 75b).
+
+    The per-advance scratch discipline (64 sec. 16 / patch 75) cycles
+    multi-GiB blocks through the pool; at tight margins the pool's
+    fragmented free list cannot serve the bridge's contiguous full-level
+    allocation while it starves cudaMalloc of device room (the 64
+    sec. 17 signature — the cluster CuPy's own free-and-retry is
+    ineffective). Healthy path: zero cost. On OOM: return every free
+    block to the driver and retry once.
+    """
+    try:
+        return xp.empty_like(a)
+    except Exception as e:
+        if type(e).__name__ != 'OutOfMemoryError' or xp.__name__ != 'cupy':
+            raise
+        xp.get_default_memory_pool().free_all_blocks()
+        return xp.empty_like(a)
+
+
 def esoteric_gather_std(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
     """Esoteric memory -> physical f in STANDARD D3Q27 ordering.
 
@@ -935,7 +955,7 @@ def esoteric_gather_std(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
     OOM'd the D40 checkpoint gather on a 24GB card (2026-07-10 cluster run).
     Values are identical to the two-step path (pure permutation + roll).
     """
-    out = xp.empty_like(f_mem)
+    out = _empty_like_retry(xp, f_mem)
     even = (t_step % 2 == 0)
     ndim = f_mem.ndim - 1
     ax = tuple(range(ndim))
@@ -970,7 +990,7 @@ def esoteric_scatter_std(xp, f_std: 'npt.NDArray', t_step: int) -> 'npt.NDArray'
     even = (t_step % 2 == 0)
     ndim = f_std.ndim - 1                 # spatial dims (3 for a D3Q27 field)
     ax = tuple(range(ndim))
-    out = xp.empty_like(f_std)
+    out = _empty_like_retry(xp, f_std)
     out[0] = f_std[_STD_TO_ESO[0]]        # rest-direction: no pair, no roll
     for p in range(13):
         i = 2 * p + 1
