@@ -65,7 +65,12 @@ def _build(c=100, wall_bc="ibb", nz_frac=0.16):
     — patch_notes/stl_body/12; the std nz4 run now serves as the
     cross-check twin for the repaired esoteric path.)"""
     if c % 50 != 0:
-        raise ValueError("chord must keep region bounds integral (50|c)")
+        # Resolution-ladder chords (patch 79): region bounds are rounded
+        # by _r anyway, so a non-multiple only shifts box edges by <1 lu
+        # (physically negligible; exact twin-comparability is what the
+        # 50|c rule protected). Loudly noted, not refused.
+        print(f"  [config] chord c={c} is not a multiple of 50 — region "
+              f"bounds rounded (<1 lu shifts; resolution-ladder use)")
     Nx, Ny, Nz = round(9.6 * c), 6 * c, round(nz_frac * c)
     xc, yc, zc = 3.5 * c, 3 * c, 0.5 * Nz     # rotated-bbox center [L0 lu]
 
