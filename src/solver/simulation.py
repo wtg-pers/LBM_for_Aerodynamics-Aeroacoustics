@@ -1509,6 +1509,18 @@ class Simulation:
             self._advance_surfel_kernel()
         else:
             self._advance_surfel()
+        # Drop f_post BEFORE the scatter allocation (patch 75c): its
+        # content is fully consumed (advect + domain BCs, above), and
+        # the scatter's empty_like is the SAME size — the pool hands it
+        # the just-freed block (stream-ordered reuse), so the advance
+        # peak is 2 level-size buffers instead of 3 and the big-block
+        # cycle recycles one size class. The census pinned the LE-L4
+        # single-GPU OOM here: chunk-level fragmentation (small lazy
+        # allocations pinning partially-freed chunks) had made
+        # free_all_blocks powerless while a 3rd full-level buffer was
+        # requested. The force path never reads f_post on the surfel
+        # branch (facet ledger), and it re-materializes lazily above.
+        self._f_post = None
         self.f = esoteric_scatter_std(xp, self.f, t + 1)
         self._esoteric_step += 1
 
