@@ -782,6 +782,17 @@ class DistributedMLGRunner:
                 L2 = self.lv[u2] if self.owns[u2] else None
                 if L2 is None or not hasattr(L2, 'sb'):
                     continue
+                # Levels WITHOUT a level-ownership partition are full-
+                # body: every one of them carries the WHOLE wing, so
+                # only the body block (finest) may report it. Summing
+                # them 4x-counted Cl on the first full-body MPI run
+                # after patch 76 (gamma run, 0825 — monitor-only, the
+                # surface channel was correct). Partial levels keep the
+                # patch 76 sum: their level_owned masks partition the
+                # facets exactly once (gate W2, accounting 3e-14).
+                if u2 != uid and getattr(L2.sb, 'level_owned',
+                                         None) is None:
+                    continue
                 sc = (2.0 ** (k_body - self.blocks[u2].level)) ** 2
                 F = F + np.asarray(L2.last_force(), dtype=float) * sc
             return F
