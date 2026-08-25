@@ -128,6 +128,83 @@ __device__ __forceinline__ double solve_utau_d(
     return ut;
 }
 
+__device__ __forceinline__ double tble_intu(
+    const double tw, const double bk, const double h,
+    const double nu, const int n_pts)
+{   // u(h) of the kinematic linear-stress TBLE (patch 81 sec. 1):
+    // tau_k(y) = tw + bk*y, nu_t = 0.41 y u_tau_local D^2, van Driest
+    // A = 19, LOCAL stress scaling (Wang & Moin 2002). Geometric grid
+    // (growth 1.35), midpoint rule. Host mirror: surfel.tble_u_of_tw
+    // - keep the arithmetic order identical.
+    const double r = 1.35;
+    double rn = 1.0;
+    for (int j = 0; j < n_pts; ++j) rn *= r;
+    double u = 0.0, y0 = 0.0, dy = h * (r - 1.0) / (rn - 1.0);
+    for (int j = 0; j < n_pts; ++j) {
+        const double ym = y0 + 0.5 * dy;
+        const double tk = tw + bk * ym;
+        const double utl = sqrt(fabs(tk));
+        const double dvd = 1.0 - exp(-ym * utl / (nu * 19.0));
+        const double nut = 0.41 * ym * utl * dvd * dvd;
+        u += tk / (nu + nut) * dy;
+        y0 += dy; dy *= r;
+    }
+    return u;
+}
+
+__device__ __forceinline__ double tble_solve_tw(
+    const double U, const double h, const double nu,
+    const double bk, const double tw_seed)
+{   // fixed-sweep bisection for u(h; tw) = U (determinism - the
+    // solve_utau_d convention). Returns tw >= 0; 0 = incipient
+    // separation under a strong adverse gradient (Q5 counts these).
+    const int NP = 24;
+    double hi = fmax(16.0 * tw_seed, 4.0 * (nu * U / h))
+              + 4.0 * fabs(bk) * h + 1e-30;
+    for (int t = 0; t < 3; ++t)
+        if (tble_intu(hi, bk, h, nu, NP) < U) hi *= 4.0;
+    if (tble_intu(0.0, bk, h, nu, NP) >= U) return 0.0;
+    double lo = 0.0;
+    for (int it = 0; it < 40; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        if (tble_intu(mid, bk, h, nu, NP) < U) lo = mid; else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+__device__ __forceinline__ double sample_rho_at(
+    const float* rho, const unsigned char* live,
+    const double sx, const double sy, const double sz,
+    const int Nx, const int Ny, const int Nz,
+    const int px, const int py, const int pz,
+    double* wsum_out)
+{   // live-masked trilinear rho at an EXPLICIT point - the patch 81
+    // dp/ds probes. Same interpolation rules as sample_state (which
+    // stays untouched: bit safety of the existing samples).
+    const double bx = floor(sx), by = floor(sy), bz = floor(sz);
+    const double fx = sx - bx, fy = sy - by, fz = sz - bz;
+    double acc = 0.0, wsum = 0.0;
+    for (int da = 0; da < 2; ++da)
+    for (int db = 0; db < 2; ++db)
+    for (int dc = 0; dc < 2; ++dc) {
+        double w = (da ? fx : 1.0-fx) * (db ? fy : 1.0-fy)
+                 * (dc ? fz : 1.0-fz);
+        int i = (int)bx + da, j = (int)by + db, k = (int)bz + dc;
+        if (px) { i %= Nx; if (i < 0) i += Nx; }
+        else    { i = min(max(i, 0), Nx-1); }
+        if (py) { j %= Ny; if (j < 0) j += Ny; }
+        else    { j = min(max(j, 0), Ny-1); }
+        if (pz) { k %= Nz; if (k < 0) k += Nz; }
+        else    { k = min(max(k, 0), Nz-1); }
+        const long long c = ((long long)i * Ny + j) * Nz + k;
+        w *= (double)live[c];
+        acc += w * (double)rho[c];
+        wsum += w;
+    }
+    *wsum_out = wsum;
+    return acc / fmax(wsum, 1e-300);
+}
+
 __device__ __forceinline__ double feq_i(
     const int i, const double rho, const double ux,
     const double uy, const double uz)
@@ -230,8 +307,9 @@ extern "C" __global__ void surfel_scatter(
     double*       __restrict__ rho_out,    // (n_f,) rho^a of the facet
                                            // state sample (p_state =
                                            // rho^a theta, patch 70)
-    const double* __restrict__ gamma_a)    // (n_f,) intermittency
+    const double* __restrict__ gamma_a,    // (n_f,) intermittency
                                            // (patch 80); ones = Musker
+    const int pg_on, const double pg_ds)   // patch 81 dp/ds probes
 {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_f) return;
@@ -327,14 +405,54 @@ extern "C" __global__ void surfel_scatter(
             const int clean = (sl[4] > 0.5);
             if (!(clean && yp > y_plus_min && Ut > 0.0)) fallback = 1;
             if (!fallback) {
+                // pressure-gradient ratio (patch 81): tau_turb =
+                // tau_Musker * R, R = tau_TBLE(beta)/tau_TBLE(0).
+                // Ratio form keeps the Musker family baseline: R == 1
+                // exactly when beta == 0, and tm*1.0 is bit-exact, so
+                // pg off (or a dead probe) reproduces the old bits.
+                // Host mirror: SurfelFacets.wall_law_tau.
+                double Rpg = 1.0;
+                if (pg_on) {
+                    // probe tangent PROJECTED off the span axis (z):
+                    // the periodic direction carries zero MEAN dp/ds,
+                    // so its component only adds noise to beta -- and
+                    // keeping the probes in-plane leaves the slab
+                    // z-envelope of the facet unchanged (patch 81,
+                    // MPI gate finding).
+                    const double fm2 = sqrt(fx*fx + fy*fy);
+                    if (fm2 > 1e-14) {
+                        const double tx = fx/fm2, ty = fy/fm2;
+                        const double ox = cen[3*a]   + h_law*nx;
+                        const double oy = cen[3*a+1] + h_law*ny;
+                        const double oz = cen[3*a+2] + h_law*nz;
+                        double wgp, wgm;
+                        const double rp_ = sample_rho_at(rho, live,
+                            ox + pg_ds*tx, oy + pg_ds*ty, oz,
+                            Nx, Ny, Nz, px, py, pz, &wgp);
+                        const double rm_ = sample_rho_at(rho, live,
+                            ox - pg_ds*tx, oy - pg_ds*ty, oz,
+                            Nx, Ny, Nz, px, py, pz, &wgm);
+                        if (wgp > 0.5 && wgm > 0.5) {
+                            const double bk =
+                                (rp_ - rm_) / (3.0 * 2.0 * pg_ds);
+                            if (bk != 0.0) {
+                                const double twb = tble_solve_tw(
+                                    fabs(Ut), h_law, nu, bk, ut*ut);
+                                const double tw0 = tble_solve_tw(
+                                    fabs(Ut), h_law, nu, 0.0, ut*ut);
+                                if (tw0 > 1e-300) Rpg = twb / tw0;
+                            }
+                        }
+                    }
+                }
                 // intermittency blend (patch 80): tau_w = (1-g) tau_lam
-                // + g tau_Musker; tau_lam = the SAME linear viscous
+                // + g tau_turb; tau_lam = the SAME linear viscous
                 // stress the fallback uses, at the SAME h_law sample.
-                // g >= 1 short-circuits to the bare Musker product so a
-                // gamma-less run stays BIT-identical (gate G1). Host
-                // mirror: SurfelFacets.wall_law_tau.
+                // g >= 1 short-circuits to the bare turbulent product
+                // so a gamma-less run stays BIT-identical (gate G1).
                 const double g = gamma_a[a];
-                const double tm = sl[0]*ut*ut;
+                double tm = sl[0]*ut*ut;
+                if (pg_on) tm *= Rpg;
                 tw = (g >= 1.0) ? tm
                    : (1.0 - g)*(sl[0]*nu*fabs(Ut)/h_law) + g*tm;
             }
@@ -531,6 +649,11 @@ class SurfelKernelD3Q27:
                           np.asarray(gam, dtype=np.float64)))
                       if gam is not None
                       else cp.ones(self.n_f, dtype=cp.float64))
+        # pressure-gradient wall function (patch 81): off by default;
+        # pg_ds = tangential probe half-spacing [cells].
+        pgd = getattr(facets, 'pg_ds', None)
+        self.pg_on = int(pgd is not None)
+        self.pg_ds = float(pgd) if pgd is not None else 0.0
         self._per = tuple(int(p) for p in facets.periodic)
         # Physics scalars are REQUIRED facet attributes (surfel_boundary
         # always sets them): a getattr default here (nu=1/6 ~ tau=1!) would
@@ -610,7 +733,8 @@ class SurfelKernelD3Q27:
             cp.int32(self._wm_seed),
             cp.int32(nx), cp.int32(ny), cp.int32(nz),
             cp.int32(self._per[0]), cp.int32(self._per[1]),
-            cp.int32(self._per[2]), self.rho_out, self.gamma))
+            cp.int32(self._per[2]), self.rho_out, self.gamma,
+            cp.int32(self.pg_on), cp.float64(self.pg_ds)))
 
         self._wm_seed = 0          # only the first pass seeds the filter
 

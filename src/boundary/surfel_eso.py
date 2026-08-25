@@ -314,6 +314,8 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     cen_h = np.asarray(k.cen.get())
     nrm_h = np.asarray(k.nrm.get())
     chk = np.flatnonzero(keep & facet_rel)
+    # patch 81 note: the dp/ds probes are span-projected (z-component
+    # zero), so pg_ds adds NOTHING to the slab-axis envelope.
     reach = (float(k.f.sample_h) + float(k.h_law)) * np.abs(
         nrm_h[chk][:, axis]) + 1.0
     pos_w = (cen_h[chk][:, axis] - (own_start - ghost)) % n_ax
@@ -340,7 +342,7 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     sk.block = k.block
     for name in ('mode', 'law_id', 'law_iters', 'h_law', 'nu',
                  'y_plus_min', 'fric_dir', 'fb_mode', 'wm_mode', 'wm_tf',
-                 '_per'):
+                 'pg_on', 'pg_ds', '_per'):
         setattr(sk, name, getattr(k, name))
     sk.n_f = int(kept.size)
     sk.shape = slab_shape

@@ -53,6 +53,10 @@ _DEFAULTS = dict(
     # per-facet gamma blend tau=(1-g)tau_lam+g tau_Musker. None = pure
     # Musker, bit-identical (kernel short-circuits g >= 1).
     intermittency=None,
+    # patch 81: pressure-gradient wall function. None = off (bit-
+    # identical); {"ds": 2.0} = tangential probe half-spacing [cells]
+    # for dp/ds; tau_turb = tau_Musker * tau_TBLE(beta)/tau_TBLE(0).
+    pressure_gradient=None,
 )
 
 #: D3Q27 weights in surfel_transport's C27 ordering, derived from |c|^2
@@ -121,6 +125,15 @@ class SurfelBoundary:
             friction_dir=p['friction_dir'], fallback=p['fallback'],
             wm_filter=None,
         )
+        if p['pressure_gradient'] is not None:
+            pgc = dict(p['pressure_gradient'])
+            bad = set(pgc) - {'ds'}
+            if bad:
+                raise ValueError(f"pressure_gradient: unknown keys "
+                                 f"{sorted(bad)}")
+            self.facets.pg_ds = float(pgc.get('ds', 2.0))
+            print(f"  [surfel] pressure-gradient WF: ds="
+                  f"{self.facets.pg_ds:g} (tau ratio TBLE, patch 81)")
         if p['intermittency'] is not None:
             # BEFORE the kernel wrapper: it snapshots facets.gamma.
             self.facets.gamma = build_facet_intermittency(
@@ -812,7 +825,8 @@ def check_level_coupling_bands(sb: SurfelBoundary, region,
     # partial cells (tolerance: the march's float64 column accumulation
     # may leave far-field fluid at 1 - eps, which is not a cut cell)
     part_xyz = np.argwhere(sb.live_h & (sb.dV_h < 1.0 - 1e-9))
-    reach = max(float(sb.facets.h_law), float(sb.facets.sample_h)) + 1.0
+    reach = (max(float(sb.facets.h_law), float(sb.facets.sample_h))
+             + 1.0 + float(getattr(sb.facets, 'pg_ds', None) or 0.0))
     samp_xyz = (np.asarray(sb.facets.centroid, dtype=np.float64)
                 + np.asarray(sb.facets.normal, dtype=np.float64) * reach)
 

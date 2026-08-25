@@ -86,6 +86,56 @@ def equilibrium(rho, u):
             * (1.0 + cu / THETA + 0.5 * (cu / THETA) ** 2 - 0.5 * usq / THETA))
 
 
+def tble_u_of_tw(tw, bk, h, nu, n_pts=24, growth=1.35):
+    """u(h) for the kinematic linear-stress TBLE (patch 81 sec. 1).
+
+    tau_k(y) = tw + bk*y, du/dy = tau_k/(nu + nu_t), nu_t = kappa y
+    u_tau_local D^2 with LOCAL stress scaling u_tau_local =
+    sqrt(|tau_k(y)|) and van Driest damping D = 1 - exp(-y u_tau_local
+    /(nu A)), kappa = 0.41, A = 19 (Wang & Moin 2002 simplified TBLE,
+    pressure-gradient term only). Geometric y-grid, midpoint rule —
+    the CUDA device mirror (tble_intu) keeps the identical arithmetic
+    order; keep the two in step.
+    """
+    tw = np.asarray(tw, dtype=np.float64)
+    bk = np.asarray(bk, dtype=np.float64)
+    y1 = h * (growth - 1.0) / (growth ** n_pts - 1.0)
+    u = np.zeros(np.broadcast(tw, bk).shape, dtype=np.float64)
+    y0, dy = 0.0, y1
+    for _ in range(n_pts):
+        ym = y0 + 0.5 * dy
+        tk = tw + bk * ym
+        utl = np.sqrt(np.abs(tk))
+        dvd = 1.0 - np.exp(-ym * utl / (nu * 19.0))
+        nut = 0.41 * ym * utl * dvd * dvd
+        u = u + tk / (nu + nut) * dy
+        y0 += dy
+        dy *= growth
+    return u
+
+
+def tble_solve_tw(U, h, nu, bk, tw_seed):
+    """Bisection for u(h; tw) = U — vectorized host mirror of the CUDA
+    tble_solve_tw (fixed 40-sweep, no early exit: determinism, the
+    solve_utau convention). Returns tw >= 0; 0 = incipient separation
+    under a strong adverse gradient (Q5 counts these)."""
+    U = np.asarray(U, dtype=np.float64)
+    bk = np.asarray(bk, dtype=np.float64)
+    hi = (np.maximum(16.0 * np.asarray(tw_seed, dtype=np.float64),
+                     4.0 * nu * U / h) + 4.0 * np.abs(bk) * h + 1e-30)
+    for _ in range(3):
+        low = tble_u_of_tw(hi, bk, h, nu) < U
+        hi = np.where(low, hi * 4.0, hi)
+    sep = tble_u_of_tw(np.zeros_like(hi), bk, h, nu) >= U
+    lo = np.zeros_like(hi)
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        below = tble_u_of_tw(mid, bk, h, nu) < U
+        lo = np.where(below, mid, lo)
+        hi = np.where(below, hi, mid)
+    return np.where(sep, 0.0, 0.5 * (lo + hi))
+
+
 def build_facet_intermittency(centroid, normal, spec):
     """Per-facet intermittency gamma from chord-frame geometry (patch 80).
 
@@ -298,6 +348,11 @@ class SurfelFacets:
         #: SurfelBoundary from the config's `intermittency` spec BEFORE
         #: the kernel wrapper is built.
         self.gamma = None
+        #: pressure-gradient wall function (patch 81): None = off; a
+        #: float = the tangential half-spacing ds [cells] of the two
+        #: extra rho samples that build dp/ds. Set by SurfelBoundary
+        #: BEFORE the kernel wrapper is built.
+        self.pg_ds = None
         self.h_law = float(h_law)
         self.nu = float(nu)
         self.y_plus_min = float(y_plus_min)
@@ -614,6 +669,34 @@ class SurfelFacets:
         clean = wsum > 0.5
         gated = clean & (y_plus > self.y_plus_min) & (U_t > 0.0)
         tau_w = rho_l * u_tau ** 2
+        if self.pg_ds is not None:
+            # pressure-gradient ratio (patch 81, kernel mirror):
+            # tau_turb = tau_Musker * R, R = tau_TBLE(beta)/tau_TBLE(0).
+            # Ratio form keeps the Musker family baseline — R == 1
+            # exactly at beta == 0 (same integrator over itself).
+            ds = float(self.pg_ds)
+            # tangent projected off the span axis (z): the periodic
+            # direction has zero mean dp/ds — kernel mirror.
+            t2 = u_fric.copy()
+            t2[:, 2] = 0.0
+            lm = np.linalg.norm(t2, axis=1)
+            that_pg = np.where(lm[:, None] > 1e-14,
+                               t2 / np.maximum(lm, 1e-300)[:, None],
+                               0.0)
+            base = self.centroid + self.h_law * self.normal
+            rp, wp = self._trilinear(rho[None], base + ds * that_pg,
+                                     want_w=True)
+            rm, wm = self._trilinear(rho[None], base - ds * that_pg,
+                                     want_w=True)
+            ok = (wp > 0.5) & (wm > 0.5) & (lm > 1e-14)
+            beta = np.where(ok, (rp[0] - rm[0]) / (3.0 * 2.0 * ds), 0.0)
+            tw_b = tble_solve_tw(np.abs(U_t), self.h_law, self.nu,
+                                 beta, u_tau ** 2)
+            tw_0 = tble_solve_tw(np.abs(U_t), self.h_law, self.nu,
+                                 np.zeros_like(beta), u_tau ** 2)
+            R = np.where(tw_0 > 1e-300, tw_b / np.maximum(tw_0, 1e-300),
+                         1.0)
+            tau_w = tau_w * np.where(beta == 0.0, 1.0, R)
         if self.gamma is not None:
             # intermittency blend (patch 80): tau_w = (1-g) tau_lam +
             # g tau_Musker, tau_lam = the same linear viscous stress the
