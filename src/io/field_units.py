@@ -173,15 +173,15 @@ class FieldUnits:
                 "position windowed TIME mean, in post)",
                 f"                  velocity_ms [x{self.vel_conv:.6e}], "
                 f"nu_t_m2s [x{self.nu_conv:.6e} * 2^-level]",
-                "          (p'/u: ONE constant for every AMR level; "
-                "nu_t/body_force applied per level)",
+                "          (p_gauge, u: ONE constant for every AMR "
+                "level; nu_t, body_force applied per level)",
                 "          (coordinates stay L0-lu; checkpoints/markers "
                 "stay lattice)",
             ]
         else:
             lines += [
-                "          ParaView recipe (lattice -> physical; p'/u "
-                "constants valid on EVERY AMR level):",
+                "          ParaView recipe (lattice -> physical; "
+                "p_gauge, u constants valid on EVERY AMR level):",
                 f"            p_gauge [Pa] = (density - 1) * "
                 f"{self.p_conv:.6e}",
                 f"            u [m/s]  = velocity * {self.vel_conv:.6e}",
