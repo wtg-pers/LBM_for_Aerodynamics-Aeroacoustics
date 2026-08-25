@@ -291,12 +291,24 @@ class DistributedMLGRunner:
         self.surface_meta: Dict[int, object] = {}
         for uid, b in enumerate(src):
             lev = b.sim
-            self.has_nut.append(
-                str((getattr(lev, "_sgs_cfg", None) or {}).get("model", "off"))
-                == "dyn_smag")
-            self.wall_masks.append(int(getattr(lev, '_eso_wall_mask', 0)))
             is_surfel = getattr(getattr(lev, 'obstacle_bc', None),
                                 'kind', None) == 'surfel'
+            # nu_t in the volume output: dyn_smag local levels carry
+            # their own nut buffer; surfel levels fill sim.nu_t for ANY
+            # enabled SGS model since the 0824 export repair — the old
+            # dyn-only flag silently dropped nu_t from every constant-
+            # Smagorinsky MPI run (user finding, patch 81 era; the
+            # single-GPU path wrote it, an output-channel parity break).
+            _sgs = getattr(lev, "_sgs_cfg", None) or {}
+            # NOTE: sim.nu_t itself is allocated LAZILY on the eso path
+            # (first advance), so the flag must come from the config,
+            # never from a buffer-existence probe at build time.
+            self.has_nut.append(
+                str(_sgs.get("model", "off")) == "dyn_smag"
+                or (is_surfel and bool(_sgs.get("enabled"))
+                    and str(_sgs.get("model", "off"))
+                    in ("smagorinsky", "wale", "dyn_smag")))
+            self.wall_masks.append(int(getattr(lev, '_eso_wall_mask', 0)))
             # rank-invariant surfel flag + rank-0 host metadata for the
             # MPI surface channel (patch 68): the writer needs the full
             # build's triangle map on rank 0 only — host refs, no device

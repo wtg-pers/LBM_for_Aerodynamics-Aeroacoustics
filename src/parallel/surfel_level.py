@@ -204,6 +204,21 @@ class SurfelSlabLevel:
     def wall_args(self) -> dict:
         return {'wall_mask': self.wall_mask, 'wall_mail': self.wall_mail}
 
+    @property
+    def nut(self):
+        """nu_t of the slab's inner sim (domain-shaped) — the volume
+        writer's gather reads L.nut (0824 surfel export repair reaches
+        MPI through here; constant-Smagorinsky included). The inner
+        sim allocates its buffer lazily at first advance, but the
+        step-0 initial VTK gather runs BEFORE that — hand it a zeros
+        buffer of the same shape/dtype so the collective sees a real
+        slice (the sim's ready path replaces it with its own)."""
+        if getattr(self.sim, 'nu_t', None) is None:
+            xp = self.sim.xp
+            self.sim.nu_t = xp.zeros(self.sim.domain_shape,
+                                     dtype=xp.float32)
+        return self.sim.nu_t
+
     def advance(self, force=None) -> None:
         if force is not None:
             raise NotImplementedError(
