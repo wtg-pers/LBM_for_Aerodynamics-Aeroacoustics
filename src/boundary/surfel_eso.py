@@ -359,6 +359,7 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     # per-facet intermittency (patch 80): kept-row slice, same pattern
     # as area/nrm — the slab kernel's apply() passes it verbatim.
     sk.gamma = k.gamma[xp.asarray(kept)].copy()
+    sk.crease = k.crease[xp.asarray(kept)].copy()      # robin/02 sec. 7.12 per-facet flag
     # g/Q support compaction on the slab (64 sec. 18): slab support =
     # full support cells inside the wrap window, re-addressed to slab
     # dense ids by the SAME wrap arithmetic as the CSR (remap_flat) —

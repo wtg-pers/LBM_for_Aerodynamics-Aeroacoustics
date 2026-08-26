@@ -63,6 +63,18 @@ _DEFAULTS = dict(
     # in 4 substeps). False = bit-identical for every existing run;
     # a convex body has no capped cell (measured: 0 on the fuselage).
     overlap_cap=False,
+    # robin/02 sec. 7.12: facets that take part in a capped (overlapping)
+    # cell = concave-crease facets. "noslip" switches THOSE facets to the
+    # mass-conserving Eq. (10) reconstruction (a corner between two walls
+    # is stagnant; the free-slip-based Eq. (16) reconstruction there pins
+    # the fully-captured crease cell to the sample state and piles up
+    # pressure: crease Cp +23 -> +0.08 measured). None = bit-identical.
+    crease_mode=None,
+    # facets whose prism weight the cap removed by MORE than this fraction
+    # are the crease set. 0.0 = every facet touching a capped cell — the
+    # measured requirement (0.05 left crease cells at Cp +5 and orifice
+    # 52 at +1.1; 0.0 gives +0.16 / -0.29, robin/02 sec. 7.12).
+    crease_frac=0.0,
 )
 
 #: D3Q27 weights in surfel_transport's C27 ordering, derived from |c|^2
@@ -131,6 +143,17 @@ class SurfelBoundary:
                   f"robin/02): {_cs['n_cells']} (cell,dir) sums capped, "
                   f"max g/dV {_cs['max_ratio']:.2f} -> 1, weight removed "
                   f"{_cs['removed']:.4g} of {_cs['total']:.4g}")
+        if p['crease_mode'] is not None:
+            if p['crease_mode'] != 'noslip':
+                raise ValueError(f"surfel crease_mode: unknown '{p['crease_mode']}' (None|'noslip')")
+            if not p['overlap_cap']:
+                raise ValueError("surfel crease_mode='noslip' needs overlap_cap=True (the crease "
+                                 "facet set is the cap's overlap set)")
+            _cf = np.asarray(self.overlap_cap_stats['facet_cap_frac'], dtype=np.float64)
+            self._crease_facets = _cf > float(p['crease_frac'])
+            self._crease_frac_hist = np.histogram(_cf[_cf > 0], bins=[0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0001])[0]
+        else:
+            self._crease_facets = None
 
         self.facets = SurfelFacets(
             sf, tb, self.shape,
@@ -140,6 +163,13 @@ class SurfelBoundary:
             friction_dir=p['friction_dir'], fallback=p['fallback'],
             wm_filter=None,
         )
+        if self._crease_facets is not None:
+            # BEFORE the kernel wrapper: it snapshots facets.crease (like gamma)
+            self.facets.crease = self._crease_facets
+            print(f"  [surfel] crease_mode=noslip: {int(self._crease_facets.sum())} of "
+                  f"{self.facets.n_f} facets (cap-removed fraction > {p['crease_frac']:g}) use Eq. (10); "
+                  f"removed-fraction histogram [0-1%,1-5%,5-10%,10-20%,20-50%,>50%] = "
+                  f"{self._crease_frac_hist.tolist()}")
         if p['pressure_gradient'] is not None:
             pgc = dict(p['pressure_gradient'])
             bad = set(pgc) - {'ds'}

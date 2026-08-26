@@ -309,10 +309,35 @@ extern "C" __global__ void surfel_scatter(
                                            // rho^a theta, patch 70)
     const double* __restrict__ gamma_a,    // (n_f,) intermittency
                                            // (patch 80); ones = Musker
-    const int pg_on, const double pg_ds)   // patch 81 dp/ds probes
+    const int pg_on, const double pg_ds,   // patch 81 dp/ds probes
+    const signed char* __restrict__ crease) // (n_f,) 1 = concave-crease facet -> Eq. (10) (robin/02 7.12)
 {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_f) return;
+    if (crease[a] != 0) {
+        // concave-crease facet (robin/02 sec. 7.12): Eq. (10) no-slip,
+        // ISOLATED branch (the wall-model path below is textually
+        // unchanged = bit-identical for every other facet). The facet
+        // state density is still sampled so the surface pressure
+        // (p_state = rho^a theta, patch 70) stays defined here.
+        const double cnx = nrm[3*a], cny = nrm[3*a+1], cnz = nrm[3*a+2];
+        const long long cb = (long long)a * 27;
+        double cgo[27];
+        for (int i = 0; i < 27; ++i) cgo[i] = 0.0;
+        for (int i = 1; i < 27; ++i) {
+            const double cni = CX[i]*cnx + CY[i]*cny + CZ[i]*cnz;
+            if (cni > 0.0) cgo[i] = G_in[cb + OPP[i]];
+        }
+        for (int i = 0; i < 27; ++i) G_out[cb + i] = cgo[i];
+        if (tau_out) tau_out[a] = 0.0;
+        if (fb_out)  fb_out[a] = 1;
+        if (rho_out) {
+            double cst[5];
+            sample_state(rho, uf, live, cen, nrm, a, h, Nx, Ny, Nz, px, py, pz, cst);
+            rho_out[a] = cst[0];
+        }
+        return;
+    }
     const double nx = nrm[3*a], ny = nrm[3*a+1], nz = nrm[3*a+2];
     const double A = area[a];
     const long long base = (long long)a * 27;
@@ -649,6 +674,9 @@ class SurfelKernelD3Q27:
                           np.asarray(gam, dtype=np.float64)))
                       if gam is not None
                       else cp.ones(self.n_f, dtype=cp.float64))
+        cr = getattr(facets, 'crease', None)
+        self.crease = cp.asarray((np.asarray(cr, dtype=bool) if cr is not None
+                                  else np.zeros(facets.n_f, dtype=bool)).astype(np.int8))
         # pressure-gradient wall function (patch 81): off by default;
         # pg_ds = tangential probe half-spacing [cells].
         pgd = getattr(facets, 'pg_ds', None)
@@ -734,7 +762,8 @@ class SurfelKernelD3Q27:
             cp.int32(nx), cp.int32(ny), cp.int32(nz),
             cp.int32(self._per[0]), cp.int32(self._per[1]),
             cp.int32(self._per[2]), self.rho_out, self.gamma,
-            cp.int32(self.pg_on), cp.float64(self.pg_ds)))
+            cp.int32(self.pg_on), cp.float64(self.pg_ds),
+            self.crease))
 
         self._wm_seed = 0          # only the first pass seeds the filter
 

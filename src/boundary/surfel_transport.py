@@ -545,6 +545,8 @@ def cap_prism_overlap(
     dv_flat = np.asarray(dV, dtype=np.float64).reshape(-1)
     live = dv_flat > 0.0
     n_capped, max_ratio, removed = 0, 0.0, 0.0
+    facet_capped = np.zeros(n_s, dtype=bool)
+    w_orig_sum = np.bincount(np.repeat(np.arange(n_s * N_PAIR) // N_PAIR, np.diff(indptr)), tables['weight'], n_s)
     for pair in range(N_PAIR):
         sgn = tables['sgn'][:, pair]
         keys = np.arange(n_s) * N_PAIR + pair
@@ -571,9 +573,14 @@ def cap_prism_overlap(
             n_capped += int(over.sum())
             max_ratio = max(max_ratio, float((S[over] / dv_flat[over]).max()))
             before = w[ig].sum()
-            w[ig] = w[ig] * scale[cg]
+            sc = scale[cg]
+            w[ig] = w[ig] * sc
+            facet_capped[np.unique(sid[group][sc < 1.0 - 1e-12])] = True
             removed += float(before - w[ig].sum())
     out = dict(tables)
     out['weight'] = w
     return out, {'n_cells': n_capped, 'max_ratio': max_ratio,
-                 'removed': removed, 'total': float(np.sum(tables['weight']))}
+                 'removed': removed, 'total': float(np.sum(tables['weight'])),
+                 'facet_capped': facet_capped,
+                 # fraction of each facet's prism weight removed by the cap
+                 'facet_cap_frac': 1.0 - np.bincount(np.repeat(np.arange(n_s * N_PAIR) // N_PAIR, np.diff(indptr)), w, n_s) / np.maximum(w_orig_sum, 1e-300)}

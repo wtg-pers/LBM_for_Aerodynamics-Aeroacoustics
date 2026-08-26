@@ -348,6 +348,9 @@ class SurfelFacets:
         #: SurfelBoundary from the config's `intermittency` spec BEFORE
         #: the kernel wrapper is built.
         self.gamma = None
+        #: per-facet crease flag (robin/02 sec. 7.12): True -> Eq. (10) for
+        #: that facet regardless of `mode`. None = off (bit-identical).
+        self.crease = None
         #: pressure-gradient wall function (patch 81): None = off; a
         #: float = the tangential half-spacing ds [cells] of the two
         #: extra rho samples that build dp/ds. Set by SurfelBoundary
@@ -557,6 +560,16 @@ class SurfelFacets:
             bb[:, 1:] = G_in[:, opp[1:]]
             G_out = np.where(fallback[:, None], bb * self.is_out, G_out)
             self._df[fallback] = 0.0
+        if self.crease is not None and np.any(self.crease):
+            # concave-crease facets: Eq. (10) (robin/02 sec. 7.12)
+            cr = np.asarray(self.crease, dtype=bool)
+            bb = np.zeros_like(G_out)
+            bb[:, 1:] = G_in[:, opp[1:]]
+            G_out = np.where(cr[:, None], bb * self.is_out, G_out)
+            self._df[cr] = 0.0
+            if tau_w is not None:
+                tau_w = np.where(cr, 0.0, np.asarray(tau_w))
+            fallback = fallback | cr
         self._fallback = fallback
         return G_out
 

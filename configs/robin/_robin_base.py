@@ -43,8 +43,8 @@ of any boolean) are sub-cell and harmless for the surfel build. v3
 (analytic union loft, robin_mod_v3.stl) is kept as the analytic
 reference / quad-export source. Surfel needs overlap_cap=True here (02
 sec. 7: the concave junction is the first non-convex surfel body); the
-crease itself carries a bounded spurious overpressure (02 sec. 7.7) —
-open solver item.
+crease pathology (spurious pocket, 02 sec. 7.7) is cured by
+crease_mode="noslip" (02 sec. 7.12).
 
 Surfel stack = NACA campaign parity (patch 45/54 defaults): law musker,
 h_law 3, tau_model ON, mode wallmodel, orient as_is, march_axis z
@@ -148,7 +148,13 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
               # g_i > dV (up to 17x at the pylon TE) -> negative density in
               # 4 substeps. Per-(cell,dir) renormalisation (Chen-Teixeira-
               # Molvig sum P <= 1); no-op on a convex body (bit-identical).
-              "overlap_cap": True}
+              "overlap_cap": True,
+              # robin/02 sec. 7.12: facets touching a capped (overlapping)
+              # cell use the mass-conserving Eq. (10) reconstruction — the
+              # free-slip-based wall-model reconstruction pumps a spurious
+              # pressure pocket into the fully-captured crease cells
+              # (measured Cp +23 -> +0.16; crease orifices +3.5 -> -0.2).
+              "crease_mode": "noslip"}
     if surfel_extra:
         surfel.update(surfel_extra)
 
