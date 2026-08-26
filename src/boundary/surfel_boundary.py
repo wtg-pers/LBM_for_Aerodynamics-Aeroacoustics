@@ -57,6 +57,12 @@ _DEFAULTS = dict(
     # identical); {"ds": 2.0} = tangential probe half-spacing [cells]
     # for dp/ds; tau_turb = tau_Musker * tau_TBLE(beta)/tau_TBLE(0).
     pressure_gradient=None,
+    # robin/02: per-(cell, direction) prism-overlap renormalisation
+    # (Chen-Teixeira-Molvig sum_a P_i^a <= 1). Required for CONCAVE
+    # creases (body/pylon junction: g_i up to 17 dV -> negative density
+    # in 4 substeps). False = bit-identical for every existing run;
+    # a convex body has no capped cell (measured: 0 on the fuselage).
+    overlap_cap=False,
 )
 
 #: D3Q27 weights in surfel_transport's C27 ordering, derived from |c|^2
@@ -116,6 +122,15 @@ class SurfelBoundary:
         dV = np.where(dv_raw > self.dv_min, dv_raw, 0.0)
         live = dV > 0.0
         self.dropped_vol = float(dv_raw.sum() - dV.sum())
+        self.overlap_cap_stats = None
+        if p['overlap_cap']:
+            from src.boundary.surfel_transport import cap_prism_overlap
+            tb, _cs = cap_prism_overlap(tb, sf, self.shape, dV)
+            self.overlap_cap_stats = _cs
+            print(f"  [surfel] overlap cap (concave-crease renormalisation, "
+                  f"robin/02): {_cs['n_cells']} (cell,dir) sums capped, "
+                  f"max g/dV {_cs['max_ratio']:.2f} -> 1, weight removed "
+                  f"{_cs['removed']:.4g} of {_cs['total']:.4g}")
 
         self.facets = SurfelFacets(
             sf, tb, self.shape,

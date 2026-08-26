@@ -505,3 +505,75 @@ def uniform_state_residual(
         src += W[i] * eps
         worst[i] = np.abs(eps).max()
     return {'source': src, 'worst_eps': worst}
+
+
+def cap_prism_overlap(
+    tables: Dict[str, np.ndarray],
+    surfels: Dict[str, np.ndarray],
+    shape: Sequence[int],
+    dV: np.ndarray,
+    tol: float = 1e-9,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+    """Per-(cell, direction) renormalisation of the prism weights.
+
+    The advect source of direction i from cell x is (dV(x) - g_i(x)) n_i(x)
+    with g_i = sum over facets of the prism overlap volume (Eq. 5). For a
+    convex/smooth wall every facet prism claims a distinct part of the
+    cell's fluid volume and g_i <= dV holds. At a CONCAVE crease (ROBIN
+    body/pylon junction, patch_notes/robin/02 sec. 7) the prisms of the
+    two walls overlap inside one cell, g_i exceeds dV (measured up to 17x
+    on the pylon trailing edge), the source turns negative and the density
+    goes negative within a few substeps. This is the canonical volumetric-
+    formulation step (Chen, Teixeira & Molvig 1998: the captured fraction
+    P_i^a(x) = V_i^a(x)/V(x) is renormalised so that sum_a P_i^a <= 1):
+    for every direction pair and sign group, weights in a cell whose sum S
+    exceeds dV are scaled by dV/S. Vsum (per facet) is derived from the
+    scaled table downstream, so distribute stays exactly mass-conserving
+    (sum_x Q_i == Gamma_out). Cells with dV = 0 (dead) are left untouched.
+
+    tol is RELATIVE (S > dV (1 + tol)): 1e-9 leaves the round-off
+    cases of a convex wall untouched (bit-identical weights, measured on
+    the ROBIN fuselage) while every real overlap is >= 10 % of dV.
+
+    Returns (tables copy with the scaled 'weight', stats dict).
+    """
+    nx, ny, nz = (int(s) for s in shape)
+    ncell = nx * ny * nz
+    n_s = int(surfels['cell'].size)
+    indptr, cell = tables['indptr'], tables['cell']
+    w = np.array(tables['weight'], dtype=np.float64, copy=True)
+    dv_flat = np.asarray(dV, dtype=np.float64).reshape(-1)
+    live = dv_flat > 0.0
+    n_capped, max_ratio, removed = 0, 0.0, 0.0
+    for pair in range(N_PAIR):
+        sgn = tables['sgn'][:, pair]
+        keys = np.arange(n_s) * N_PAIR + pair
+        beg, end = indptr[keys], indptr[keys + 1]
+        cnt = end - beg
+        if int(cnt.sum()) == 0:
+            continue
+        sid = np.repeat(np.arange(n_s), cnt)
+        idx = (np.arange(int(cnt.sum()))
+               - np.repeat(np.cumsum(cnt) - cnt, cnt)
+               + np.repeat(beg, cnt))
+        cc = cell[idx]
+        for group in (sgn[sid] < 0, sgn[sid] >= 0):
+            ig = idx[group]
+            cg = cc[group]
+            if ig.size == 0:
+                continue
+            S = np.bincount(cg, w[ig], ncell)
+            over = live & (S > dv_flat * (1.0 + tol))
+            if not over.any():
+                continue
+            scale = np.ones(ncell)
+            scale[over] = dv_flat[over] / S[over]
+            n_capped += int(over.sum())
+            max_ratio = max(max_ratio, float((S[over] / dv_flat[over]).max()))
+            before = w[ig].sum()
+            w[ig] = w[ig] * scale[cg]
+            removed += float(before - w[ig].sum())
+    out = dict(tables)
+    out['weight'] = w
+    return out, {'n_cells': n_capped, 'max_ratio': max_ratio,
+                 'removed': removed, 'total': float(np.sum(tables['weight']))}

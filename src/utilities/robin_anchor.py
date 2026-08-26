@@ -1,0 +1,383 @@
+"""ROBIN (TM-80051) rotor-off Cp anchor — loader, station tables, sim overlay.
+
+Anchor data (data/robin/, digitised 2026-08-26 from NASA TM-80051,
+Freeman & Mineck 1979 — appendix listings + Table III orifice
+coordinates; provenance in patch_notes/robin/02):
+
+    data/robin/tm80051_orifices.csv       176 orifices: station, side, x/R y/R z/R
+    data/robin/tm80051_cp_rotor_off.csv   Run 12 pts 88-91 (alpha -10/-5/0/+5,
+                                          beta 0, 81.5-81.7 kt), Cp per orifice
+    data/robin/tm80051_raw/pt<NN>_visual.txt   raw transcriptions with flags
+
+Conventions
+    * Coordinates are in ROTOR RADII (R); the body is 2R long, nose at
+      x/R = 0. Same frame as input_files/geom/robin_mod.stl (verified: every
+      orifice lies within 0.0035 R of the STL surface).
+    * Orifices 89-176 are the Y-mirrors (port side) of 1-88 (starboard).
+      For beta = 0 the mirror pair is a repeatability/asymmetry measure
+      (|dCp| mean 0.010-0.017, max ~0.06 near the nose).
+    * phi = polar angle about the body axis, atan2(y, z): 0 = top (dorsal),
+      +90 = starboard, 180 = bottom (TM eq. 8 uses Y = r sin phi, Z = r cos
+      phi + Z0). Station numbering 1-14 follows TM strips 1-14 (x/R 0.0517
+      ... 1.5303).
+
+Simulation overlay: surface_<step>.vtk written by the surfel stack (per
+STL triangle: p_use, tau, traction, area, Cp). Cp is recomputed here as
+(p_use - p_inf)/q_inf with p_inf = rho_inf/3 (lattice, rho_inf = 1) and
+q_inf = 0.5 U_lu^2, because the file's own Cp uses the AREA-MEAN surface
+pressure as reference (fine for a wing, biased for a closed body). The
+orifice positions are mapped into the run's L0-lu frame with the SAME
+transform the solver applies to the STL (scale -> rotate about the scaled
+bbox centre -> shift the rotated bbox centre onto center_lu), then each
+orifice samples the area-weighted mean of the triangle Cp within a
+radius r_s (default 1.5 fine cells) — nearest triangle as fallback.
+
+CLI (main dir):
+    python -m src.utilities.robin_anchor --point 90                 # tables
+    python -m src.utilities.robin_anchor --point 90 --plot cp_pt90.png
+    python -m src.utilities.robin_anchor --point 90 \
+        --config configs/robin/robin_r0_musker.py \
+        --surface results_robin_r0/vtk/surface_00007000.vtk [more files...] \
+        --plot overlay.png --csv overlay.csv
+Cluster is Python 3.9: no PEP 604 annotations here.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import importlib.util
+import math
+import os
+import re
+import sys
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA_DIR = os.path.join(_REPO, "data", "robin")
+ORIFICE_CSV = os.path.join(DATA_DIR, "tm80051_orifices.csv")
+CP_CSV = os.path.join(DATA_DIR, "tm80051_cp_rotor_off.csv")
+
+#: TM-80051 Table IV, Run 12 (rotor off, closed test section)
+POINT_CONDITIONS = {
+    88: {"run": 12, "V_kt": 81.5, "alpha_deg": -10.0, "beta_deg": 0.0},
+    89: {"run": 12, "V_kt": 81.7, "alpha_deg": -5.0, "beta_deg": 0.0},
+    90: {"run": 12, "V_kt": 81.7, "alpha_deg": 0.0, "beta_deg": 0.0},
+    91: {"run": 12, "V_kt": 81.6, "alpha_deg": 5.0, "beta_deg": 0.0},
+}
+#: station groups used by the pre-registered discriminators (patch robin/02)
+FORE_STATIONS = (1, 2)           # x/R 0.05, 0.09 — carried-over question
+NOSE_STATIONS = (1, 2, 3, 4)     # x/R <= 0.20
+PYLON_STATIONS = (8, 9, 10, 11)  # x/R 0.47-1.00 (pylon span 0.40-1.018)
+AFT_STATIONS = (12, 13, 14)      # x/R 1.16-1.53 (sting-side caveat)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Loading
+# ──────────────────────────────────────────────────────────────────────
+def load_orifices(path: str = ORIFICE_CSV) -> Dict[str, np.ndarray]:
+    """Orifice table -> dict of arrays (orifice, station, side, xyz, phi_deg)."""
+    rows = list(csv.DictReader(open(path)))
+    o = np.array([int(r["orifice"]) for r in rows])
+    st = np.array([int(r["station"]) for r in rows])
+    side = np.array([r["side"].split("(")[0] for r in rows])
+    xyz = np.array([[float(r["x_R"]), float(r["y_R"]), float(r["z_R"])]
+                    for r in rows])
+    phi = np.degrees(np.arctan2(xyz[:, 1], xyz[:, 2]))
+    order = np.argsort(o)
+    return {"orifice": o[order], "station": st[order], "side": side[order],
+            "xyz": xyz[order], "phi_deg": phi[order]}
+
+
+def load_cp(path: str = CP_CSV) -> Dict[int, Dict[str, np.ndarray]]:
+    """Cp table -> {point: {'orifice', 'cp', 'flag', ...conditions}}."""
+    out: Dict[int, Dict[str, list]] = {}
+    for r in csv.DictReader(open(path)):
+        pt = int(r["point"])
+        d = out.setdefault(pt, {"orifice": [], "cp": [], "flag": []})
+        d["orifice"].append(int(r["orifice"]))
+        d["cp"].append(float(r["cp"]) if r["cp"] != "" else float("nan"))
+        d["flag"].append(r["flag"])
+        d["run"] = int(r["run"]); d["V_kt"] = float(r["V_kt"])
+        d["alpha_deg"] = float(r["alpha_deg"]); d["beta_deg"] = float(r["beta_deg"])
+    res: Dict[int, Dict[str, np.ndarray]] = {}
+    for pt, d in out.items():
+        idx = np.argsort(d["orifice"])
+        cp = np.array(d["cp"])[idx]
+        assert len(cp) == 176, (pt, len(cp))
+        res[pt] = {"orifice": np.array(d["orifice"])[idx], "cp": cp,
+                   "flag": np.array(d["flag"])[idx],
+                   "run": d["run"], "V_kt": d["V_kt"],
+                   "alpha_deg": d["alpha_deg"], "beta_deg": d["beta_deg"]}
+    return res
+
+
+def mirror_pairs(cp: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(cp_starboard[88], cp_port[88], mirror-mean[88]) for orifices 1-88."""
+    s, p = cp[:88], cp[88:]
+    mean = np.where(np.isnan(s), p, np.where(np.isnan(p), s, 0.5 * (s + p)))
+    return s, p, mean
+
+
+def station_table(orf: Dict[str, np.ndarray], cp: np.ndarray, station: int
+                  ) -> List[Tuple[int, float, float, str]]:
+    """[(orifice, phi_deg, cp, side)] sorted by phi (-180..180) for one station."""
+    sel = np.where(orf["station"] == station)[0]
+    rows = [(int(orf["orifice"][i]), float(orf["phi_deg"][i]), float(cp[i]),
+             str(orf["side"][i])) for i in sel]
+    return sorted(rows, key=lambda t: t[1])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Simulation surface files (surfel stack)
+# ──────────────────────────────────────────────────────────────────────
+def read_surface_vtk(path: str):
+    """surface_<step>.vtk (legacy ASCII polydata, per-triangle cell data)."""
+    txt = open(path).read()
+    m = re.search(r"POINTS (\d+) float\n", txt)
+    n_pts = int(m.group(1)); p0 = m.end()
+    m2 = re.search(r"\nPOLYGONS (\d+) (\d+)\n", txt)
+    pts = np.array(txt[p0:m2.start()].split(), dtype=np.float64).reshape(n_pts, 3)
+    n_poly = int(m2.group(1)); q0 = m2.end()
+    m3 = re.search(r"\nCELL_DATA (\d+)\n", txt)
+    poly = np.array(txt[q0:m3.start()].split(), dtype=np.int64).reshape(n_poly, 4)[:, 1:]
+    rest = txt[m3.end():]
+    fields = {}
+    for mm in re.finditer(r"(SCALARS|VECTORS) (\w+) float( 1)?\n(LOOKUP_TABLE default\n)?", rest):
+        s = mm.end(); nxt = re.search(r"\n(SCALARS|VECTORS) ", rest[s:])
+        blk = rest[s: s + nxt.start()] if nxt else rest[s:]
+        arr = np.array(blk.split(), dtype=np.float64)
+        fields[mm.group(2)] = arr.reshape(-1, 3) if mm.group(1) == "VECTORS" else arr
+    return pts, poly, fields
+
+
+def load_config(path: str) -> dict:
+    spec = importlib.util.spec_from_file_location("robin_cfg", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.config
+
+
+def orifices_to_l0lu(xyz_R: np.ndarray, stl_cfg: dict) -> np.ndarray:
+    """Map orifice coordinates (STL frame) into the run's global L0-lu frame
+    with the solver's own STL transform (src.boundary.stl_mesh)."""
+    if _REPO not in sys.path:
+        sys.path.insert(0, _REPO)
+    from src.boundary.stl_mesh import load_stl_checked, _rotation_matrix
+    mesh = load_stl_checked(stl_cfg["file"])
+    scale = float(stl_cfg["scale_to_lu"])
+    v = mesh.vertices * scale
+    p = np.asarray(xyz_R, dtype=np.float64) * scale
+    rot = stl_cfg.get("rotation_deg")
+    if rot is not None and np.any(np.asarray(rot, dtype=np.float64) != 0.0):
+        pivot = 0.5 * (v.min(axis=0) + v.max(axis=0))
+        Rm = _rotation_matrix(np.asarray(rot, dtype=np.float64)).T
+        v = (v - pivot) @ Rm + pivot
+        p = (p - pivot) @ Rm + pivot
+    bbox_center = 0.5 * (v.min(axis=0) + v.max(axis=0))
+    return p + (np.asarray(stl_cfg["center_lu"], dtype=np.float64) - bbox_center)
+
+
+def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float):
+    """Time-mean per-triangle Cp over several surface files.
+
+    Returns (centroids, cp_mean, cp_std_over_files, area, file_cp_offset)
+    where file_cp_offset = mean(Cp_file - Cp_here) documents the writer's
+    area-mean p_ref choice."""
+    cps, areas, cen, off = [], None, None, []
+    for path in paths:
+        pts, poly, F = read_surface_vtk(path)
+        tri = pts[poly]
+        c = tri.mean(axis=1)
+        a = F["area"]
+        nan_frac = float(np.mean(~np.isfinite(F["p_use"])))
+        if nan_frac > 0.0:
+            # step-0 files predate the first facet pass (all NaN); a partial
+            # NaN share means a diverged run -> never average it in silently
+            print(f"   [surface] {os.path.basename(path)}: p_use NaN share "
+                  f"{nan_frac:.3f} -> SKIPPED")
+            continue
+        cp = (F["p_use"] - p_inf) / q_inf
+        if "Cp" in F:
+            off.append(float(np.average(F["Cp"] - cp, weights=np.maximum(a, 1e-300))))
+        cps.append(cp); areas = a if areas is None else np.maximum(areas, a); cen = c
+    if not cps:
+        raise SystemExit("no usable surface file (all skipped: NaN p_use)")
+    cps = np.array(cps)
+    return cen, cps.mean(axis=0), cps.std(axis=0), areas, (float(np.mean(off)) if off else float("nan"))
+
+
+def sample_at_points(pts_lu: np.ndarray, cen: np.ndarray, val: np.ndarray,
+                     area: np.ndarray, r_s: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Area-weighted mean of `val` over triangles (with surfel coverage
+    area > 0) within r_s of each point; nearest covered triangle otherwise.
+    Returns (sampled, n_triangles_used)."""
+    from scipy.spatial import cKDTree
+    live = area > 0.0
+    tree = cKDTree(cen[live])
+    vl, al = val[live], area[live]
+    out = np.full(len(pts_lu), np.nan); n_used = np.zeros(len(pts_lu), dtype=int)
+    for i, p in enumerate(pts_lu):
+        idx = tree.query_ball_point(p, r_s)
+        if not idx:
+            _, j = tree.query(p); idx = [j]
+        w = al[idx]
+        out[i] = float(np.sum(vl[idx] * w) / np.sum(w)); n_used[i] = len(idx)
+    return out, n_used
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Metrics (pre-registered readouts, patch robin/02)
+# ──────────────────────────────────────────────────────────────────────
+def compare(orf: Dict[str, np.ndarray], cp_exp: np.ndarray, cp_sim: np.ndarray
+            ) -> Dict[str, object]:
+    """Station-wise and grouped RMS / mean offsets, sim - exp, mirror-mean
+    exp basis (both sides of the sim are sampled and averaged the same way)."""
+    _, _, exp_m = mirror_pairs(cp_exp)
+    _, _, sim_m = mirror_pairs(cp_sim)
+    st = orf["station"][:88]
+    d = sim_m - exp_m
+    per = {}
+    for s in range(1, 15):
+        sel = (st == s) & np.isfinite(d)
+        per[s] = {"x_R": float(orf["xyz"][:88][st == s, 0].mean()),
+                  "n": int(sel.sum()),
+                  "rms": float(np.sqrt(np.mean(d[sel] ** 2))) if sel.any() else float("nan"),
+                  "mean": float(np.mean(d[sel])) if sel.any() else float("nan"),
+                  "exp_min": float(np.nanmin(exp_m[st == s])),
+                  "sim_min": float(np.nanmin(sim_m[st == s]))}
+    def grp(stations):
+        sel = np.isin(st, stations) & np.isfinite(d)
+        return {"rms": float(np.sqrt(np.mean(d[sel] ** 2))),
+                "mean": float(np.mean(d[sel]))}
+    ok = np.isfinite(d)
+    return {"per_station": per,
+            "all": {"rms": float(np.sqrt(np.mean(d[ok] ** 2))),
+                    "mean": float(np.mean(d[ok]))},
+            "fore": grp(FORE_STATIONS), "nose": grp(NOSE_STATIONS),
+            "pylon": grp(PYLON_STATIONS), "aft": grp(AFT_STATIONS),
+            "sim_LR_asym_rms": float(np.sqrt(np.nanmean((cp_sim[:88] - cp_sim[88:]) ** 2))),
+            "exp_LR_asym_rms": float(np.sqrt(np.nanmean((cp_exp[:88] - cp_exp[88:]) ** 2)))}
+
+
+def print_report(pt: int, cpd: Dict[str, np.ndarray], orf: Dict[str, np.ndarray],
+                 cp_sim: Optional[np.ndarray] = None) -> None:
+    cp = cpd["cp"]
+    print(f"== TM-80051 Run {cpd['run']} point {pt}: alpha {cpd['alpha_deg']:+.0f} deg, "
+          f"beta {cpd['beta_deg']:.0f}, V {cpd['V_kt']} kt (rotor off)")
+    s, p, m = mirror_pairs(cp)
+    dd = np.abs(s - p)
+    print(f"   mirror asymmetry |dCp|: mean {np.nanmean(dd):.4f}, max {np.nanmax(dd):.3f}; "
+          f"flags: {int(np.sum(cpd['flag'] != ''))} cells, unreadable: "
+          f"{int(np.sum(np.isnan(cp)))}")
+    hdr = "   st  x/R    n   Cp_min(exp)  Cp_max(exp)  phi(Cp_min)"
+    if cp_sim is not None:
+        hdr += "   | Cp_min(sim)  rms(sim-exp)  mean(sim-exp)"
+    print(hdr)
+    rep = compare(orf, cp, cp_sim) if cp_sim is not None else None
+    for st in range(1, 15):
+        rows = station_table(orf, cp, st)
+        vals = np.array([r[2] for r in rows]); phis = np.array([r[1] for r in rows])
+        k = int(np.nanargmin(vals))
+        line = (f"   {st:2d}  {rows[0][0] and orf['xyz'][orf['station'] == st, 0].mean():.3f}  "
+                f"{len(rows):2d}   {np.nanmin(vals):+.3f}       {np.nanmax(vals):+.3f}      "
+                f"{phis[k]:+6.1f}")
+        if rep is not None:
+            ps = rep["per_station"][st]
+            line += f"   | {ps['sim_min']:+.3f}       {ps['rms']:.4f}        {ps['mean']:+.4f}"
+        print(line)
+    if rep is not None:
+        print(f"   ALL  rms {rep['all']['rms']:.4f} mean {rep['all']['mean']:+.4f} | "
+              f"fore(1-2) rms {rep['fore']['rms']:.4f} mean {rep['fore']['mean']:+.4f} | "
+              f"nose(1-4) rms {rep['nose']['rms']:.4f} | pylon(8-11) rms {rep['pylon']['rms']:.4f} | "
+              f"aft(12-14) rms {rep['aft']['rms']:.4f}")
+        print(f"   L/R asymmetry rms: sim {rep['sim_LR_asym_rms']:.4f}  exp {rep['exp_LR_asym_rms']:.4f}")
+
+
+def plot_stations(orf, cp_exp, cp_sim, path: str, title: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 7, figsize=(22, 7), sharey=True)
+    for st, ax in zip(range(1, 15), axes.ravel()):
+        rows = station_table(orf, cp_exp, st)
+        phi = np.array([r[1] for r in rows]); v = np.array([r[2] for r in rows])
+        ax.plot(phi, v, "ko", ms=4, label="TM-80051")
+        if cp_sim is not None:
+            rs = station_table(orf, cp_sim, st)
+            ax.plot([r[1] for r in rs], [r[2] for r in rs], "r-s", ms=3, lw=1, label="LBM")
+        ax.set_title(f"st {st}  x/R={orf['xyz'][orf['station'] == st, 0].mean():.3f}", fontsize=9)
+        ax.set_xlim(-185, 185); ax.grid(alpha=0.3); ax.invert_yaxis()
+        ax.set_xlabel("phi [deg] (0=top, +90=stbd)", fontsize=7)
+    axes[0, 0].set_ylabel("Cp"); axes[0, 0].legend(fontsize=7)
+    fig.suptitle(title); fig.tight_layout()
+    fig.savefig(path, dpi=130); print(f"   plot -> {path}")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--point", type=int, default=90, choices=sorted(POINT_CONDITIONS))
+    ap.add_argument("--data", default=DATA_DIR)
+    ap.add_argument("--config", default=None, help="run config (.py) for the sim overlay")
+    ap.add_argument("--surface", nargs="*", default=None,
+                    help="surface_*.vtk files (time-averaged); globs allowed")
+    ap.add_argument("--r-sample", type=float, default=1.5,
+                    help="sampling radius in FINE (surfel-level) cells")
+    ap.add_argument("--p-inf", type=float, default=1.0 / 3.0, help="lattice p_inf (rho_inf/3)")
+    ap.add_argument("--plot", default=None); ap.add_argument("--csv", default=None)
+    ap.add_argument("--stations", action="store_true", help="print orifice-level tables")
+    a = ap.parse_args(argv)
+
+    orf = load_orifices(os.path.join(a.data, "tm80051_orifices.csv"))
+    cpd = load_cp(os.path.join(a.data, "tm80051_cp_rotor_off.csv"))[a.point]
+    cp_sim = None
+    if a.surface:
+        if a.config is None:
+            sys.exit("--surface needs --config (STL placement + U_lu)")
+        cfg = load_config(a.config)
+        files = sorted(sum((glob.glob(s) for s in a.surface), []))
+        if not files:
+            sys.exit("no surface files matched")
+        u_lu = float(cfg["physics"]["initial_flow_velocity"][0])
+        q_inf = 0.5 * u_lu ** 2
+        stl = cfg["internal_geometry"]["stl"]
+        nlev = int(cfg.get("mlg", {}).get("num_levels", 1))
+        r_s = a.r_sample / 2 ** (nlev - 1)          # fine cells -> L0 lu
+        pts_lu = orifices_to_l0lu(orf["xyz"], stl)
+        cen, cpm, cps, area, off = surface_cp_mean(files, a.p_inf, q_inf)
+        cp_sim, n_used = sample_at_points(pts_lu, cen, cpm, area, r_s)
+        print(f"== sim: {len(files)} surface file(s) {os.path.basename(files[0])} .. "
+              f"{os.path.basename(files[-1])}; U_lu {u_lu:.5f} q_inf {q_inf:.4e} "
+              f"p_inf {a.p_inf:.6f}; r_s {r_s:.3f} L0 lu; triangles/orifice "
+              f"min {n_used.min()} median {int(np.median(n_used))}; "
+              f"file-Cp offset (area-mean p_ref) {off:+.4f}; "
+              f"per-triangle time-std median {np.median(cps):.4f}")
+    print_report(a.point, cpd, orf, cp_sim)
+    if a.stations:
+        for st in range(1, 15):
+            print(f"   -- station {st}")
+            for o, phi, v, side in station_table(orf, cpd["cp"], st):
+                extra = f"  sim {cp_sim[o - 1]:+.3f}" if cp_sim is not None else ""
+                print(f"      orifice {o:3d} phi {phi:+7.1f} Cp {v:+.3f} {side}{extra}")
+    if a.csv:
+        with open(a.csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["orifice", "station", "side", "x_R", "y_R", "z_R", "phi_deg",
+                        "cp_exp", "flag", "cp_sim"])
+            for i in range(176):
+                w.writerow([int(orf["orifice"][i]), int(orf["station"][i]), orf["side"][i],
+                            *[f"{v:.4f}" for v in orf["xyz"][i]], f"{orf['phi_deg'][i]:.2f}",
+                            "" if np.isnan(cpd["cp"][i]) else f"{cpd['cp'][i]:.3f}",
+                            cpd["flag"][i],
+                            "" if cp_sim is None else f"{cp_sim[i]:.4f}"])
+        print(f"   csv -> {a.csv}")
+    if a.plot:
+        plot_stations(orf, cpd["cp"], cp_sim, a.plot,
+                      f"ROBIN rotor-off Cp — TM-80051 pt {a.point} "
+                      f"(alpha {cpd['alpha_deg']:+.0f}, {cpd['V_kt']} kt)")
+
+
+if __name__ == "__main__":
+    main()
