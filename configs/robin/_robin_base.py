@@ -33,10 +33,13 @@ Timing: dt0 = dx0*U_lu/U = 8.35e-5 s; body flow-through L/U = 0.0749 s =
 surface files (every output_interval) from step >= 6500 form the Cp
 averaging window (>= 2.2 body FT after >= 7 body FT of development).
 
-Geometry asset = robin_mod_v2.stl (robin_src/make_robin_union.py: exact
-per-station 2D union loft, sliver-free; v1 boolean union kept for record,
-surfaces agree to 0.002 R). Surfel needs overlap_cap=True here (02 sec. 7:
-the concave junction is the first non-convex surfel body).
+Geometry asset = robin_mod_v3.stl (robin_src/make_robin_union.py: exact
+per-station 2D union loft with the junction corners as ring vertices —
+clean crease edge, section deviation 5e-4 R, sliver-free; v2 (arc-length
+resampling) had a zig-zag crease and is retired, v1 boolean union kept
+for record). Surfel needs overlap_cap=True here (02 sec. 7: the concave
+junction is the first non-convex surfel body); the crease itself carries
+a bounded spurious overpressure (02 sec. 7.7) — open solver item.
 
 Surfel stack = NACA campaign parity (patch 45/54 defaults): law musker,
 h_law 3, tau_model ON, mode wallmodel, orient as_is, march_axis z
@@ -87,7 +90,7 @@ NU_PHYS  = U_INF * L_PHYS / RE         # derived knob (== NU_SLS here)
 MA       = U_INF / C_S_PHYS            # 0.1235
 U_LU     = MA / math.sqrt(3.0)         # 0.07130 (acoustic scaling)
 
-STL_PATH = os.path.join(_repo, "input_files", "geom", "robin_mod_v2.stl")   # clean union loft (02 sec. 7)
+STL_PATH = os.path.join(_repo, "input_files", "geom", "robin_mod_v3.stl")   # corner-preserving union loft (02 sec. 7.7)
 BODY_BBOX_R = ((0.0, -0.125, -0.125), (2.0, 0.125, 0.1975))   # measured (01)
 
 # region boxes in R, relative to the nose (x) and the body axis (y, z)
