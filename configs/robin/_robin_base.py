@@ -33,13 +33,18 @@ Timing: dt0 = dx0*U_lu/U = 8.35e-5 s; body flow-through L/U = 0.0749 s =
 surface files (every output_interval) from step >= 6500 form the Cp
 averaging window (>= 2.2 body FT after >= 7 body FT of development).
 
-Geometry asset = robin_mod_v3.stl (robin_src/make_robin_union.py: exact
-per-station 2D union loft with the junction corners as ring vertices —
-clean crease edge, section deviation 5e-4 R, sliver-free; v2 (arc-length
-resampling) had a zig-zag crease and is retired, v1 boolean union kept
-for record). Surfel needs overlap_cap=True here (02 sec. 7: the concave
-junction is the first non-convex surfel body); the crease itself carries
-a bounded spurious overpressure (02 sec. 7.7) — open solver item.
+Geometry asset = robin_mod_v1c.stl (user decision 0826, 02 sec. 7.10-7.11):
+the genROBIN/makerobin boolean union (v1: fuselage 400x128 + pylon 120x64,
+manifold3d) with the seam slivers collapsed by robin_src/clean_seam.py
+(relative sliver criterion, pylon tips frozen, cap flips) — the genROBIN
+triangulation everywhere else, 0 folds, surface within 0.0017 R of v1.
+The ~50 hair triangles at the pylon tips (tangential-contact singularity
+of any boolean) are sub-cell and harmless for the surfel build. v3
+(analytic union loft, robin_mod_v3.stl) is kept as the analytic
+reference / quad-export source. Surfel needs overlap_cap=True here (02
+sec. 7: the concave junction is the first non-convex surfel body); the
+crease itself carries a bounded spurious overpressure (02 sec. 7.7) —
+open solver item.
 
 Surfel stack = NACA campaign parity (patch 45/54 defaults): law musker,
 h_law 3, tau_model ON, mode wallmodel, orient as_is, march_axis z
@@ -90,7 +95,7 @@ NU_PHYS  = U_INF * L_PHYS / RE         # derived knob (== NU_SLS here)
 MA       = U_INF / C_S_PHYS            # 0.1235
 U_LU     = MA / math.sqrt(3.0)         # 0.07130 (acoustic scaling)
 
-STL_PATH = os.path.join(_repo, "input_files", "geom", "robin_mod_v3.stl")   # corner-preserving union loft (02 sec. 7.7)
+STL_PATH = os.path.join(_repo, "input_files", "geom", "robin_mod_v1c.stl")  # v1 boolean union, seam-cleaned (02 sec. 7.11)
 BODY_BBOX_R = ((0.0, -0.125, -0.125), (2.0, 0.125, 0.1975))   # measured (01)
 
 # region boxes in R, relative to the nose (x) and the body axis (y, z)
