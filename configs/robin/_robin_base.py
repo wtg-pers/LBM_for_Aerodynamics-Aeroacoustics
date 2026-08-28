@@ -78,6 +78,8 @@ import math
 import os
 import sys
 
+import numpy as np
+
 _here = os.path.dirname(os.path.abspath(__file__))
 _repo = os.path.dirname(os.path.dirname(_here))
 if _repo not in sys.path:
@@ -119,12 +121,34 @@ def _stl_bbox_center_R():
     return tuple(0.5 * (float(lo[d]) + float(hi[d])) for d in range(3))
 
 
+#: L3 pads used by the alpha = 0 design, re-applied to the ROTATED bbox for
+#: the alpha clones (fore, aft, y, z_lo, z_hi) [R]; L2/L1 = L3 + these
+#: margins (the alpha = 0 boxes: L2 = L3 + 0.375R, L1 = L2 + 0.5/0.75R).
+_PAD_L3 = (0.125, 0.25, 0.125, 0.125, 0.15)
+_MARGIN_L2 = 0.375
+_MARGIN_L1 = (0.5, 0.75, 0.5, 0.5, 0.5)
+
+
+def _rotated_bbox_R(rotation_deg):
+    """bbox of the STL after Rz@Ry@Rx about its bbox centre, in R, relative
+    to the (unrotated) bbox centre (= the point the solver pins to center_lu)."""
+    from src.boundary.stl_mesh import load_stl_checked, _rotation_matrix
+    v = load_stl_checked(STL_PATH).vertices
+    pivot = 0.5 * (v.min(axis=0) + v.max(axis=0))
+    w = (v - pivot) @ _rotation_matrix(rotation_deg).T
+    return w.min(axis=0), w.max(axis=0), pivot
+
+
 def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
           output_interval: int = 500, surfel_extra: dict = None,
           rotation_deg=(0.0, 0.0, 0.0)) -> dict:
     """Config for R = r_lu0 L0 cells. rotation_deg = (0, alpha, 0) pitches
-    the body about its bbox centre (nose UP for positive alpha — verify on
-    first use, 02 sec. 5); the boxes are for alpha = 0."""
+    the body about its bbox centre: Ry gives z' = -sin(a) x + cos(a) z, so
+    the nose (x = -1R from the pivot) rises for positive alpha = nose-up
+    = positive angle of attack (report() prints nose/tail z as the check).
+    alpha = 0 uses the registered boxes (_BOXES_R); for alpha != 0 the
+    L3/L2/L1 boxes are rebuilt from the ROTATED bbox with the same pads
+    (patch robin/07), the flow stays along +x."""
     r = float(r_lu0)
     (x0, x1), (y0, y1), (z0, z1) = DOMAIN_R
     Nx, Ny, Nz = (int(round((x1 - x0) * r)), int(round((y1 - y0) * r)),
@@ -133,14 +157,34 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
     cx, cy, cz = _stl_bbox_center_R()
     center_lu = (nose_x + cx * r, axis_y + cy * r, axis_z + cz * r)
 
-    def _r(box):
+    def _r(box, outward=False):
+        """Region in inclusive L0 nodes. outward=True (rotated-bbox boxes)
+        rounds min down / max up so the pad rule is never under-cut by
+        rounding; the alpha = 0 design boxes keep plain rounding (bit-
+        identical to the registered R0 grid)."""
         (bx0, bx1), (by0, by1), (bz0, bz1) = box
+        lo = (lambda v: int(math.floor(v))) if outward else (lambda v: int(round(v)))
+        hi = (lambda v: int(math.ceil(v))) if outward else (lambda v: int(round(v)))
         return {"region": {
-            "x_min": int(round(nose_x + bx0 * r)), "x_max": int(round(nose_x + bx1 * r)),
-            "y_min": int(round(axis_y + by0 * r)), "y_max": int(round(axis_y + by1 * r)),
-            "z_min": int(round(axis_z + bz0 * r)), "z_max": int(round(axis_z + bz1 * r))}}
+            "x_min": lo(nose_x + bx0 * r), "x_max": hi(nose_x + bx1 * r),
+            "y_min": lo(axis_y + by0 * r), "y_max": hi(axis_y + by1 * r),
+            "z_min": lo(axis_z + bz0 * r), "z_max": hi(axis_z + bz1 * r)}}
 
-    levels = [{}, _r(_BOXES_R[1]), _r(_BOXES_R[2]), _r(_BOXES_R[3])]
+    rot = tuple(float(a) for a in rotation_deg)
+    if any(a != 0.0 for a in rot):
+        lo, hi, _ = _rotated_bbox_R(rot)
+        # rotated bbox relative to the nose-x / axis frame used by _r():
+        # the pivot (bbox centre) sits at (cx, cy, cz) in that frame
+        bx = (cx + lo[0], cx + hi[0]); by = (cy + lo[1], cy + hi[1]); bz = (cz + lo[2], cz + hi[2])
+        f, a_, py, zl, zh = _PAD_L3
+        b3 = ((bx[0] - f, bx[1] + a_), (by[0] - py, by[1] + py), (bz[0] - zl, bz[1] + zh))
+        m = _MARGIN_L2
+        b2 = ((b3[0][0] - m, b3[0][1] + m), (b3[1][0] - m, b3[1][1] + m), (b3[2][0] - m, b3[2][1] + m))
+        f1, a1, y1_, zl1, zh1 = _MARGIN_L1
+        b1 = ((b2[0][0] - f1, b2[0][1] + a1), (b2[1][0] - y1_, b2[1][1] + y1_), (b2[2][0] - zl1, b2[2][1] + zh1))
+        levels = [{}, _r(b1, True), _r(b2, True), _r(b3, True)]
+    else:
+        levels = [{}, _r(_BOXES_R[1]), _r(_BOXES_R[2]), _r(_BOXES_R[3])]
 
     surfel = {"tau_model": True, "law": "musker", "h_law": 3.0,
               "march_axis": 2, "orient": "as_is",
@@ -242,8 +286,18 @@ def report(cfg: dict, label: str = "") -> dict:
           f"max_steps {cfg['time']['max_steps']} = {cfg['time']['max_steps'] / ft:.1f} body FT")
     # body placement + pad check
     c = cfg["internal_geometry"]["stl"]["center_lu"]; cR = _stl_bbox_center_R()
-    lo = [c[d] + (BODY_BBOX_R[0][d] - cR[d]) * r for d in range(3)]
-    hi = [c[d] + (BODY_BBOX_R[1][d] - cR[d]) * r for d in range(3)]
+    rot = tuple(float(a) for a in cfg["internal_geometry"]["stl"].get("rotation_deg", (0, 0, 0)))
+    if any(a != 0.0 for a in rot):
+        rlo, rhi, _ = _rotated_bbox_R(rot)
+        lo = [c[d] + rlo[d] * r for d in range(3)]; hi = [c[d] + rhi[d] * r for d in range(3)]
+        from src.boundary.stl_mesh import _rotation_matrix
+        Rm = _rotation_matrix(rot)
+        nose = Rm @ np.array([0.0 - cR[0], 0.0, 0.0 - cR[2]]); tail = Rm @ np.array([2.0 - cR[0], 0.0, 0.04 - cR[2]])
+        print(f"  rotation {rot}: nose tip z {nose[2]:+.3f} R vs tail z {tail[2]:+.3f} R -> "
+              f"{'NOSE UP (positive alpha)' if nose[2] > tail[2] + 0.5 * (0.04) else 'nose down'} ; rotated bbox z [{rlo[2]:+.3f},{rhi[2]:+.3f}] R")
+    else:
+        lo = [c[d] + (BODY_BBOX_R[0][d] - cR[d]) * r for d in range(3)]
+        hi = [c[d] + (BODY_BBOX_R[1][d] - cR[d]) * r for d in range(3)]
     rg = cfg["mlg"]["levels"][-1]["region"]
     pads = [(lo[0] - rg["x_min"]) / r, (rg["x_max"] - hi[0]) / r,
             (lo[1] - rg["y_min"]) / r, (rg["y_max"] - hi[1]) / r,
