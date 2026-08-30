@@ -209,6 +209,54 @@ def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float):
     return cen, cps.mean(axis=0), cps.std(axis=0), areas, (float(np.mean(off)) if off else float("nan"))
 
 
+def orifice_normals(stl_path: str, xyz_R: np.ndarray) -> np.ndarray:
+    """Outward unit normals at the orifices = normal of the nearest STL facet."""
+    import trimesh
+    from scipy.spatial import cKDTree
+    m = trimesh.load(stl_path)
+    _, fi = cKDTree(m.triangles_center).query(xyz_R)
+    n = np.array(m.face_normals[fi], dtype=np.float64)
+    cb = m.triangles_center.mean(axis=0)
+    flip = ((m.triangles_center[fi] - cb) * n).sum(axis=1) < 0.0
+    n[flip] *= -1.0
+    return n
+
+
+def volume_cp_at_height(level_dir: str, steps: Sequence[int], stl_cfg: dict, xyz_R: np.ndarray,
+                        h_cells: float, n_levels: int, rho_phys: float, u_phys: float,
+                        scale_R: float) -> np.ndarray:
+    """Cp read from the FINEST-level volume output (lbm_<step>_level<k>.vti,
+    p_gauge_pa) at h_cells fine cells along the outward normal of every
+    orifice, time-averaged over `steps` (robin/08: the surfel p_state is
+    sampled 0.5 cell from the wall, inside the slip/cut-cell numerical
+    layer whose pressure carries the centrifugal gradient down to the
+    wall — on the ROBIN nose that reads 0.05-0.09 low; the pressure at the
+    edge of that layer, ~1.5-2 cells, matches the measured wall Cp)."""
+    import glob as _glob
+    import vtk
+    from vtk.util.numpy_support import vtk_to_numpy
+    from scipy.ndimage import map_coordinates
+    q = 0.5 * rho_phys * u_phys ** 2
+    n = orifice_normals(stl_cfg["file"], xyz_R)
+    cell_R = 1.0 / scale_R / 2 ** (n_levels - 1)               # fine cell in R
+    pts_lu = orifices_to_l0lu(xyz_R + n * h_cells * cell_R, stl_cfg)
+    acc = None
+    for s in steps:
+        f = sorted(_glob.glob(os.path.join(level_dir, f"*{int(s):08d}*level{n_levels - 1}.vti")))
+        if not f:
+            raise SystemExit(f"no level-{n_levels - 1} vti for step {s} in {level_dir}")
+        r = vtk.vtkXMLImageDataReader(); r.SetFileName(f[0]); r.Update(); im = r.GetOutput()
+        dims = im.GetDimensions(); org = np.array(im.GetOrigin()); sp = np.array(im.GetSpacing())
+        src = im.GetPointData() if im.GetPointData().GetNumberOfArrays() else im.GetCellData()
+        p = vtk_to_numpy(src.GetArray("p_gauge_pa")).reshape(dims[2], dims[1], dims[0]).transpose(2, 1, 0).astype(np.float64)
+        sm = vtk_to_numpy(src.GetArray("solid_mask")).reshape(dims[2], dims[1], dims[0]).transpose(2, 1, 0) > 0
+        p = np.where(sm, np.nan, p)
+        g = (pts_lu - org) / sp
+        v = map_coordinates(p, g.T, order=1, mode="nearest") / q
+        acc = v if acc is None else acc + v
+    return acc / len(steps)
+
+
 def sample_at_points(pts_lu: np.ndarray, cen: np.ndarray, val: np.ndarray,
                      area: np.ndarray, r_s: float) -> Tuple[np.ndarray, np.ndarray]:
     """Area-weighted mean of `val` over triangles (with surfel coverage
@@ -316,6 +364,20 @@ def plot_stations(orf, cp_exp, cp_sim, path: str, title: str) -> None:
     fig.savefig(path, dpi=130); print(f"   plot -> {path}")
 
 
+def _write_csv(path: str, orf, cpd, cp_sim) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["orifice", "station", "side", "x_R", "y_R", "z_R", "phi_deg",
+                    "cp_exp", "flag", "cp_sim"])
+        for i in range(176):
+            w.writerow([int(orf["orifice"][i]), int(orf["station"][i]), orf["side"][i],
+                        *[f"{v:.4f}" for v in orf["xyz"][i]], f"{orf['phi_deg'][i]:.2f}",
+                        "" if np.isnan(cpd["cp"][i]) else f"{cpd['cp'][i]:.3f}",
+                        cpd["flag"][i],
+                        "" if cp_sim is None else f"{cp_sim[i]:.4f}"])
+    print(f"   csv -> {path}")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--point", type=int, default=90, choices=sorted(POINT_CONDITIONS))
@@ -326,6 +388,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap.add_argument("--r-sample", type=float, default=1.5,
                     help="sampling radius in FINE (surfel-level) cells")
     ap.add_argument("--p-inf", type=float, default=1.0 / 3.0, help="lattice p_inf (rho_inf/3)")
+    ap.add_argument("--volume-dir", default=None,
+                    help="finest-level vti directory (…/vtk/level3): read the wall Cp from the VOLUME "
+                         "at --p-h fine cells along the orifice normal instead of the surface file (robin/08)")
+    ap.add_argument("--p-h", type=float, default=1.5, help="normal sampling height [fine cells] for --volume-dir")
+    ap.add_argument("--steps", nargs="*", type=int, default=None, help="steps for --volume-dir (default: from --surface file names)")
     ap.add_argument("--plot", default=None); ap.add_argument("--csv", default=None)
     ap.add_argument("--stations", action="store_true", help="print orifice-level tables")
     a = ap.parse_args(argv)
@@ -346,6 +413,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         nlev = int(cfg.get("mlg", {}).get("num_levels", 1))
         r_s = a.r_sample / 2 ** (nlev - 1)          # fine cells -> L0 lu
         pts_lu = orifices_to_l0lu(orf["xyz"], stl)
+        if a.volume_dir:
+            steps = a.steps or [int(re.search(r"surface_(\d+)", f).group(1)) for f in files]
+            cp_sim = volume_cp_at_height(a.volume_dir, steps, stl, orf["xyz"], a.p_h, nlev,
+                                         float(cfg["physics"]["rho"]), float(cfg["physics"]["U_inf"]),
+                                         float(stl["scale_to_lu"]))
+            print(f"== sim (VOLUME, h = {a.p_h:g} fine cells along the orifice normal): steps {steps}; "
+                  f"nan {int(np.isnan(cp_sim).sum())}")
+            print_report(a.point, cpd, orf, cp_sim)
+            if a.csv:
+                _write_csv(a.csv, orf, cpd, cp_sim)
+            if a.plot:
+                plot_stations(orf, cpd["cp"], cp_sim, a.plot,
+                              f"ROBIN rotor-off Cp — TM-80051 pt {a.point} (volume p at h={a.p_h:g} cells)")
+            return
         cen, cpm, cps, area, off = surface_cp_mean(files, a.p_inf, q_inf)
         cp_sim, n_used = sample_at_points(pts_lu, cen, cpm, area, r_s)
         print(f"== sim: {len(files)} surface file(s) {os.path.basename(files[0])} .. "
@@ -362,17 +443,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 extra = f"  sim {cp_sim[o - 1]:+.3f}" if cp_sim is not None else ""
                 print(f"      orifice {o:3d} phi {phi:+7.1f} Cp {v:+.3f} {side}{extra}")
     if a.csv:
-        with open(a.csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["orifice", "station", "side", "x_R", "y_R", "z_R", "phi_deg",
-                        "cp_exp", "flag", "cp_sim"])
-            for i in range(176):
-                w.writerow([int(orf["orifice"][i]), int(orf["station"][i]), orf["side"][i],
-                            *[f"{v:.4f}" for v in orf["xyz"][i]], f"{orf['phi_deg'][i]:.2f}",
-                            "" if np.isnan(cpd["cp"][i]) else f"{cpd['cp'][i]:.3f}",
-                            cpd["flag"][i],
-                            "" if cp_sim is None else f"{cp_sim[i]:.4f}"])
-        print(f"   csv -> {a.csv}")
+        _write_csv(a.csv, orf, cpd, cp_sim)
     if a.plot:
         plot_stations(orf, cpd["cp"], cp_sim, a.plot,
                       f"ROBIN rotor-off Cp — TM-80051 pt {a.point} "
