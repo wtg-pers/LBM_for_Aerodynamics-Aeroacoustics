@@ -809,7 +809,7 @@ class SurfelFacets:
 
     # ------------------------------------------------------------------
     def facet_traction(self, G_in=None, G_out=None,
-                       rho_a=None) -> Dict[str, np.ndarray]:
+                       rho_a=None, rho_ph=None) -> Dict[str, np.ndarray]:
         """Per-facet surface load, on the GEOMETRY (not the lattice).
 
         Eq. (9) IS the momentum flux through a facet, so this is the
@@ -861,8 +861,9 @@ class SurfelFacets:
         # writes (the same trap as G_in/G_out above). Without it the
         # production surface Cp silently fell back to -pn (68 sec. 0).
         if rho_a is None:
-            _pr = getattr(self, '_p_rho', None)
-            rho_a = _pr if _pr is not None else self._state[0]
+            rho_a = self._state[0]
+        if rho_ph is None:
+            rho_ph = getattr(self, '_p_rho', None)
         if rho_a is None:
             p_state = np.full(self.n_f, np.nan)
             p_use = -pn
@@ -871,4 +872,10 @@ class SurfelFacets:
             p_use = p_state
         return {'force': f_body, 'traction': trac, 'p': -pn, 'tau': tau,
                 'tau_mag': np.linalg.norm(tau, axis=1), 'dp': dp,
-                'p_state': p_state, 'p_use': p_use}
+                'p_state': p_state, 'p_use': p_use,
+                # 2nd channel (robin/10b): pressure sampled at p_sample_h
+                # (outside the modeled layer, patch 08/09); NaN when the
+                # channel is absent (noslip, or no kernel rho_out2).
+                'p_state_ph': (np.asarray(rho_ph, dtype=np.float64) * THETA
+                               if rho_ph is not None
+                               else np.full(self.n_f, np.nan))}

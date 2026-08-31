@@ -180,7 +180,8 @@ def orifices_to_l0lu(xyz_R: np.ndarray, stl_cfg: dict) -> np.ndarray:
     return p + (np.asarray(stl_cfg["center_lu"], dtype=np.float64) - bbox_center)
 
 
-def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float):
+def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float,
+                    channel: str = "p_use"):
     """Time-mean per-triangle Cp over several surface files.
 
     Returns (centroids, cp_mean, cp_std_over_files, area, file_cp_offset)
@@ -192,14 +193,18 @@ def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float):
         tri = pts[poly]
         c = tri.mean(axis=1)
         a = F["area"]
-        nan_frac = float(np.mean(~np.isfinite(F["p_use"])))
+        if channel not in F:
+            raise SystemExit(f"surface file has no '{channel}' array "
+                             f"(p_state_ph needs a run with the robin/10b "
+                             f"two-channel writer)")
+        nan_frac = float(np.mean(~np.isfinite(F[channel])))
         if nan_frac > 0.0:
             # step-0 files predate the first facet pass (all NaN); a partial
             # NaN share means a diverged run -> never average it in silently
             print(f"   [surface] {os.path.basename(path)}: p_use NaN share "
                   f"{nan_frac:.3f} -> SKIPPED")
             continue
-        cp = (F["p_use"] - p_inf) / q_inf
+        cp = (F[channel] - p_inf) / q_inf
         if "Cp" in F:
             off.append(float(np.average(F["Cp"] - cp, weights=np.maximum(a, 1e-300))))
         cps.append(cp); areas = a if areas is None else np.maximum(areas, a); cen = c
@@ -388,6 +393,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap.add_argument("--r-sample", type=float, default=1.5,
                     help="sampling radius in FINE (surfel-level) cells")
     ap.add_argument("--p-inf", type=float, default=1.0 / 3.0, help="lattice p_inf (rho_inf/3)")
+    ap.add_argument("--p-channel", default="p_use",
+                    choices=["p_use", "p_state_ph"],
+                    help="surface pressure array: p_use = legacy p_state at "
+                         "sample_h (0.5); p_state_ph = the p_sample_h channel "
+                         "(robin/10b, outside the modeled layer)")
     ap.add_argument("--volume-dir", default=None,
                     help="finest-level vti directory (…/vtk/level3): read the wall Cp from the VOLUME "
                          "at --p-h fine cells along the orifice normal instead of the surface file (robin/08)")
@@ -427,7 +437,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 plot_stations(orf, cpd["cp"], cp_sim, a.plot,
                               f"ROBIN rotor-off Cp — TM-80051 pt {a.point} (volume p at h={a.p_h:g} cells)")
             return
-        cen, cpm, cps, area, off = surface_cp_mean(files, a.p_inf, q_inf)
+        cen, cpm, cps, area, off = surface_cp_mean(files, a.p_inf, q_inf,
+                                                   channel=a.p_channel)
         cp_sim, n_used = sample_at_points(pts_lu, cen, cpm, area, r_s)
         print(f"== sim: {len(files)} surface file(s) {os.path.basename(files[0])} .. "
               f"{os.path.basename(files[-1])}; U_lu {u_lu:.5f} q_inf {q_inf:.4e} "

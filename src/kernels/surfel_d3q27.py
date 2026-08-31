@@ -311,11 +311,13 @@ extern "C" __global__ void surfel_scatter(
                                            // (patch 80); ones = Musker
     const int pg_on, const double pg_ds,   // patch 81 dp/ds probes
     const signed char* __restrict__ crease, // (n_f,) 1 = concave-crease facet -> Eq. (10) (robin/02 7.12)
-    const double p_h)                      // p_state sample height [cells]
-                                           // (robin/10, survey robin/09):
-                                           // OUTPUT-ONLY (rho_out); == h
-                                           // reproduces the old path bit-
-                                           // for-bit (no extra sample).
+    const double p_h,                      // 2nd-channel sample height
+    double*       __restrict__ rho_out2)   // (n_f,) rho at p_h (robin/10b:
+                                           // TWO-channel surface pressure.
+                                           // rho_out stays at h = legacy
+                                           // p_state; rho_out2 at p_h =
+                                           // outside the modeled layer.
+                                           // p_h == h copies, no sample).
 {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_f) return;
@@ -338,8 +340,16 @@ extern "C" __global__ void surfel_scatter(
         if (fb_out)  fb_out[a] = 1;
         if (rho_out) {
             double cst[5];
-            sample_state(rho, uf, live, cen, nrm, a, p_h, Nx, Ny, Nz, px, py, pz, cst);
+            sample_state(rho, uf, live, cen, nrm, a, h, Nx, Ny, Nz, px, py, pz, cst);
             rho_out[a] = cst[0];
+            if (rho_out2) {
+                if (p_h == h) { rho_out2[a] = cst[0]; }
+                else {
+                    sample_state(rho, uf, live, cen, nrm, a, p_h,
+                                 Nx, Ny, Nz, px, py, pz, cst);
+                    rho_out2[a] = cst[0];
+                }
+            }
         }
         return;
     }
@@ -362,19 +372,21 @@ extern "C" __global__ void surfel_scatter(
         if (tau_out) tau_out[a] = 0.0;
         if (fb_out)  fb_out[a] = 1;
         if (rho_out) rho_out[a] = 0.0;     // no sample in no-slip (host: NaN)
+        if (rho_out2) rho_out2[a] = 0.0;
         return;
     }
 
     double st[5];
     sample_state(rho, uf, live, cen, nrm, a, h, Nx, Ny, Nz, px, py, pz, st);
     double ur = st[0], ux = st[1], uy = st[2], uz = st[3];
-    if (rho_out) {
-        if (p_h == h) { rho_out[a] = ur; }
+    if (rho_out) rho_out[a] = ur;
+    if (rho_out2) {
+        if (p_h == h) { rho_out2[a] = ur; }
         else {
             double pst[5];
             sample_state(rho, uf, live, cen, nrm, a, p_h,
                          Nx, Ny, Nz, px, py, pz, pst);
-            rho_out[a] = pst[0];
+            rho_out2[a] = pst[0];
         }
     }
     const double un = ux*nx + uy*ny + uz*nz;           // Eq. (12): u_n = 0
@@ -680,6 +692,8 @@ class SurfelKernelD3Q27:
         # writer's p_state = rho^a theta — the pressure Eq. (20)
         # intends, free of the Eq. (24) dp the normal traction carries.
         self.rho_out = cp.zeros(self.n_f, dtype=cp.float64)
+        #: 2nd channel (robin/10b): rho at p_h -> p_state_ph in the writer
+        self.rho_out2 = cp.zeros(self.n_f, dtype=cp.float64)
         # per-facet intermittency (patch 80): ones = pure Musker, and the
         # kernel short-circuits g >= 1, so the default is bit-neutral.
         gam = getattr(facets, 'gamma', None)
@@ -780,7 +794,7 @@ class SurfelKernelD3Q27:
             cp.int32(self._per[0]), cp.int32(self._per[1]),
             cp.int32(self._per[2]), self.rho_out, self.gamma,
             cp.int32(self.pg_on), cp.float64(self.pg_ds),
-            self.crease, cp.float64(self.p_h)))
+            self.crease, cp.float64(self.p_h), self.rho_out2))
 
         self._wm_seed = 0          # only the first pass seeds the filter
 

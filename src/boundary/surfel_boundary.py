@@ -671,7 +671,10 @@ class SurfelBoundary:
         # no-slip (mode 0) takes no sample -> host convention p = -pn
         rho_a = (np.asarray(self.kernel.rho_out.get(), dtype=np.float64)
                  if self.kernel.mode != 0 else None)
-        t = self.facets.facet_traction(G_in=G_in, G_out=G_out, rho_a=rho_a)
+        rho_ph = (np.asarray(self.kernel.rho_out2.get(), dtype=np.float64)
+                  if self.kernel.mode != 0 else None)
+        t = self.facets.facet_traction(G_in=G_in, G_out=G_out, rho_a=rho_a,
+                                       rho_ph=rho_ph)
         import os as _os
         if _os.environ.get('LBM_SURF_DUMP'):          # gate U1 forensics
             full = np.empty((self.n_facets, 9))
@@ -680,10 +683,12 @@ class SurfelBoundary:
             full[:, 8] = t['p_use']
             np.save(path + '.facets.npy', full)
         fields = {'p_use': t['p_use'], 'dp': t['dp'],
+                  'p_state_ph': t['p_state_ph'],
                   'tau_mag': t['tau_mag'], 'tau': t['tau'],
                   'traction': t['traction']}
         if self.q_inf:
             fields['Cp'] = (t['p_use'] - self.p_ref) / float(self.q_inf)
+            fields['Cp_ph'] = (t['p_state_ph'] - self.p_ref) / float(self.q_inf)
             fields['Cf'] = t['tau_mag'] / float(self.q_inf)
         a_tri, agg, is_sum = self.surface_contribution(fields)
         if extra:
@@ -725,13 +730,19 @@ class SurfelBoundary:
             G_out = np.asarray(self.kernel.G_out.get(), dtype=np.float64)
             rho_a = (np.asarray(self.kernel.rho_out.get(), dtype=np.float64)
                      if self.kernel.mode != 0 else None)
+            rho_ph = (np.asarray(self.kernel.rho_out2.get(),
+                                 dtype=np.float64)
+                      if self.kernel.mode != 0 else None)
             t = self.facets.facet_traction(G_in=G_in, G_out=G_out,
-                                           rho_a=rho_a)
+                                           rho_a=rho_a, rho_ph=rho_ph)
             fields = {'p_use': t['p_use'], 'dp': t['dp'],
+                      'p_state_ph': t['p_state_ph'],
                       'tau_mag': t['tau_mag'], 'tau': t['tau'],
                       'traction': t['traction']}
             if self.q_inf:
                 fields['Cp'] = (t['p_use'] - self.p_ref) / float(self.q_inf)
+                fields['Cp_ph'] = ((t['p_state_ph'] - self.p_ref)
+                                   / float(self.q_inf))
                 fields['Cf'] = t['tau_mag'] / float(self.q_inf)
         own = getattr(self, 'facet_owned_h', None)
         surf = self.surfels

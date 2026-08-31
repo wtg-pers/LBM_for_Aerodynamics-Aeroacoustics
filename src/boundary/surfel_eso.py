@@ -397,6 +397,7 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     sk.tau_out = xp.zeros(sk.n_f, dtype=xp.float64)
     sk.fb_out = xp.zeros(sk.n_f, dtype=xp.uint8)
     sk.rho_out = xp.zeros(sk.n_f, dtype=xp.float64)
+    sk.rho_out2 = xp.zeros(sk.n_f, dtype=xp.float64)
     sk.u_wm = xp.zeros((sk.n_f, 3), dtype=xp.float64)
     sk.utau_prev = xp.zeros(sk.n_f, dtype=xp.float64)
     sk._wm_seed = 1
@@ -548,7 +549,8 @@ class SlabSurfelBoundary(_SB):
     # so every global facet arrives exactly once; the traction arithmetic
     # is the shared primitive (surfel.traction_kinematics) on the owned
     # subset -> the assembled arrays are bitwise the 1-GPU evaluation.
-    _SURF_COLS = 9       # p(-pn), tau(3), tau_mag, traction(3), p_state
+    _SURF_COLS = 10      # p(-pn), tau(3), tau_mag, traction(3), p_state,
+                         # p_state_ph (robin/10b 2nd channel)
 
     def surface_payload(self):
         """(gids int64 (n_own,), vals f64 (n_own, 8)) of OWNED facets, or
@@ -587,8 +589,11 @@ class SlabSurfelBoundary(_SB):
             from src.boundary.surfel import THETA
             rho_a = np.asarray(k.rho_out.get(), dtype=np.float64)[own]
             vals[:, 8] = rho_a * THETA
+            vals[:, 9] = (np.asarray(k.rho_out2.get(),
+                                     dtype=np.float64)[own] * THETA)
         else:
             vals[:, 8] = -pn
+            vals[:, 9] = -pn
         return np.asarray(self.facet_gids, dtype=np.int64)[own], vals
 
     def write_surface_assembled(self, path: str, gids, vals) -> int:
@@ -615,12 +620,15 @@ class SlabSurfelBoundary(_SB):
         if _os.environ.get('LBM_SURF_DUMP'):
             np.save(path + '.facets.npy', full)       # gate U1 forensics
         p_use = full[:, 8]                  # p_state (patch 70)
+        p_ph = full[:, 9]                   # p_state_ph (robin/10b)
         tau_mag = full[:, 4]
         fields = {'p_use': p_use, 'dp': np.zeros(n_f),
+                  'p_state_ph': p_ph,
                   'tau_mag': tau_mag, 'tau': full[:, 1:4],
                   'traction': full[:, 5:8]}
         if self.q_inf:
             fields['Cp'] = (p_use - self.p_ref) / float(self.q_inf)
+            fields['Cp_ph'] = (p_ph - self.p_ref) / float(self.q_inf)
             fields['Cf'] = tau_mag / float(self.q_inf)
         a_tri, agg = aggregate_to_triangles(self.surfels, fields,
                                             self.n_faces)
