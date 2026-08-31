@@ -214,6 +214,131 @@ def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float,
     return cen, cps.mean(axis=0), cps.std(axis=0), areas, (float(np.mean(off)) if off else float("nan"))
 
 
+def orifice_curvature_quadric(stl_path: str, xyz_R: np.ndarray,
+                              radius: float = 0.012, min_pts: int = 12
+                              ) -> Dict[str, np.ndarray]:
+    """Principal curvatures/directions at surface points from a local quadric
+    fit on the STL (robin/11 K0).
+
+    Fits z = f + d x + e y + a x^2 + b xy + c y^2 over mesh vertices within
+    `radius` (mesh units = R for the ROBIN STL) in a frame whose z axis is
+    the area-weighted outward facet normal; curvature from the Weingarten
+    map at the origin. The intercept f is REQUIRED: the query points sit up
+    to ~3e-3 R off the discrete surface and without f that offset aliases
+    into the quadratic terms as 2f/r^2 (~10/R for r = 0.02 — robin/11).
+    Sign convention: convex (curving away from the outward normal) positive.
+    Validated against the analytic genROBIN surface at the 176 orifices:
+    |k|max relative error median 1.0%, p90 7.6% at radius 0.012 (robin/11 K0;
+    the trimesh angle-defect/dihedral ball measures failed the same <=10%
+    gate at p90 21-46%, any radius 0.010-0.030).
+
+    Returns dict: k1, k2 (principal, k1 >= k2), dir1, dir2 (unit, 3D),
+    normal (outward), n_pts (vertices used; fit widens radius x1.5 until
+    min_pts or 4x radius)."""
+    import trimesh
+    from scipy.spatial import cKDTree
+    mesh = trimesh.load(stl_path)
+    vt = cKDTree(mesh.vertices)
+    ft = cKDTree(mesh.triangles_center)
+    fn = np.asarray(mesh.face_normals); fa = np.asarray(mesh.area_faces)
+    cb = mesh.triangles_center.mean(axis=0)
+    pts = np.asarray(xyz_R, dtype=np.float64)
+    m = len(pts)
+    out = {"k1": np.full(m, np.nan), "k2": np.full(m, np.nan),
+           "dir1": np.full((m, 3), np.nan), "dir2": np.full((m, 3), np.nan),
+           "normal": np.full((m, 3), np.nan), "n_pts": np.zeros(m, dtype=int)}
+    for i, p in enumerate(pts):
+        r = radius
+        vi = vt.query_ball_point(p, r)
+        while len(vi) < min_pts and r < 4.0 * radius:
+            r *= 1.5
+            vi = vt.query_ball_point(p, r)
+        fi = ft.query_ball_point(p, r)
+        if len(vi) < 6 or not fi:
+            continue
+        n = (fn[fi] * fa[fi, None]).sum(axis=0)
+        nn = np.linalg.norm(n)
+        if nn == 0.0:
+            continue
+        n /= nn
+        if np.dot(mesh.triangles_center[fi[0]] - cb, n) < 0.0:
+            n = -n
+        t1 = np.cross(n, [0.0, 0.0, 1.0])
+        if np.linalg.norm(t1) < 1e-6:
+            t1 = np.cross(n, [0.0, 1.0, 0.0])
+        t1 /= np.linalg.norm(t1)
+        t2 = np.cross(n, t1)
+        Q = mesh.vertices[vi] - p
+        x, y, z = Q @ t1, Q @ t2, Q @ n
+        A = np.column_stack([np.ones_like(x), x, y, x ** 2, x * y, y ** 2])
+        try:
+            coef, *_ = np.linalg.lstsq(A, z, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+        _, d, e, a, b, c = coef
+        g = np.array([[1 + d * d, d * e], [d * e, 1 + e * e]])
+        II = np.array([[2 * a, b], [b, 2 * c]]) / math.sqrt(1 + d * d + e * e)
+        w, V = np.linalg.eig(np.linalg.solve(g, II))
+        k = -w.real                       # outward z: convex -> negative Hessian
+        dirs = np.stack([V[0, j].real * t1 + V[1, j].real * t2 for j in range(2)])
+        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+        s = np.argsort(k)[::-1]
+        out["k1"][i], out["k2"][i] = k[s]
+        out["dir1"][i], out["dir2"][i] = dirs[s[0]], dirs[s[1]]
+        out["normal"][i] = n
+        out["n_pts"][i] = len(vi)
+    return out
+
+
+def kappa_n_direction(curv: Dict[str, np.ndarray], u_dir: np.ndarray) -> np.ndarray:
+    """Normal curvature along u_dir projected on the tangent plane (Euler's
+    theorem: kn = k1 cos^2 + k2 sin^2). u_dir: (3,) or (m,3). Signed, convex
+    positive; NaN where the projection is degenerate (u_dir ~ normal)."""
+    n = curv["normal"]
+    u = np.broadcast_to(np.asarray(u_dir, dtype=np.float64), n.shape)
+    t = u - (u * n).sum(axis=1, keepdims=True) * n
+    tl = np.linalg.norm(t, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t = t / tl[:, None]
+        c1 = np.abs((t * curv["dir1"]).sum(axis=1))
+    kn = curv["k1"] * c1 ** 2 + curv["k2"] * (1.0 - c1 ** 2)
+    return np.where(tl > 1e-6, kn, np.nan)
+
+
+def flow_dir_body(alpha_deg: float) -> np.ndarray:
+    """Freestream direction in the body/STL frame for pitch alpha (deg).
+
+    Sign fixed EMPIRICALLY from pt 88 (alpha -10): exp st1 Cp is +0.72 on the
+    upper side (phi 47.6) and -0.48 below (phi 150) -> windward = UPPER at
+    nose-down, i.e. u = (cos a, 0, +sin a) (robin/11; note the swapped
+    windward/acceleration labels in robin/10 s2-s3)."""
+    a = math.radians(alpha_deg)
+    return np.array([math.cos(a), 0.0, math.sin(a)])
+
+
+def read_sim_csv(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """(cp_exp[176], cp_sim[176]) back from a robin_anchor --csv output."""
+    cp_exp = np.full(176, np.nan)
+    cp_sim = np.full(176, np.nan)
+    for r in csv.DictReader(open(path)):
+        i = int(r["orifice"]) - 1
+        if r["cp_exp"] != "":
+            cp_exp[i] = float(r["cp_exp"])
+        if r["cp_sim"] != "":
+            cp_sim[i] = float(r["cp_sim"])
+    return cp_exp, cp_sim
+
+
+def select_channel_cp(cp05: np.ndarray, cp15: np.ndarray, kh: np.ndarray,
+                      kh_star: float) -> np.ndarray:
+    """Per-orifice wall-Cp channel choice (robin/11 K4): the outer channel
+    (h 1.5, outside the wall-model numerical layer) where the flow-direction
+    normal curvature satisfies kappa_n*h >= kh_star, the wall-attached
+    p_state (h 0.5) elsewhere. Hard switch: the logistic blend measured
+    slightly worse on all five rotor-off runs (robin/11 K4)."""
+    return np.where(kh >= kh_star, cp15, cp05)
+
+
 def orifice_normals(stl_path: str, xyz_R: np.ndarray) -> np.ndarray:
     """Outward unit normals at the orifices = normal of the nearest STL facet."""
     import trimesh
@@ -401,6 +526,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap.add_argument("--volume-dir", default=None,
                     help="finest-level vti directory (…/vtk/level3): read the wall Cp from the VOLUME "
                          "at --p-h fine cells along the orifice normal instead of the surface file (robin/08)")
+    ap.add_argument("--select-from", nargs=2, default=None, metavar=("CSV_H05", "CSV_H15"),
+                    help="kappa_n*h channel selection (robin/11 K4) from two existing "
+                         "--csv outputs: the h0.5 surface p_state readout and the h1.5 "
+                         "readout (volume or p_state_ph). Needs --config (STL + levels) "
+                         "and --point (alpha). Overrides --surface/--volume-dir.")
+    ap.add_argument("--kh-star", type=float, default=0.0034,
+                    help="kappa_n(flow)*h switch threshold for --select-from "
+                         "(robin/11: pooled logistic 0.0034, LORO 0.0029-0.0035, "
+                         "ALL-rms plateau 0.002-0.008)")
     ap.add_argument("--p-h", type=float, default=1.5, help="normal sampling height [fine cells] for --volume-dir")
     ap.add_argument("--steps", nargs="*", type=int, default=None, help="steps for --volume-dir (default: from --surface file names)")
     ap.add_argument("--plot", default=None); ap.add_argument("--csv", default=None)
@@ -410,6 +544,32 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     orf = load_orifices(os.path.join(a.data, "tm80051_orifices.csv"))
     cpd = load_cp(os.path.join(a.data, "tm80051_cp_rotor_off.csv"))[a.point]
     cp_sim = None
+    if a.select_from:
+        if a.config is None:
+            sys.exit("--select-from needs --config (STL placement + levels)")
+        cfg = load_config(a.config)
+        stl = cfg["internal_geometry"]["stl"]
+        nlev = int(cfg.get("mlg", {}).get("num_levels", 1))
+        cell_R = 1.0 / float(stl["scale_to_lu"]) / 2 ** (nlev - 1)
+        _, cp05 = read_sim_csv(a.select_from[0])
+        _, cp15 = read_sim_csv(a.select_from[1])
+        curv = orifice_curvature_quadric(stl["file"], orf["xyz"])
+        alpha = POINT_CONDITIONS[a.point]["alpha_deg"]
+        kn = kappa_n_direction(curv, flow_dir_body(alpha))
+        kh = kn * a.p_h * cell_R
+        cp_sim = select_channel_cp(cp05, cp15, kh, a.kh_star)
+        n15 = int(np.sum(kh >= a.kh_star))
+        print(f"== sim (kappa_n*h channel selection, robin/11): kh* {a.kh_star:g}, "
+              f"h {a.p_h:g} fine cells (cell {cell_R:.5f} R), alpha {alpha:+.0f}; "
+              f"h1.5 channel at {n15}/176 orifices")
+        print_report(a.point, cpd, orf, cp_sim)
+        if a.csv:
+            _write_csv(a.csv, orf, cpd, cp_sim)
+        if a.plot:
+            plot_stations(orf, cpd["cp"], cp_sim, a.plot,
+                          f"ROBIN rotor-off Cp — TM-80051 pt {a.point} "
+                          f"(kappa_n*h selected, kh*={a.kh_star:g})")
+        return
     if a.surface:
         if a.config is None:
             sys.exit("--surface needs --config (STL placement + U_lu)")
