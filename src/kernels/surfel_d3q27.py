@@ -310,7 +310,12 @@ extern "C" __global__ void surfel_scatter(
     const double* __restrict__ gamma_a,    // (n_f,) intermittency
                                            // (patch 80); ones = Musker
     const int pg_on, const double pg_ds,   // patch 81 dp/ds probes
-    const signed char* __restrict__ crease) // (n_f,) 1 = concave-crease facet -> Eq. (10) (robin/02 7.12)
+    const signed char* __restrict__ crease, // (n_f,) 1 = concave-crease facet -> Eq. (10) (robin/02 7.12)
+    const double p_h)                      // p_state sample height [cells]
+                                           // (robin/10, survey robin/09):
+                                           // OUTPUT-ONLY (rho_out); == h
+                                           // reproduces the old path bit-
+                                           // for-bit (no extra sample).
 {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_f) return;
@@ -333,7 +338,7 @@ extern "C" __global__ void surfel_scatter(
         if (fb_out)  fb_out[a] = 1;
         if (rho_out) {
             double cst[5];
-            sample_state(rho, uf, live, cen, nrm, a, h, Nx, Ny, Nz, px, py, pz, cst);
+            sample_state(rho, uf, live, cen, nrm, a, p_h, Nx, Ny, Nz, px, py, pz, cst);
             rho_out[a] = cst[0];
         }
         return;
@@ -363,7 +368,15 @@ extern "C" __global__ void surfel_scatter(
     double st[5];
     sample_state(rho, uf, live, cen, nrm, a, h, Nx, Ny, Nz, px, py, pz, st);
     double ur = st[0], ux = st[1], uy = st[2], uz = st[3];
-    if (rho_out) rho_out[a] = ur;
+    if (rho_out) {
+        if (p_h == h) { rho_out[a] = ur; }
+        else {
+            double pst[5];
+            sample_state(rho, uf, live, cen, nrm, a, p_h,
+                         Nx, Ny, Nz, px, py, pz, pst);
+            rho_out[a] = pst[0];
+        }
+    }
     const double un = ux*nx + uy*ny + uz*nz;           // Eq. (12): u_n = 0
     ux -= un*nx; uy -= un*ny; uz -= un*nz;
 
@@ -674,6 +687,10 @@ class SurfelKernelD3Q27:
                           np.asarray(gam, dtype=np.float64)))
                       if gam is not None
                       else cp.ones(self.n_f, dtype=cp.float64))
+        _ph = getattr(facets, 'p_sample_h', None)
+        #: p_state sample height (robin/10) -- output-only; defaults to
+        #: sample_h so an unset knob is bit-identical (kernel guard p_h==h).
+        self.p_h = float(_ph) if _ph is not None else float(facets.sample_h)
         cr = getattr(facets, 'crease', None)
         self.crease = cp.asarray((np.asarray(cr, dtype=bool) if cr is not None
                                   else np.zeros(facets.n_f, dtype=bool)).astype(np.int8))
@@ -763,7 +780,7 @@ class SurfelKernelD3Q27:
             cp.int32(self._per[0]), cp.int32(self._per[1]),
             cp.int32(self._per[2]), self.rho_out, self.gamma,
             cp.int32(self.pg_on), cp.float64(self.pg_ds),
-            self.crease))
+            self.crease, cp.float64(self.p_h)))
 
         self._wm_seed = 0          # only the first pass seeds the filter
 

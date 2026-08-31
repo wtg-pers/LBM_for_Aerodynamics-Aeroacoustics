@@ -316,7 +316,9 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     chk = np.flatnonzero(keep & facet_rel)
     # patch 81 note: the dp/ds probes are span-projected (z-component
     # zero), so pg_ds adds NOTHING to the slab-axis envelope.
-    reach = (float(k.f.sample_h) + float(k.h_law)) * np.abs(
+    reach = (max(float(k.f.sample_h),
+                 float(getattr(k.f, 'p_sample_h', None) or 0.0))
+             + float(k.h_law)) * np.abs(
         nrm_h[chk][:, axis]) + 1.0
     pos_w = (cen_h[chk][:, axis] - (own_start - ghost)) % n_ax
     if ((pos_w - reach < 0) | (pos_w + reach > W)).any():
@@ -342,7 +344,7 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     sk.block = k.block
     for name in ('mode', 'law_id', 'law_iters', 'h_law', 'nu',
                  'y_plus_min', 'fric_dir', 'fb_mode', 'wm_mode', 'wm_tf',
-                 'pg_on', 'pg_ds', '_per'):
+                 'pg_on', 'pg_ds', 'p_h', '_per'):
         setattr(sk, name, getattr(k, name))
     sk.n_f = int(kept.size)
     sk.shape = slab_shape
@@ -400,6 +402,7 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     sk._wm_seed = 1
     sk.f = SimpleNamespace(
         sample_h=k.f.sample_h,
+        p_sample_h=getattr(k.f, 'p_sample_h', None),
         cdotn=np.ascontiguousarray(np.asarray(k.f.cdotn)[kept]))
 
     # ── slab boundary object ────────────────────────────────────────

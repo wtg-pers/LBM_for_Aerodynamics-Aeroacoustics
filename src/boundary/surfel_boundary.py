@@ -46,6 +46,12 @@ from src.kernels.surfel_d3q27 import SurfelKernelD3Q27
 #: campaign-final defaults (patch 45 sec. 3 / testbed CLI defaults)
 _DEFAULTS = dict(
     law='musker', h_law=3.0, y_plus_min=30.0, sample_h=0.5,
+    # p_state sample height [cells] (robin/10, survey robin/09): where the
+    # SURFACE PRESSURE channel samples rho -- outside the modeled near-wall
+    # layer (WMLES matching-location practice). OUTPUT-ONLY: physics
+    # (Eq. 16/25 state, wall law) stays at sample_h/h_law. None = sample_h
+    # (bit-identical legacy path).
+    p_sample_h=None,
     friction_dir='log', fallback='viscous', mode='wallmodel',
     dv_min=1e-6, march_axis=2, orient='as_is',
     tau_model=False, collide='kernel',
@@ -163,6 +169,10 @@ class SurfelBoundary:
             friction_dir=p['friction_dir'], fallback=p['fallback'],
             wm_filter=None,
         )
+        _ph = p['p_sample_h']
+        if _ph is not None and not float(_ph) > 0.0:
+            raise ValueError("surfel p_sample_h must be > 0 [cells]")
+        self.facets.p_sample_h = None if _ph is None else float(_ph)
         if self._crease_facets is not None:
             # BEFORE the kernel wrapper: it snapshots facets.crease (like gamma)
             self.facets.crease = self._crease_facets
@@ -757,7 +767,9 @@ class SurfelBoundary:
         p = self.params
         s = (f"surfel wall BC (S8a): {self.n_facets} facets, "
              f"prism nnz {self.nnz}, dropped dV {self.dropped_vol:.3g}, "
-             f"law {p['law']} h={p['h_law']:g} fallback {p['fallback']} "
+             f"law {p['law']} h={p['h_law']:g} "
+             f"p_h {(p['p_sample_h'] if p['p_sample_h'] is not None else p['sample_h']):g} "
+             f"fallback {p['fallback']} "
              f"dv_min {p['dv_min']:g}")
         if self._taum_summary:
             s += "\n            " + self._taum_summary
@@ -870,7 +882,8 @@ def check_level_coupling_bands(sb: SurfelBoundary, region,
     # partial cells (tolerance: the march's float64 column accumulation
     # may leave far-field fluid at 1 - eps, which is not a cut cell)
     part_xyz = np.argwhere(sb.live_h & (sb.dV_h < 1.0 - 1e-9))
-    reach = (max(float(sb.facets.h_law), float(sb.facets.sample_h))
+    reach = (max(float(sb.facets.h_law), float(sb.facets.sample_h),
+                 float(getattr(sb.facets, 'p_sample_h', None) or 0.0))
              + 1.0 + float(getattr(sb.facets, 'pg_ds', None) or 0.0))
     samp_xyz = (np.asarray(sb.facets.centroid, dtype=np.float64)
                 + np.asarray(sb.facets.normal, dtype=np.float64) * reach)

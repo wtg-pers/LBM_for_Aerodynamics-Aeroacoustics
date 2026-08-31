@@ -444,6 +444,7 @@ class SurfelFacets:
         self._force = np.zeros(3)
         self._df = np.zeros((self.n_f, len(_SHELLS)))
         self._state = (None, None)
+        self._p_rho = None
         self._fallback = np.zeros(self.n_f, dtype=bool)
         self._u_tau = np.zeros(self.n_f)
         self._y_plus = np.zeros(self.n_f)
@@ -483,12 +484,21 @@ class SurfelFacets:
             # Eq. (21)-(22) correction and hence NO dp term: no-slip surface
             # pressure carries none of the deferred Eq. (23)-(24) error.
             self._state = (None, None)
+            self._p_rho = None
             self._df = np.zeros((self.n_f, len(_SHELLS)))
             self._fallback = np.ones(self.n_f, dtype=bool)
             self._tau_w = np.zeros(self.n_f)
             return G_out
 
         rho_a, u_a, u_n = self.sample_state(rho, u, want_un=True)
+        # p_state channel (robin/10): rho for the surface pressure may be
+        # sampled at a SEPARATE height p_sample_h (survey robin/09: outside
+        # the modeled layer). Output-only -- rho_a below stays the physics
+        # state. Mirrors the CUDA kernel's p_h == h guard bit-for-bit.
+        _ph = getattr(self, 'p_sample_h', None)
+        self._p_rho = (rho_a if _ph is None
+                       or float(_ph) == float(self.sample_h)
+                       else self.sample_state(rho, u, h=float(_ph))[0])
         fallback = np.zeros(self.n_f, dtype=bool)
         #: velocity the Eq. (25) friction is BUILT from. Same direction as
         #: u_a in Chen's structure; `friction_dir="log"` swaps the direction
@@ -595,9 +605,14 @@ class SurfelFacets:
             .sum(axis=0)
 
     # ------------------------------------------------------------------
-    def sample_state(self, rho, u, want_un=False):
-        """(rho^a, u^a) at x_a + h n, with the NORMAL velocity zeroed (12)."""
-        xs = self.centroid + self.sample_h * self.normal
+    def sample_state(self, rho, u, want_un=False, h=None):
+        """(rho^a, u^a) at x_a + h n, with the NORMAL velocity zeroed (12).
+
+        h: sample height override [cells]; None = self.sample_h. Used by
+        the p_state channel (p_sample_h, robin/10) -- physics callers
+        never pass it."""
+        xs = self.centroid + (self.sample_h if h is None else float(h)) \
+            * self.normal
         fields = np.concatenate([rho[None, ...], u], axis=0)
         got = self._trilinear(fields, xs)
         r, v = got[0], got[1:].T
@@ -846,7 +861,8 @@ class SurfelFacets:
         # writes (the same trap as G_in/G_out above). Without it the
         # production surface Cp silently fell back to -pn (68 sec. 0).
         if rho_a is None:
-            rho_a = self._state[0]
+            _pr = getattr(self, '_p_rho', None)
+            rho_a = _pr if _pr is not None else self._state[0]
         if rho_a is None:
             p_state = np.full(self.n_f, np.nan)
             p_use = -pn

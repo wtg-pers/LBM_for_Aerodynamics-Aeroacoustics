@@ -187,6 +187,10 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
         levels = [{}, _r(_BOXES_R[1]), _r(_BOXES_R[2]), _r(_BOXES_R[3])]
 
     surfel = {"tau_model": True, "law": "musker", "h_law": 3.0,
+        # p_state sample height (robin/10, survey 09): surface pressure read
+        # OUTSIDE the modeled layer (readout definition of patch 08). Output-
+        # only; physics stays at sample_h/h_law.
+        "p_sample_h": 1.5,
               "march_axis": 2, "orient": "as_is",
               # robin/02 sec. 7: concave body/pylon crease -> prism overlap
               # g_i > dV (up to 17x at the pylon TE) -> negative density in
