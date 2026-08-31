@@ -128,6 +128,16 @@ _PAD_L3 = (0.125, 0.25, 0.125, 0.125, 0.15)
 _MARGIN_L2 = 0.375
 _MARGIN_L1 = (0.5, 0.75, 0.5, 0.5, 0.5)
 
+#: 2-level grid-ladder L1 box (patch robin/13, user-set round convention):
+#: full body + 1R wake, >= 0.5R pad to the surface everywhere. The finest
+#: level is L1 = R/(2 r_lu0); the 10-cells-across-the-thinnest-boom rule
+#: (finest-level criterion, boom D = 0.05R at x/R 1.9 -> cell <= R/200)
+#: is NOT met by this family (r40: 4 cells) BY DESIGN - the ladder
+#: measures how the integral QoIs drift while under-resolved, and the
+#: rule then sets the LEVEL DEPTH of the final grid (r20 -> 5, r30/r40
+#: -> 4 levels; production r32 x 4 = R/256 = 12.8 cells passes).
+GRID2_L1_BOX_R = ((-0.5, 3.0), (-1.0, 1.0), (-1.0, 1.0))
+
 
 def _rotated_bbox_R(rotation_deg):
     """bbox of the STL after Rz@Ry@Rx about its bbox centre, in R, relative
@@ -141,7 +151,7 @@ def _rotated_bbox_R(rotation_deg):
 
 def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
           output_interval: int = 500, surfel_extra: dict = None,
-          rotation_deg=(0.0, 0.0, 0.0)) -> dict:
+          rotation_deg=(0.0, 0.0, 0.0), num_levels: int = 4) -> dict:
     """Config for R = r_lu0 L0 cells. rotation_deg = (0, alpha, 0) pitches
     the body about its bbox centre: Ry gives z' = -sin(a) x + cos(a) z, so
     the nose (x = -1R from the pivot) rises for positive alpha = nose-up
@@ -171,7 +181,15 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
             "z_min": lo(axis_z + bz0 * r), "z_max": hi(axis_z + bz1 * r)}}
 
     rot = tuple(float(a) for a in rotation_deg)
-    if any(a != 0.0 for a in rot):
+    if num_levels == 2:
+        # grid-ladder family (robin/13): L0 everywhere + one body box.
+        # alpha = 0 only (the ladder is the alpha = 0 anchor case).
+        if any(a != 0.0 for a in rot):
+            raise ValueError("num_levels=2 grid-ladder is alpha=0 only")
+        levels = [{}, _r(GRID2_L1_BOX_R)]
+    elif num_levels != 4:
+        raise ValueError(f"num_levels must be 2 or 4, got {num_levels}")
+    elif any(a != 0.0 for a in rot):
         lo, hi, _ = _rotated_bbox_R(rot)
         # rotated bbox relative to the nose-x / axis frame used by _r():
         # the pivot (bbox centre) sits at (cx, cy, cz) in that frame
@@ -236,7 +254,7 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
                     "wall_bc": "surfel",
                     "surfel": surfel},
         },
-        "mlg": {"enabled": True, "num_levels": 4, "overlap_width": 2,
+        "mlg": {"enabled": True, "num_levels": len(levels), "overlap_width": 2,
                 "interpolation": "cubic", "filter_level": 1, "levels": levels},
         "sgs": {"enabled": True, "model": "smagorinsky", "Cs": 0.1},
         "conservation": {"enabled": True, "verbose": 0, "log_to_csv": True},
@@ -266,9 +284,12 @@ def report(cfg: dict, label: str = "") -> dict:
     VRAM ~ x1.15 + 0.9 GiB) + timing."""
     g = cfg["grid"]; r = float(cfg["internal_geometry"]["stl"]["scale_to_lu"])
     dx0 = R_PHYS / r
+    kf = 2 ** (len(cfg["mlg"]["levels"]) - 1)          # finest-level factor
     nodes = {0: g["Nx"] * g["Ny"] * g["Nz"]}
     print(f"  [{label}] R = {r:g} L0 cells, dx0 = {dx0 * 1e3:.2f} mm, "
-          f"dx3 = {dx0 * 1e3 / 8:.3f} mm, L = {2 * r:g} L0 = {16 * r:g} L3 cells")
+          f"dx_fine = {dx0 * 1e3 / kf:.3f} mm (L{len(cfg['mlg']['levels']) - 1}), "
+          f"L = {2 * r:g} L0 = {2 * r * kf:g} fine cells, "
+          f"boom-min 0.05R = {0.05 * r * kf:.1f} fine cells")
     print(f"  L0  {g['Nx']}x{g['Ny']}x{g['Nz']} = {nodes[0] / 1e6:6.2f} M  "
           f"domain x[{-4:g},{10:g}]R y+-3R z+-3R")
     for k, lv in enumerate(cfg["mlg"]["levels"][1:], 1):
