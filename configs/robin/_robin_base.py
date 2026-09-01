@@ -142,6 +142,12 @@ GRID2_L1_BOX_R = ((-0.5, 3.0), (-1.0, 1.0), (-1.0, 1.0))
 #: 2-level r40 (fine R/80) isolates the LEVEL-STRUCTURE axis at equal
 #: finest dx (if equal within noise: deep-levels + coarse L0 wins ~6x).
 GRID3_L2_BOX_R = ((-0.25, 2.5), (-0.5, 0.5), (-0.5, 0.5))
+#: 4-level ladder variant (robin/14 s6, Phase 2): finest body box, pads
+#: fore 0.15 / aft 0.25 / y 0.125 / z 0.125-0.15 R (>= the 0.125R rule
+#: floor; production-L3 precedent). r20 x 4 -> finest R/160, boom 8.0
+#: cells = a DELIBERATE test of the 10-cell rule (user's rotor recipe
+#: D40+MLG4 mapped to the fuselage; r20 = D40). Margins to L2 >= 8 cells.
+GRID4_L3_BOX_R = ((-0.15, 2.25), (-0.25, 0.25), (-0.25, 0.35))
 
 
 def _rotated_bbox_R(rotation_deg):
@@ -156,7 +162,8 @@ def _rotated_bbox_R(rotation_deg):
 
 def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
           output_interval: int = 500, surfel_extra: dict = None,
-          rotation_deg=(0.0, 0.0, 0.0), num_levels: int = 4) -> dict:
+          rotation_deg=(0.0, 0.0, 0.0), num_levels: int = 4,
+          ladder_boxes: bool = False) -> dict:
     """Config for R = r_lu0 L0 cells. rotation_deg = (0, alpha, 0) pitches
     the body about its bbox centre: Ry gives z' = -sin(a) x + cos(a) z, so
     the nose (x = -1R from the pivot) rises for positive alpha = nose-up
@@ -186,14 +193,18 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
             "z_min": lo(axis_z + bz0 * r), "z_max": hi(axis_z + bz1 * r)}}
 
     rot = tuple(float(a) for a in rotation_deg)
-    if num_levels in (2, 3):
-        # grid-ladder family (robin/13): L0 everywhere + body box(es).
-        # alpha = 0 only (the ladder is the alpha = 0 anchor case).
+    if num_levels in (2, 3) or ladder_boxes:
+        # grid-ladder family (robin/13-14): L0 everywhere + nested body
+        # boxes. alpha = 0 only (the ladder is the alpha = 0 anchor case).
         if any(a != 0.0 for a in rot):
-            raise ValueError("grid-ladder levels (2/3) are alpha=0 only")
+            raise ValueError("grid-ladder boxes are alpha=0 only")
+        if not 2 <= num_levels <= 4:
+            raise ValueError(f"ladder num_levels must be 2-4, got {num_levels}")
         levels = [{}, _r(GRID2_L1_BOX_R)]
-        if num_levels == 3:
+        if num_levels >= 3:
             levels.append(_r(GRID3_L2_BOX_R))
+        if num_levels >= 4:
+            levels.append(_r(GRID4_L3_BOX_R))
     elif num_levels != 4:
         raise ValueError(f"num_levels must be 2, 3 or 4, got {num_levels}")
     elif any(a != 0.0 for a in rot):
