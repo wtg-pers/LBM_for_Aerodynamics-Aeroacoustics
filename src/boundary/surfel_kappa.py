@@ -2,7 +2,7 @@
 
 Runtime home of the robin/11 wall-pressure channel criterion (robin/13b):
 the surface writer outputs, per STL triangle,
-    p_facet  wall-attached sample (h = sample_h, inside the modeled layer)
+    p_state  wall-attached sample (h = sample_h, inside the modeled layer)
     p_state_ph  raw outer sample (h = p_sample_h, outside the layer)
     p_sknh   the SELECTED channel: outer where kappa_n(flow)*h >= kh_star,
              wall-attached elsewhere (robin/11 K4: beats both fixed

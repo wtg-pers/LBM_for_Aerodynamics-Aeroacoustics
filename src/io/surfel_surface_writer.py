@@ -166,7 +166,8 @@ def finalize_surface_channels(
     """robin/13b surface output convention (applied per STL triangle, after
     aggregation/merge, at every write path):
 
-        p_facet / Cp_facet   wall-attached channel (ex p_use / Cp; sampled
+        p_state / Cp_state   wall-attached channel (ex p_use / Cp): the
+                             facet STATE sample — historical track name,
                              at sample_h inside the modeled layer)
         p_state_ph / Cp_ph   RAW outer channel (p_sample_h) — kept so the
                              kh* selection stays re-derivable offline
@@ -179,14 +180,14 @@ def finalize_surface_channels(
                              wall-attached channel.
 
     h_lu = p_sample_h in L0 lu (None or missing ph channel -> p_sknh is a
-    copy of p_facet: legacy configs stay two-name-richer but value-equal).
+    copy of p_state: legacy configs stay two-name-richer but value-equal).
     """
     out = dict(fields)
     if 'p_use' in out:
-        out['p_facet'] = out.pop('p_use')
+        out['p_state'] = out.pop('p_use')
     if 'Cp' in out:
-        out['Cp_facet'] = out.pop('Cp')
-    pf = out.get('p_facet')
+        out['Cp_state'] = out.pop('Cp')
+    pf = out.get('p_state')
     if pf is None:
         return out
     pph = out.get('p_state_ph')
@@ -198,13 +199,13 @@ def finalize_surface_channels(
         sel = mask & np.isfinite(np.asarray(pph))
     if sel is None:
         out['p_sknh'] = np.asarray(pf).copy()
-        if 'Cp_facet' in out:
-            out['Cp_sknh'] = np.asarray(out['Cp_facet']).copy()
+        if 'Cp_state' in out:
+            out['Cp_sknh'] = np.asarray(out['Cp_state']).copy()
         out['sknh_sel'] = np.zeros(len(np.asarray(pf)))
     else:
         out['p_sknh'] = np.where(sel, pph, pf)
-        if 'Cp_facet' in out and 'Cp_ph' in out:
-            out['Cp_sknh'] = np.where(sel, out['Cp_ph'], out['Cp_facet'])
+        if 'Cp_state' in out and 'Cp_ph' in out:
+            out['Cp_sknh'] = np.where(sel, out['Cp_ph'], out['Cp_state'])
         # audit channels (13b): the mask actually applied + kappa_n*h per
         # triangle — the selection is exactly reproducible (and kh* is
         # re-tunable) from the FILE alone; offline refits from the %.7g

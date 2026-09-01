@@ -196,11 +196,11 @@ def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float,
         if channel == "auto":                    # 13b default readout
             channel = "p_sknh" if "p_sknh" in F else "p_use"
         if channel not in F:
-            alias = {"p_facet": "p_use", "p_use": "p_facet"}
+            alias = {"p_state": "p_use", "p_use": "p_state"}
             channel = alias.get(channel, channel)
         if channel not in F:
             raise SystemExit(f"surface file has no '{channel}' array "
-                             f"(p_sknh/p_facet = robin/13b writer; "
+                             f"(p_sknh/p_state = robin/13b writer; "
                              f"p_state_ph = robin/10b two-channel writer; "
                              f"older files: p_use)")
         nan_frac = float(np.mean(~np.isfinite(F[channel])))
@@ -211,7 +211,7 @@ def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float,
                   f"{nan_frac:.3f} -> SKIPPED")
             continue
         cp = (F[channel] - p_inf) / q_inf
-        _cpw = F.get("Cp_facet", F.get("Cp"))
+        _cpw = F.get("Cp_state", F.get("Cp"))
         if _cpw is not None:
             off.append(float(np.average(_cpw - cp, weights=np.maximum(a, 1e-300))))
         cps.append(cp); areas = a if areas is None else np.maximum(areas, a); cen = c
@@ -454,10 +454,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     help="sampling radius in FINE (surfel-level) cells")
     ap.add_argument("--p-inf", type=float, default=1.0 / 3.0, help="lattice p_inf (rho_inf/3)")
     ap.add_argument("--p-channel", default="auto",
-                    choices=["auto", "p_sknh", "p_facet", "p_state_ph", "p_use"],
+                    choices=["auto", "p_sknh", "p_state", "p_state_ph", "p_use"],
                     help="surface pressure array: auto = p_sknh (robin/13b "
                          "kappa_n*h-selected default) with p_use fallback on "
-                         "older files; p_facet(=old p_use) = wall-attached "
+                         "older files; p_state(=old p_use) = wall-attached "
                          "sample_h channel; p_state_ph = raw p_sample_h "
                          "channel (robin/10b)")
     ap.add_argument("--volume-dir", default=None,
