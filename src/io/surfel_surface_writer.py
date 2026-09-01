@@ -156,6 +156,64 @@ def aggregate_to_triangles(
     return a_tri, out
 
 
+def finalize_surface_channels(
+    fields: Dict[str, np.ndarray],
+    verts_lu: np.ndarray,
+    faces: np.ndarray,
+    h_lu: Optional[float],
+    kh_star: Optional[float] = None,
+) -> Dict[str, np.ndarray]:
+    """robin/13b surface output convention (applied per STL triangle, after
+    aggregation/merge, at every write path):
+
+        p_facet / Cp_facet   wall-attached channel (ex p_use / Cp; sampled
+                             at sample_h inside the modeled layer)
+        p_state_ph / Cp_ph   RAW outer channel (p_sample_h) — kept so the
+                             kh* selection stays re-derivable offline
+                             (kh* is a stack constant; robin/10b lesson:
+                             never destroy a raw channel)
+        p_sknh / Cp_sknh     the DEFAULT readout: kappa_n(flow)*h channel
+                             selection (robin/11 K4), outer where
+                             kh >= kh_star, wall-attached elsewhere;
+                             NaN-kappa / NaN-ph triangles fall back to the
+                             wall-attached channel.
+
+    h_lu = p_sample_h in L0 lu (None or missing ph channel -> p_sknh is a
+    copy of p_facet: legacy configs stay two-name-richer but value-equal).
+    """
+    out = dict(fields)
+    if 'p_use' in out:
+        out['p_facet'] = out.pop('p_use')
+    if 'Cp' in out:
+        out['Cp_facet'] = out.pop('Cp')
+    pf = out.get('p_facet')
+    if pf is None:
+        return out
+    pph = out.get('p_state_ph')
+    sel = None
+    if h_lu is not None and pph is not None and np.isfinite(pph).any():
+        from src.boundary.surfel_kappa import KH_STAR_DEFAULT, sknh_mask
+        ks = KH_STAR_DEFAULT if kh_star is None else float(kh_star)
+        mask, kh = sknh_mask(verts_lu, faces, float(h_lu), ks)
+        sel = mask & np.isfinite(np.asarray(pph))
+    if sel is None:
+        out['p_sknh'] = np.asarray(pf).copy()
+        if 'Cp_facet' in out:
+            out['Cp_sknh'] = np.asarray(out['Cp_facet']).copy()
+        out['sknh_sel'] = np.zeros(len(np.asarray(pf)))
+    else:
+        out['p_sknh'] = np.where(sel, pph, pf)
+        if 'Cp_facet' in out and 'Cp_ph' in out:
+            out['Cp_sknh'] = np.where(sel, out['Cp_ph'], out['Cp_facet'])
+        # audit channels (13b): the mask actually applied + kappa_n*h per
+        # triangle — the selection is exactly reproducible (and kh* is
+        # re-tunable) from the FILE alone; offline refits from the %.7g
+        # vtk coordinates flip threshold-adjacent / sliver triangles.
+        out['sknh_sel'] = sel.astype(np.float64)
+        out['kh_flow'] = kh
+    return out
+
+
 def write_triangle_surface(
     path: str,
     triangles_lu: Tuple[np.ndarray, np.ndarray],

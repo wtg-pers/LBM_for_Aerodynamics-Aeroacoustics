@@ -322,7 +322,8 @@ class DistributedMLGRunner:
                     a: getattr(ob, a, None)
                     for a in ('surfels', 'triangles_lu', 'n_faces',
                               'q_inf', 'p_ref', 'coord_origin',
-                              'coord_spacing', 'n_facets')}
+                              'coord_spacing', 'n_facets',
+                              'p_sample_h', 'kh_star')}
             if self.owns[uid]:
                 if is_surfel:
                     from src.parallel.surfel_level import SurfelSlabLevel

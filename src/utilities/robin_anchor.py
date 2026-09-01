@@ -193,10 +193,16 @@ def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float,
         tri = pts[poly]
         c = tri.mean(axis=1)
         a = F["area"]
+        if channel == "auto":                    # 13b default readout
+            channel = "p_sknh" if "p_sknh" in F else "p_use"
+        if channel not in F:
+            alias = {"p_facet": "p_use", "p_use": "p_facet"}
+            channel = alias.get(channel, channel)
         if channel not in F:
             raise SystemExit(f"surface file has no '{channel}' array "
-                             f"(p_state_ph needs a run with the robin/10b "
-                             f"two-channel writer)")
+                             f"(p_sknh/p_facet = robin/13b writer; "
+                             f"p_state_ph = robin/10b two-channel writer; "
+                             f"older files: p_use)")
         nan_frac = float(np.mean(~np.isfinite(F[channel])))
         if nan_frac > 0.0:
             # step-0 files predate the first facet pass (all NaN); a partial
@@ -205,8 +211,9 @@ def surface_cp_mean(paths: Sequence[str], p_inf: float, q_inf: float,
                   f"{nan_frac:.3f} -> SKIPPED")
             continue
         cp = (F[channel] - p_inf) / q_inf
-        if "Cp" in F:
-            off.append(float(np.average(F["Cp"] - cp, weights=np.maximum(a, 1e-300))))
+        _cpw = F.get("Cp_facet", F.get("Cp"))
+        if _cpw is not None:
+            off.append(float(np.average(_cpw - cp, weights=np.maximum(a, 1e-300))))
         cps.append(cp); areas = a if areas is None else np.maximum(areas, a); cen = c
     if not cps:
         raise SystemExit("no usable surface file (all skipped: NaN p_use)")
@@ -218,91 +225,19 @@ def orifice_curvature_quadric(stl_path: str, xyz_R: np.ndarray,
                               radius: float = 0.012, min_pts: int = 12
                               ) -> Dict[str, np.ndarray]:
     """Principal curvatures/directions at surface points from a local quadric
-    fit on the STL (robin/11 K0).
-
-    Fits z = f + d x + e y + a x^2 + b xy + c y^2 over mesh vertices within
-    `radius` (mesh units = R for the ROBIN STL) in a frame whose z axis is
-    the area-weighted outward facet normal; curvature from the Weingarten
-    map at the origin. The intercept f is REQUIRED: the query points sit up
-    to ~3e-3 R off the discrete surface and without f that offset aliases
-    into the quadratic terms as 2f/r^2 (~10/R for r = 0.02 — robin/11).
-    Sign convention: convex (curving away from the outward normal) positive.
-    Validated against the analytic genROBIN surface at the 176 orifices:
-    |k|max relative error median 1.0%, p90 7.6% at radius 0.012 (robin/11 K0;
-    the trimesh angle-defect/dihedral ball measures failed the same <=10%
-    gate at p90 21-46%, any radius 0.010-0.030).
-
-    Returns dict: k1, k2 (principal, k1 >= k2), dir1, dir2 (unit, 3D),
-    normal (outward), n_pts (vertices used; fit widens radius x1.5 until
-    min_pts or 4x radius)."""
+    fit on the STL (robin/11 K0; radius 0.012 R validated vs the analytic
+    genROBIN surface: |k|max rel err median 1.0 %, p90 7.6 %). Since
+    robin/13b this delegates to src.boundary.surfel_kappa (the runtime
+    home of the same fit — intercept term REQUIRED, see there)."""
     import trimesh
-    from scipy.spatial import cKDTree
-    mesh = trimesh.load(stl_path)
-    vt = cKDTree(mesh.vertices)
-    ft = cKDTree(mesh.triangles_center)
-    fn = np.asarray(mesh.face_normals); fa = np.asarray(mesh.area_faces)
-    cb = mesh.triangles_center.mean(axis=0)
-    pts = np.asarray(xyz_R, dtype=np.float64)
-    m = len(pts)
-    out = {"k1": np.full(m, np.nan), "k2": np.full(m, np.nan),
-           "dir1": np.full((m, 3), np.nan), "dir2": np.full((m, 3), np.nan),
-           "normal": np.full((m, 3), np.nan), "n_pts": np.zeros(m, dtype=int)}
-    for i, p in enumerate(pts):
-        r = radius
-        vi = vt.query_ball_point(p, r)
-        while len(vi) < min_pts and r < 4.0 * radius:
-            r *= 1.5
-            vi = vt.query_ball_point(p, r)
-        fi = ft.query_ball_point(p, r)
-        if len(vi) < 6 or not fi:
-            continue
-        n = (fn[fi] * fa[fi, None]).sum(axis=0)
-        nn = np.linalg.norm(n)
-        if nn == 0.0:
-            continue
-        n /= nn
-        if np.dot(mesh.triangles_center[fi[0]] - cb, n) < 0.0:
-            n = -n
-        t1 = np.cross(n, [0.0, 0.0, 1.0])
-        if np.linalg.norm(t1) < 1e-6:
-            t1 = np.cross(n, [0.0, 1.0, 0.0])
-        t1 /= np.linalg.norm(t1)
-        t2 = np.cross(n, t1)
-        Q = mesh.vertices[vi] - p
-        x, y, z = Q @ t1, Q @ t2, Q @ n
-        A = np.column_stack([np.ones_like(x), x, y, x ** 2, x * y, y ** 2])
-        try:
-            coef, *_ = np.linalg.lstsq(A, z, rcond=None)
-        except np.linalg.LinAlgError:
-            continue
-        _, d, e, a, b, c = coef
-        g = np.array([[1 + d * d, d * e], [d * e, 1 + e * e]])
-        II = np.array([[2 * a, b], [b, 2 * c]]) / math.sqrt(1 + d * d + e * e)
-        w, V = np.linalg.eig(np.linalg.solve(g, II))
-        k = -w.real                       # outward z: convex -> negative Hessian
-        dirs = np.stack([V[0, j].real * t1 + V[1, j].real * t2 for j in range(2)])
-        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
-        s = np.argsort(k)[::-1]
-        out["k1"][i], out["k2"][i] = k[s]
-        out["dir1"][i], out["dir2"][i] = dirs[s[0]], dirs[s[1]]
-        out["normal"][i] = n
-        out["n_pts"][i] = len(vi)
-    return out
+    from src.boundary.surfel_kappa import quadric_curvature
+    m = trimesh.load(stl_path)
+    return quadric_curvature(np.asarray(m.vertices), np.asarray(m.faces),
+                             points=np.asarray(xyz_R, dtype=np.float64),
+                             radius=radius, min_pts=min_pts)
 
 
-def kappa_n_direction(curv: Dict[str, np.ndarray], u_dir: np.ndarray) -> np.ndarray:
-    """Normal curvature along u_dir projected on the tangent plane (Euler's
-    theorem: kn = k1 cos^2 + k2 sin^2). u_dir: (3,) or (m,3). Signed, convex
-    positive; NaN where the projection is degenerate (u_dir ~ normal)."""
-    n = curv["normal"]
-    u = np.broadcast_to(np.asarray(u_dir, dtype=np.float64), n.shape)
-    t = u - (u * n).sum(axis=1, keepdims=True) * n
-    tl = np.linalg.norm(t, axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        t = t / tl[:, None]
-        c1 = np.abs((t * curv["dir1"]).sum(axis=1))
-    kn = curv["k1"] * c1 ** 2 + curv["k2"] * (1.0 - c1 ** 2)
-    return np.where(tl > 1e-6, kn, np.nan)
+from src.boundary.surfel_kappa import kappa_n_direction  # noqa: E402  (13b: single source)
 
 
 def flow_dir_body(alpha_deg: float) -> np.ndarray:
@@ -518,11 +453,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap.add_argument("--r-sample", type=float, default=1.5,
                     help="sampling radius in FINE (surfel-level) cells")
     ap.add_argument("--p-inf", type=float, default=1.0 / 3.0, help="lattice p_inf (rho_inf/3)")
-    ap.add_argument("--p-channel", default="p_use",
-                    choices=["p_use", "p_state_ph"],
-                    help="surface pressure array: p_use = legacy p_state at "
-                         "sample_h (0.5); p_state_ph = the p_sample_h channel "
-                         "(robin/10b, outside the modeled layer)")
+    ap.add_argument("--p-channel", default="auto",
+                    choices=["auto", "p_sknh", "p_facet", "p_state_ph", "p_use"],
+                    help="surface pressure array: auto = p_sknh (robin/13b "
+                         "kappa_n*h-selected default) with p_use fallback on "
+                         "older files; p_facet(=old p_use) = wall-attached "
+                         "sample_h channel; p_state_ph = raw p_sample_h "
+                         "channel (robin/10b)")
     ap.add_argument("--volume-dir", default=None,
                     help="finest-level vti directory (…/vtk/level3): read the wall Cp from the VOLUME "
                          "at --p-h fine cells along the orifice normal instead of the surface file (robin/08)")

@@ -443,12 +443,17 @@ class MPIOutputManager(OutputManager):
             area = np.asarray(meta['surfels']['area'],
                               dtype=np.float64)[gids] * sc2
             p_use = vals[:, 8]
+            p_ph = vals[:, 9]      # robin/10b 2nd channel (13b: was
+                                   # dropped here — payload col 9)
             fields = {'p_use': p_use, 'dp': np.zeros(gids.size),
+                      'p_state_ph': p_ph,
                       'tau_mag': vals[:, 4], 'tau': vals[:, 1:4],
                       'traction': vals[:, 5:8]}
             if meta['q_inf']:
                 fields['Cp'] = ((p_use - meta['p_ref'])
                                 / float(meta['q_inf']))
+                fields['Cp_ph'] = ((p_ph - meta['p_ref'])
+                                   / float(meta['q_inf']))
                 fields['Cf'] = vals[:, 4] / float(meta['q_inf'])
             n_faces = int(meta['n_faces'])
             a_tri, agg = aggregate_to_triangles(
@@ -474,6 +479,12 @@ class MPIOutputManager(OutputManager):
         verts_out = (np.asarray(verts, dtype=np.float64)
                      * float(meta['coord_spacing'])
                      + np.asarray(meta['coord_origin'], dtype=np.float64))
+        from src.io.surfel_surface_writer import finalize_surface_channels
+        _ph = meta.get('p_sample_h')
+        h_lu = (None if _ph is None
+                else float(_ph) * float(meta['coord_spacing']))
+        total = finalize_surface_channels(total, verts_out, faces, h_lu,
+                                          meta.get('kh_star'))
         outdir = (self.mlg_vtk_writer.output_dir
                   if self.mlg_vtk_writer is not None else '.')
         write_triangle_surface(
@@ -511,7 +522,7 @@ class MPIOutputManager(OutputManager):
             gids, vals = sb.surface_payload()
         else:
             gids, vals = (np.zeros(0, dtype=np.int64),
-                          np.zeros((0, 9)))
+                          np.zeros((0, 10)))   # 10-col payload (10b)
         if self._nr > 1:
             parts = self._comm.gather((gids, vals), root=0)
         else:
@@ -530,8 +541,9 @@ class MPIOutputManager(OutputManager):
             from src.boundary.surfel_eso import SlabSurfelBoundary
             writer = SlabSurfelBoundary.__new__(SlabSurfelBoundary)
             for a in ('surfels', 'triangles_lu', 'n_faces', 'q_inf',
-                      'p_ref', 'coord_origin', 'coord_spacing'):
-                setattr(writer, a, meta[a])
+                      'p_ref', 'coord_origin', 'coord_spacing',
+                      'p_sample_h', 'kh_star'):
+                setattr(writer, a, meta.get(a))
             writer.n_facets_full = int(meta['n_facets'])
         import os
         outdir = (self.mlg_vtk_writer.output_dir

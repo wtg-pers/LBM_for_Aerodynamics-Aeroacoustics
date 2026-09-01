@@ -425,7 +425,8 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     out._d_CC = None
     out._force = None
     for name in ('params', 'dv_min', 'tau_model_on', 'collide_path',
-                 'q_inf', 'p_ref', 'coord_origin', 'coord_spacing'):
+                 'q_inf', 'p_ref', 'coord_origin', 'coord_spacing',
+                 'p_sample_h', 'kh_star'):
         setattr(out, name, getattr(sb, name))
     out._taum_summary = getattr(sb, '_taum_summary', '')
     out.facets = sk.f                       # hot chain reads sample_h only
@@ -606,7 +607,8 @@ class SlabSurfelBoundary(_SB):
         here — the p_state vs -pn gap IS the dp).
         """
         from src.io.surfel_surface_writer import (
-            aggregate_to_triangles, write_triangle_surface)
+            aggregate_to_triangles, finalize_surface_channels,
+            write_triangle_surface)
         n_f = self.n_facets_full
         gids = np.asarray(gids, dtype=np.int64)
         if gids.size != n_f or np.unique(gids).size != n_f:
@@ -636,6 +638,10 @@ class SlabSurfelBoundary(_SB):
         verts_out = (np.asarray(verts, dtype=np.float64)
                      * float(self.coord_spacing)
                      + np.asarray(self.coord_origin, dtype=np.float64))
+        _ph = getattr(self, 'p_sample_h', None)
+        h_lu = None if _ph is None else float(_ph) * float(self.coord_spacing)
+        agg = finalize_surface_channels(agg, verts_out, faces, h_lu,
+                                        getattr(self, 'kh_star', None))
         return write_triangle_surface(path, (verts_out, faces), a_tri, agg)
 
     def write_surface(self, path: str) -> int:

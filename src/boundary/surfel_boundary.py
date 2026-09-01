@@ -52,6 +52,10 @@ _DEFAULTS = dict(
     # (Eq. 16/25 state, wall law) stays at sample_h/h_law. None = sample_h
     # (bit-identical legacy path).
     p_sample_h=None,
+    # robin/13b: kappa_n(flow)*h channel-selection threshold for the
+    # p_sknh surface output (robin/11 K4; stack constant, LORO
+    # 0.0029-0.0035, plateau 0.002-0.008). Selection is OUTPUT-ONLY.
+    kh_star=0.0034,
     friction_dir='log', fallback='viscous', mode='wallmodel',
     dv_min=1e-6, march_axis=2, orient='as_is',
     tau_model=False, collide='kernel',
@@ -173,6 +177,8 @@ class SurfelBoundary:
         if _ph is not None and not float(_ph) > 0.0:
             raise ValueError("surfel p_sample_h must be > 0 [cells]")
         self.facets.p_sample_h = None if _ph is None else float(_ph)
+        self.p_sample_h = self.facets.p_sample_h   # writer/meta (13b)
+        self.kh_star = float(p['kh_star'])
         if self._crease_facets is not None:
             # BEFORE the kernel wrapper: it snapshots facets.crease (like gamma)
             self.facets.crease = self._crease_facets
@@ -655,7 +661,8 @@ class SurfelBoundary:
         carries (Eq. 23).
         """
         from src.io.surfel_surface_writer import (
-            aggregate_to_triangles, write_triangle_surface,
+            aggregate_to_triangles, finalize_surface_channels,
+            write_triangle_surface,
         )
         if getattr(self, '_force', None) is None:
             return 0                       # no facet pass yet this run
@@ -710,6 +717,11 @@ class SurfelBoundary:
         verts_out = (np.asarray(verts, dtype=np.float64)
                      * float(self.coord_spacing)
                      + np.asarray(self.coord_origin, dtype=np.float64))
+        h_lu = (None if self.facets.p_sample_h is None
+                else float(self.facets.p_sample_h)
+                * float(self.coord_spacing))
+        agg = finalize_surface_channels(agg, verts_out, faces, h_lu,
+                                        getattr(self, 'kh_star', None))
         return write_triangle_surface(path, (verts_out, faces), a_tri, agg)
 
     def full_triangles_lu(self):
