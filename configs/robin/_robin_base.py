@@ -137,6 +137,11 @@ _MARGIN_L1 = (0.5, 0.75, 0.5, 0.5, 0.5)
 #: rule then sets the LEVEL DEPTH of the final grid (r20 -> 5, r30/r40
 #: -> 4 levels; production r32 x 4 = R/256 = 12.8 cells passes).
 GRID2_L1_BOX_R = ((-0.5, 3.0), (-1.0, 1.0), (-1.0, 1.0))
+#: 3-level variant (robin/13 s7, user hypothesis H2): same L1 box + one
+#: nested body box -> finest = R/(4 r). robin_g3_r20 (fine R/80) vs the
+#: 2-level r40 (fine R/80) isolates the LEVEL-STRUCTURE axis at equal
+#: finest dx (if equal within noise: deep-levels + coarse L0 wins ~6x).
+GRID3_L2_BOX_R = ((-0.25, 2.5), (-0.5, 0.5), (-0.5, 0.5))
 
 
 def _rotated_bbox_R(rotation_deg):
@@ -181,14 +186,16 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
             "z_min": lo(axis_z + bz0 * r), "z_max": hi(axis_z + bz1 * r)}}
 
     rot = tuple(float(a) for a in rotation_deg)
-    if num_levels == 2:
-        # grid-ladder family (robin/13): L0 everywhere + one body box.
+    if num_levels in (2, 3):
+        # grid-ladder family (robin/13): L0 everywhere + body box(es).
         # alpha = 0 only (the ladder is the alpha = 0 anchor case).
         if any(a != 0.0 for a in rot):
-            raise ValueError("num_levels=2 grid-ladder is alpha=0 only")
+            raise ValueError("grid-ladder levels (2/3) are alpha=0 only")
         levels = [{}, _r(GRID2_L1_BOX_R)]
+        if num_levels == 3:
+            levels.append(_r(GRID3_L2_BOX_R))
     elif num_levels != 4:
-        raise ValueError(f"num_levels must be 2 or 4, got {num_levels}")
+        raise ValueError(f"num_levels must be 2, 3 or 4, got {num_levels}")
     elif any(a != 0.0 for a in rot):
         lo, hi, _ = _rotated_bbox_R(rot)
         # rotated bbox relative to the nose-x / axis frame used by _r():

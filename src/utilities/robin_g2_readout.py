@@ -183,6 +183,8 @@ def cp_three_ways(d: str, cfg: dict, files: Sequence[str], r: int
 def main(argv: Optional[Sequence[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runs", nargs="*", type=int, default=[10, 20, 30, 40])
+    ap.add_argument("--tags", nargs="*", default=[],
+                    help="extra config tags (e.g. robin_g3_r20, robin/13 s7 H2)")
     ap.add_argument("--base", default=RES_GRID)
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
@@ -191,16 +193,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                              "robin_g2_ladder")
 
     table: List[Dict[str, object]] = []
-    for r in a.runs:
-        tag = f"robin_g2_r{r}"
+    tags = [f"robin_g2_r{r}" for r in a.runs] + list(a.tags)
+    for tag in tags:
+        r = int(re.search(r"_r(\d+)$", tag).group(1))
         d = find_dir(a.base, tag)
         if d is None:
             print(f"== {tag}: NOT FOUND — skipped")
             continue
         cfg = load_config(os.path.join(_REPO, "configs", "robin", f"{tag}.py"))
         max_steps = int(cfg["time"]["max_steps"])
-        dx_fine_R = 1.0 / (2.0 * r)
-        print(f"== {tag} ({d}); fine = R/{2 * r}, boom-min {0.05 * 2 * r:.1f} cells")
+        nlev = int(cfg["mlg"]["num_levels"])
+        kf = 2 ** (nlev - 1)
+        dx_fine_R = 1.0 / (kf * r)
+        print(f"== {tag} ({d}); {nlev} levels, fine = R/{kf * r}, "
+              f"boom-min {0.05 * kf * r:.1f} cells")
         g = gate_representability(d, cfg, r)
         print(f"   [A gate] {g}")
         fw = force_window(d, max_steps)
@@ -219,7 +225,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cp = cp_three_ways(d, cfg, surfs, r)
         print(f"   [E Cp rms] h05 {cp['h05']:.4f}  ph {cp['ph']:.4f}  "
               f"sknh {cp['sknh']:.4f} (ph at {cp['n_ph_sel']}/176)")
-        table.append({"r": r, "dx_fine_R": dx_fine_R, **fw,
+        table.append({"tag": tag, "r": r, "nlev": nlev,
+                      "dx_fine_R": dx_fine_R, **fw,
                       "Cd_p": cd_p, "Cd_f": cd_f, "yplus_h3": yplus,
                       "cp_h05": cp["h05"], "cp_ph": cp["ph"],
                       "cp_sknh": cp["sknh"],
