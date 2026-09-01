@@ -148,6 +148,12 @@ GRID3_L2_BOX_R = ((-0.25, 2.5), (-0.5, 0.5), (-0.5, 0.5))
 #: cells = a DELIBERATE test of the 10-cell rule (user's rotor recipe
 #: D40+MLG4 mapped to the fuselage; r20 = D40). Margins to L2 >= 8 cells.
 GRID4_L3_BOX_R = ((-0.15, 2.25), (-0.25, 0.25), (-0.25, 0.35))
+#: 5-level ladder (robin/15 s6b): L3 cushion between the frozen L2 and the
+#: SAME finest body box (GRID4_L3_BOX_R becomes L4 at R/(16 r)) -> g4/g5
+#: differ only by one halving of the finest dx over an identical box.
+#: Fore gap to L2 is 1 L0 cell (0.05R = 4 L2 cells) = the validator's
+#: boundary case; every other margin >= 8 parent cells.
+GRID5_L3_BOX_R = ((-0.2, 2.4), (-0.4, 0.4), (-0.4, 0.45))
 
 
 def _rotated_bbox_R(rotation_deg):
@@ -198,13 +204,15 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
         # boxes. alpha = 0 only (the ladder is the alpha = 0 anchor case).
         if any(a != 0.0 for a in rot):
             raise ValueError("grid-ladder boxes are alpha=0 only")
-        if not 2 <= num_levels <= 4:
-            raise ValueError(f"ladder num_levels must be 2-4, got {num_levels}")
+        if not 2 <= num_levels <= 5:
+            raise ValueError(f"ladder num_levels must be 2-5, got {num_levels}")
         levels = [{}, _r(GRID2_L1_BOX_R)]
         if num_levels >= 3:
             levels.append(_r(GRID3_L2_BOX_R))
+        if num_levels == 5:
+            levels.append(_r(GRID5_L3_BOX_R))     # cushion (robin/15 s6b)
         if num_levels >= 4:
-            levels.append(_r(GRID4_L3_BOX_R))
+            levels.append(_r(GRID4_L3_BOX_R))     # finest body box (g4=g5)
     elif num_levels != 4:
         raise ValueError(f"num_levels must be 2, 3 or 4, got {num_levels}")
     elif any(a != 0.0 for a in rot):
