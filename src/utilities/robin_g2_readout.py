@@ -59,15 +59,15 @@ def find_dir(base: str, tag: str) -> Optional[str]:
     return None
 
 
-def gate_representability(d: str, cfg: dict, r: int) -> Dict[str, object]:
+def gate_representability(d: str, cfg: dict, r: int, nlev: int = 2) -> Dict[str, object]:
     out: Dict[str, object] = {}
     log = os.path.join(d, "csv", "setup_log.txt")
     if os.path.exists(log):
         txt = open(log).read()
-        m = re.search(r"overlap cap.*?: (\d+) \(cell,dir\) sums capped, "
-                      r"max g/dV ([\d.]+)", txt)
-        if m:
-            out["cap_sums"] = int(m.group(1)); out["cap_max"] = float(m.group(2))
+        mm = re.findall(r"overlap cap.*?: (\d+) \(cell,dir\) sums capped, "
+                        r"max g/dV ([\d.]+)", txt)
+        if mm:                       # per-level build lines; last = finest
+            out["cap_sums"] = int(mm[-1][0]); out["cap_max"] = float(mm[-1][1])
         m = re.search(r"crease_mode=noslip: (\d+) of (\d+) facets", txt)
         if m:
             out["crease_frac"] = int(m.group(1)) / int(m.group(2))
@@ -84,8 +84,9 @@ def gate_representability(d: str, cfg: dict, r: int) -> Dict[str, object]:
             m2 = (xR >= a) & (xR < b)
             cov[f"{a:g}-{b:g}"] = float((area[m2] > 0).mean()) if m2.any() else np.nan
         out["coverage"] = cov
-    # boom solid thickness from the last level-1 volume (fine cells)
-    vols = sorted(glob.glob(os.path.join(d, "vtk", "level1", "*level1.vti")))
+    # boom solid thickness from the last FINEST-level volume (fine cells)
+    lv = f"level{nlev - 1}"
+    vols = sorted(glob.glob(os.path.join(d, "vtk", lv, f"*{lv}.vti")))
     if vols:
         import vtk as _vtk
         from vtk.util.numpy_support import vtk_to_numpy
@@ -207,7 +208,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         dx_fine_R = 1.0 / (kf * r)
         print(f"== {tag} ({d}); {nlev} levels, fine = R/{kf * r}, "
               f"boom-min {0.05 * kf * r:.1f} cells")
-        g = gate_representability(d, cfg, r)
+        g = gate_representability(d, cfg, r, nlev)
         print(f"   [A gate] {g}")
         fw = force_window(d, max_steps)
         print(f"   [B force] Cd {fw['Cd']:.5f}±{fw['Cd_std']:.5f} "
