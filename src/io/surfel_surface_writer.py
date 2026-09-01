@@ -169,10 +169,10 @@ def finalize_surface_channels(
         p_state / Cp_state   wall-attached channel (ex p_use / Cp): the
                              facet STATE sample — historical track name,
                              at sample_h inside the modeled layer)
-        p_state_ph / Cp_ph   RAW outer channel (p_sample_h) — kept so the
-                             kh* selection stays re-derivable offline
-                             (kh* is a stack constant; robin/10b lesson:
-                             never destroy a raw channel)
+        (p_state_ph / Cp_ph  are computed internally but NOT written —
+                             user decision 0901: sknh_sel + kh_flow keep
+                             the selection auditable and upward-retunable;
+                             downward retune falls back to the volumes)
         p_sknh / Cp_sknh     the DEFAULT readout: kappa_n(flow)*h channel
                              selection (robin/11 K4), outer where
                              kh >= kh_star, wall-attached elsewhere;
@@ -207,11 +207,20 @@ def finalize_surface_channels(
         if 'Cp_state' in out and 'Cp_ph' in out:
             out['Cp_sknh'] = np.where(sel, out['Cp_ph'], out['Cp_state'])
         # audit channels (13b): the mask actually applied + kappa_n*h per
-        # triangle — the selection is exactly reproducible (and kh* is
-        # re-tunable) from the FILE alone; offline refits from the %.7g
-        # vtk coordinates flip threshold-adjacent / sliver triangles.
+        # triangle — the selection is auditable and kh* is re-tunable
+        # UPWARD from the file alone (new_sel = kh_flow >= kh*_new subset
+        # of sel, where p_sknh already carries the outer value); offline
+        # refits from the %.7g vtk coordinates flip threshold-adjacent /
+        # sliver triangles, so these channels are the canon.
         out['sknh_sel'] = sel.astype(np.float64)
         out['kh_flow'] = kh
+    # user decision 0901 (13b s2b): the raw outer channel is NOT written —
+    # p_sknh + sknh_sel + kh_flow cover audit and upward retuning; a
+    # DOWNWARD kh* retune needs the outer pressure where sel = 0, which
+    # is re-readable offline from the saved volumes (robin/08
+    # --volume-dir) or a rerun.
+    out.pop('p_state_ph', None)
+    out.pop('Cp_ph', None)
     return out
 
 
