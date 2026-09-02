@@ -147,18 +147,27 @@ class DistributedMLGRunner:
                                                  n_ranks, ghost)
         bounds = self.bounds
 
-        # surfel MPI (patch 64): z-cut only (62 sec. 1 registration) and
+        # surfel MPI: VERIFIED cut axes only — this is a verified-set
+        # gate, not a capability switch (value-gate registration per
+        # axis; bit gates are impossible on the surfel atomicAdd stack).
+        # z: patch 64 (periodic span cut) + mpi_axis/02 F1 repair
+        #    (global-position face BCs — required for non-periodic z).
+        # x: mpi_axis/02 S2 (F1 repair is the precondition; gates =
+        #    2/4-rank vs single-GPU QoI on the robin smoke twin).
+        # y: unregistered (S3 option — no demand case yet).
         # ghost >= 4 — the bridge chain consumes 4 ghost cells/substep
         # (advect 1 + facet cell spread 2 + trilinear 1; the slab build's
         # sample-envelope assert measures the real need and re-raises).
+        _surfel_axes_verified = (0, 2)
         has_surfel = any(
             getattr(getattr(b.sim, 'obstacle_bc', None), 'kind', None)
             == 'surfel' for b in src)
         if has_surfel and n_ranks > 1:
-            if self.axis != 2:
+            if self.axis not in _surfel_axes_verified:
                 raise ValueError(
-                    "surfel + MPI is registered for the z (span) cut only "
-                    "— pass --axis z (patch_notes/surfel/62 sec. 1)")
+                    "surfel + MPI is registered for cut axes "
+                    f"{_surfel_axes_verified} (x, z) only — axis "
+                    f"{self.axis} is unverified (patch_notes/mpi_axis/02)")
             if ghost < 4:
                 raise ValueError(
                     "surfel + MPI needs --ghost 4: the surfel stencil "

@@ -256,6 +256,12 @@ class RankLocalCouplingV1:
         # fine index — with the odd node-based nf (2n-1) a linear 2*c
         # extension would alias fine row 1 for the wrap of row 0.
         pad_lo = pad_hi = 0
+        # z-literal is CORRECT, not a z-cut assumption (mpi_axis/01 #3):
+        # the single-GPU _filter_f_neq periodic variant is itself z-flush
+        # only (grid/coupling.py "Flush-z span-through prism"), so the
+        # wrap margin is needed exactly when cut==z==both-flush. If an
+        # x/y-flush filter variant is ever added there, revise this gate
+        # in the same patch.
         span_z = (a == 2
                   and getattr(gc, '_flush_faces', {}).get('z_min', False)
                   and gc._flush_faces.get('z_max', False))

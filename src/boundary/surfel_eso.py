@@ -315,11 +315,16 @@ def build_slab_surfel(sb, axis: int, own_start: int, own_count: int,
     nrm_h = np.asarray(k.nrm.get())
     chk = np.flatnonzero(keep & facet_rel)
     # patch 81 note: the dp/ds probes are span-projected (z-component
-    # zero), so pg_ds adds NOTHING to the slab-axis envelope.
+    # zero), so for a z-cut pg_ds adds NOTHING to the slab-axis envelope.
+    # For an x/y cut the in-plane tangent CAN have a slab-axis component
+    # (|t_axis| <= 1) — add the full pg_ds as a conservative bound
+    # (mpi_axis/02 #4; the pre-fix assert was silently blind there).
+    pg_reach = (float(getattr(k, 'pg_ds', 0.0) or 0.0)
+                if (axis != 2 and int(getattr(k, 'pg_on', 0) or 0)) else 0.0)
     reach = (max(float(k.f.sample_h),
                  float(getattr(k.f, 'p_sample_h', None) or 0.0))
              + float(k.h_law)) * np.abs(
-        nrm_h[chk][:, axis]) + 1.0
+        nrm_h[chk][:, axis]) + pg_reach + 1.0
     pos_w = (cen_h[chk][:, axis] - (own_start - ghost)) % n_ax
     if ((pos_w - reach < 0) | (pos_w + reach > W)).any():
         raise ValueError(

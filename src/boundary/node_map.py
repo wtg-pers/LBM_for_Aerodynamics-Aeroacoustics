@@ -102,11 +102,29 @@ class NodeMap:
     
     def __init__(self, domain_shape: Tuple[int, ...],
                  face_configs: List[FaceConfig],
-                 dim: int) -> None:
+                 dim: int,
+                 cut: Optional[Tuple[int, int, int, int, int]] = None) -> None:
         self.domain_shape = domain_shape
         self.face_configs = face_configs
         self.dim = dim
-        
+
+        # MPI slab cut = (axis, own_start, own_count, ghost, n_glob).
+        # With a cut, positions along the cut axis are GLOBAL boundary
+        # rows mapped into the local wrap window: the min/max face exists
+        # only on the rank owning global row 0 / n_glob-1, at local row
+        # ghost / ghost+own_count-1 (F1 repair, patch_notes/mpi_axis/02).
+        # None (default) keeps the historical full-domain positions.
+        self.cut = cut
+        if cut is not None:
+            if dim != 3:
+                raise ValueError("NodeMap cut is 3D-only")
+            a, s, n, g, N = (int(v) for v in cut)
+            if domain_shape[a] != n + 2 * g:
+                raise ValueError(
+                    f"NodeMap cut window mismatch: shape[{a}]="
+                    f"{domain_shape[a]} != own {n} + 2*ghost {g}")
+            self.cut = (a, s, n, g, N)
+
         # Build lookup: FaceLocation → FaceConfig
         # PERIODIC faces are excluded — they are not real domain boundaries
         # (streaming handles wrap-around), so they should not generate edges
@@ -139,6 +157,26 @@ class NodeMap:
     def get_face_config(self, location: FaceLocation) -> Optional[FaceConfig]:
         """Get FaceConfig for a given location, or None if periodic."""
         return self._face_map.get(location)
+
+    def face_position(self, location: FaceLocation) -> Optional[int]:
+        """Index of this face's boundary row along its normal axis.
+
+        Uncut (default): 0 / N-1 — the historical formula, bit-identical.
+        Cut axis: the LOCAL wrap-window row of the GLOBAL boundary row
+        (ghost / ghost+own-1) on the owning rank, or None on every other
+        rank — the face then does not exist on this slab (F1 repair).
+        """
+        axis = location.axis
+        if self.cut is not None and axis == self.cut[0]:
+            a, s, n, g, N = self.cut
+            if location.is_min:
+                return g if s == 0 else None
+            return g + n - 1 if s + n == N else None
+        return 0 if location.is_min else self.domain_shape[axis] - 1
+
+    def face_active(self, location: FaceLocation) -> bool:
+        """Whether this face exists on this rank (always True uncut)."""
+        return self.face_position(location) is not None
     
     # =========================================================================
     # Classification Logic
@@ -238,10 +276,12 @@ class NodeMap:
         for x_loc in faces_by_axis[0]:
             for y_loc in faces_by_axis[1]:
                 for z_loc in faces_by_axis[2]:
-                    ix = 0 if x_loc == FaceLocation.XMIN else Nx - 1
-                    iy = 0 if y_loc == FaceLocation.YMIN else Ny - 1
-                    iz = 0 if z_loc == FaceLocation.ZMIN else Nz - 1
-                    
+                    ix = self.face_position(x_loc)
+                    iy = self.face_position(y_loc)
+                    iz = self.face_position(z_loc)
+                    if ix is None or iy is None or iz is None:
+                        continue  # cut-axis face owned by another rank
+
                     corner = CornerNode(
                         face_a=fm[x_loc],
                         face_b=fm[y_loc],
@@ -259,9 +299,11 @@ class NodeMap:
             
             for loc_a in faces_by_axis[ax_a]:
                 for loc_b in faces_by_axis[ax_b]:
-                    idx_a = 0 if loc_a.is_min else shape_by_axis[ax_a] - 1
-                    idx_b = 0 if loc_b.is_min else shape_by_axis[ax_b] - 1
-                    
+                    idx_a = self.face_position(loc_a)
+                    idx_b = self.face_position(loc_b)
+                    if idx_a is None or idx_b is None:
+                        continue  # cut-axis face owned by another rank
+
                     edge = EdgeNode(
                         face_a=fm[loc_a],
                         face_b=fm[loc_b],
@@ -279,21 +321,32 @@ class NodeMap:
             axis = loc.axis
             other_axes = sorted([a for a in range(3) if a != axis])
             
-            # For each transverse axis, determine start/end
+            # For each transverse axis, determine start/end.
+            # Trim endpoints where a neighbouring face exists — via
+            # face_position so the trim lands on the GLOBAL boundary row
+            # under an MPI cut (uncut: position 0/N-1 → start 1/end N-1,
+            # bit-identical to the historical constants). On a cut axis
+            # the trim also drops the ghost band beyond the boundary row
+            # (harmless: domain BCs are the last substep op and every
+            # advance is preceded by a halo sync that rewrites ghosts).
             ranges = {}
             for oa in other_axes:
                 start = 0
                 end = shape_by_axis[oa]
-                
+
                 # Check if there's a face at min/max of this axis
                 min_loc = FaceLocation(('xmin', 'ymin', 'zmin')[oa])
                 max_loc = FaceLocation(('xmax', 'ymax', 'zmax')[oa])
-                
+
                 if min_loc in fm:
-                    start = 1
+                    p = self.face_position(min_loc)
+                    if p is not None:
+                        start = p + 1
                 if max_loc in fm:
-                    end = shape_by_axis[oa] - 1
-                
+                    p = self.face_position(max_loc)
+                    if p is not None:
+                        end = p
+
                 ranges[oa] = (start, end)
             
             self.flat_masks[loc] = {oa: ranges[oa] for oa in other_axes}
@@ -344,8 +397,12 @@ class NodeMap:
         """
         Nx, Ny, Nz = self.domain_shape
         axis = location.axis
-        gi = 0 if location.is_min else self.domain_shape[axis] - 1
-        
+        gi = self.face_position(location)
+        if gi is None:
+            raise AssertionError(
+                f"face {location.value} is not on this rank "
+                "(cut-axis boundary row owned elsewhere)")
+
         flat_ranges = self.flat_masks.get(location, {})
         
         # Build slices for each axis
@@ -377,9 +434,9 @@ class NodeMap:
         """Get slice for interior neighbor nodes in 3D."""
         face_slice = list(self.get_face_slice_3d(location))
         axis = location.axis
-        gi = 0 if location.is_min else self.domain_shape[axis] - 1
+        gi = face_slice[axis]          # cut-aware (face_position)
         offset = location.inward_offset
-        
+
         face_slice[axis] = gi + offset
         return tuple(face_slice)
     

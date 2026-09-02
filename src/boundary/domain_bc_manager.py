@@ -79,6 +79,7 @@ class DomainBCManager:
         # Phase 1: Parse configuration
         # =====================================================================
         self.face_configs: List[FaceConfig] = parse_all_boundaries(boundaries_config)
+        self.cut = None    # full-domain manager (MPI slabs: see for_shape)
 
         if verbose:
             print(f"  Parsed {len(self.face_configs)} boundary faces:")
@@ -89,19 +90,33 @@ class DomainBCManager:
 
     @classmethod
     def for_shape(cls, other: 'DomainBCManager', xp, lattice,
-                  domain_shape: Tuple[int, ...]) -> 'DomainBCManager':
+                  domain_shape: Tuple[int, ...],
+                  cut: Optional[Tuple[int, int, int, int, int]] = None
+                  ) -> 'DomainBCManager':
         """Same parsed faces, different shape (surfel MPI slab, patch 64).
 
-        Bit-compatibility argument: periodic faces carry no BC and do not
-        count for edge/corner classification, so on a cut along a
-        PERIODIC axis every non-cut face's node treatment is uniform
-        along that axis — the slab rebuild applies the exact per-row
-        operations of the full-domain manager on every owned row.
+        cut = (axis, own_start, own_count, ghost, n_glob) makes the slab
+        manager GLOBAL-position aware (F1 repair, patch_notes/mpi_axis/02):
+        cut-axis faces are built only on the rank owning global row
+        0 / n_glob-1, at local row ghost / ghost+own-1; edge/corner
+        classification, transverse flat-mask trims and sponge zones follow
+        the same global positions. Non-cut faces apply on every window row
+        — the exact per-row operations of the full-domain manager (window
+        rows ARE global rows there). Ghost-row treatment is free: domain
+        BCs are the LAST substep op (simulation._surfel_post_collide step
+        4) and every advance is preceded by a halo sync that rewrites the
+        ghost bands, so owned-row parity never depends on it.
+
+        Without cut (legacy): positions fall back to slab-local 0/W-1 —
+        sound ONLY for a cut along a PERIODIC axis, where no cut-axis
+        faces exist and every non-cut face's node treatment is uniform
+        along that axis (span16 wing). Non-periodic cut axes REQUIRE cut.
         """
         m = cls.__new__(cls)
         m.xp, m.lattice = xp, lattice
         m.domain_shape, m.dim = domain_shape, lattice.dim
         m.face_configs = other.face_configs
+        m.cut = tuple(int(v) for v in cut) if cut is not None else None
         m._build_from_faces(verbose=False)
         return m
 
@@ -111,7 +126,8 @@ class DomainBCManager:
         # =====================================================================
         # Phase 2: Build node map (flat/edge/corner classification)
         # =====================================================================
-        self.node_map = NodeMap(domain_shape, self.face_configs, self.dim)
+        self.node_map = NodeMap(domain_shape, self.face_configs, self.dim,
+                                cut=self.cut)
         
         if verbose:
             print(self.node_map.summary())
@@ -132,11 +148,19 @@ class DomainBCManager:
                 # then applies volume damping (Stage B). No separate face BC is
                 # registered here — see sponge.py for the rationale.
                 sponge = SpongeLayerBC(xp, lattice, fc, domain_shape, self.node_map)
+                if not sponge.active:
+                    # cut-axis sponge with neither zone rows nor the
+                    # boundary row in this rank's window (F1)
+                    continue
                 self.sponge_layers.append(sponge)
                 if verbose:
                     print(f"    {sponge.get_info()}")
                 continue
-            
+
+            if not self.node_map.face_active(fc.location):
+                # cut-axis face whose global boundary row is owned by
+                # another rank (F1): no face BC on this slab
+                continue
             face_bc = create_face_bc(xp, lattice, fc, self.node_map)
             self.face_bcs.append(face_bc)
         

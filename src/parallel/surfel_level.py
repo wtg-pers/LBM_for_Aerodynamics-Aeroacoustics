@@ -119,8 +119,15 @@ class SurfelSlabLevel:
                     raise AssertionError(
                         "surfel slab called streaming.compute")
 
+            # cut = global-position awareness (F1 repair, mpi_axis/02):
+            # cut-axis domain faces land on the rank owning the global
+            # boundary row, at its local window row — required for any
+            # NON-periodic cut axis (ROBIN z-cut included; the legacy
+            # cut-less rebuild was sound only for the periodic span cut)
             bc = DomainBCManager.for_shape(
-                lev.bc_manager, lev.xp, lev.bc_manager.lattice, slab_shape)
+                lev.bc_manager, lev.xp, lev.bc_manager.lattice, slab_shape,
+                cut=(part.axis, part.own_start, part.own_count,
+                     part.ghost, n_ax))
             self.sim = Simulation(
                 xp=lev.xp, macroscopic=lev.macroscopic,
                 collision=lev.collision, streaming=_NoStream(),
@@ -131,10 +138,13 @@ class SurfelSlabLevel:
             self.sim.adopt_esoteric_surfel_slab(mem, t0)
 
             # sustained trip (patch 66): rebuild on the wrap window —
-            # GLOBAL z rows via the same modulo as the slab slice, so
-            # both ranks evaluate the identical field on shared/ghost
-            # rows with zero communication (gate T3). Caches are lazy;
-            # the replicated sim's copy never advances and never builds.
+            # GLOBAL rows along the cut axis via the same modulo as the
+            # slab slice, so both ranks evaluate the identical field on
+            # shared/ghost rows with zero communication (gate T3). The
+            # coordinate triple is indexed by part.axis (mpi_axis/02 #2;
+            # the pre-fix wiring hardcoded the wrap rows into z). Caches
+            # are lazy; the replicated sim's copy never advances and
+            # never builds.
             ta = getattr(lev, '_trip_args', None)
             if ta is not None:
                 from src.utilities.trip_forcing import TripForcing
@@ -142,11 +152,12 @@ class SurfelSlabLevel:
                 rows = (np.arange(part.own_start - part.ghost,
                                   part.own_start + part.own_count
                                   + part.ghost) % n_ax)
+                coords = [org[ax] + np.arange(slab_shape[ax]) * dx
+                          for ax in range(3)]
+                coords[part.axis] = org[part.axis] + rows * dx
                 self.sim._trip = TripForcing(
                     lev.xp, ta['cfg'],
-                    org[0] + np.arange(slab_shape[0]) * dx,
-                    org[1] + np.arange(slab_shape[1]) * dx,
-                    org[2] + rows * dx,
+                    coords[0], coords[1], coords[2],
                     level=int(ta['level']),
                     lattice=lev.bc_manager.lattice)
                 lev._trip = None
