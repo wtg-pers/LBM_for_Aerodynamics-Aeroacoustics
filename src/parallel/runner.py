@@ -153,12 +153,13 @@ class DistributedMLGRunner:
         # z: patch 64 (periodic span cut) + mpi_axis/02 F1 repair
         #    (global-position face BCs — required for non-periodic z).
         # x: mpi_axis/02 S2 (F1 repair is the precondition; gates =
-        #    2/4-rank vs single-GPU QoI on the robin smoke twin).
-        # y: unregistered (S3 option — no demand case yet).
+        #    2/4-rank vs single-GPU QoI on the robin smoke twin +
+        #    robin_g4_r20 x-cut 4-rank production, 02 sec. 6).
+        # y: mpi_axis/03 S3 (abbreviated gate set — Phase A closure).
         # ghost >= 4 — the bridge chain consumes 4 ghost cells/substep
         # (advect 1 + facet cell spread 2 + trilinear 1; the slab build's
         # sample-envelope assert measures the real need and re-raises).
-        _surfel_axes_verified = (0, 2)
+        _surfel_axes_verified = (0, 1, 2)
         has_surfel = any(
             getattr(getattr(b.sim, 'obstacle_bc', None), 'kind', None)
             == 'surfel' for b in src)
