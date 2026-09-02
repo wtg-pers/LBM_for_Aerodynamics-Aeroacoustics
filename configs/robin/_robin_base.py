@@ -154,6 +154,19 @@ GRID4_L3_BOX_R = ((-0.15, 2.25), (-0.25, 0.25), (-0.25, 0.35))
 #: Fore gap to L2 is 1 L0 cell (0.05R = 4 L2 cells) = the validator's
 #: boundary case; every other margin >= 8 parent cells.
 GRID5_L3_BOX_R = ((-0.2, 2.4), (-0.4, 0.4), (-0.4, 0.45))
+#: 6-level ladder (robin/16 s10, user: "last test"): finest = the SAME body
+#: box again (GRID4_L3_BOX_R -> L5 at R/(32 r) = R/640, boom 32 cells) with
+#: GRID5_L3_BOX_R as the L4 cushion. At r = 20 the L2 fore edge (-0.25R =
+#: node 75) and the body box (-0.15R = 77) leave ONE integer L0 node (76)
+#: between them, so a second cushion cannot fit unless L2/L3 move outward:
+#: L2' = -0.35R (73) / L3' = -0.25R (75) / L4 = -0.2R (76) / L5 = -0.15R (77).
+#: Every parent->child margin is >= 8 parent cells (validator Rule A needs
+#: >= 2 = overlap_width), the r20-5 boundary case (4 L2 cells) is avoided.
+#: g5 -> g6 is therefore finest-dx halving over an identical body box PLUS
+#: a far-cushion enlargement (L2/L3, level-structure axis = neutral per
+#: robin/14 s4b H2) -- stated, not a pure 1-knob.
+GRID6_L2_BOX_R = ((-0.35, 2.55), (-0.55, 0.55), (-0.55, 0.6))
+GRID6_L3_BOX_R = ((-0.25, 2.45), (-0.45, 0.45), (-0.45, 0.5))
 
 
 def _rotated_bbox_R(rotation_deg):
@@ -204,15 +217,18 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
         # boxes. alpha = 0 only (the ladder is the alpha = 0 anchor case).
         if any(a != 0.0 for a in rot):
             raise ValueError("grid-ladder boxes are alpha=0 only")
-        if not 2 <= num_levels <= 5:
-            raise ValueError(f"ladder num_levels must be 2-5, got {num_levels}")
+        if not 2 <= num_levels <= 6:
+            raise ValueError(f"ladder num_levels must be 2-6, got {num_levels}")
         levels = [{}, _r(GRID2_L1_BOX_R)]
-        if num_levels >= 3:
+        if num_levels == 6:                       # robin/16 s10 family
+            levels.append(_r(GRID6_L2_BOX_R))     # enlarged L2 (see note)
+            levels.append(_r(GRID6_L3_BOX_R))     # new L3 cushion
+        elif num_levels >= 3:
             levels.append(_r(GRID3_L2_BOX_R))
-        if num_levels == 5:
-            levels.append(_r(GRID5_L3_BOX_R))     # cushion (robin/15 s6b)
+        if num_levels >= 5:
+            levels.append(_r(GRID5_L3_BOX_R))     # cushion (robin/15 s6b; L4 in g6)
         if num_levels >= 4:
-            levels.append(_r(GRID4_L3_BOX_R))     # finest body box (g4=g5)
+            levels.append(_r(GRID4_L3_BOX_R))     # finest body box (g4=g5=g6)
     elif num_levels != 4:
         raise ValueError(f"num_levels must be 2, 3 or 4, got {num_levels}")
     elif any(a != 0.0 for a in rot):
