@@ -58,6 +58,7 @@ TAG_MACRO = 20480       # + 4*uid   : checkpoint/final rho+u gather
 TAG_VERIFY = 24576      # + 4*uid   : --verify assembly
 TAG_TAUM = 26624        # + uid     : surfel tau-band margin exchange (64 ii)
 TAG_PROBE = 28672       # + rank    : probe column blocks, owner -> rank 0
+TAG_COUPLE = 30720      # + 2*uid   : B1 coupling row strips (mpi_axis/04)
 
 # Model state that every output channel reads. Broadcast from each block's
 # owners to the rest at reporting cadence (see sync_alm_reporting): with a
@@ -143,6 +144,10 @@ class DistributedMLGRunner:
         self.multiblock = bool(mlg.is_multiblock)
         shapes = [tuple(b.sim.domain_shape) for b in src]
 
+        # Phase B1 (mpi_axis/04): set by _decompose when the shared-cut
+        # partitioner is infeasible — [uid][rank] -> (own_start, own_count)
+        # with every level cut INDEPENDENTLY in its own index space.
+        self._plevel_table = None
         self.axis, self.bounds = self._decompose(src, shapes, axis,
                                                  n_ranks, ghost)
         bounds = self.bounds
@@ -181,7 +186,8 @@ class DistributedMLGRunner:
         # stay rank-local. Every rank derives the full ownership table (cuts
         # are replicated) and hands it to from_range, so neighbor() can skip
         # ranks that hold nothing of this block.
-        table = derive_block_ranges(src, self.axis, bounds)
+        table = (self._plevel_table if self._plevel_table is not None
+                 else derive_block_ranges(src, self.axis, bounds))
         # Kept for the output channels (plane strips): [uid][rank] ->
         # (own_start, own_count) — replicated ints, so every rank can
         # enumerate every other rank's pieces without communication.
@@ -392,8 +398,17 @@ class DistributedMLGRunner:
         for uid, b in enumerate(src):
             if b.parent is None or not self.owns[uid]:
                 continue
-            self.rlc[uid] = RankLocalCouplingV1(
-                b.coupling, self.parts[b.parent.uid], self.parts[uid], cp)
+            if self._plevel_table is not None:
+                # B1: independent per-level bounds -> coupling reads are
+                # assembled via row-strip exchange (mpi_axis/04 sec. 2b)
+                self.rlc[uid] = RankLocalCouplingV1(
+                    b.coupling, self.parts[b.parent.uid], self.parts[uid],
+                    cp, transport=transport, rank=rank, n_ranks=n_ranks,
+                    tag_base=TAG_COUPLE + 2 * uid)
+            else:
+                self.rlc[uid] = RankLocalCouplingV1(
+                    b.coupling, self.parts[b.parent.uid], self.parts[uid],
+                    cp)
             Lf, Lc = self.lv[uid], self.lv[b.parent.uid]
             if (hasattr(Lf, 'sb') and getattr(Lf.sb, 'partial_body', False)
                     and Lc is not None and hasattr(Lc, 'sb')):
@@ -484,11 +499,41 @@ class DistributedMLGRunner:
             boxes.append(((fdc.x_start, fdc.x_end),
                           (fdc.y_start, fdc.y_end),
                           (fdc.z_start, fdc.z_end)))
-        if axis is None:
-            return choose_axis_balanced(shapes, boxes, n_ranks, ghost,
-                                        exclude_axes=wall_axes)
-        axis = int(axis)
-        return axis, balance_cuts(shapes, boxes, axis, n_ranks, ghost)
+        try:
+            if axis is None:
+                return choose_axis_balanced(shapes, boxes, n_ranks, ghost,
+                                            exclude_axes=wall_axes)
+            axis = int(axis)
+            return axis, balance_cuts(shapes, boxes, axis, n_ranks, ghost)
+        except ValueError as shared_err:
+            # ── Phase B1 engage (mpi_axis/04): shared-cut infeasible ──
+            # (deep ladder: the innermost span holds < n_ranks*ghost L0
+            # cells). Cut every level INDEPENDENTLY in its own units;
+            # coupling reads become row-strip exchanges. Chains only.
+            from src.parallel.partition import per_level_ranges
+            axes_try = ([int(axis)] if axis is not None else
+                        [a for a in (0, 1, 2) if a not in wall_axes])
+            last = shared_err
+            for ax in axes_try:
+                try:
+                    table = per_level_ranges(src, shapes, ax, n_ranks,
+                                             ghost)
+                except ValueError as e:
+                    last = e
+                    continue
+                self._plevel_table = table
+                if self.rank == 0:
+                    print(f"[mpi] PER-LEVEL decomposition engaged on axis "
+                          f"{AXIS_NAME[ax]} (shared-cut infeasible: "
+                          f"{shared_err}) — mpi_axis/04 B1")
+                    for uid, row in enumerate(table):
+                        print(f"[mpi]   L{src[uid].level} bounds "
+                              f"{[s for s, _ in row] + [row[-1][0] + row[-1][1]]}")
+                b0 = table[0]
+                bounds = [0] + [b0[r][0] for r in range(1, n_ranks)] \
+                    + [b0[-1][0] + b0[-1][1]]
+                return ax, bounds
+            raise last
 
     # ── plumbing ─────────────────────────────────────────────────────
     def _tic(self):
@@ -549,12 +594,13 @@ class DistributedMLGRunner:
         its own window on the same parent."""
         t0 = self._tic()
         uid, puid = child.uid, child.parent.uid
-        reg = self.rlc[uid].coarse_block_region_local()
         P = self.lv[puid]
-        self._fprev[uid] = (esoteric_gather_std_region(
-            cp, P.mem, P.t, reg,
-            wall_mask=P.wall_mask, wall_mail=P.wall_mail)
-            if reg else None)
+        # fetch_coarse_block: legacy = the same single rank-local gather
+        # (bit-identical); B1 engaged = local + exchanged row strips over
+        # the fine-derived needed range (mpi_axis/04 sec. 2c)
+        self._fprev[uid] = self.rlc[uid].fetch_coarse_block(
+            P.mem, P.t,
+            {'wall_mask': P.wall_mask, 'wall_mail': P.wall_mail})
         self._toc("fprev", t0)
 
     def _advance_level(self, uid: int) -> None:

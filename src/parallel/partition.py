@@ -573,3 +573,73 @@ class Partition1D:
         return (f"Partition1D(axis={AXIS_NAME[self.axis]}, rank={self.rank}/"
                 f"{self.n_ranks}, own=[{self.own_start},"
                 f"{self.own_start + self.own_count}), ghost={self.ghost})")
+
+
+def per_level_ranges(blocks, shapes, axis: int, n_ranks: int,
+                     ghost: int = 3):
+    """[uid][rank] -> (own_start, own_count), each level cut INDEPENDENTLY
+    in its OWN index space (Phase B1, patch_notes/mpi_axis/04).
+
+    Engaged only when the shared-cut partitioner (balance_cuts) is
+    infeasible: deep ladders concentrate the innermost span below
+    n_ranks*ghost L0 cells, while every level individually has plenty of
+    rows in its own units. Policy = FINEST-EVEN, COARSER NEAREST-FEASIBLE:
+    the finest level gets even cuts (it carries the work); each coarser
+    level places its cuts at the physically co-located positions, clamped
+    to spacing >= ghost inside [0, n_k]. Where the derived (shared-cut)
+    position is feasible this degenerates to it, so coupling-exchange
+    strips stay thin at the expensive (deep) interfaces and only the
+    cheap coarse interfaces carry wide strips.
+
+    CHAIN trees only (one block per level, level-major uids). Raises
+    ValueError when any level has n_k < n_ranks * ghost (B2 scope: rank
+    groups / zero-owner levels).
+    """
+    import numpy as _np
+    nb = len(blocks)
+    for uid, b in enumerate(blocks[1:], 1):
+        if b.parent.uid != uid - 1:
+            raise ValueError(
+                "per-level decomposition is registered for CHAIN trees "
+                "only (one block per level) — multiblock trees keep the "
+                "shared-cut path (patch_notes/mpi_axis/04 sec. 3)")
+    # physical (L0-fractional) placement of each level: offset + scale
+    n_ax, A, s = [], [], []
+    for uid, b in enumerate(blocks):
+        n_ax.append(int(shapes[uid][axis]))
+        if uid == 0:
+            A.append(0.0)
+            s.append(1.0)
+        else:
+            lo, _hi = block_axis_box(b, axis)
+            A.append(A[uid - 1] + lo * s[uid - 1])
+            s.append(s[uid - 1] * 0.5)
+    for uid in range(nb):
+        if n_ax[uid] < n_ranks * ghost:
+            raise ValueError(
+                f"per-level cuts: level {uid} has {n_ax[uid]} rows on axis "
+                f"{AXIS_NAME[axis]} < ranks {n_ranks} x ghost {ghost} — "
+                "rank grouping is B2 scope (mpi_axis/04)")
+    nF = nb - 1
+    phys = [A[nF] + (i * n_ax[nF] / n_ranks) * s[nF]
+            for i in range(1, n_ranks)]
+    out = []
+    for uid in range(nb):
+        n_k = n_ax[uid]
+        cuts = [int(round((p - A[uid]) / s[uid])) for p in phys]
+        for i in range(len(cuts)):
+            cuts[i] = max(cuts[i], (i + 1) * ghost)
+            if i > 0:
+                cuts[i] = max(cuts[i], cuts[i - 1] + ghost)
+        for i in range(len(cuts) - 1, -1, -1):
+            cuts[i] = min(cuts[i], n_k - (len(cuts) - i) * ghost)
+            if i < len(cuts) - 1:
+                cuts[i] = min(cuts[i], cuts[i + 1] - ghost)
+        bounds = [0] + cuts + [n_k]
+        if any(b1 - b0 < ghost for b0, b1 in zip(bounds, bounds[1:])):
+            raise ValueError(
+                f"per-level cuts: level {uid} infeasible on axis "
+                f"{AXIS_NAME[axis]} ({n_ranks} ranks, ghost {ghost})")
+        out.append([(bounds[r], bounds[r + 1] - bounds[r])
+                    for r in range(n_ranks)])
+    return out

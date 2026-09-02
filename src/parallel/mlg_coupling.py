@@ -66,7 +66,8 @@ class RankLocalCouplingV1:
     #: None = whole-body pair (no-op)
     _f2c_wall_keep = None
 
-    def __init__(self, gc, part_c, part_f, xp) -> None:
+    def __init__(self, gc, part_c, part_f, xp, transport=None, rank=0,
+                 n_ranks=1, tag_base=0) -> None:
         if part_c.axis != part_f.axis:
             raise ValueError("coarse/fine partitions must share the axis")
         self._gc = gc
@@ -79,13 +80,265 @@ class RankLocalCouplingV1:
         self._box_lo = (box.x_start, box.y_start, box.z_start)[self._a]
         self._box_hi = (box.x_end, box.y_end, box.z_end)[self._a]
         self._nf_ax = r.fine_shape[self._a]
-        # consistency: fine partition must be the coarse-derived one
-        f0, fc = fine_range_from_coarse(part_c, self._box_lo, self._box_hi,
-                                        self._nf_ax)
-        if (f0, fc) != (part_f.own_start, part_f.own_count):
-            raise ValueError(
-                f"fine partition {part_f.own_start, part_f.own_count} != "
-                f"coarse-derived {(f0, fc)}")
+        # Phase B1 (mpi_axis/04): with a transport, the partitions may be
+        # INDEPENDENT per level — reads are assembled from the local wrap
+        # window plus row strips exchanged with the owning ranks. Without
+        # one (legacy shared-cut path), the derived-alignment contract is
+        # enforced exactly as before and every read stays rank-local.
+        self._tr = transport
+        self._rank = int(rank)
+        self._nr = int(n_ranks)
+        self._tag_c = int(tag_base)          # c2f/fprev coarse-row strips
+        self._tag_f = int(tag_base) + 1      # f2c fine-row strips
+        if transport is None:
+            # consistency: fine partition must be the coarse-derived one
+            f0, fc = fine_range_from_coarse(
+                part_c, self._box_lo, self._box_hi, self._nf_ax)
+            if (f0, fc) != (part_f.own_start, part_f.own_count):
+                raise ValueError(
+                    f"fine partition {part_f.own_start, part_f.own_count}"
+                    f" != coarse-derived {(f0, fc)}")
+        else:
+            cc = np.asarray(part_c._counts, dtype=np.int64)
+            cf = np.asarray(part_f._counts, dtype=np.int64)
+            self._starts_c = np.concatenate([[0], np.cumsum(cc)])[:-1]
+            self._counts_c = cc
+            self._starts_f = np.concatenate([[0], np.cumsum(cf)])[:-1]
+            self._counts_f = cf
+            ex = gc.excised_spatial_slices
+            self._ex_lo = int(ex[self._a].start)
+            self._ex_hi = int(ex[self._a].stop)
+            self._span_z = (
+                self._a == 2
+                and getattr(gc, '_flush_faces', {}).get('z_min', False)
+                and gc._flush_faces.get('z_max', False))
+
+    # ── Phase B1 row tables (replicated — both sides compute the same
+    #    sets from the shared counts, so strips match with no handshake) ─
+    def _need_c(self, r) -> Tuple[int, int]:
+        """Coarse rows [lo, hi) rank r's OWNED-fine strips read for C2F /
+        f_prev: parents of its fine range +-2 (the M2 stencil margin),
+        clipped to the box. On derived partitions this equals the legacy
+        coarse_block_range() row for row."""
+        fs = int(self._starts_f[r])
+        fc = int(self._counts_f[r])
+        if fc == 0:
+            return (self._box_lo, self._box_lo)
+        lo = max(self._box_lo, self._box_lo + fs // 2 - 2)
+        hi = min(self._box_hi + 1,
+                 self._box_lo + (fs + fc + 1) // 2 + 2)
+        return (lo, hi)
+
+    def _need_f_rows(self, r):
+        """(fine row list, pad_lo, pad_hi, w_lo, w_hi) rank r reads for
+        F2C: 2x strided rows for its coarse write range +-1, plus the
+        span-z wrap margin rows (patch 64 sec. 10 conditions mirrored)."""
+        w_lo = max(self._ex_lo, int(self._starts_c[r]))
+        w_hi = min(self._ex_hi,
+                   int(self._starts_c[r]) + int(self._counts_c[r]))
+        if w_hi <= w_lo:
+            return np.empty(0, np.int64), 0, 0, w_lo, w_hi
+        rr_lo = max(w_lo - 1, self._box_lo)
+        rr_hi = min(w_hi + 1, self._box_hi + 1)
+        g0 = 2 * (rr_lo - self._box_lo)
+        g1 = 2 * (rr_hi - 1 - self._box_lo) + 1
+        rows = np.arange(g0, g1, 2, dtype=np.int64)
+        pad_lo = pad_hi = 0
+        if self._span_z:
+            n_c = self._box_hi + 1 - self._box_lo
+            pre = post = None
+            if w_lo - 1 < self._box_lo:
+                pre = 2 * ((w_lo - 1 - self._box_lo) % n_c)
+                pad_lo = 1
+            if w_hi + 1 > self._box_hi + 1:
+                post = 2 * ((w_hi - self._box_lo) % n_c)
+                pad_hi = 1
+            parts = ([np.asarray([pre], np.int64)] if pre is not None
+                     else []) + [rows] + \
+                    ([np.asarray([post], np.int64)] if post is not None
+                     else [])
+            rows = np.concatenate(parts)
+        return rows, pad_lo, pad_hi, w_lo, w_hi
+
+    @staticmethod
+    def _win_pos(part, rows):
+        """Local window position of each global row; -1 when absent."""
+        N = int(part.global_shape[part.axis])
+        W = int(part.own_count) + 2 * int(part.ghost)
+        pos = (np.asarray(rows, np.int64)
+               - (int(part.own_start) - int(part.ghost))) % N
+        return np.where(pos < W, pos, np.int64(-1))
+
+    @staticmethod
+    def _peer_pos(starts, counts, ghost, N, r, rows):
+        """_win_pos for PEER rank r, from the replicated tables."""
+        W = int(counts[r]) + 2 * ghost
+        pos = (np.asarray(rows, np.int64)
+               - (int(starts[r]) - ghost)) % N
+        return np.where(pos < W, pos, np.int64(-1))
+
+    def _gather_rows(self, mem, t, rows_pos, sub, wall):
+        """Gather local window rows (positions rows_pos, ascending order
+        of the caller's row list) as std blocks — one region gather per
+        maximal constant-stride run, concatenated along the axis."""
+        xp, a = self._xp, self._a
+        out = []
+        i, n = 0, len(rows_pos)
+        while i < n:
+            j = i
+            step = 1
+            if j + 1 < n:
+                step = int(rows_pos[j + 1] - rows_pos[j])
+                if step <= 0:
+                    step = 1
+            while (j + 1 < n
+                   and rows_pos[j + 1] - rows_pos[j] == step and step > 0):
+                j += 1
+            sl = list(sub)
+            sl[a] = slice(int(rows_pos[i]), int(rows_pos[j]) + 1,
+                          step if step > 1 else 1)
+            out.append(esoteric_gather_std_region(xp, mem, t, tuple(sl),
+                                                  **wall))
+            i = j + 1
+        if not out:
+            return None
+        return out[0] if len(out) == 1 else xp.concatenate(out, axis=1 + a)
+
+    def _exchange(self, mem, t, wall, part, starts, counts, need_rows_of,
+                  my_rows, my_pos, sub, ext_shape, tag):
+        """One symmetric strip-exchange round. Returns {index_in_my_rows:
+        received block} per peer. Sends are flushed before return (the
+        persistent (dst, tag) send buffer is reused next round)."""
+        xp, a, tr = self._xp, self._a, self._tr
+        N = int(part.global_shape[part.axis])
+        g = int(part.ghost)
+        # sends: peer's needed rows outside ITS window, owned by me
+        posted = False
+        for p in range(self._nr):
+            if p == self._rank:
+                continue
+            prow = need_rows_of(p)
+            if prow.size == 0:
+                continue
+            ppos = self._peer_pos(starts, counts, g, N, p, prow)
+            m0 = int(starts[self._rank])
+            m1 = m0 + int(counts[self._rank])
+            srow = prow[(ppos < 0) & (prow >= m0) & (prow < m1)]
+            if srow.size == 0:
+                continue
+            spos = srow - (int(part.own_start) - g)   # owned rows: no wrap
+            buf = self._gather_rows(mem, t, spos, sub, wall)
+            tr.post(self._rank, p, tag, buf)
+            posted = True
+        tr.commit()
+        if not posted and hasattr(xp, 'cuda'):
+            # prepost/Recv hazard guard (halo R3-1): commit()'s stream sync
+            # is skipped when nothing was staged, but the persistent recv
+            # buffer may still be read by the previous round's assembly.
+            xp.cuda.get_current_stream().synchronize()
+        # receives: my needed rows outside MY window, grouped by owner
+        recv = {}
+        if my_rows.size:
+            owner = np.searchsorted(np.concatenate(
+                [starts, [N]]), my_rows, side='right') - 1
+            for p in range(self._nr):
+                if p == self._rank:
+                    continue
+                sel = np.flatnonzero((my_pos < 0) & (owner == p))
+                if sel.size == 0:
+                    continue
+                shape = list(ext_shape)
+                shape[1 + a] = int(sel.size)
+                arr = tr.collect(p, self._rank, tag, shape=tuple(shape),
+                                 dtype=mem.dtype)
+                recv[int(sel[0])] = (sel, arr)
+        tr.flush()
+        return recv
+
+    def _sub_ext_shape(self, mem, sub, n_pop):
+        ext = [n_pop]
+        for d in range(3):
+            ext.append(len(range(*sub[d].indices(mem.shape[1 + d])))
+                       if d != self._a else 0)
+        return ext
+
+    def fetch_coarse_block(self, mem_c, t_c, wall_c):
+        """Assembled std block over the coarse rows THIS rank's C2F/f_prev
+        needs (legacy: the rank-local block, bit-identical gather)."""
+        wc = wall_c or {}
+        if self._tr is None:
+            reg = self.coarse_block_region_local()
+            if reg is None:
+                return None
+            return esoteric_gather_std_region(self._xp, mem_c, t_c, reg,
+                                              **wc)
+        xp, a = self._xp, self._a
+        lo, hi = self._need_c(self._rank)
+        rows = np.arange(lo, hi, dtype=np.int64)
+        pos = self._win_pos(self._pc, rows)
+        sub = list(self._gc.coarse_sub_spatial_slices)
+        ext = self._sub_ext_shape(mem_c, sub, int(mem_c.shape[0]))
+        recv = self._exchange(
+            mem_c, t_c, wc, self._pc, self._starts_c, self._counts_c,
+            lambda p: np.arange(*self._need_c(p), dtype=np.int64),
+            rows, pos, sub, ext, self._tag_c)
+        return self._assemble(mem_c, t_c, wc, rows, pos, sub, recv)
+
+    def fetch_fine_rows(self, mem_f, t_f, wall_f):
+        """(assembled strided fine block, pad_lo, pad_hi) for THIS rank's
+        F2C — engaged path only. Runs the exchange even when this rank
+        writes nothing (peers may need its rows)."""
+        wf = wall_f or {}
+        xp, a = self._xp, self._a
+        rows, pad_lo, pad_hi, _w0, _w1 = self._need_f_rows(self._rank)
+        pos = self._win_pos(self._pf, rows)
+        sub = list(self._gc.fine_at_coarse_spatial_slices)
+        ext = self._sub_ext_shape(mem_f, sub, int(mem_f.shape[0]))
+        recv = self._exchange(
+            mem_f, t_f, wf, self._pf, self._starts_f, self._counts_f,
+            lambda p: self._need_f_rows(p)[0],
+            rows, pos, sub, ext, self._tag_f)
+        if rows.size == 0:
+            return None, pad_lo, pad_hi
+        return (self._assemble(mem_f, t_f, wf, rows, pos, sub, recv),
+                pad_lo, pad_hi)
+
+    def _assemble(self, mem, t, wall, rows, pos, sub, recv):
+        """Stitch local runs + received strips into row order."""
+        xp, a = self._xp, self._a
+        pieces = {}
+        i, n = 0, rows.size
+        while i < n:
+            if pos[i] < 0:
+                i += 1
+                continue
+            j = i
+            step = 1
+            if j + 1 < n and pos[j + 1] >= 0:
+                step = int(pos[j + 1] - pos[j])
+            while (j + 1 < n and pos[j + 1] >= 0 and step > 0
+                   and pos[j + 1] - pos[j] == step
+                   and rows[j + 1] - rows[j] == step):
+                j += 1
+            blk = self._gather_rows(mem, t, pos[i:j + 1], sub, wall)
+            pieces[i] = blk
+            i = j + 1
+        for k, (sel, arr) in recv.items():
+            # received strips arrive in ascending row order; split into
+            # maximal contiguous index runs of my row list
+            runs = np.split(np.arange(sel.size),
+                            np.flatnonzero(np.diff(sel) > 1) + 1)
+            off = 0
+            for run in runs:
+                sl = [slice(None)] * arr.ndim
+                sl[1 + a] = slice(off, off + len(run))
+                pieces[int(sel[run[0]])] = arr[tuple(sl)]
+                off += len(run)
+        parts = [pieces[k] for k in sorted(pieces)]
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else xp.concatenate(
+            parts, axis=1 + self._a)
 
     # ── coordinate translation (global -> local, along split axis) ──
     def _l_c(self, g: int) -> int:
@@ -122,13 +375,19 @@ class RankLocalCouplingV1:
         fine LocalLevel (eso_wall §4-5b) — gathers/scatters at wall rows
         must go through the swap-slot/mailbox LOAD view, exactly as the
         single-GPU MLG coupling does since patch 04."""
-        if self._pf.own_count == 0:
+        if self._pf.own_count == 0 and self._tr is None:
             return
         gc, xp, a = self._gc, self._xp, self._a
         wc, wf = (wall_c or {}), (wall_f or {})
-        rng = self.coarse_block_range()
-        region_loc = self.coarse_block_region_local()
-        f_sub = esoteric_gather_std_region(xp, mem_c, t_c, region_loc, **wc)
+        # B1 engaged: the block covers the FINE-derived needed rows and is
+        # assembled local+exchanged (fetch runs even with own_count 0 —
+        # peers may need this rank's coarse rows). Legacy: bit-identical
+        # single local gather over the derived block.
+        f_sub = self.fetch_coarse_block(mem_c, t_c, wc)
+        if self._pf.own_count == 0:
+            return
+        rng = (self.coarse_block_range() if self._tr is None
+               else self._need_c(self._rank))
         if self._dead_fill_live is not None:
             # partial-body fine level (patch 76 = the runner port of the
             # patch-74 C2F dead fill): the band crosses the body, so the
@@ -137,7 +396,12 @@ class RankLocalCouplingV1:
             # with the rest-state equilibrium — same constant as the
             # single-GPU MultiLevelGrid fill, so own strips stay bit-
             # comparable.
+            if self._tr is not None:
+                raise NotImplementedError(
+                    "partial-body C2F dead fill is not wired for the "
+                    "per-level exchange path (mpi_axis/04 sec. 3)")
             from src.grid.multi_level_grid import _rest_feq_27
+            region_loc = self.coarse_block_region_local()
             dead = ~self._dead_fill_live[region_loc].astype(bool)
             w27 = _rest_feq_27(xp, f_sub.dtype)
             f_sub = xp.where(dead[None], w27[:, None, None, None], f_sub)
@@ -228,18 +492,28 @@ class RankLocalCouplingV1:
         ex_hi = ex[a].stop                                # exclusive
         w_lo = max(ex_lo, self._pc.own_start)
         w_hi = min(ex_hi, self._pc.own_start + self._pc.own_count)
-        if w_hi <= w_lo:
-            return
-        # strided fine read rows: coarse [w_lo-1, w_hi+1) ∩ box (filter halo 1)
-        rr_lo = max(w_lo - 1, self._box_lo)
-        rr_hi = min(w_hi + 1, self._box_hi + 1)
-        # global strided region over the FULL box on non-split axes
-        f_at = list(gc.fine_at_coarse_spatial_slices)     # (0::R,)*3 global
-        g0 = 2 * (rr_lo - self._box_lo)
-        g1 = 2 * (rr_hi - 1 - self._box_lo) + 1
-        f_at[a] = slice(self._l_f(g0), self._l_f(g0) + (g1 - g0), R)
-        f_fine_at = esoteric_gather_std_region(xp, mem_f, t_f, tuple(f_at),
-                                               **wf)
+        if self._tr is not None:
+            # B1 engaged: assembled strided block (local + exchanged) with
+            # the span-z wrap margins folded into the row set. Runs even
+            # when this rank writes nothing — peers may need its rows.
+            f_fine_at, pad_lo, pad_hi = self.fetch_fine_rows(mem_f, t_f, wf)
+            if w_hi <= w_lo:
+                return
+            rr_lo = max(w_lo - 1, self._box_lo)
+        else:
+            if w_hi <= w_lo:
+                return
+            # strided fine read rows: coarse [w_lo-1, w_hi+1) ∩ box
+            # (filter halo 1)
+            rr_lo = max(w_lo - 1, self._box_lo)
+            rr_hi = min(w_hi + 1, self._box_hi + 1)
+            # global strided region over the FULL box on non-split axes
+            f_at = list(gc.fine_at_coarse_spatial_slices)  # (0::R,)*3 global
+            g0 = 2 * (rr_lo - self._box_lo)
+            g1 = 2 * (rr_hi - 1 - self._box_lo) + 1
+            f_at[a] = slice(self._l_f(g0), self._l_f(g0) + (g1 - g0), R)
+            f_fine_at = esoteric_gather_std_region(xp, mem_f, t_f,
+                                                   tuple(f_at), **wf)
 
         # ── span-through z: WRAP filter margins (patch 64 sec. 10) ──
         # The single-GPU f_neq filter is z-PERIODIC on z-flush regions
@@ -255,16 +529,20 @@ class RankLocalCouplingV1:
         # the STRIDED coarse-co-located rows (period n_c), NOT linear
         # fine index — with the odd node-based nf (2n-1) a linear 2*c
         # extension would alias fine row 1 for the wrap of row 0.
-        pad_lo = pad_hi = 0
         # z-literal is CORRECT, not a z-cut assumption (mpi_axis/01 #3):
         # the single-GPU _filter_f_neq periodic variant is itself z-flush
         # only (grid/coupling.py "Flush-z span-through prism"), so the
         # wrap margin is needed exactly when cut==z==both-flush. If an
         # x/y-flush filter variant is ever added there, revise this gate
-        # in the same patch.
-        span_z = (a == 2
-                  and getattr(gc, '_flush_faces', {}).get('z_min', False)
-                  and gc._flush_faces.get('z_max', False))
+        # in the same patch. Engaged (B1) runs fold these margin rows into
+        # the fetch_fine_rows row set instead (_need_f_rows).
+        if self._tr is not None:
+            span_z = False
+        else:
+            pad_lo = pad_hi = 0
+            span_z = (a == 2
+                      and getattr(gc, '_flush_faces', {}).get('z_min', False)
+                      and gc._flush_faces.get('z_max', False))
         if span_z:
             n_c = self._box_hi + 1 - self._box_lo
 
