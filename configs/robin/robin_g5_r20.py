@@ -5,9 +5,10 @@ the reference grid. finest = R/320 (boom 16.0 cells) over the SAME finest
 body box as robin_g4_r20 (GRID4_L3_BOX_R, now L4) with a new L3 cushion
 (GRID5_L3_BOX_R) -> the g4/g5 pair isolates one halving of the finest dx.
 Cost ~1.6x the r32-4 production compute (~37M nodes, working set ~26 GiB
--> DGX Spark single GPU ~11 h, or 2-rank z-slab). p_sample_h stays 1.5
-(registered); the h*(R/320) calibration point comes from the offline
-volume h-probe at readout (robin/15 s3c rig procedure).
+-> DGX Spark single GPU ~11 h, or 2-rank z-slab). The 0902 run asset was
+made with p_sample_h 1.5 (registered then); readout robin/16 s3-correction
+set the base to 1.1 (true layer edge, all grids) -- a rerun from this file
+now samples at 1.1 with the derived kh*.
 
 Pre-registered readout: representability gate -> Cd_p/Cz + Cp(sknh) ->
 h-probe (3rd point of the h*(dx) curve) -> recalibrated composite vs

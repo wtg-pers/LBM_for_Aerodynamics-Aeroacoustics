@@ -12,9 +12,10 @@ order (patch robin/13 s3):
      window Cd -> Cd_p (PRIMARY QoI with Cz), Cd_f (operating-point row)
   D  wall-model operating point: area-weighted Cf -> y+ at h_law = 3 cells
   E  Cp rms (secondary): h05 (p_use) / ph (p_state_ph) / selective
-     kappa_n*h (offline robin/11 selection, kh* = 0.0034, h = 1.5 fine
-     cells = 1.5/(2r) R) -- old-code runs carry no p_sknh channel, so the
-     selection is applied HERE (post-processing), per the user's call.
+     kappa_n*h (offline robin/11 selection; h = the config's p_sample_h
+     [fine cells], kh* derived from it -- robin/16 sec. 3) -- old-code runs
+     carry no p_sknh channel, so the selection is applied HERE
+     (post-processing), per the user's call.
 Outputs: table to stdout, temp_results/robin/robin_g2_ladder.csv + .png.
 
 Usage (main dir):
@@ -44,8 +45,10 @@ from src.utilities.robin_anchor import (POINT_CONDITIONS, _REPO, compare,
 RES = os.path.join(_REPO, "temp_results", "robin")
 #: user-designated drop point for the Phase-1 ladder results (0901)
 RES_GRID = os.path.join(RES, "grid_test", "01_baseline_L1_difference_r_values")
-KH_STAR = 0.0034
-H_CELLS = 1.5          # outer-channel height [fine cells]
+#: outer-channel height / kh* come from the run config (p_sample_h) via
+#: surfel_kappa.kh_star_for (robin/16); this is only the pre-16 fallback
+#: for configs that set no p_sample_h.
+H_CELLS_FALLBACK = 1.5
 U_PHYS, NU_PHYS = 42.03, 1.4610e-5
 R_PHYS = 1.574
 
@@ -165,19 +168,33 @@ def cp_three_ways(d: str, cfg: dict, files: Sequence[str], r: int
     cell_R = 1.0 / float(stl["scale_to_lu"]) / 2 ** (nlev - 1)
     r_s = 1.5 * cell_R * float(stl["scale_to_lu"])      # fine cells -> L0 lu
     pts_lu = orifices_to_l0lu(orf["xyz"], stl)
+    have = set(read_surface_vtk(files[-1])[2].keys())
     sims = {}
-    for ch in ("p_use", "p_state_ph"):
+    # channels: p_state (= old p_use) always; p_state_ph only on two-channel
+    # files (robin/10b); p_sknh = the writer's own selection (robin/13b)
+    for ch in [c for c in ("p_use", "p_state_ph", "p_sknh")
+               if c in have or (c == "p_use" and "p_state" in have)]:
         cen, cpm, _, area, _ = surface_cp_mean(files, 1.0 / 3.0, q_inf, channel=ch)
         sims[ch], _ = sample_at_points(pts_lu, cen, cpm, area, r_s)
+    nan = np.full(176, np.nan)
+    from src.boundary.surfel_kappa import kh_star_for
+    h_cells = float(stl.get("surfel", {}).get("p_sample_h") or H_CELLS_FALLBACK)
+    kh_star = kh_star_for(h_cells)
     curv = orifice_curvature_quadric(stl["file"], orf["xyz"])
     kn = kappa_n_direction(curv, flow_dir_body(0.0))
-    kh = kn * H_CELLS * cell_R
-    sel = np.where(kh >= KH_STAR, sims["p_state_ph"], sims["p_use"])
+    kh = kn * h_cells * cell_R
+    if "p_sknh" in sims:                 # 13b+ file: the writer already selected
+        sel = sims["p_sknh"]
+    elif "p_state_ph" in sims:           # 10b two-channel file: select offline
+        sel = np.where(kh >= kh_star, sims["p_state_ph"], sims["p_use"])
+    else:                                # legacy single-channel file
+        sel = sims["p_use"]
     out = {}
-    for name, sim in (("h05", sims["p_use"]), ("ph", sims["p_state_ph"]),
+    for name, sim in (("h05", sims["p_use"]), ("ph", sims.get("p_state_ph", nan)),
                       ("sknh", sel)):
-        out[name] = compare(orf, cpd["cp"], sim)["all"]["rms"]
-    out["n_ph_sel"] = int((kh >= KH_STAR).sum())
+        out[name] = (compare(orf, cpd["cp"], sim)["all"]["rms"]
+                     if np.isfinite(sim).any() else float("nan"))
+    out["n_ph_sel"] = int((kh >= kh_star).sum())
     return out
 
 

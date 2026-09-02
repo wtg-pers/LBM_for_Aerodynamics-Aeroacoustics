@@ -53,9 +53,11 @@ _DEFAULTS = dict(
     # (bit-identical legacy path).
     p_sample_h=None,
     # robin/13b: kappa_n(flow)*h channel-selection threshold for the
-    # p_sknh surface output (robin/11 K4; stack constant, LORO
-    # 0.0029-0.0035, plateau 0.002-0.008). Selection is OUTPUT-ONLY.
-    kh_star=0.0034,
+    # p_sknh surface output (robin/11 K4). None = DERIVED from p_sample_h
+    # (surfel_kappa.kh_star_for: 0.0034 * h / 1.5 -- the calibrated
+    # invariant is kappa_n*dx, robin/16 sec. 3-correction; h = 1.5 keeps
+    # 0.0034 exactly). An explicit value is used as given. OUTPUT-ONLY.
+    kh_star=None,
     friction_dir='log', fallback='viscous', mode='wallmodel',
     dv_min=1e-6, march_axis=2, orient='as_is',
     tau_model=False, collide='kernel',
@@ -178,7 +180,12 @@ class SurfelBoundary:
             raise ValueError("surfel p_sample_h must be > 0 [cells]")
         self.facets.p_sample_h = None if _ph is None else float(_ph)
         self.p_sample_h = self.facets.p_sample_h   # writer/meta (13b)
-        self.kh_star = float(p['kh_star'])
+        if p['kh_star'] is not None:
+            self.kh_star = float(p['kh_star'])
+        else:                                       # derived (robin/16)
+            from src.boundary.surfel_kappa import kh_star_for
+            self.kh_star = (None if self.facets.p_sample_h is None
+                            else kh_star_for(self.facets.p_sample_h))
         if self._crease_facets is not None:
             # BEFORE the kernel wrapper: it snapshots facets.crease (like gamma)
             self.facets.crease = self._crease_facets
@@ -792,6 +799,7 @@ class SurfelBoundary:
              f"prism nnz {self.nnz}, dropped dV {self.dropped_vol:.3g}, "
              f"law {p['law']} h={p['h_law']:g} "
              f"p_h {(p['p_sample_h'] if p['p_sample_h'] is not None else p['sample_h']):g} "
+             f"kh* {(getattr(self, 'kh_star', None) if getattr(self, 'kh_star', None) is not None else float('nan')):.5g} "
              f"fallback {p['fallback']} "
              f"dv_min {p['dv_min']:g}")
         if self._taum_summary:

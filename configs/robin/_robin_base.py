@@ -233,8 +233,19 @@ def build(r_lu0: int = 32, tag: str = "robin_r0_musker", max_steps: int = 9000,
     surfel = {"tau_model": True, "law": "musker", "h_law": 3.0,
         # p_state sample height (robin/10, survey 09): surface pressure read
         # OUTSIDE the modeled layer (readout definition of patch 08). Output-
-        # only; physics stays at sample_h/h_law.
-        "p_sample_h": 1.5,
+        # only; physics stays at sample_h/h_law. robin/16 sec. 3-correction
+        # (0902): the 1.5 registered in 08-15 was measured from the TM-80051
+        # orifice points, which sit 0.00145 R INSIDE the STL; the true layer
+        # edge is h* = 1.0-1.1 cells on R/160, R/256 and R/320 alike (fore
+        # mean zero crossing 1.04/1.08/1.00). The kernel samples from the
+        # facet (true height), so 1.5 read 0.4-0.5 cells too high (fore
+        # +0.02..+0.04 over-correction). p_sknh now selects between
+        # p_state (h 0.5, first cell) and this 1.1-cell sample per facet.
+        # kh_star is DERIVED from this value (surfel_kappa.kh_star_for:
+        # 0.0034 * 1.1/1.5 = 0.0024933) so the robin/11 selection set is
+        # unchanged; runs made before 0902 carry p_sample_h 1.5 in their
+        # setup_log / surface meta.
+        "p_sample_h": 1.1,
               "march_axis": 2, "orient": "as_is",
               # robin/02 sec. 7: concave body/pylon crease -> prism overlap
               # g_i > dV (up to 17x at the pylon TE) -> negative density in

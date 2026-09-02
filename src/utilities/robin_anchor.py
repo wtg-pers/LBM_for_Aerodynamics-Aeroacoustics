@@ -287,24 +287,66 @@ def orifice_normals(stl_path: str, xyz_R: np.ndarray) -> np.ndarray:
     return n
 
 
+def surface_projection(stl_path: str, xyz_R: np.ndarray, k: int = 60
+                       ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(closest surface point, outward normal, signed distance [+ = outside])
+    of every orifice on the STL. Candidate faces from a KD-tree on the
+    triangle centres (no rtree dependency). robin/16 sec. 3-correction: the
+    TM-80051 orifice coordinates sit 0.00145 R INSIDE robin_mod (0.23 /
+    0.37 / 0.46 fine cells at R/160 / R/256 / R/320), so a probe raised
+    from the raw orifice point reads that much LOWER than its nominal h."""
+    import trimesh
+    from scipy.spatial import cKDTree
+    m = trimesh.load(stl_path)
+    npts = len(xyz_R)
+    _, cand = cKDTree(m.triangles_center).query(xyz_R, k=k)
+    cp = trimesh.triangles.closest_point(m.triangles[cand.ravel()],
+                                         np.repeat(xyz_R, k, axis=0)).reshape(npts, k, 3)
+    dd = np.linalg.norm(cp - xyz_R[:, None, :], axis=2)
+    j = np.argmin(dd, axis=1)
+    closest = cp[np.arange(npts), j]
+    fid = cand[np.arange(npts), j]
+    n = np.array(m.face_normals[fid], dtype=np.float64)
+    cb = m.triangles_center.mean(axis=0)
+    flip = ((m.triangles_center[fid] - cb) * n).sum(axis=1) < 0.0
+    n[flip] *= -1.0
+    signed = ((xyz_R - closest) * n).sum(axis=1)
+    return closest, n, signed
+
+
 def volume_cp_at_height(level_dir: str, steps: Sequence[int], stl_cfg: dict, xyz_R: np.ndarray,
                         h_cells: float, n_levels: int, rho_phys: float, u_phys: float,
-                        scale_R: float) -> np.ndarray:
+                        scale_R: float, probe_base: str = "surface") -> np.ndarray:
     """Cp read from the FINEST-level volume output (lbm_<step>_level<k>.vti,
     p_gauge_pa) at h_cells fine cells along the outward normal of every
     orifice, time-averaged over `steps` (robin/08: the surfel p_state is
     sampled 0.5 cell from the wall, inside the slip/cut-cell numerical
     layer whose pressure carries the centrifugal gradient down to the
     wall — on the ROBIN nose that reads 0.05-0.09 low; the pressure at the
-    edge of that layer, ~1.5-2 cells, matches the measured wall Cp)."""
+    edge of that layer matches the measured wall Cp).
+
+    probe_base = "surface" (default, robin/16): the probe is raised from the
+    orifice's projection onto the STL, so h_cells is the TRUE height above
+    the simulated wall (layer edge h* = 1.0-1.1 cells on every grid, the
+    same height the kernel's p_sample_h channel samples from the facet).
+    "orifice" = the pre-16 convention (raw TM point, 0.00145 R inside the
+    surface -> nominal h reads 0.2-0.5 cells low; h* looked like 1.3-1.55)."""
     import glob as _glob
     import vtk
     from vtk.util.numpy_support import vtk_to_numpy
     from scipy.ndimage import map_coordinates
     q = 0.5 * rho_phys * u_phys ** 2
-    n = orifice_normals(stl_cfg["file"], xyz_R)
     cell_R = 1.0 / scale_R / 2 ** (n_levels - 1)               # fine cell in R
-    pts_lu = orifices_to_l0lu(xyz_R + n * h_cells * cell_R, stl_cfg)
+    if probe_base == "surface":
+        base, n, signed = surface_projection(stl_cfg["file"], xyz_R)
+        print(f"   [volume probe] base = STL projection of the orifices "
+              f"(orifice offset mean {signed.mean():+.5f} R = "
+              f"{signed.mean() / cell_R:+.2f} fine cells, + = outside)")
+    elif probe_base == "orifice":
+        base, n = xyz_R, orifice_normals(stl_cfg["file"], xyz_R)
+    else:
+        raise ValueError(f"probe_base must be 'surface' or 'orifice', got {probe_base!r}")
+    pts_lu = orifices_to_l0lu(base + n * h_cells * cell_R, stl_cfg)
     acc = None
     for s in steps:
         f = sorted(_glob.glob(os.path.join(level_dir, f"*{int(s):08d}*level{n_levels - 1}.vti")))
@@ -468,15 +510,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                          "--csv outputs: the h0.5 surface p_state readout and the h1.5 "
                          "readout (volume or p_state_ph). Needs --config (STL + levels) "
                          "and --point (alpha). Overrides --surface/--volume-dir.")
-    ap.add_argument("--kh-star", type=float, default=0.0034,
-                    help="kappa_n(flow)*h switch threshold for --select-from "
-                         "(robin/11: pooled logistic 0.0034, LORO 0.0029-0.0035, "
-                         "ALL-rms plateau 0.002-0.008)")
-    ap.add_argument("--p-h", type=float, default=1.5, help="normal sampling height [fine cells] for --volume-dir")
+    ap.add_argument("--kh-star", type=float, default=None,
+                    help="kappa_n(flow)*h switch threshold for --select-from. "
+                         "Default = derived from --p-h (surfel_kappa.kh_star_for: "
+                         "0.0034 * h / 1.5 -- robin/11 pooled logistic 0.0034 was "
+                         "fitted at the h-1.5 label; the calibrated set is the "
+                         "h-independent kappa_n*dx >= 0.002267, robin/16 sec. 3)")
+    ap.add_argument("--p-h", type=float, default=1.1,
+                    help="normal sampling height [fine cells] for --volume-dir / the kh label "
+                         "of --select-from (robin/16: true layer edge 1.0-1.1 cells on every grid; "
+                         "1.5 was the raw-orifice value)")
+    ap.add_argument("--probe-base", default="surface", choices=["surface", "orifice"],
+                    help="--volume-dir probe origin: 'surface' = orifice projected onto the STL "
+                         "(true height, default since robin/16); 'orifice' = raw TM point "
+                         "(0.00145 R inside the surface; reproduces the 08-15 numbers)")
     ap.add_argument("--steps", nargs="*", type=int, default=None, help="steps for --volume-dir (default: from --surface file names)")
     ap.add_argument("--plot", default=None); ap.add_argument("--csv", default=None)
     ap.add_argument("--stations", action="store_true", help="print orifice-level tables")
     a = ap.parse_args(argv)
+    if a.kh_star is None:
+        from src.boundary.surfel_kappa import kh_star_for
+        a.kh_star = kh_star_for(a.p_h)
 
     orf = load_orifices(os.path.join(a.data, "tm80051_orifices.csv"))
     cpd = load_cp(os.path.join(a.data, "tm80051_cp_rotor_off.csv"))[a.point]
@@ -524,15 +578,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             steps = a.steps or [int(re.search(r"surface_(\d+)", f).group(1)) for f in files]
             cp_sim = volume_cp_at_height(a.volume_dir, steps, stl, orf["xyz"], a.p_h, nlev,
                                          float(cfg["physics"]["rho"]), float(cfg["physics"]["U_inf"]),
-                                         float(stl["scale_to_lu"]))
-            print(f"== sim (VOLUME, h = {a.p_h:g} fine cells along the orifice normal): steps {steps}; "
+                                         float(stl["scale_to_lu"]), probe_base=a.probe_base)
+            print(f"== sim (VOLUME, h = {a.p_h:g} fine cells along the normal, base {a.probe_base}): steps {steps}; "
                   f"nan {int(np.isnan(cp_sim).sum())}")
             print_report(a.point, cpd, orf, cp_sim)
             if a.csv:
                 _write_csv(a.csv, orf, cpd, cp_sim)
             if a.plot:
                 plot_stations(orf, cpd["cp"], cp_sim, a.plot,
-                              f"ROBIN rotor-off Cp — TM-80051 pt {a.point} (volume p at h={a.p_h:g} cells)")
+                              f"ROBIN rotor-off Cp — TM-80051 pt {a.point} (volume p at h={a.p_h:g} cells, {a.probe_base})")
             return
         cen, cpm, cps, area, off = surface_cp_mean(files, a.p_inf, q_inf,
                                                    channel=a.p_channel)

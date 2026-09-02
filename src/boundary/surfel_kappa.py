@@ -26,10 +26,33 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-#: robin/11 K4: pooled-logistic switch point; LORO 0.0029-0.0035; the
-#: ALL-rms plateau spans 0.002-0.008 (not finely tuned). Stack constant —
-#: re-estimate if the wall model or the numerical-layer thickness changes.
-KH_STAR_DEFAULT = 0.0034
+#: robin/11 K4 calibration pair: pooled-logistic switch point kh* = 0.0034
+#: was fitted with the outer channel LABELLED h = 1.5 cells (LORO
+#: 0.0029-0.0035; ALL-rms plateau 0.002-0.008). robin/16 sec. 3-correction:
+#: that readout actually sat ~1.1 cells above the STL (the TM-80051
+#: orifice coordinates lie 0.00145 R INSIDE the surface), and the true
+#: layer edge h* = 1.0-1.1 cells is the same on R/160, R/256 and R/320.
+#: The calibrated SELECTION SET is therefore the h-independent invariant
+#:     kappa_n(flow) * dx_fine >= KH_STAR_CAL / H_CAL  (= 0.002267)
+#: and the threshold in kh = kappa_n*h space must scale with the sampling
+#: height: kh*(h) = KH_STAR_CAL * h / H_CAL  (`kh_star_for`). With
+#: p_sample_h = 1.1 this gives 0.0024933 and reproduces the robin/11 set
+#: exactly (0 facet flips on the r20-5 run); keeping 0.0034 would silently
+#: drop 9 % of the outer set. Stack constant — re-estimate if the wall
+#: model or the numerical-layer thickness changes.
+KH_STAR_CAL = 0.0034
+H_CAL = 1.5
+#: legacy fallback for callers that pass no kh_star at all (= the h-1.5
+#: labelled value; every solver path derives kh* from p_sample_h instead)
+KH_STAR_DEFAULT = KH_STAR_CAL
+
+
+def kh_star_for(p_sample_h: float) -> float:
+    """kh* consistent with the robin/11 calibration for an outer-channel
+    sample height p_sample_h [fine cells]: KH_STAR_CAL * h / H_CAL. Exact
+    (1.0 multiplier) at h = H_CAL, so registered h = 1.5 runs keep 0.0034
+    bit-for-bit."""
+    return KH_STAR_CAL * (float(p_sample_h) / H_CAL)
 
 _MASK_CACHE = {}     # (fingerprint) -> (mask, kh); survives shell writers
 
