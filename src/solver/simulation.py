@@ -1511,6 +1511,34 @@ class Simulation:
         that launches it lands with the slab filter (62 (2)) where the
         same restriction is needed for MPI anyway.
         """
+        # V2 band sandwich (patch 83, opt-in LBM_SURFEL_V2=1): interior
+        # fine levels stage/deposit only the static body band and run
+        # the fused eso kernel on the bulk — the V1 full staging below
+        # stays the default and keeps L0-class levels (domain faces).
+        v2 = getattr(self, '_band_v2', None)
+        if v2 is None:
+            import os
+            v2 = False
+            if os.environ.get('LBM_SURFEL_V2', '0') == '1':
+                from src.boundary.surfel_band import (
+                    band_eligible, SurfelBandBridge)
+                why = band_eligible(self)
+                if not why:
+                    v2 = SurfelBandBridge(self)
+                    nb = v2.n_box
+                    ntot = 1
+                    for d in self.domain_shape:
+                        ntot *= d
+                    print(f"[v2] band sandwich ON: stage box "
+                          f"{v2.stage_shape} = {nb / ntot:.1%} of the "
+                          f"level ({tuple(self.domain_shape)})")
+                else:
+                    print(f"[v2] level stays V1: {why}")
+            self._band_v2 = v2
+        if v2 is not False:
+            v2.advance(self)
+            return
+
         from src.kernels.esoteric_d3q27 import (
             esoteric_gather_std, esoteric_scatter_std)
         xp = self.xp
