@@ -52,17 +52,38 @@ class SurfelSlabLevel:
             # the build the full-minus-window difference in headroom;
             # the eso/std conversion itself stays where it was (after
             # the full-surfel release below).
-            idx = cp.asarray(
-                np.arange(part.own_start - part.ghost,
-                          part.own_start + part.own_count + part.ghost)
-                % n_ax)
-            take = [slice(None)] * 4
-            take[1 + part.axis] = idx
-            f_slab = cp.ascontiguousarray(lev.f[tuple(take)])
             from src.utilities.build_census import build_census
-            build_census('surfel slab: f window sliced')
-            was_eso = bool(getattr(lev, '_use_esoteric', False))
-            lev.f = None
+            if lev.f is None and getattr(lev, '_dist_init_ic', None) \
+                    is not None:
+                # dist-init (mpi_axis/06b): the replicated build never
+                # materialized full-domain f — broadcast the ONE
+                # equilibrium vector over the slab window instead. Same
+                # per-cell math as the replicated elementwise init ->
+                # bit-equal (the local_level.py:54 contract, surfel twin).
+                rho0, u0 = lev._dist_init_ic
+                rho_t = cp.full((1, 1, 1), rho0, dtype=cp.float32)
+                u_t = cp.zeros((3, 1, 1, 1), dtype=cp.float32)
+                for d in range(min(3, len(u0))):
+                    u_t[d] = u0[d]
+                feq27 = lev.collision.compute_equilibrium(
+                    rho_t, u_t).astype(cp.float32, copy=False)
+                sl_shape = list(lev.domain_shape)
+                sl_shape[part.axis] = part.own_count + 2 * part.ghost
+                f_slab = cp.ascontiguousarray(cp.broadcast_to(
+                    feq27, (feq27.shape[0],) + tuple(sl_shape)))
+                was_eso = False        # dist-init keeps f standard
+                build_census('surfel slab: dist-init slab f built')
+            else:
+                idx = cp.asarray(
+                    np.arange(part.own_start - part.ghost,
+                              part.own_start + part.own_count + part.ghost)
+                    % n_ax)
+                take = [slice(None)] * 4
+                take[1 + part.axis] = idx
+                f_slab = cp.ascontiguousarray(lev.f[tuple(take)])
+                build_census('surfel slab: f window sliced')
+                was_eso = bool(getattr(lev, '_use_esoteric', False))
+                lev.f = None
             cp.get_default_memory_pool().free_all_blocks()
 
             self.sb = build_slab_surfel(
