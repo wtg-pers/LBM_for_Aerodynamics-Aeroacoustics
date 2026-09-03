@@ -423,6 +423,13 @@ class DistributedMLGRunner:
                 self.rlc[uid]._f2c_wall_keep = getattr(
                     Lc.sb, 'f2c_wall_keep', None)
         self._fprev: List[Optional[object]] = [None] * self.nb
+        # LBM_FPREV_HOST=1: park f_prev snapshots on the host between the
+        # save and the half-step c2f (mpi_axis/06 sec. 7 relief valve for
+        # 24 GB-class cards at g6 scale; costs one H2D per child substep)
+        import os as _os
+        self._fprev_host = _os.environ.get('LBM_FPREV_HOST', '0') == '1'
+        if self._fprev_host and rank == 0:
+            print("[mpi] fprev host staging ON (LBM_FPREV_HOST=1)")
         self.profile = None          # dict -> per-section seconds (opt-in)
         # halo scheduling state (backlog #5): ghosts_fresh -> skip idempotent
         # re-exchanges of unchanged mem (the A-syncs after a same-cycle
@@ -601,9 +608,17 @@ class DistributedMLGRunner:
         # fetch_coarse_block: legacy = the same single rank-local gather
         # (bit-identical); B1 engaged = local + exchanged row strips over
         # the fine-derived needed range (mpi_axis/04 sec. 2c)
-        self._fprev[uid] = self.rlc[uid].fetch_coarse_block(
+        blk = self.rlc[uid].fetch_coarse_block(
             P.mem, P.t,
             {'wall_mask': P.wall_mask, 'wall_mail': P.wall_mail})
+        if self._fprev_host and blk is not None:
+            # LBM_FPREV_HOST=1 (mpi_axis/06 sec. 7): park the snapshot on
+            # the host so the parent-block buffer does not sit on the
+            # device through the child's advances (the g6 24 GB cliff);
+            # re-uploaded once at the half-step c2f. Identical bytes ->
+            # identical math (device round-trip is exact).
+            blk = cp.asnumpy(blk)
+        self._fprev[uid] = blk
         self._toc("fprev", t0)
 
     def _advance_level(self, uid: int) -> None:
@@ -679,14 +694,24 @@ class DistributedMLGRunner:
                 self._sync(puid)
             if mine:
                 t0 = self._tic()
+                fp = self._fprev[uid] if is_half else None
+                if fp is not None and not isinstance(fp, cp.ndarray):
+                    fp = cp.asarray(fp)   # LBM_FPREV_HOST staging upload
                 self.rlc[uid].c2f(self.lv[puid].mem, self.lv[uid].mem,
                                   self.lv[puid].t, self.lv[uid].t,
                                   is_half_step=is_half,
-                                  f_prev_sub_loc=(self._fprev[uid] if is_half
-                                                  else None),
+                                  f_prev_sub_loc=fp,
                                   nt_f=self.lv[uid].nt_c2f,
                                   wall_c=self.lv[puid].wall_args,
                                   wall_f=self.lv[uid].wall_args)
+                if is_half:
+                    # consumed exactly once (the half-step temporal
+                    # interp); the parent's next substep re-saves it —
+                    # freeing here returns a parent-block-sized buffer
+                    # (~1.5 GB at g6-L4) for the rest of the child pair
+                    # (mpi_axis/06 sec. 7 peak trim)
+                    fp = None
+                    self._fprev[uid] = None
                 self._toc("coupling", t0)
                 self._touch(uid)      # c2f wrote our strips
             for g in b.children:
