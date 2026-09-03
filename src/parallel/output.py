@@ -63,6 +63,98 @@ def _gather_block(comm, rank: int, nr: int, part, arr_local, tag0: int,
     return np.concatenate(pieces, axis=1 + part.axis)
 
 
+# ── checkpoint f STREAMS (robin/16 s12) ──────────────────────────────
+# The old checkpoint gather (_gather_block on runner.owned_f_std_block)
+# materialised a full std copy of every rank's slab on the device, moved
+# it to the host and assembled the WHOLE level on rank 0 -- rank-0 host
+# peak = every level's f (29 GB float32 on the 6-level ROBIN grid) -> the
+# first checkpoint OOM'd the host. The stream below hands rank 0 one
+# (xs, Ny, Nz) piece of one population at a time, in the .npy C order
+# (q-major, then x), so CheckpointManager writes each piece as it arrives.
+# Every rank walks the SAME plan; a rank that owns nothing of a block
+# sends zero-length pieces so the message pattern stays rank-invariant.
+
+def ckpt_stream_plan(global_shape, n_pop: int, max_cells: int = 3_000_000):
+    """[(q, x0, x1)] in .npy C order for a (Q, Nx, Ny, Nz) level."""
+    Nx, Ny, Nz = (int(v) for v in global_shape)
+    step = max(1, max_cells // max(Ny * Nz, 1))
+    return [(q, x0, min(x0 + step, Nx))
+            for q in range(int(n_pop)) for x0 in range(0, Nx, step)]
+
+
+def _ckpt_piece(lev, part, q: int, x0: int, x1: int):
+    """This rank's OWNED part of global x-slab [x0, x1) of population q,
+    as a host array + its placement (gx0, s0, s1) in the (x1-x0, Ny, Nz)
+    chunk: rows gx0.. along x when the cut axis is x, columns s0..s1 along
+    the cut axis otherwise. Zero-size when the rank owns nothing there."""
+    Nx, Ny, Nz = (int(v) for v in part.global_shape)
+    a, s, n, g = part.axis, part.own_start, part.own_count, part.ghost
+    empty = (np.empty((0, Ny, Nz), np.float32), (0, 0, 0))
+    if lev is None or n <= 0:
+        return empty
+    if a == 0:
+        gx0, gx1 = max(x0, s), min(x1, s + n)
+        if gx1 <= gx0:
+            return empty
+        region = (slice(gx0 - s + g, gx1 - s + g), slice(None), slice(None))
+        place = (gx0 - x0, 0, 0)
+    elif a == 1:
+        region = (slice(x0, x1), slice(g, g + n), slice(None))
+        place = (0, s, s + n)
+    else:
+        region = (slice(x0, x1), slice(None), slice(g, g + n))
+        place = (0, s, s + n)
+    from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
+    blk = esoteric_gather_std_region(cp, lev.mem, lev.t, region)
+    piece = cp.asnumpy(blk[q])
+    del blk
+    return np.ascontiguousarray(piece), place
+
+
+def ckpt_send_block(comm, rank: int, part, lev, uid: int, n_pop: int,
+                    tag0: int) -> None:
+    """Non-root side of one block's stream: produce and send every piece
+    of the plan, in order (blocks until rank 0 consumes them)."""
+    for q, x0, x1 in ckpt_stream_plan(part.global_shape, n_pop):
+        piece, place = _ckpt_piece(lev, part, q, x0, x1)
+        comm.send((piece.shape, piece.dtype.str, place), dest=0, tag=tag0)
+        comm.Send(piece, dest=0, tag=tag0 + 1)
+
+
+def ckpt_lazy_block(comm, rank: int, nr: int, part, lev, uid: int,
+                    n_pop: int, tag0: int):
+    """Rank-0 side: a LazyArray whose chunks are assembled from this rank's
+    own piece + one piece per other rank, per plan entry, as the checkpoint
+    writer asks for them."""
+    from src.io.checkpoint import LazyArray
+    Nx, Ny, Nz = (int(v) for v in part.global_shape)
+    a = part.axis
+
+    def _place(chunk, piece, place):
+        if piece.size == 0:
+            return
+        gx0, s0, s1 = place
+        if a == 0:
+            chunk[gx0:gx0 + piece.shape[0]] = piece
+        elif a == 1:
+            chunk[:, s0:s1] = piece
+        else:
+            chunk[:, :, s0:s1] = piece
+
+    def _chunks():
+        for q, x0, x1 in ckpt_stream_plan(part.global_shape, n_pop):
+            chunk = np.empty((x1 - x0, Ny, Nz), np.float32)
+            piece, place = _ckpt_piece(lev, part, q, x0, x1)
+            _place(chunk, piece, place)
+            for src in range(1, nr):
+                shape, dt, place = comm.recv(source=src, tag=tag0)
+                buf = np.empty(shape, dtype=np.dtype(dt))
+                comm.Recv(buf, source=src, tag=tag0 + 1)
+                _place(chunk, buf, place)
+            yield chunk
+    return LazyArray((int(n_pop), Nx, Ny, Nz), np.float32, _chunks)
+
+
 class _MaskCarrier:
     """Minimal duck for MLGVTKWriter's `obstacle_bc.solid_mask` read."""
 

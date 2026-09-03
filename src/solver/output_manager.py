@@ -860,8 +860,58 @@ class OutputManager:
         self._last_ckpt_step = step
     
     @staticmethod
-    def _f_checkpoint_cpu(sim_like):
-        """Level f for checkpointing, moved to host IMMEDIATELY.
+    def _f_checkpoint_lazy(sim_like):
+        """Level f for checkpointing as a LazyArray (robin/16 s12).
+
+        Chunks are produced WHILE the checkpoint member is written, in the
+        file's C order: for each population q, x-slabs of (xs, Ny, Nz).
+        Esoteric levels gather each slab with the region kernel (device
+        transient one (27, xs, Ny, Nz) block, <= ~0.3 GB) and copy only
+        the q-th population to the host; standard levels slice f directly.
+        Host memory: one (xs, Ny, Nz) piece. The region gather re-reads
+        the level 27x per checkpoint -- memory-bound GPU work, ~1 s for a
+        190 M-node level -- which is what buys the bounded host.
+        """
+        from src.io.checkpoint import LazyArray
+        import numpy as _np
+        sim = (sim_like.get_level(0) if hasattr(sim_like, 'get_level')
+               else sim_like)
+        f_dev = sim.f
+        Q = int(f_dev.shape[0])
+        shape = tuple(int(v) for v in f_dev.shape)
+        Nx, Ny, Nz = sim.domain_shape
+        step = max(1, 3_000_000 // max(Ny * Nz, 1))
+
+        def _chunks():
+            if getattr(sim, '_use_esoteric', False):
+                from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
+                xp = sim.xp
+                full = (slice(None), slice(None))
+                for q in range(Q):
+                    for x0 in range(0, Nx, step):
+                        sl = slice(x0, min(x0 + step, Nx))
+                        g = esoteric_gather_std_region(
+                            xp, sim.f, sim._esoteric_step, (sl,) + full)
+                        piece = g[q]
+                        yield (piece.get() if hasattr(piece, 'get')
+                               else _np.asarray(piece))
+                        del g, piece
+                if xp.__name__ == 'cupy':
+                    import cupy
+                    cupy.get_default_memory_pool().free_all_blocks()
+            else:
+                f = sim.physical_f
+                for q in range(Q):
+                    for x0 in range(0, Nx, step):
+                        piece = f[q, x0:min(x0 + step, Nx)]
+                        yield (piece.get() if hasattr(piece, 'get')
+                               else _np.ascontiguousarray(piece))
+        return LazyArray(shape, f_dev.dtype, _chunks)
+
+    @classmethod
+    def _f_checkpoint_cpu(cls, sim_like):
+        """Level f for checkpointing as a HOST array (materialised
+        _f_checkpoint_lazy; kept for callers that need the array itself).
 
         Esoteric levels gather a full physical copy on the GPU; converting
         to host per level (freeing the GPU copy before the next level) keeps
@@ -870,33 +920,7 @@ class OutputManager:
         at D40) and OOM'd the first checkpoint (2026-07-10 cluster run).
         Non-GPU arrays pass through unchanged.
         """
-        import numpy as _np
-        sim = (sim_like.get_level(0) if hasattr(sim_like, 'get_level')
-               else sim_like)
-        if getattr(sim, '_use_esoteric', False):
-            # SLAB-STREAMED gather -> host: a full-field GPU gather is one
-            # f-sized block (1.9-2.9 GB/level at D40) that the fragmented
-            # pool cannot reuse across levels -- the first D40 checkpoint
-            # OOM'd exactly here (2026-07-10 cluster). Gathering x-slabs via
-            # the bit-exact region gather caps the GPU transient at ~0.5 GB.
-            from src.kernels.esoteric_d3q27 import esoteric_gather_std_region
-            xp = sim.xp
-            Nx, Ny, Nz = sim.domain_shape
-            out = _np.empty((sim.f.shape[0], Nx, Ny, Nz), dtype=sim.f.dtype)
-            step = max(1, 3_000_000 // max(Ny * Nz, 1))
-            full = (slice(None), slice(None))
-            for x0 in range(0, Nx, step):
-                sl = slice(x0, min(x0 + step, Nx))
-                g = esoteric_gather_std_region(
-                    xp, sim.f, sim._esoteric_step, (sl,) + full)
-                out[:, sl] = g.get() if hasattr(g, 'get') else g
-                del g
-            if xp.__name__ == 'cupy':
-                import cupy
-                cupy.get_default_memory_pool().free_all_blocks()
-            return out
-        f = sim.physical_f
-        return f.get() if hasattr(f, 'get') else f
+        return cls._f_checkpoint_lazy(sim_like).materialize()
 
     def _build_checkpoint_extra(self, sim) -> dict:
         """Build extra_data dict for MLG checkpoint (fine level f arrays)
@@ -931,7 +955,7 @@ class OutputManager:
                             continue
                         _sfx = "" if _per[_b.level] <= 1 else f"_b{_b.index}"
                         extra[f'f_level_{_b.level}{_sfx}'] = \
-                            self._f_checkpoint_cpu(_b.sim)
+                            self._f_checkpoint_lazy(_b.sim)
                         # open-face track: a flush fine wall's mailbox is
                         # per-level state — same key rule as f_level_*.
                         if getattr(_b.sim, '_eso_wall_mask', 0):
@@ -943,7 +967,7 @@ class OutputManager:
                     # Host-immediate per level: keeps the GPU transient bounded to ONE
                     # level's gather instead of retaining every level's physical copy
                     # until save() (OOM'd the D40 checkpoint on a 24GB card).
-                    extra[f'f_level_{k}'] = self._f_checkpoint_cpu(sim.get_level(k))
+                    extra[f'f_level_{k}'] = self._f_checkpoint_lazy(sim.get_level(k))
         return extra if extra else None
 
     def _ckpt_due(self, step: int) -> bool:
@@ -957,10 +981,11 @@ class OutputManager:
                             include_extra: bool = True):
         """Data seam: host f (+ MLG fine-level extras) for a checkpoint.
 
-        Single-GPU: slab-streamed host gather per level. MPI override:
-        collective owned_f_std gathers -> dict on rank 0, None elsewhere."""
+        Single-GPU: LazyArray per level (produced while the checkpoint is
+        written, robin/16 s12). MPI override: collective streams -> lazy
+        payload on rank 0, None elsewhere (after joining the streams)."""
         return {
-            'f': self._f_checkpoint_cpu(sim),
+            'f': self._f_checkpoint_lazy(sim),
             'extra': (self._build_checkpoint_extra(sim)
                       if include_extra else None),
         }

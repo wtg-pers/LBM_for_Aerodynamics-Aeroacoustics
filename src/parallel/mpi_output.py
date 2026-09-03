@@ -33,7 +33,8 @@ import numpy as np
 
 from src.solver.output_manager import OutputManager
 from src.parallel.output import (
-    _gather_block, _BlockView, _LevelView, _MLGView)
+    _gather_block, _BlockView, _LevelView, _MLGView,
+    ckpt_send_block, ckpt_lazy_block)
 from src.parallel.runner import TAG_FIELD, TAG_CKPT, TAG_MACRO
 
 
@@ -558,23 +559,20 @@ class MPIOutputManager(OutputManager):
                 and step % self._ckpt_every == 0)
 
     def _checkpoint_payload(self, sim, include_extra: bool = True):
-        """COLLECTIVE per-block owned_f_std gathers -> rank0 payload / None.
+        """COLLECTIVE checkpoint payload -> rank0 payload / None elsewhere.
 
         Key rule mirrors the single-GPU writer exactly: no block suffix when
         the level holds one block, so a chain writes the SAME key set as
-        before and either reader loads either file."""
+        before and either reader loads either file.
+
+        robin/16 s12 -- the block f arrays are STREAMS, not gathers: the
+        small collectives (L0 rho/u, wall-mail strips) run first on every
+        rank; then rank 0 returns LazyArray entries whose chunks receive
+        one (q, x-slab) piece per rank while CheckpointManager writes,
+        and every other rank sends its pieces block by block in the same
+        order ('f' = block 0 first, then f_level_* in block order) before
+        returning None. Rank-0 host peak: one piece, not every level."""
         comm, rank, nr, r = self._comm, self._rank, self._nr, self._runner
-        f_blocks = []
-        for uid in range(len(r.blocks)):
-            fk = _gather_block(comm, rank, nr, r.parts[uid],
-                               r.owned_f_std_block(uid), TAG_CKPT + 4 * uid,
-                               r.n_pop, pre_sliced=True)
-            f_blocks.append(fk)
-            try:
-                import cupy as cp
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
         # eso implicit-wall mailbox (L0-only until fine walls exist;
         # eso_wall §4-5b): cell-local state OUTSIDE the f slots. Gather
         # each rank's OWNED strips (collective — must run on every rank)
@@ -607,7 +605,27 @@ class MPIOutputManager(OutputManager):
         # Restore reads f only, so checkpoint rho/u are informational — but
         # "informational" is not a licence to differ from the single path.
         rho_c, u_c = self._gather_l0_macros()
+        # ── block f streams (order = the writer's key order) ──
+        f_blocks = []
+        # include_extra=False (single-grid emergency save) consumes block 0
+        # only -- stream only that block on EVERY rank or the senders of
+        # the fine blocks would block forever.
+        for uid in (range(len(r.blocks)) if include_extra else [0]):
+            lev = r.lv[uid] if r.owns[uid] else None
+            if rank != 0:
+                ckpt_send_block(comm, rank, r.parts[uid], lev, uid, r.n_pop,
+                                TAG_CKPT + 4 * uid)
+                f_blocks.append(None)
+            else:
+                f_blocks.append(ckpt_lazy_block(
+                    comm, rank, nr, r.parts[uid], lev, uid, r.n_pop,
+                    TAG_CKPT + 4 * uid) )
         if rank != 0:
+            try:
+                import cupy as cp
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
             return None
         extra = None
         if include_extra:
