@@ -59,6 +59,8 @@ class SurfelSlabLevel:
             take = [slice(None)] * 4
             take[1 + part.axis] = idx
             f_slab = cp.ascontiguousarray(lev.f[tuple(take)])
+            from src.utilities.build_census import build_census
+            build_census('surfel slab: f window sliced')
             was_eso = bool(getattr(lev, '_use_esoteric', False))
             lev.f = None
             cp.get_default_memory_pool().free_all_blocks()
@@ -66,6 +68,7 @@ class SurfelSlabLevel:
             self.sb = build_slab_surfel(
                 sb_full, part.axis, part.own_start, part.own_count,
                 ghost=part.ghost, consume=True)
+            build_census('surfel slab: slab surfel built')
             slab_shape = self.sb.shape
             self.surfel_live = self.sb.d_live
             live_h = self.sb.live_h
@@ -96,6 +99,7 @@ class SurfelSlabLevel:
                 if hasattr(sb_full, a_):
                     setattr(sb_full, a_, None)
             cp.get_default_memory_pool().free_all_blocks()
+            build_census('surfel slab: full-build arrays released')
 
             if was_eso:
                 # window slice of the full eso mem (taken above):
@@ -136,6 +140,7 @@ class SurfelSlabLevel:
                 sgs_cfg=getattr(lev, '_sgs_cfg', None),
             )
             self.sim.adopt_esoteric_surfel_slab(mem, t0)
+            build_census('surfel slab: slab sim adopted')
 
             # sustained trip (patch 66): rebuild on the wrap window —
             # GLOBAL rows along the cut axis via the same modulo as the

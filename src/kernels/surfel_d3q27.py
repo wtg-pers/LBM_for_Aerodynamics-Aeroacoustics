@@ -676,8 +676,15 @@ class SurfelKernelD3Q27:
         qmap[sup] = np.arange(self.n_sup, dtype=np.int32)
         self.qmap = cp.asarray(qmap)
         self.cellc = cp.asarray(qmap[self._csr_cell])    # compact CSR
+        # host g is sparse over the SAME unique cell set (facets.g_cols
+        # == unique(_t_cell); this CSR is a permutation of those tables)
+        # so the compact upload is the sparse values verbatim — bit-
+        # identical to the retired dense reshape[:, sup] (mpi_axis/06)
+        if not np.array_equal(facets.g_cols, sup):
+            raise AssertionError(
+                "surfel g support != CSR support (mpi_axis/06 contract)")
         self.g_field = cp.asarray(np.ascontiguousarray(
-            facets.g_field.reshape(27, -1)[:, sup]))     # (27, n_sup)
+            facets.g_vals))                              # (27, n_sup)
         self.G_in = cp.zeros((self.n_f, 27), dtype=cp.float64)
         self.G_out = cp.zeros((self.n_f, 27), dtype=cp.float64)
         # Q is PER-STEP scratch on the support band (216 B/support-cell

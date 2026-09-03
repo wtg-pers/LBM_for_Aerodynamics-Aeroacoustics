@@ -427,15 +427,29 @@ class SurfelFacets:
             for i in np.nonzero(PAIR_OF == p)[0]:
                 self.Vsum[:, int(i)] = tot
 
-        # per-direction outflow field g_i(x) (Eq. 5 numerator)
-        self.g_field = np.zeros((27,) + self.shape)
+        # per-direction outflow field g_i(x) (Eq. 5 numerator) — stored
+        # SPARSE over the transport-table cells (mpi_axis/06): g is
+        # pair_cell_sums over the SAME tables, structurally zero
+        # elsewhere (the patch-64 sec. 18 device-compaction argument,
+        # host twin). The dense (27, N) f64 host field this replaces was
+        # 216 B/node RESIDENT per surfel level — at g6 scale 43 GiB for
+        # L5 alone, x4 ranks/node = the measured build OOM kill.
+        # g_cols == unique(_t_cell) == the kernel's unique(_csr_cell)
+        # (the CSR is a permutation of these tables), so the kernel's
+        # compact (27, n_sup) upload is g_vals verbatim.
+        cols = np.unique(self._t_cell).astype(np.int64)
+        self.g_cols = cols                    # sorted flat cell ids
+        self.g_vals = np.zeros((27, cols.size))
         for p in range(N_PAIR):
             S_minus, S_plus = pair_cell_sums(tables, surfels, shape, p)
+            sm = S_minus.reshape(-1)[cols]
+            sp = S_plus.reshape(-1)[cols]
             for i in range(1, 27):
                 if PAIR_OF[i] != p:
                     continue
                 same = bool((C27[i] == PAIR_DIR[p]).all())
-                self.g_field[i] = S_minus if same else S_plus
+                self.g_vals[i] = sm if same else sp
+        self.g_field = None    # dense host field retired (fail-fast)
 
         self.live = (np.ones(self.shape, dtype=bool) if live is None
                      else np.asarray(live, dtype=bool))

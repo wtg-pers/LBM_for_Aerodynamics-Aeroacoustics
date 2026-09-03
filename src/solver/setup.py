@@ -2635,6 +2635,8 @@ class SimulationSetup:
             eso_wall_implicit_ok=True,
         )
         simulations.append(sim_0)
+        from src.utilities.build_census import build_census
+        build_census('setup: L0 sim built')
         self._attach_coupling_skip(sim_0, self._mask, level=0)
 
         # ── Fine levels ──────────────────────────────────────────
@@ -2775,6 +2777,7 @@ class SimulationSetup:
                     sim_k._eso_band_faces |= 1 << _bit
             sim_k._eso_wall_q_scale = 0.5 * (2 ** k)
             simulations.append(sim_k)
+            build_census(f'setup: L{k} sim built')
             _blk.sim = sim_k
             self._attach_coupling_skip(sim_k, fine_mask_k, level=k,
                                        label=_blk.name)
@@ -3048,6 +3051,8 @@ class SimulationSetup:
             sgs_cfg=self._sgs_cfg,
         )
         simulations.append(sim_0)
+        from src.utilities.build_census import build_census
+        build_census('setup: L0 sim built')
 
         # Import 2D-specific fine-level geometry transform
         from src.boundary.geometry_manager import (
@@ -3135,6 +3140,7 @@ class SimulationSetup:
                 sgs_cfg=self._sgs_cfg,
             )
             simulations.append(sim_k)
+            build_census(f'setup: L{k} sim built')
 
             # ── Coupling engine (2D) for pair (k-1, k) ───────────
             coupling_k = GridCoupling2D(
@@ -3147,6 +3153,7 @@ class SimulationSetup:
             )
             couplings.append(coupling_k)
 
+        build_census('setup: MLG assembled')
         mlg = MultiLevelGrid(levels=simulations, couplings=couplings)
         print(f"\n  MultiLevelGrid (2D) assembled:")
         print(f"  {mlg.summary()}")

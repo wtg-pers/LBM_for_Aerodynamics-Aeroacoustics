@@ -305,6 +305,8 @@ class DistributedMLGRunner:
         self.is_surfel: List[bool] = []
         self.is_surfel_partial: List[bool] = []
         self.surface_meta: Dict[int, object] = {}
+        from src.utilities.build_census import build_census
+        build_census('runner: before slab extraction')
         for uid, b in enumerate(src):
             lev = b.sim
             is_surfel = getattr(getattr(lev, 'obstacle_bc', None),
@@ -380,6 +382,7 @@ class DistributedMLGRunner:
                     except AttributeError:
                         pass                     # read-only property
             cp.get_default_memory_pool().free_all_blocks()
+            build_census(f'runner: block uid{uid} slab done')
 
         self.n_pop = int(self.lv[0].mem.shape[0])      # 27 (D3Q27)
 
