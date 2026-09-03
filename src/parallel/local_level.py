@@ -66,7 +66,12 @@ def extract_level(lev, part=None) -> dict:
     # behaviour and what a 1-rank/no-partition caller still gets.
     f0_is_slab = False
     if restart_host is not None and part is not None:
-        f0 = wrap_slice(restart_host, part, 1)   # host -> device, slab only
+        if hasattr(restart_host, 'read_window'):
+            # deferred npz slab loader (robin/16 s12c): decode only this
+            # rank's wrap window — the full field never touches the host
+            f0 = cp.asarray(restart_host.read_window(part))
+        else:
+            f0 = wrap_slice(restart_host, part, 1)  # host->device, slab
         f0_is_slab = True
         lev._dist_restart_f = None               # release the host reference
     elif lev.f is None:

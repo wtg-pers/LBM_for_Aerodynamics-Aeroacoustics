@@ -116,6 +116,92 @@ def write_npz_streaming(filepath: str, entries: Dict[str, Any],
                     raise ValueError(f"{key}: streamed {nbytes} bytes, declared {need}")
 
 
+class SlabNpzLoader:
+    """Deferred slab reader for ONE npz f member (robin/16 s12c).
+
+    Restart creates this BEFORE the decomposition exists (the cut axis
+    and bounds are the runner's); the level extractor resolves its
+    partition and calls read_window(part), which decodes the zip member
+    once, SEQUENTIALLY, keeping only this rank's wrap-window rows.
+    Host peak = one (q, i) plane (~N2*N3*4 B) + the slab — never the
+    full field (g6 L5: 21.6 GB full vs ~5.6 GB slab + 0.5 MB plane).
+    Format untouched: plain npz member, same bytes the eager np.load
+    reads (the unit gate pins bit-equality against load+slice).
+    """
+
+    def __init__(self, path: str, member: str) -> None:
+        from numpy.lib import format as npf
+        self.path = path
+        self.member = member + '.npy'
+        with zipfile.ZipFile(path) as zf:
+            with zf.open(self.member) as fp:
+                ver = npf.read_magic(fp)
+                shape, fortran, dtype = npf._read_array_header(fp, ver)
+        if fortran:
+            raise ValueError(f"{member}: fortran-order npy unsupported")
+        if len(shape) != 4:
+            raise ValueError(f"{member}: expected (Q, Nx, Ny, Nz), "
+                             f"got {shape}")
+        self.shape = tuple(int(v) for v in shape)
+        self.dtype = np.dtype(dtype)
+
+    @staticmethod
+    def _readn(fp, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            b = fp.read(n - len(out))
+            if not b:
+                raise EOFError("npz member truncated mid-plane")
+            out += b
+        return bytes(out)
+
+    def read_rows(self, axis: int, rows: np.ndarray) -> np.ndarray:
+        """(Q, ...) host array whose `axis` (spatial 0..2) dim holds the
+        given global rows IN ORDER (a wrap window keeps its wrap order —
+        bit-equal to fancy-indexing the eagerly loaded array)."""
+        from numpy.lib import format as npf
+        Q, N1, N2, N3 = self.shape
+        dims = [N1, N2, N3]
+        rows = np.asarray(rows, dtype=np.int64)
+        inv = np.full(dims[axis], -1, dtype=np.int64)
+        inv[rows] = np.arange(rows.size)
+        oshape = [Q] + dims
+        oshape[1 + axis] = int(rows.size)
+        out = np.empty(tuple(oshape), self.dtype)
+        plane_b = N2 * N3 * self.dtype.itemsize
+        with zipfile.ZipFile(self.path) as zf:
+            with zf.open(self.member) as fp:
+                ver = npf.read_magic(fp)
+                npf._read_array_header(fp, ver)
+                for q in range(Q):
+                    for i1 in range(N1):
+                        buf = self._readn(fp, plane_b)
+                        if axis == 0:
+                            k = inv[i1]
+                            if k >= 0:
+                                out[q, k] = np.frombuffer(
+                                    buf, self.dtype).reshape(N2, N3)
+                            continue
+                        plane = np.frombuffer(
+                            buf, self.dtype).reshape(N2, N3)
+                        if axis == 1:
+                            out[q, i1] = plane[rows]
+                        else:
+                            out[q, i1] = plane[:, rows]
+        return out
+
+    def read_window(self, part=None) -> np.ndarray:
+        if part is None:
+            return self.read_rows(
+                0, np.arange(self.shape[1], dtype=np.int64))
+        a = int(part.axis)
+        n_ax = self.shape[1 + a]
+        rows = (np.arange(part.own_start - part.ghost,
+                          part.own_start + part.own_count + part.ghost)
+                % n_ax)
+        return self.read_rows(a, rows)
+
+
 class _LazyState(Mapping):
     """CheckpointManager.load result: keys resolved on ACCESS, never cached.
 

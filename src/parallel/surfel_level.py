@@ -53,7 +53,30 @@ class SurfelSlabLevel:
             # the eso/std conversion itself stays where it was (after
             # the full-surfel release below).
             from src.utilities.build_census import build_census
-            if lev.f is None and getattr(lev, '_dist_init_ic', None) \
+            _rst = getattr(lev, '_dist_restart_f', None)
+            if lev.f is None and _rst is not None:
+                # slab-scoped surfel dist-RESTART (robin/16 s12c — this
+                # wiring did not exist: dist+restart+surfel died on the
+                # f window slice). Checkpoint f is std physical; decode
+                # only this rank's wrap window (deferred loader) or
+                # slice the stashed host field, then fall through to the
+                # std->eso conversion below (t0 parity = the even-
+                # checkpoint contract, 64 sec. 12 G5).
+                if hasattr(_rst, 'read_window'):
+                    f_slab = cp.asarray(_rst.read_window(part))
+                else:
+                    _idx = np.arange(
+                        part.own_start - part.ghost,
+                        part.own_start + part.own_count + part.ghost) % n_ax
+                    _take = [slice(None)] * 4
+                    _take[1 + part.axis] = _idx
+                    f_slab = cp.asarray(np.ascontiguousarray(
+                        np.asarray(_rst).reshape(
+                            (27,) + tuple(lev.domain_shape))[tuple(_take)]))
+                lev._dist_restart_f = None
+                was_eso = False        # checkpoint f is standard
+                build_census('surfel slab: dist-restart slab f loaded')
+            elif lev.f is None and getattr(lev, '_dist_init_ic', None) \
                     is not None:
                 # dist-init (mpi_axis/06b): the replicated build never
                 # materialized full-domain f — broadcast the ONE

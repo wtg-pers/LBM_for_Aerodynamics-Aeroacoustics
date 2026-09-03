@@ -14,6 +14,8 @@ Date: 2026-03 (MLG checkpoint restart: 2026-04)
 """
 
 import os
+
+import numpy as np
 from typing import TYPE_CHECKING, Any, Tuple
 
 if TYPE_CHECKING:
@@ -495,16 +497,28 @@ class SolverInitializer:
         # holds the full field; the device never sees more than a slab).
         dist = os.environ.get("LBM_DIST_INIT", "0") == "1"
 
-        def _restore(level_sim, arr_host, tag):
+        def _restore(level_sim, key, tag):
             if dist:
                 level_sim.init_esoteric_metadata_host()
-                level_sim._dist_restart_f = arr_host
+                # robin/16 s12c: hand a DEFERRED slab loader when the
+                # state is file-backed — each rank later decodes only
+                # its wrap window (host peak: full field -> slab). The
+                # eager host stash stays as the fallback for dict-like
+                # states (tests / emergency paths).
+                m = getattr(state, '_member', None)
+                fn = getattr(state, 'filename', None)
+                if m is not None and fn and state._member(key) is not None:
+                    from src.io.checkpoint import SlabNpzLoader
+                    level_sim._dist_restart_f = SlabNpzLoader(
+                        fn, state._member(key))
+                else:
+                    level_sim._dist_restart_f = np.asarray(state[key])
             else:
                 # from_checkpoint: skip the IC seeders — the scattered
                 # checkpoint f already holds the true bounce/wall
                 # deposits (same latent restore-seeding bug class as the
                 # single-grid path; eso_wall patch 02/04).
-                level_sim.set_distribution(xp.asarray(arr_host),
+                level_sim.set_distribution(xp.asarray(state[key]),
                                            from_checkpoint=True)
             print(f"  {tag}: restored from checkpoint"
                   + (" (slab-scoped)" if dist else ""))
@@ -531,7 +545,7 @@ class SolverInitializer:
 
         # ── Restore Level 0 ──────────────────────────────────────
         _l0 = mlg.get_level(0)
-        _restore(_l0, state['f'], "Level 0")
+        _restore(_l0, 'f', "Level 0")
         _l0.step_count = start_step
         # eso implicit-wall mailbox (extra_wall_mail_L*) + series-
         # consistency guard. Replicated: device inject; dist-init: host
@@ -567,7 +581,7 @@ class SolverInitializer:
                     f"(fine-level keys present: {_avail or 'none'}). "
                     "Restart with the same block layout / level count the "
                     "checkpoint was written with.")
-            _restore(level_sim, state[key], f"Level {k}")
+            _restore(level_sim, key, f"Level {k}")
             # open-face track: flush fine wall mailbox, per-level keys
             # (key = 'f_level_{k}{sfx}' -> wall keys 'L{k}{sfx}')
             self._restore_wall_mail(level_sim, state,
