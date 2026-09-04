@@ -96,6 +96,47 @@ def level_spans_L0(level_shapes, pair_boxes, axis):
     return spans
 
 
+def surfel_band_density(blocks, shapes, pair_boxes, axis, alpha):
+    """Per-L0-column extra update-density from surfel band cells
+    (mpi_axis/08, B2 weight correction).
+
+    Band cells (kernel.sup = the transport-table support) carry the
+    facet-chain extra cost the plain cells*2^k density cannot see; the
+    g5 3-rank profile measured a 27% per-rank kernel spread at equal
+    update counts (body ranks slow). Each band cell contributes
+    alpha * 2^level plain-cell-update equivalents to its L0 column.
+    alpha is the LBM_BAND_WEIGHT knob (default 2.5, provisional
+    calibration from that measurement; 0 disables = bit-identical cuts).
+    """
+    import numpy as _np
+    n0 = int(shapes[0][axis])
+    w = _np.zeros(n0)
+    level_shapes = [tuple(sh) for sh in shapes]
+    spans = level_spans_L0(level_shapes, pair_boxes, axis)
+    for uid, b in enumerate(blocks):
+        sb = getattr(b.sim, 'obstacle_bc', None)
+        if getattr(sb, 'kind', None) != 'surfel':
+            continue
+        k = sb.kernel
+        sup = getattr(k, 'sup', None)
+        if sup is None:
+            continue
+        sup = _np.asarray(sup.get() if hasattr(sup, 'get') else sup,
+                          dtype=_np.int64)
+        _nx, ny, nz = (int(v) for v in shapes[uid])
+        if axis == 2:
+            c = sup % nz
+        elif axis == 1:
+            c = (sup // nz) % ny
+        else:
+            c = sup // (ny * nz)
+        A = spans[uid][0]
+        scale = 0.5 ** b.level
+        pos = _np.clip((A + (c + 0.5) * scale).astype(_np.int64), 0, n0 - 1)
+        _np.add.at(w, pos, float(alpha) * (2.0 ** b.level))
+    return w
+
+
 def chain_owns(level_shapes, pair_boxes, axis, bounds, ghost=3):
     """Exact per-rank chain from explicit L0 cut bounds.
 
@@ -131,7 +172,8 @@ def chain_owns(level_shapes, pair_boxes, axis, bounds, ghost=3):
     return min_own, max(loads) / total, owns_last
 
 
-def balance_cuts(level_shapes, pair_boxes, axis, n_ranks, ghost=3):
+def balance_cuts(level_shapes, pair_boxes, axis, n_ranks, ghost=3,
+                 extra_w=None):
     """Load-balanced L0 cut bounds [0, c1, ..., c_{R-1}, N0] along `axis`.
 
     Even L0 splits fail on nested MLG cases: the fine boxes concentrate in
@@ -160,6 +202,13 @@ def balance_cuts(level_shapes, pair_boxes, axis, n_ranks, ghost=3):
             ov = min(iy + 1.0, B) - max(float(iy), A)
             if ov > 0:
                 w[iy] += dens * ov
+    if extra_w is not None:
+        # surfel band-weight correction (mpi_axis/08): measured per-cell
+        # cost is NOT uniform — body/band columns carry the facet-chain
+        # extra. Adding the calibrated band density here moves the cuts
+        # so per-rank TIME balances, not just update counts (g5 3-rank
+        # measurement: 27% kernel spread at equal updates).
+        w = w + _np.asarray(extra_w, dtype=float)
     cum = _np.concatenate([[0.0], _np.cumsum(w)])
     cuts = [int(_np.searchsorted(cum, cum[-1] * q / n_ranks))
             for q in range(1, n_ranks)]

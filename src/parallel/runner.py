@@ -511,10 +511,30 @@ class DistributedMLGRunner:
                           (fdc.z_start, fdc.z_end)))
         try:
             if axis is None:
+                # NOTE: the auto-axis path selects and cuts WITHOUT the
+                # band-weight correction (mpi_axis/08 registered gap —
+                # production surfel runs pass --axis explicitly)
                 return choose_axis_balanced(shapes, boxes, n_ranks, ghost,
                                             exclude_axes=wall_axes)
             axis = int(axis)
-            return axis, balance_cuts(shapes, boxes, axis, n_ranks, ghost)
+            # surfel band-weight correction (mpi_axis/08, B2): per-cell
+            # cost is not uniform — band columns carry the facet chain.
+            # alpha=0 restores the exact historical cuts.
+            extra = None
+            alpha = float(os.environ.get('LBM_BAND_WEIGHT', '0'))
+            if alpha > 0 and any(
+                    getattr(getattr(b.sim, 'obstacle_bc', None), 'kind',
+                            None) == 'surfel' for b in src):
+                from src.parallel.partition import surfel_band_density
+                extra = surfel_band_density(src, shapes, boxes, axis,
+                                            alpha)
+                if self.rank == 0 and extra is not None:
+                    import numpy as _np
+                    print(f"[mpi] band-weight alpha={alpha:g}: extra "
+                          f"density {float(_np.sum(extra)):.3g} "
+                          f"(LBM_BAND_WEIGHT=0 restores plain cuts)")
+            return axis, balance_cuts(shapes, boxes, axis, n_ranks, ghost,
+                                      extra_w=extra)
         except ValueError as shared_err:
             # ── Phase B1 engage (mpi_axis/04): shared-cut infeasible ──
             # (deep ladder: the innermost span holds < n_ranks*ghost L0
