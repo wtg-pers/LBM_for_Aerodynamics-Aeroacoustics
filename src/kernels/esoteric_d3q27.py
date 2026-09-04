@@ -946,6 +946,104 @@ def _empty_like_retry(xp, a):
         return xp.empty_like(a)
 
 
+# ============================================================
+# FUSED one-launch gather/scatter (mpi_axis/08 profile repair)
+# The 27-slot python loop above launches ~54 roll/copy device ops per
+# call; at 31 substeps/coarse step the HOST glue alone measured
+# ~18 ms/substep (cProfile, r14: roll x48k = 18 s + gather/scatter
+# python 15 s per 60 steps) — a serial CPU floor that starves the GPU
+# (the 30-90% util oscillation). One kernel per direction table.
+# Mapping is DERIVED from the loop above at import time, so the fused
+# path is a pure re-expression (unit gate: bit-identical, both parities).
+# ============================================================
+
+def _bridge_maps():
+    """(gather_maps, scatter_maps)[parity][out_slot] = (src, sx, sy, sz);
+    out[q][x] = src_field[src][x + s] with periodic wrap."""
+    g = [[None] * 27 for _ in range(2)]
+    sc = [[None] * 27 for _ in range(2)]
+    for par in (0, 1):
+        even = (par == 0)
+        g[par][_STD_TO_ESO[0]] = (0, 0, 0, 0)
+        sc[par][0] = (_STD_TO_ESO[0], 0, 0, 0)
+        for pp in range(13):
+            i = 2 * pp + 1
+            c = (int(CX_ESO[i]), int(CY_ESO[i]), int(CZ_ESO[i]))
+            a, b = _STD_TO_ESO[i], _STD_TO_ESO[i + 1]
+            if even:
+                g[par][a] = (i + 1, 0, 0, 0)
+                g[par][b] = (i, c[0], c[1], c[2])
+                sc[par][i + 1] = (a, 0, 0, 0)
+                sc[par][i] = (b, -c[0], -c[1], -c[2])
+            else:
+                g[par][a] = (i, 0, 0, 0)
+                g[par][b] = (i + 1, c[0], c[1], c[2])
+                sc[par][i] = (a, 0, 0, 0)
+                sc[par][i + 1] = (b, -c[0], -c[1], -c[2])
+    return g, sc
+
+
+_BRIDGE_HEAD = r"""
+extern "C" __global__
+void eso_bridge_map(const float* __restrict__ src,
+                    float*       __restrict__ dst,
+                    const int Nx, const int Ny, const int Nz,
+                    const int par)
+{
+    const long long N = (long long)Nx * Ny * Nz;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    const int z = (int)(idx % Nz);
+    const int y = (int)((idx / Nz) % Ny);
+    const int x = (int)(idx / ((long long)Ny * Nz));
+    long long si; int xs, ys, zs;
+"""
+
+
+def _emit_moves(maps, par):
+    """Unrolled per-direction copy statements — literal constants only
+    (a MAP[] array indexed at runtime demotes to thread-local memory:
+    measured 1.73 -> 2.2 s/step regression before this unroll)."""
+    out = []
+    for q in range(27):
+        m0, sx, sy, sz = maps[par][q]
+        if sx == 0 and sy == 0 and sz == 0:
+            out.append(f"    dst[{q}*N + idx] = src[{m0}*N + idx];")
+            continue
+        out.append(f"    xs = x + ({sx}); "
+                   f"xs += (xs < 0) * Nx; xs -= (xs >= Nx) * Nx;")
+        out.append(f"    ys = y + ({sy}); "
+                   f"ys += (ys < 0) * Ny; ys -= (ys >= Ny) * Ny;")
+        out.append(f"    zs = z + ({sz}); "
+                   f"zs += (zs < 0) * Nz; zs -= (zs >= Nz) * Nz;")
+        out.append("    si = ((long long)xs * Ny + ys) * Nz + zs;")
+        out.append(f"    dst[{q}*N + idx] = src[{m0}*N + si];")
+    return "\n".join(out)
+
+
+def _bridge_src(maps):
+    return (_BRIDGE_HEAD
+            + "    if (par == 0) {\n" + _emit_moves(maps, 0)
+            + "\n    } else {\n" + _emit_moves(maps, 1)
+            + "\n    }\n}\n")
+
+
+_bridge_kernels = {}
+
+
+def _bridge_kernel(which: str):
+    import cupy as cp
+    k = _bridge_kernels.get(which)
+    if k is None:
+        g, sc = _bridge_maps()
+        maps = g if which == 'gather' else sc
+        src = _bridge_src(maps)
+        k = cp.RawKernel(src, 'eso_bridge_map',
+                         options=('--use_fast_math',))
+        _bridge_kernels[which] = k
+    return k
+
+
 def esoteric_gather_std(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
     """Esoteric memory -> physical f in STANDARD D3Q27 ordering.
 
@@ -958,6 +1056,17 @@ def esoteric_gather_std(xp, f_mem: 'npt.NDArray', t_step: int) -> 'npt.NDArray':
     out = _empty_like_retry(xp, f_mem)
     even = (t_step % 2 == 0)
     ndim = f_mem.ndim - 1
+    if (ndim == 3 and xp.__name__ == 'cupy'
+            and f_mem.dtype == xp.float32 and f_mem.flags.c_contiguous):
+        # fused one-launch path (mpi_axis/08): identical mapping, no
+        # 54-op python loop — see _bridge_maps
+        nx, ny, nz = f_mem.shape[1:]
+        n = nx * ny * nz
+        k = _bridge_kernel('gather')
+        k(((n + 255) // 256,), (256,),
+          (f_mem, out, xp.int32(nx), xp.int32(ny), xp.int32(nz),
+           xp.int32(0 if even else 1)))
+        return out
     ax = tuple(range(ndim))
     out[_STD_TO_ESO[0]] = f_mem[0]
     for p in range(13):
@@ -989,8 +1098,17 @@ def esoteric_scatter_std(xp, f_std: 'npt.NDArray', t_step: int) -> 'npt.NDArray'
     """
     even = (t_step % 2 == 0)
     ndim = f_std.ndim - 1                 # spatial dims (3 for a D3Q27 field)
-    ax = tuple(range(ndim))
     out = _empty_like_retry(xp, f_std)
+    if (ndim == 3 and xp.__name__ == 'cupy'
+            and f_std.dtype == xp.float32 and f_std.flags.c_contiguous):
+        nx, ny, nz = f_std.shape[1:]
+        n = nx * ny * nz
+        k = _bridge_kernel('scatter')
+        k(((n + 255) // 256,), (256,),
+          (f_std, out, xp.int32(nx), xp.int32(ny), xp.int32(nz),
+           xp.int32(0 if even else 1)))
+        return out
+    ax = tuple(range(ndim))
     out[0] = f_std[_STD_TO_ESO[0]]        # rest-direction: no pair, no roll
     for p in range(13):
         i = 2 * p + 1

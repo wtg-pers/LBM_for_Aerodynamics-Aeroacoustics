@@ -86,8 +86,19 @@ def write_npz_streaming(filepath: str, entries: Dict[str, Any],
     """
     from numpy.lib import format as npf
     comp = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    # LBM_CKPT_COMPRESS: zlib level for checkpoint members (mpi_axis/08
+    # profile finding: level-6 deflate of turbulent f32 fields is a
+    # single-thread CPU wall — 97 s at 17.5M nodes, ~25 min extrapolated
+    # at g6 — for only a 0.57-0.62 ratio). Default 1 keeps most of the
+    # ratio at ~4-5x the speed; 0 = STORED (no compression, np.load
+    # compatible); 6 = the historical np.savez_compressed behaviour.
+    lvl = int(os.environ.get('LBM_CKPT_COMPRESS', '1'))
+    if lvl <= 0:
+        comp = zipfile.ZIP_STORED
     with zipfile.ZipFile(filepath, mode='w', compression=comp,
-                         allowZip64=True) as zf:
+                         allowZip64=True,
+                         **({'compresslevel': lvl}
+                            if comp == zipfile.ZIP_DEFLATED else {})) as zf:
         for key, val in entries.items():
             name = key + '.npy'
             if isinstance(val, LazyArray):
